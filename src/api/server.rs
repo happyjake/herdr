@@ -29,10 +29,48 @@ mod subscription_socket_tests;
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
-const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// One accepted API client connection, independent of how its bytes travel.
+///
+/// The Unix socket frames messages as JSON lines; the WebSocket transport
+/// frames them as one JSON message per text frame. Everything above framing
+/// (request dispatch, subscription streaming, wait loops) is shared through
+/// this trait.
+pub(super) trait ApiTransport {
+    /// Write one JSON API message to the client.
+    fn write_message(&mut self, message: &str) -> std::io::Result<()>;
+
+    /// Non-blocking probe: has the client torn down the request stream?
+    ///
+    /// Any readable payload also counts as torn down — a client that keeps
+    /// writing after starting a stream forfeits the connection, matching the
+    /// Unix socket's one-request-per-stream contract.
+    fn probe_closed(&mut self) -> std::io::Result<bool>;
+
+    /// Optional local-process diagnostics for a direct stop request.
+    /// Remote transports have no local process identity to report.
+    fn peer_description(&self) -> Option<String> {
+        None
+    }
+}
+
+impl ApiTransport for LocalStream {
+    fn peer_description(&self) -> Option<String> {
+        crate::platform::local_stream_peer_description(self)
+    }
+
+    fn write_message(&mut self, message: &str) -> std::io::Result<()> {
+        write_text_line(self, message)
+    }
+
+    fn probe_closed(&mut self) -> std::io::Result<bool> {
+        local_stream_peer_closed(self)
+    }
+}
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -63,11 +101,20 @@ pub(crate) fn start_server_with_stop_control(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     server_stop: ServerStop,
+    server_name: crate::api::SharedServerName,
 ) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
+    start_server_inner(
+        api_tx,
+        event_hub,
+        default_capabilities(),
+        Some(server_stop),
+        server_name,
+    )
 }
 
-fn default_capabilities() -> Option<ServerCapabilities> {
+/// The ping capabilities of this server, shared by every API transport so a
+/// pong reads the same over the unix socket and the websocket.
+pub(super) fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
@@ -83,6 +130,7 @@ fn start_server_inner(
     event_hub: EventHub,
     mut capabilities: Option<ServerCapabilities>,
     server_stop: Option<ServerStop>,
+    server_name: crate::api::SharedServerName,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -91,6 +139,7 @@ fn start_server_inner(
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
     info!(path = %path.display(), "api server listening");
+    crate::api::attachment::spawn_ttl_sweeper();
 
     #[cfg(unix)]
     let ssh_agents = match crate::platform::ssh_agent::SshAgentRegistry::new(
@@ -129,6 +178,7 @@ fn start_server_inner(
                 let event_hub = event_hub.clone();
                 let capabilities = capabilities.clone();
                 let server_stop = server_stop.clone();
+                let server_name = server_name.clone();
                 let connection_running = Arc::clone(&listener_running);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
@@ -142,6 +192,7 @@ fn start_server_inner(
                         server_stop.as_ref(),
                         #[cfg(unix)]
                         ssh_agents.as_ref(),
+                        &server_name,
                     ) {
                         warn!(err = %err, "api connection failed");
                     }
@@ -322,9 +373,11 @@ fn handle_connection(
         None,
         #[cfg(unix)]
         None,
+        &crate::api::SharedServerName::new("test".to_string()),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection_with_stop(
     mut stream: LocalStream,
     api_tx: &ApiRequestSender,
@@ -333,6 +386,7 @@ fn handle_connection_with_stop(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&ServerStop>,
     #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
+    server_name: &crate::api::SharedServerName,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -342,13 +396,100 @@ fn handle_connection_with_stop(
         return Ok(());
     };
 
-    let line = line.trim();
-    if line.is_empty() {
+    let Some(request) = parse_api_request(&mut stream, &line)? else {
         return Ok(());
+    };
+
+    // An SSH agent registration lives exactly as long as this local
+    // connection, so it needs the owned local stream and stays outside the
+    // transport-generic dispatch core.
+    match request.method {
+        #[cfg(unix)]
+        Method::ServerSshAgentRegister(params) => {
+            serve_ssh_agent_registration(stream, request.id, params, running, ssh_agents)
+        }
+        method_body => handle_parsed_request(
+            Request {
+                id: request.id,
+                method: method_body,
+            },
+            &mut stream,
+            api_tx,
+            event_hub,
+            running,
+            capabilities,
+            server_stop,
+            server_name,
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn serve_ssh_agent_registration(
+    mut stream: LocalStream,
+    request_id: String,
+    params: crate::api::schema::ServerSshAgentRegisterParams,
+    running: &Arc<AtomicBool>,
+    ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
+) -> std::io::Result<()> {
+    crate::logging::api_request_started(&request_id, "server.ssh_agent.register", false);
+    let lease = ssh_agents
+        .ok_or_else(|| io::Error::other("SSH agent registration is unavailable"))
+        .and_then(|registry| registry.register(PathBuf::from(params.socket_path)));
+    let lease = match lease {
+        Ok(lease) => lease,
+        Err(error) => {
+            return write_message_allow_disconnect(
+                &mut stream,
+                &error_response_json(
+                    request_id,
+                    if error.kind() == io::ErrorKind::InvalidInput {
+                        "invalid_ssh_agent"
+                    } else {
+                        "ssh_agent_unavailable"
+                    },
+                    error.to_string(),
+                ),
+            )
+        }
+    };
+    write_json_message(
+        &mut stream,
+        &SuccessResponse {
+            id: request_id,
+            result: ResponseResult::Ok {},
+        },
+    )?;
+    set_local_stream_polling(&mut stream, true)?;
+    let mut byte = [0];
+    while running.load(Ordering::Relaxed) {
+        match poll_local_stream_read(&mut stream, &mut byte)? {
+            LocalStreamRead::Pending => {
+                // SSH can unlink an inherited socket after its bridge's lease closes.
+                lease.refresh()?;
+                std::thread::sleep(CONNECTION_POLL_INTERVAL);
+            }
+            _ => break,
+        }
+    }
+    Ok(())
+}
+
+/// Parse one API request from raw message text. Empty text is skipped
+/// silently; malformed JSON gets an `invalid_request` error message written
+/// to the client. Both yield `Ok(None)` — how the connection continues
+/// afterwards is the transport's call.
+pub(super) fn parse_api_request<T: ApiTransport>(
+    transport: &mut T,
+    text: &str,
+) -> std::io::Result<Option<Request>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
-        Ok(request) => request,
+    match serde_json::from_str::<Request>(text) {
+        Ok(request) => Ok(Some(request)),
         Err(request_error) => {
             // Recover correlation without relaxing typed request validation or accepting
             // ambiguous duplicate IDs. Invalid JSON and non-string IDs stay uncorrelated.
@@ -356,78 +497,74 @@ fn handle_connection_with_stop(
             struct RequestId {
                 id: String,
             }
-            let id = if line.starts_with('{') {
-                serde_json::from_str::<RequestId>(line)
+            let id = if text.starts_with('{') {
+                serde_json::from_str::<RequestId>(text)
                     .map(|request| request.id)
                     .unwrap_or_default()
             } else {
                 String::new()
             };
             let response =
-                retired_pane_graphics_method_error(line, &id).unwrap_or_else(|| ErrorResponse {
+                retired_pane_graphics_method_error(text, &id).unwrap_or_else(|| ErrorResponse {
                     id,
                     error: ErrorBody {
                         code: "invalid_request".into(),
                         message: format!("invalid request: {request_error}"),
                     },
                 });
-            write_json_line_allow_disconnect(&mut stream, &response)?;
-            return Ok(());
+            write_json_message_allow_disconnect(transport, &response)?;
+            Ok(None)
         }
-    };
+    }
+}
 
+pub(super) fn handle_parsed_request<T: ApiTransport>(
+    request: Request,
+    transport: &mut T,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&ServerStop>,
+    server_name: &crate::api::SharedServerName,
+) -> std::io::Result<()> {
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
     match request.method {
-        #[cfg(unix)]
-        Method::ServerSshAgentRegister(params) => {
-            let lease = ssh_agents
-                .ok_or_else(|| io::Error::other("SSH agent registration is unavailable"))
-                .and_then(|registry| registry.register(PathBuf::from(params.socket_path)));
-            let lease = match lease {
-                Ok(lease) => lease,
-                Err(error) => {
-                    return write_text_line_allow_disconnect(
-                        &mut stream,
-                        &error_response_json(
-                            request_id,
-                            if error.kind() == io::ErrorKind::InvalidInput {
-                                "invalid_ssh_agent"
-                            } else {
-                                "ssh_agent_unavailable"
-                            },
-                            error.to_string(),
-                        ),
-                    )
-                }
-            };
-            write_json_line(
-                &mut stream,
-                &SuccessResponse {
-                    id: request_id,
-                    result: ResponseResult::Ok {},
+        Method::ServerSshAgentRegister(_) => {
+            // Served at the connection layer for the local socket, where the
+            // registration lasts as long as the connection; other transports
+            // cannot hold that lease.
+            let response = serde_json::to_string(&ErrorResponse {
+                id: request_id.clone(),
+                error: ErrorBody {
+                    code: "unsupported_transport".into(),
+                    message:
+                        "server.ssh_agent.register requires a dedicated local socket connection"
+                            .into(),
                 },
-            )?;
-            set_local_stream_polling(&mut stream, true)?;
-            let mut byte = [0];
-            while running.load(Ordering::Relaxed) {
-                match poll_local_stream_read(&mut stream, &mut byte)? {
-                    LocalStreamRead::Pending => {
-                        // SSH can unlink an inherited socket after its bridge's lease closes.
-                        lease.refresh()?;
-                        std::thread::sleep(CONNECTION_POLL_INTERVAL);
-                    }
-                    _ => break,
+            })
+            .map_err(std::io::Error::other)?;
+            let result = write_message_allow_disconnect(transport, &response);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
                 }
             }
-            Ok(())
+            result
         }
         Method::EventsSubscribe(params) => {
             let result = stream_subscriptions(
-                stream,
+                transport,
                 request_id.clone(),
                 params,
                 api_tx,
@@ -451,44 +588,43 @@ fn handle_connection_with_stop(
             let response = wait_for_event(
                 request_id.clone(),
                 params,
-                &mut stream,
+                transport,
                 api_tx,
                 event_hub,
                 running,
             )?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         Method::AgentPrompt(params) => {
             let response = prompt_agent(
                 request_id.clone(),
                 params,
-                &mut stream,
+                transport,
                 api_tx,
                 event_hub,
                 running,
             )?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         Method::AgentWait(params) => {
             let response = wait_for_agent(
                 request_id.clone(),
                 params,
-                &mut stream,
+                transport,
                 api_tx,
                 event_hub,
                 running,
             )?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         Method::PaneWaitForOutput(params) => {
-            let response =
-                wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            let response = wait_for_output(request_id.clone(), params, transport, api_tx, running)?;
+            finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
             let stop_caller = matches!(method_body, Method::ServerStop(_))
-                .then(|| crate::platform::local_stream_peer_description(&stream))
+                .then(|| transport.peer_description())
                 .flatten();
             let response = handle_request(
                 Request {
@@ -500,8 +636,9 @@ fn handle_connection_with_stop(
                 server_stop,
                 stop_caller,
                 Some(response_write_rx),
+                server_name,
             );
-            let result = write_text_line_allow_disconnect(&mut stream, &response);
+            let result = write_message_allow_disconnect(transport, &response);
             let _ = response_write_tx.send(());
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -519,8 +656,8 @@ fn handle_connection_with_stop(
     }
 }
 
-fn finish_wait_response(
-    stream: &mut LocalStream,
+fn finish_wait_response<T: ApiTransport>(
+    transport: &mut T,
     response: Option<String>,
     request_id: &str,
     method: &'static str,
@@ -535,7 +672,7 @@ fn finish_wait_response(
         );
         return Ok(());
     };
-    let result = write_text_line_allow_disconnect(stream, &response);
+    let result = write_message_allow_disconnect(transport, &response);
     match &result {
         Ok(()) => crate::logging::api_request_completed(
             request_id,
@@ -555,7 +692,10 @@ fn handle_request(
     server_stop: Option<&ServerStop>,
     stop_caller: Option<String>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    server_name: &crate::api::SharedServerName,
 ) -> String {
+    // The name is read per request, not captured at listener start, so a
+    // reloaded name shows up in the next pong on every transport.
     if matches!(&request.method, Method::Ping(_)) {
         return serde_json::to_string(&SuccessResponse {
             id: request.id,
@@ -563,6 +703,7 @@ fn handle_request(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
+                name: Some(server_name.current()),
             },
         })
         .unwrap_or_else(|_| {
@@ -598,7 +739,23 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None)
+    match request.method {
+        // Pure file I/O on the connection thread: no app state involved, so
+        // the method behaves identically over every transport and mode.
+        Method::AttachmentCreate(params) => {
+            crate::api::attachment::handle_create(request.id, &params)
+        }
+        method => dispatch_to_app(
+            Request {
+                id: request.id,
+                method,
+            },
+            api_tx,
+            None,
+            response_write_complete,
+            None,
+        ),
+    }
 }
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
@@ -808,8 +965,8 @@ mod windows_tests {
     }
 }
 
-fn stream_subscriptions(
-    mut stream: LocalStream,
+fn stream_subscriptions<T: ApiTransport>(
+    transport: &mut T,
     request_id: String,
     params: crate::api::schema::EventsSubscribeParams,
     api_tx: &ApiRequestSender,
@@ -830,7 +987,7 @@ fn stream_subscriptions(
             Ok(active) => active,
             Err(mut response) => {
                 response.id = request_id;
-                if let Err(err) = write_json_line(&mut stream, &response) {
+                if let Err(err) = write_json_message(transport, &response) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
                     }
@@ -842,8 +999,8 @@ fn stream_subscriptions(
         subscriptions.push(active);
     }
 
-    if let Err(err) = write_json_line(
-        &mut stream,
+    if let Err(err) = write_json_message(
+        transport,
         &SuccessResponse {
             id: request_id.clone(),
             result: ResponseResult::SubscriptionStarted {},
@@ -856,7 +1013,7 @@ fn stream_subscriptions(
     }
 
     loop {
-        if should_stop_connection(&mut stream, running)? {
+        if should_stop_connection(transport, running)? {
             return Ok(());
         }
 
@@ -864,8 +1021,8 @@ fn stream_subscriptions(
             let events = match subscription.poll_batch(api_tx, event_hub) {
                 Ok(events) => events,
                 Err(error) => {
-                    write_json_line_allow_disconnect(
-                        &mut stream,
+                    write_json_message_allow_disconnect(
+                        transport,
                         &ErrorResponse {
                             id: request_id,
                             error,
@@ -875,10 +1032,10 @@ fn stream_subscriptions(
                 }
             };
             for event in events {
-                if should_stop_connection(&mut stream, running)? {
+                if should_stop_connection(transport, running)? {
                     return Ok(());
                 }
-                if let Err(err) = write_json_line(&mut stream, &event) {
+                if let Err(err) = write_json_message(transport, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
                     }
@@ -896,40 +1053,43 @@ fn write_text_line(stream: &mut LocalStream, value: &str) -> std::io::Result<()>
     stream.flush()
 }
 
-fn write_text_line_allow_disconnect(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
-    match write_text_line(stream, value) {
+fn write_message_allow_disconnect<T: ApiTransport>(
+    transport: &mut T,
+    value: &str,
+) -> std::io::Result<()> {
+    match transport.write_message(value) {
         Err(err) if is_connection_closed_error(&err) => Ok(()),
         result => result,
     }
 }
 
-fn write_json_line<T: serde::Serialize>(
-    stream: &mut LocalStream,
-    value: &T,
+fn write_json_message<T: ApiTransport, V: serde::Serialize>(
+    transport: &mut T,
+    value: &V,
 ) -> std::io::Result<()> {
     let encoded = serde_json::to_string(value)
         .map_err(|err| std::io::Error::other(format!("failed to encode json: {err}")))?;
-    write_text_line(stream, &encoded)
+    transport.write_message(&encoded)
 }
 
-fn write_json_line_allow_disconnect<T: serde::Serialize>(
-    stream: &mut LocalStream,
-    value: &T,
+fn write_json_message_allow_disconnect<T: ApiTransport, V: serde::Serialize>(
+    transport: &mut T,
+    value: &V,
 ) -> std::io::Result<()> {
     let encoded = serde_json::to_string(value)
         .map_err(|err| std::io::Error::other(format!("failed to encode json: {err}")))?;
-    write_text_line_allow_disconnect(stream, &encoded)
+    write_message_allow_disconnect(transport, &encoded)
 }
 
-pub(super) fn should_stop_connection(
-    stream: &mut LocalStream,
+pub(super) fn should_stop_connection<T: ApiTransport>(
+    transport: &mut T,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
     if !running.load(Ordering::Relaxed) {
         return Ok(true);
     }
 
-    local_stream_peer_closed(stream)
+    transport.probe_closed()
 }
 
 pub(super) fn dispatch_to_app_with_timeout(
@@ -1031,7 +1191,7 @@ fn caller_timeout_dispatch_uses_timeout_error() {
     assert_eq!(error.error.code, "timeout");
 }
 
-fn error_response_json(id: String, code: &str, message: String) -> String {
+pub(super) fn error_response_json(id: String, code: &str, message: String) -> String {
     serde_json::to_string(&ErrorResponse {
         id,
         error: ErrorBody {
@@ -1105,10 +1265,11 @@ mod tests {
                 None,
                 None,
                 Some(&worker_registry),
+                &crate::api::SharedServerName::new("test".to_string()),
             )
             .unwrap();
         });
-        write_json_line(
+        write_json_message(
             &mut client,
             &Request {
                 id: "agent-lease".into(),
@@ -1203,7 +1364,13 @@ mod tests {
         let (api_tx, _api_rx) = mpsc::unbounded_channel();
 
         crate::thread_spawn::test_hook::fail_next_spawns(1);
-        let result = start_server_inner(api_tx, EventHub::default(), None, None);
+        let result = start_server_inner(
+            api_tx,
+            EventHub::default(),
+            None,
+            None,
+            crate::api::SharedServerName::new("test".into()),
+        );
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
 
         assert!(result.is_err());
@@ -1380,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn ping_request_returns_pong() {
+    fn ping_request_returns_pong_with_the_declared_server_name() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let response = handle_request(
             Request {
@@ -1401,17 +1568,53 @@ mod tests {
             None,
             None,
             None,
+            &crate::api::SharedServerName::new("the-mini".to_string()),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
-        assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+        match parsed.result {
+            ResponseResult::Pong { name, .. } => assert_eq!(name.as_deref(), Some("the-mini")),
+            other => panic!("expected pong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pong_reflects_a_renamed_server_without_restarting_anything() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let server_name = crate::api::SharedServerName::new("before".to_string());
+        let ping = |id: &str| {
+            handle_request(
+                Request {
+                    id: id.into(),
+                    method: Method::Ping(crate::api::schema::PingParams::default()),
+                },
+                &tx,
+                None,
+                None,
+                None,
+                None,
+                &server_name,
+            )
+        };
+
+        assert!(ping("req_before").contains(r#""name":"before""#));
+
+        // The same reload path token rotation uses (see app config reload).
+        let changed = server_name.apply_reloaded_config(&crate::config::WebSocketApiConfig {
+            name: Some("after".to_string()),
+            ..crate::config::WebSocketApiConfig::default()
+        });
+        assert!(changed);
+
+        assert!(ping("req_after").contains(r#""name":"after""#));
     }
 
     #[test]
     fn server_stop_control_bypasses_app_channel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let stop = ServerStop::default();
+        let server_name = crate::api::SharedServerName::new("test".to_string());
         let response = handle_request(
             Request {
                 id: "priority_stop".into(),
@@ -1422,6 +1625,7 @@ mod tests {
             Some(&stop),
             Some("pid 42 (herdr)".into()),
             None,
+            &server_name,
         );
 
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1445,10 +1649,78 @@ mod tests {
             Some(&stop),
             None,
             None,
+            &server_name,
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn attachment_create_is_answered_in_process_with_distinct_error_codes() {
+        use base64::Engine as _;
+
+        // The channel receiver is dropped up front: if attachment.create ever
+        // dispatched to the app, handle_request would fail, so these
+        // assertions also pin that the method is served on the connection
+        // thread — identically for every transport and server mode.
+        let (tx, _) = mpsc::unbounded_channel();
+        let server_name = crate::api::SharedServerName::new("test".to_string());
+        let create = |id: &str, bytes_b64: String| {
+            handle_request(
+                Request {
+                    id: id.into(),
+                    method: Method::AttachmentCreate(crate::api::schema::AttachmentCreateParams {
+                        bytes_b64,
+                    }),
+                },
+                &tx,
+                None,
+                None,
+                None,
+                None,
+                &server_name,
+            )
+        };
+        let error_code = |response: &str| {
+            serde_json::from_str::<ErrorResponse>(response)
+                .map(|parsed| parsed.error.code)
+                .unwrap_or_else(|_| panic!("expected error response, got: {response}"))
+        };
+
+        let mut oversize = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        oversize.resize(crate::api::attachment::MAX_ATTACHMENT_BYTES + 1, 0);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&oversize);
+        assert_eq!(
+            error_code(&create("req_big", encoded)),
+            "attachment_too_large"
+        );
+
+        let text = base64::engine::general_purpose::STANDARD.encode(b"not an image");
+        assert_eq!(
+            error_code(&create("req_text", text)),
+            "attachment_unsupported_format"
+        );
+
+        assert_eq!(
+            error_code(&create("req_bad_b64", "%%%".into())),
+            "invalid_params"
+        );
+
+        let png = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3]);
+        let response = create("req_ok", png);
+        let parsed: SuccessResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|_| panic!("expected success response, got: {response}"));
+        match parsed.result {
+            ResponseResult::AttachmentCreated { path, expires_at } => {
+                let path = PathBuf::from(path);
+                assert!(path.is_file(), "success response must name a readable file");
+                assert!(expires_at > 0);
+                let _ = fs::remove_file(path);
+            }
+            other => panic!("expected attachment_created, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1461,7 +1733,15 @@ mod tests {
 
         let request_for_thread = request.clone();
         let thread = std::thread::spawn(move || {
-            handle_request(request_for_thread, &tx, None, None, None, None)
+            handle_request(
+                request_for_thread,
+                &tx,
+                None,
+                None,
+                None,
+                None,
+                &crate::api::SharedServerName::new("test".to_string()),
+            )
         });
 
         let msg = rx.blocking_recv().unwrap();

@@ -28,6 +28,7 @@ pub(crate) mod notification;
 pub(crate) mod pane;
 pub(crate) mod plugin;
 pub(crate) mod projection;
+mod pair;
 mod protocol_guard;
 mod server;
 mod server_not_running;
@@ -130,6 +131,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
         "notification" => notification::run_notification_command(&args[2..])?,
+        "pair" => pair::run_pair_command(&args[2..])?,
         "agent" => agent::run_agent_command(&args[2..])?,
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,

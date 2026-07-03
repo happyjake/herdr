@@ -47,9 +47,23 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+        /// Display name the server declares (`websocket_api.name`, falling
+        /// back to the machine hostname). Additive: absent from pongs of
+        /// older servers, so the protocol version is unchanged. Display
+        /// only, never identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
+    },
+    AttachmentCreated {
+        /// Absolute, space-free path of the fully written attachment file.
+        /// The success response is encoded only after the file is renamed
+        /// into place, so this path always names a complete, readable file.
+        path: String,
+        /// Unix seconds after which the TTL sweep may remove the file.
+        expires_at: u64,
     },
     WorkspaceInfo {
         workspace: WorkspaceInfo,

@@ -26,7 +26,7 @@ pub use self::{
         ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, PaneBordersConfig,
         ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
         ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
-        UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
+        UpdateChannelConfig, WebSocketApiConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,
@@ -213,6 +213,32 @@ mod tests {
             restored.keybinds.new_tab.bindings,
             config.keybinds().new_tab.bindings
         );
+    }
+
+    #[test]
+    fn websocket_api_defaults_to_disabled() {
+        let config = Config::default();
+        assert!(config.websocket_api.bind.is_none());
+        assert!(config.websocket_api.token.is_none());
+
+        let parsed: Config = toml::from_str("").unwrap();
+        assert!(parsed.websocket_api.bind.is_none());
+        assert!(parsed.websocket_api.token.is_none());
+    }
+
+    #[test]
+    fn websocket_api_section_parses_bind_and_token() {
+        let config: Config = toml::from_str(
+            r#"
+[websocket_api]
+bind = "127.0.0.1:4433"
+token = "secret-token"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.websocket_api.bind.as_deref(), Some("127.0.0.1:4433"));
+        assert_eq!(config.websocket_api.token.as_deref(), Some("secret-token"));
     }
 
     #[test]
