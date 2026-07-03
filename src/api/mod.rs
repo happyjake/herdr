@@ -5,11 +5,15 @@ mod server;
 mod status;
 mod subscriptions;
 mod wait;
+mod websocket;
 
 pub use event_hub::EventHub;
 pub(crate) use server::start_server_with_stop_control;
 pub use server::{start_server_with_capabilities, ServerHandle};
 pub use status::{read_runtime_status_at, RuntimeStatus};
+pub use websocket::{
+    start_websocket_server, start_websocket_server_with_capabilities, WebSocketServerHandle,
+};
 
 use std::path::PathBuf;
 

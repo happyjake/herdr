@@ -202,17 +202,8 @@ fn handle_connection_with_stop(
         return Ok(());
     };
 
-    let line = line.trim();
-    if line.is_empty() {
+    let Some(request) = parse_api_request(&mut stream, &line)? else {
         return Ok(());
-    }
-
-    let request = match serde_json::from_str::<Request>(line) {
-        Ok(request) => request,
-        Err(request_error) => {
-            write_invalid_request_message(&mut stream, &request_error)?;
-            return Ok(());
-        }
     };
 
     // pane.graphics.stream converts this connection into a binary frame
@@ -253,20 +244,35 @@ fn handle_connection_with_stop(
     }
 }
 
-pub(super) fn write_invalid_request_message<T: ApiTransport>(
+/// Parse one API request from raw message text. Empty text is skipped
+/// silently; malformed JSON gets an `invalid_request` error message written
+/// to the client. Both yield `Ok(None)` — how the connection continues
+/// afterwards is the transport's call.
+pub(super) fn parse_api_request<T: ApiTransport>(
     transport: &mut T,
-    err: &serde_json::Error,
-) -> std::io::Result<()> {
-    write_json_message_allow_disconnect(
-        transport,
-        &ErrorResponse {
-            id: String::new(),
-            error: ErrorBody {
-                code: "invalid_request".into(),
-                message: format!("invalid request: {err}"),
-            },
-        },
-    )
+    text: &str,
+) -> std::io::Result<Option<Request>> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+
+    match serde_json::from_str::<Request>(text) {
+        Ok(request) => Ok(Some(request)),
+        Err(err) => {
+            write_json_message_allow_disconnect(
+                transport,
+                &ErrorResponse {
+                    id: String::new(),
+                    error: ErrorBody {
+                        code: "invalid_request".into(),
+                        message: format!("invalid request: {err}"),
+                    },
+                },
+            )?;
+            Ok(None)
+        }
+    }
 }
 
 pub(super) fn handle_parsed_request<T: ApiTransport>(

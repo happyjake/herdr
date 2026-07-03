@@ -16,6 +16,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "theme",
     "ui",
     "update",
+    "websocket_api",
     "worktrees",
 ];
 
@@ -348,6 +349,14 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.remote = section,
+    );
+    load_live_section(
+        table,
+        "websocket_api",
+        "websocket api config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.websocket_api = section,
     );
 
     diagnostics.extend(config.theme.diagnostics());
@@ -724,6 +733,22 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_reload_parses_websocket_api_section_without_diagnostics() {
+        let loaded = load_live_config_from_str(
+            "[websocket_api]\nbind = \"127.0.0.1:4433\"\ntoken = \"secret\"\n",
+        )
+        .unwrap();
+
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert!(loaded.invalid_sections.is_empty());
+        assert_eq!(
+            loaded.config.websocket_api.bind.as_deref(),
+            Some("127.0.0.1:4433")
+        );
+        assert_eq!(loaded.config.websocket_api.token.as_deref(), Some("secret"));
+    }
 
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {

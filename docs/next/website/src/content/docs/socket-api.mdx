@@ -667,6 +667,29 @@ A successful response includes the same `id`:
 
 Event subscriptions keep the connection open after the initial response.
 
+## WebSocket transport
+
+The same JSON API can optionally be served over WebSocket for non-terminal clients. The listener is a transport adapter in front of the same request dispatch and event subscription paths, so requests, responses, and event payloads are identical to the Unix socket. It is off by default and requires explicit configuration; see [Configuration](/docs/configuration/#websocket-api-listener).
+
+Framing differences from the Unix socket:
+
+- Send one JSON message per text frame instead of one JSON line.
+- A connection may carry sequential requests: after a response you can send the next request on the same connection. (The Unix socket serves one request per connection.)
+- `events.subscribe` dedicates the connection to the event stream until the client disconnects, exactly like the Unix socket.
+
+Authentication happens at the WebSocket handshake with the configured bearer token. Send an `Authorization: Bearer <token>` header, or a `token` query parameter from clients that cannot set headers:
+
+```text
+websocat -H "Authorization: Bearer $TOKEN" ws://100.64.0.5:4433
+```
+
+```js
+// Browser: headers are not settable on WebSocket upgrades.
+const ws = new WebSocket("ws://100.64.0.5:4433/?token=" + token);
+```
+
+Handshakes with a missing or invalid token are rejected with HTTP 401 before any API processing.
+
 ## Socket paths
 
 The default socket lives under your Herdr config directory.

@@ -291,6 +291,10 @@ pub struct HeadlessServer {
     // Kept on every platform so dropping HeadlessServer owns API server shutdown.
     #[cfg_attr(windows, allow(dead_code))]
     api_server: Option<api::ServerHandle>,
+    /// Config for the optional WebSocket API listener, kept so a failed live
+    /// handoff can rebind the listener it released.
+    websocket_api_config: crate::config::WebSocketApiConfig,
+    websocket_server: Option<api::WebSocketServerHandle>,
     #[cfg(unix)]
     client_listener: LocalListener,
     client_socket_path: PathBuf,
@@ -509,6 +513,8 @@ impl HeadlessServer {
             #[cfg(unix)]
             api_tx,
             api_server,
+            websocket_api_config: crate::config::WebSocketApiConfig::default(),
+            websocket_server: None,
             #[cfg(unix)]
             client_listener: listener,
             client_socket_path: client_path,
@@ -1395,6 +1401,12 @@ impl HeadlessServer {
             let _ = std::fs::remove_file(crate::api::socket_path());
         }
         let _ = remove_socket_file_if_owned(&self.client_socket_path, &self.client_socket_identity);
+        // A TCP port, unlike a unix socket path, cannot be bound twice: drop
+        // the websocket listener now so the replacement server can bind it.
+        // Live websocket clients are disconnected here and reconnect to the
+        // replacement server; restore_public_sockets_after_failed_handoff
+        // rebinds on rollback.
+        self.websocket_server = None;
         if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             match self.wait_then_restore_public_sockets_after_failed_handoff() {
@@ -1455,6 +1467,17 @@ impl HeadlessServer {
         Err(io::Error::other("live handoff is only supported on Unix"))
     }
 
+    /// Attach the optional WebSocket API listener started for this server,
+    /// with the config used to start it so a failed live handoff can rebind.
+    pub(crate) fn set_websocket_api(
+        &mut self,
+        config: crate::config::WebSocketApiConfig,
+        server: Option<api::WebSocketServerHandle>,
+    ) {
+        self.websocket_api_config = config;
+        self.websocket_server = server;
+    }
+
     fn sync_visible_server_config_diagnostic(&mut self, uses_local_keybindings: bool) {
         let visible = if uses_local_keybindings {
             &self.server_config_diagnostic_without_keybindings
@@ -1475,9 +1498,14 @@ impl HeadlessServer {
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
         let api_server = api::start_server_with_stop_control(
-            api_tx,
+            api_tx.clone(),
             self.app.event_hub.clone(),
             self.should_quit.clone(),
+        )?;
+        let websocket_server = api::start_websocket_server(
+            &self.websocket_api_config,
+            api_tx,
+            self.app.event_hub.clone(),
         )?;
 
         let client_path = client_socket_path();
@@ -1488,6 +1516,7 @@ impl HeadlessServer {
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
         self.api_server = Some(api_server);
+        self.websocket_server = websocket_server;
         self.client_listener = listener;
         self.client_socket_path = client_path;
         self.client_socket_identity = client_socket_identity;
@@ -5084,6 +5113,20 @@ pub fn run_server() -> io::Result<()> {
         Err(err) => return Err(err),
     };
 
+    // Start the optional WebSocket API listener. Off unless configured; an
+    // explicitly configured listener that cannot start is a startup error.
+    let ws_server = match api::start_websocket_server(
+        &loaded_config.config.websocket_api,
+        api_tx.clone(),
+        event_hub.clone(),
+    ) {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("error: failed to start websocket api listener: {err}");
+            std::process::exit(1);
+        }
+    };
+
     let no_session = false; // Server always does session persistence.
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -5127,6 +5170,7 @@ pub fn run_server() -> io::Result<()> {
             }
             Err(err) => return Err(err),
         };
+        server.set_websocket_api(loaded_config.config.websocket_api.clone(), ws_server);
 
         info!(
             api_socket = %api::socket_path().display(),
@@ -5226,6 +5270,14 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             event_hub.clone(),
             should_quit.clone(),
         )?;
+        // The old server released the websocket port with its socket files;
+        // bind it here so a committed handoff keeps the listener alive.
+        // Failure fails the handoff and the old server restores its sockets.
+        let ws_server = api::start_websocket_server(
+            &loaded_config.config.websocket_api,
+            api_tx.clone(),
+            event_hub.clone(),
+        )?;
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
@@ -5236,6 +5288,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         // Carried across before any client attaches, so the first title sent is
         // the override rather than the configured one it replaced.
         server.api_window_title = received.manifest.api_window_title.take();
+        server.set_websocket_api(loaded_config.config.websocket_api.clone(), ws_server);
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
         server.app.assume_handoff_ownership();
@@ -5391,6 +5444,8 @@ mod tests {
             #[cfg(unix)]
             api_tx: None,
             api_server: None,
+            websocket_api_config: crate::config::WebSocketApiConfig::default(),
+            websocket_server: None,
             #[cfg(unix)]
             client_listener: listener,
             client_socket_path: socket_path,

@@ -327,6 +327,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub websocket_api: WebSocketApiConfig,
 }
 
 #[derive(Debug)]
@@ -958,6 +959,26 @@ pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
     #[serde(alias = "scrollback_lines")]
     pub scrollback_limit_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct WebSocketApiConfig {
+    /// TCP address for the optional WebSocket JSON API listener, e.g.
+    /// "100.64.0.5:4433". Unset (the default) means the listener is off and
+    /// no network port is opened. The listener binds exactly this address;
+    /// prefer a tailnet or loopback address. The transport is plain ws://
+    /// and relies on the network layer (e.g. WireGuard) for encryption.
+    /// Changes require a server restart; `server.reload_config` does not
+    /// rebind the listener.
+    pub bind: Option<String>,
+    /// Bearer token WebSocket clients must present during the handshake,
+    /// via an `Authorization: Bearer <token>` header or a `token` query
+    /// parameter. Required when `bind` is set; the server refuses to start
+    /// without it. Restricted to ASCII letters, digits, and `-._~` so the
+    /// query form never needs URL escaping. Handshakes with a missing or
+    /// wrong token are rejected before any API request is processed.
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -443,6 +443,19 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
 
+[websocket_api]
+# Optional WebSocket transport for the JSON API, for non-terminal clients.
+# Off by default: with no bind address, no network port is opened.
+# The listener binds exactly this address; prefer a tailnet or loopback
+# address. The transport is plain ws:// — the network layer (e.g. your
+# tailnet's WireGuard encryption) is the transport security.
+# Changes require a server restart.
+# bind = "100.64.0.5:4433"
+# Bearer token clients must present during the WebSocket handshake, via an
+# "Authorization: Bearer <token>" header or a "token" query parameter.
+# Required when bind is set. ASCII letters, digits, and -._~ only.
+# token = ""
+
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
 # allow_nested = false
@@ -831,14 +844,29 @@ fn main() -> io::Result<()> {
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
-    let _api_server = match api::start_server_with_capabilities(api_tx, event_hub.clone(), None) {
+    let _api_server =
+        match api::start_server_with_capabilities(api_tx.clone(), event_hub.clone(), None) {
+            Ok(server) => server,
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                eprintln!("error: herdr is already running");
+                eprintln!("socket: {}", api::socket_path().display());
+                std::process::exit(1);
+            }
+            Err(err) => return Err(err),
+        };
+    // Optional WebSocket API listener; off unless configured. Uses the same
+    // capabilities as the socket server above so ping responses match.
+    let _websocket_server = match api::start_websocket_server_with_capabilities(
+        &loaded_config.config.websocket_api,
+        api_tx,
+        event_hub.clone(),
+        None,
+    ) {
         Ok(server) => server,
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: herdr is already running");
-            eprintln!("socket: {}", api::socket_path().display());
+        Err(err) => {
+            eprintln!("error: failed to start websocket api listener: {err}");
             std::process::exit(1);
         }
-        Err(err) => return Err(err),
     };
 
     let modify_other_keys_mode = crate::input::host_modify_other_keys_mode();
@@ -964,6 +992,13 @@ mod tests {
     fn nested_herdr_does_not_block_without_env() {
         let config = config::Config::default();
         assert!(!should_block_nested_for_env(&config, None));
+    }
+
+    #[test]
+    fn default_config_template_parses_with_websocket_api_disabled() {
+        let config: config::Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert!(config.websocket_api.bind.is_none());
+        assert!(config.websocket_api.token.is_none());
     }
 
     #[test]

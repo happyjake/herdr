@@ -119,6 +119,20 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+## WebSocket API listener
+
+The JSON API can optionally be served over WebSocket for non-terminal clients. The listener is off by default: with no `bind` address, no network port is opened, and nothing enables it implicitly.
+
+```toml
+[websocket_api]
+bind = "100.64.0.5:4433"
+token = "generate-a-long-random-token"
+```
+
+`bind` is the exact TCP address the listener binds; prefer a tailnet or loopback address. `token` is required whenever `bind` is set — the server refuses to start without it — and clients must present it during the WebSocket handshake, either as an `Authorization: Bearer <token>` header or as a `token` query parameter for clients that cannot set headers (browsers). Tokens may use ASCII letters, digits, and `-._~` only, so the query form never needs URL escaping. Handshakes with a missing or wrong token are rejected with HTTP 401 before any API request is processed.
+
+The transport is plain `ws://`; the network layer (for example your tailnet's WireGuard encryption) provides transport security. Changes to this section require a server restart — `server.reload_config` does not rebind the listener. See [Socket API](/docs/socket-api/) for the wire protocol.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).
