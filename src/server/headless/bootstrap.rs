@@ -31,11 +31,16 @@ pub fn run_server() -> io::Result<()> {
     let event_hub = api::EventHub::default();
     let should_quit = Arc::new(AtomicBool::new(false));
 
+    // The declared server name, shared by both API transports so their pongs
+    // match and by the app so config reloads rename the live server.
+    let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+
     // Start the JSON API socket server.
     let _api_server = match api::start_server_with_stop_control(
         api_tx.clone(),
         event_hub.clone(),
         should_quit.clone(),
+        server_name.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -44,6 +49,21 @@ pub fn run_server() -> io::Result<()> {
             std::process::exit(1);
         }
         Err(err) => return Err(err),
+    };
+
+    // Start the optional WebSocket API listener. Off unless configured; an
+    // explicitly configured listener that cannot start is a startup error.
+    let ws_server = match api::start_websocket_server(
+        &loaded_config.config.websocket_api,
+        api_tx.clone(),
+        event_hub.clone(),
+        server_name.clone(),
+    ) {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("error: failed to start websocket api listener: {err}");
+            std::process::exit(1);
+        }
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -60,6 +80,7 @@ pub fn run_server() -> io::Result<()> {
             api_rx,
             event_hub,
         );
+        app.set_server_name(Some(server_name));
         seed_startup_workspace_if_empty(&mut app);
 
         // Create the headless server.
@@ -78,6 +99,7 @@ pub fn run_server() -> io::Result<()> {
             }
             Err(err) => return Err(err),
         };
+        server.set_websocket_api(loaded_config.config.websocket_api.clone(), ws_server);
 
         info!(
             api_socket = %api::socket_path().display(),
@@ -153,7 +175,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         .map_err(io::Error::other)?;
 
     let result = rt.block_on(async {
-        let app = app::App::new_from_handoff(
+        let mut app = app::App::new_from_handoff(
             &loaded_config.config,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
@@ -169,10 +191,22 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
+        let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+        app.set_server_name(Some(server_name.clone()));
         let api_server = api::start_server_with_stop_control(
             api_tx.clone(),
             event_hub.clone(),
             should_quit.clone(),
+            server_name.clone(),
+        )?;
+        // The old server released the websocket port with its socket files;
+        // bind it here so a committed handoff keeps the listener alive.
+        // Failure fails the handoff and the old server restores its sockets.
+        let ws_server = api::start_websocket_server(
+            &loaded_config.config.websocket_api,
+            api_tx.clone(),
+            event_hub.clone(),
+            server_name,
         )?;
         let mut server = HeadlessServer::new(
             app,
@@ -184,6 +218,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         // Carried across before any client attaches, so the first title sent is
         // the override rather than the configured one it replaced.
         server.api_window_title = received.manifest.api_window_title.take();
+        server.set_websocket_api(loaded_config.config.websocket_api.clone(), ws_server);
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
         server.app.assume_handoff_ownership();

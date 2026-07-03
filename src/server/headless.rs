@@ -185,6 +185,10 @@ pub struct HeadlessServer {
     // Kept on every platform so dropping HeadlessServer owns API server shutdown.
     #[cfg_attr(windows, allow(dead_code))]
     api_server: Option<api::ServerHandle>,
+    /// Config for the optional WebSocket API listener, kept so a failed live
+    /// handoff can rebind the listener it released.
+    websocket_api_config: crate::config::WebSocketApiConfig,
+    websocket_server: Option<api::WebSocketServerHandle>,
     #[cfg(unix)]
     client_listener: LocalListener,
     client_socket_path: PathBuf,
@@ -331,6 +335,8 @@ impl HeadlessServer {
             #[cfg(unix)]
             api_tx,
             api_server,
+            websocket_api_config: crate::config::WebSocketApiConfig::default(),
+            websocket_server: None,
             #[cfg(unix)]
             client_listener: listener,
             client_socket_path: client_path,

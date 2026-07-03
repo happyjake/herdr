@@ -407,6 +407,21 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
 
+[websocket_api]
+# Optional WebSocket transport for the JSON API, for non-terminal clients.
+# Off by default: with no bind address, no network port is opened.
+# The listener binds exactly this address; prefer a tailnet or loopback
+# address. The transport is plain ws:// — the network layer (e.g. your
+# tailnet's WireGuard encryption) is the transport security.
+# Changing bind requires a server restart.
+# bind = "100.64.0.5:4433"
+# Bearer token clients must present during the WebSocket handshake, via an
+# "Authorization: Bearer <token>" header or a "token" query parameter.
+# Required when bind is set. ASCII letters, digits, and -._~ only.
+# `herdr pair` mints and stores this token and prints a QR pairing payload;
+# re-running it rotates the token. Token changes apply on config reload.
+# token = ""
+
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
 # allow_nested = false
@@ -617,6 +632,7 @@ fn main() -> io::Result<()> {
         println!("       herdr worktree <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
         println!("       herdr notification <subcommand> ...");
+        println!("       herdr pair");
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
         println!("       herdr session <subcommand> ...");
@@ -668,6 +684,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr notification <subcommand>",
                 "Notification helpers over the socket API",
+            ),
+            (
+                "herdr pair",
+                "Mint the websocket api token and print a QR pairing payload",
             ),
             (
                 "herdr agent <subcommand>",
@@ -763,6 +783,7 @@ fn main() -> io::Result<()> {
                 "machine",
                 "workspace",
                 "worktree",
+                "pair",
                 "pane",
                 "session",
                 "integration",
@@ -829,6 +850,13 @@ mod tests {
     fn nested_herdr_does_not_block_without_env() {
         let config = config::Config::default();
         assert!(!should_block_nested_for_env(&config, None));
+    }
+
+    #[test]
+    fn default_config_template_parses_with_websocket_api_disabled() {
+        let config: config::Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert!(config.websocket_api.bind.is_none());
+        assert!(config.websocket_api.token.is_none());
     }
 
     #[test]

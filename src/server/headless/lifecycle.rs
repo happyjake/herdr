@@ -178,6 +178,13 @@ impl HeadlessServer {
             let _ = std::fs::remove_file(crate::api::socket_path());
         }
         let _ = remove_socket_file_if_owned(&self.client_socket_path, &self.client_socket_identity);
+        // A TCP port, unlike a unix socket path, cannot be bound twice: drop
+        // the websocket listener now so the replacement server can bind it.
+        // Live websocket clients are disconnected here and reconnect to the
+        // replacement server; restore_public_sockets_after_failed_handoff
+        // rebinds on rollback.
+        let websocket_api_config = self.websocket_api_config.clone();
+        self.set_websocket_api(websocket_api_config, None);
         if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             match self.wait_then_restore_public_sockets_after_failed_handoff() {
@@ -238,16 +245,48 @@ impl HeadlessServer {
         Err(io::Error::other("live handoff is only supported on Unix"))
     }
 
+    /// Attach the optional WebSocket API listener started for this server,
+    /// with the config used to start it so a failed live handoff can rebind.
+    /// Also hands the listener's expected-token slot to the app so config
+    /// reloads rotate the bearer token on the live listener.
+    pub(crate) fn set_websocket_api(
+        &mut self,
+        config: crate::config::WebSocketApiConfig,
+        server: Option<api::WebSocketServerHandle>,
+    ) {
+        self.app.set_websocket_api_token(
+            server
+                .as_ref()
+                .map(api::WebSocketServerHandle::shared_token),
+        );
+        self.websocket_api_config = config;
+        self.websocket_server = server;
+    }
+
     #[cfg(unix)]
     fn restore_public_sockets_after_failed_handoff(&mut self) -> io::Result<()> {
         let api_tx = self
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
+        // Keep the live name slot across the failed handoff so an earlier
+        // reload-applied rename survives the restored listeners.
+        let server_name = self
+            .app
+            .server_name
+            .clone()
+            .unwrap_or_else(|| api::SharedServerName::from_config(&self.websocket_api_config));
         let api_server = api::start_server_with_stop_control(
-            api_tx,
+            api_tx.clone(),
             self.app.event_hub.clone(),
             self.should_quit.clone(),
+            server_name.clone(),
+        )?;
+        let websocket_server = api::start_websocket_server(
+            &self.websocket_api_config,
+            api_tx,
+            self.app.event_hub.clone(),
+            server_name,
         )?;
 
         let client_path = client_socket_path();
@@ -258,6 +297,8 @@ impl HeadlessServer {
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
         self.api_server = Some(api_server);
+        let websocket_api_config = self.websocket_api_config.clone();
+        self.set_websocket_api(websocket_api_config, websocket_server);
         self.client_listener = listener;
         self.client_socket_path = client_path;
         self.client_socket_identity = client_socket_identity;

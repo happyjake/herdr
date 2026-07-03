@@ -98,6 +98,8 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         #[cfg(unix)]
         api_tx: None,
         api_server: None,
+        websocket_api_config: crate::config::WebSocketApiConfig::default(),
+        websocket_server: None,
         #[cfg(unix)]
         client_listener: listener,
         client_socket_path: socket_path,
