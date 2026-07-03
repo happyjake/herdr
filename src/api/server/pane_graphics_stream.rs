@@ -14,8 +14,8 @@ use crate::api::ApiRequestSender;
 use crate::ipc::{is_connection_closed_error, LocalStream};
 
 use super::{
-    api_response_outcome, dispatch_to_app_with_timeout, write_json_line,
-    write_json_line_allow_disconnect, write_text_line_allow_disconnect, APP_RESPONSE_TIMEOUT,
+    api_response_outcome, dispatch_to_app_with_timeout, write_json_message,
+    write_json_message_allow_disconnect, write_message_allow_disconnect, APP_RESPONSE_TIMEOUT,
     CONNECTION_POLL_INTERVAL,
 };
 
@@ -113,13 +113,13 @@ fn serve_with_timeouts(
         Some(open_timeout),
     );
     if api_response_outcome(&open_response) != "ok" {
-        let write_result = write_text_line_allow_disconnect(&mut stream, &open_response);
+        let write_result = write_message_allow_disconnect(&mut stream, &open_response);
         clear_layer(&pane_id, &owner, api_tx);
         write_result?;
         return Ok(());
     }
 
-    if let Err(err) = write_json_line(
+    if let Err(err) = write_json_message(
         &mut stream,
         &SuccessResponse {
             id: request_id.clone(),
@@ -180,7 +180,7 @@ fn serve_frames(
         let header = match serde_json::from_str::<FrameHeader>(header_line) {
             Ok(header) => header,
             Err(err) => {
-                write_json_line_allow_disconnect(
+                write_json_message_allow_disconnect(
                     stream,
                     &ErrorResponse {
                         id: request_id.to_string(),
@@ -194,7 +194,7 @@ fn serve_frames(
             }
         };
         if header.data_length == 0 {
-            write_json_line_allow_disconnect(
+            write_json_message_allow_disconnect(
                 stream,
                 &ErrorResponse {
                     id: request_id.to_string(),
@@ -207,7 +207,7 @@ fn serve_frames(
             return Ok(());
         }
         if header.data_length > crate::api::schema::PANE_GRAPHICS_STREAM_MAX_BYTES {
-            write_json_line_allow_disconnect(
+            write_json_message_allow_disconnect(
                 stream,
                 &ErrorResponse {
                     id: request_id.to_string(),
@@ -252,7 +252,7 @@ fn serve_frames(
             Some(APP_RESPONSE_TIMEOUT),
         );
         if api_response_outcome(&response) != "ok" {
-            write_text_line_allow_disconnect(stream, &response)?;
+            write_message_allow_disconnect(stream, &response)?;
             return Ok(());
         }
     }
