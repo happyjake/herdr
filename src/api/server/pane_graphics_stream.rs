@@ -14,8 +14,8 @@ use crate::ipc::{is_connection_closed_error, LocalStream};
 
 use super::{
     api_response_outcome, dispatch_stream_frame, dispatch_stream_open,
-    dispatch_to_app_with_timeout, write_json_line, write_json_line_allow_disconnect,
-    write_text_line_allow_disconnect, APP_RESPONSE_TIMEOUT, CONNECTION_POLL_INTERVAL,
+    dispatch_to_app_with_timeout, write_json_message, write_json_message_allow_disconnect,
+    write_message_allow_disconnect, APP_RESPONSE_TIMEOUT, CONNECTION_POLL_INTERVAL,
 };
 
 const MAX_STREAM_FRAME_HEADER_BYTES: usize = 64 * 1024;
@@ -127,13 +127,13 @@ fn serve_with_timeouts(
     );
     if api_response_outcome(&open_response) != "ok" {
         stream_active.store(false, Ordering::Release);
-        let write_result = write_text_line_allow_disconnect(&mut stream, &open_response);
+        let write_result = write_message_allow_disconnect(&mut stream, &open_response);
         clear_layer(&pane_id, layer_id.as_deref(), z_index, &owner, api_tx);
         write_result?;
         return Ok(());
     }
 
-    if let Err(err) = write_json_line(
+    if let Err(err) = write_json_message(
         &mut stream,
         &SuccessResponse {
             id: request_id.clone(),
@@ -197,7 +197,7 @@ fn serve_frames(
         let header = match serde_json::from_str::<FrameHeader>(header_line) {
             Ok(header) => header,
             Err(err) => {
-                write_json_line_allow_disconnect(
+                write_json_message_allow_disconnect(
                     stream,
                     &ErrorResponse {
                         id: request_id.to_string(),
@@ -216,7 +216,7 @@ fn serve_frames(
                 crate::api::schema::PaneGraphicsFormat::Rgba
                     | crate::api::schema::PaneGraphicsFormat::Bgra
             ) {
-                write_json_line_allow_disconnect(
+                write_json_message_allow_disconnect(
                     stream,
                     &ErrorResponse {
                         id: request_id.to_string(),
@@ -250,7 +250,7 @@ fn serve_frames(
                 api_tx,
                 Arc::clone(stream_active),
             );
-            write_text_line_allow_disconnect(stream, &response)?;
+            write_message_allow_disconnect(stream, &response)?;
             if api_response_outcome(&response) != "ok" {
                 return Ok(());
             }
@@ -258,7 +258,7 @@ fn serve_frames(
         }
 
         let Some(data_length) = header.data_length else {
-            write_json_line_allow_disconnect(
+            write_json_message_allow_disconnect(
                 stream,
                 &ErrorResponse {
                     id: request_id.to_string(),
@@ -271,7 +271,7 @@ fn serve_frames(
             return Ok(());
         };
         if data_length == 0 {
-            write_json_line_allow_disconnect(
+            write_json_message_allow_disconnect(
                 stream,
                 &ErrorResponse {
                     id: request_id.to_string(),
@@ -284,7 +284,7 @@ fn serve_frames(
             return Ok(());
         }
         if data_length > crate::api::schema::PANE_GRAPHICS_STREAM_MAX_BYTES {
-            write_json_line_allow_disconnect(
+            write_json_message_allow_disconnect(
                 stream,
                 &ErrorResponse {
                     id: request_id.to_string(),
@@ -331,7 +331,7 @@ fn serve_frames(
             Some(APP_RESPONSE_TIMEOUT),
         );
         if api_response_outcome(&response) != "ok" {
-            write_text_line_allow_disconnect(stream, &response)?;
+            write_message_allow_disconnect(stream, &response)?;
             return Ok(());
         }
     }

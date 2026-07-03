@@ -27,9 +27,37 @@ mod pane_graphics_stream;
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
-const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// One accepted API client connection, independent of how its bytes travel.
+///
+/// The Unix socket frames messages as JSON lines; the WebSocket transport
+/// frames them as one JSON message per text frame. Everything above framing
+/// (request dispatch, subscription streaming, wait loops) is shared through
+/// this trait.
+pub(super) trait ApiTransport {
+    /// Write one JSON API message to the client.
+    fn write_message(&mut self, message: &str) -> std::io::Result<()>;
+
+    /// Non-blocking probe: has the client torn down the request stream?
+    ///
+    /// Any readable payload also counts as torn down — a client that keeps
+    /// writing after starting a stream forfeits the connection, matching the
+    /// Unix socket's one-request-per-stream contract.
+    fn probe_closed(&mut self) -> std::io::Result<bool>;
+}
+
+impl ApiTransport for LocalStream {
+    fn write_message(&mut self, message: &str) -> std::io::Result<()> {
+        write_text_line(self, message)
+    }
+
+    fn probe_closed(&mut self) -> std::io::Result<bool> {
+        local_stream_peer_closed(self)
+    }
+}
 
 pub struct ServerHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -182,27 +210,20 @@ fn handle_connection_with_stop(
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
-            write_json_line_allow_disconnect(
-                &mut stream,
-                &ErrorResponse {
-                    id: String::new(),
-                    error: ErrorBody {
-                        code: "invalid_request".into(),
-                        message: format!("invalid request: {request_error}"),
-                    },
-                },
-            )?;
+            write_invalid_request_message(&mut stream, &request_error)?;
             return Ok(());
         }
     };
 
-    let request_id = request.id.clone();
+    // pane.graphics.stream converts this connection into a binary frame
+    // channel, so it needs the owned local stream and stays outside the
+    // transport-generic dispatch core.
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
-    crate::logging::api_request_started(&request_id, method, changes_ui);
-
     match request.method {
         Method::PaneGraphicsStream(params) => {
+            let request_id = request.id;
+            crate::logging::api_request_started(&request_id, method, changes_ui);
             let result =
                 pane_graphics_stream::serve(stream, request_id.clone(), params, api_tx, running);
             match &result {
@@ -218,9 +239,79 @@ fn handle_connection_with_stop(
             }
             result
         }
+        method_body => handle_parsed_request(
+            Request {
+                id: request.id,
+                method: method_body,
+            },
+            &mut stream,
+            api_tx,
+            event_hub,
+            running,
+            capabilities,
+        ),
+    }
+}
+
+pub(super) fn write_invalid_request_message<T: ApiTransport>(
+    transport: &mut T,
+    err: &serde_json::Error,
+) -> std::io::Result<()> {
+    write_json_message_allow_disconnect(
+        transport,
+        &ErrorResponse {
+            id: String::new(),
+            error: ErrorBody {
+                code: "invalid_request".into(),
+                message: format!("invalid request: {err}"),
+            },
+        },
+    )
+}
+
+pub(super) fn handle_parsed_request<T: ApiTransport>(
+    request: Request,
+    transport: &mut T,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    capabilities: Option<ServerCapabilities>,
+) -> std::io::Result<()> {
+    let request_id = request.id.clone();
+    let method = api_method_name(&request.method);
+    let changes_ui = request_changes_ui(&request);
+    crate::logging::api_request_started(&request_id, method, changes_ui);
+
+    match request.method {
+        Method::PaneGraphicsStream(_) => {
+            // Served at the connection layer for the local socket; other
+            // transports cannot hand their raw stream over for frame data.
+            let response = serde_json::to_string(&ErrorResponse {
+                id: request_id.clone(),
+                error: ErrorBody {
+                    code: "unsupported_transport".into(),
+                    message: "pane.graphics.stream requires a dedicated local socket connection"
+                        .into(),
+                },
+            })
+            .map_err(std::io::Error::other)?;
+            let result = write_message_allow_disconnect(transport, &response);
+            match &result {
+                Ok(()) => crate::logging::api_request_completed(
+                    &request_id,
+                    method,
+                    api_response_outcome(&response),
+                    changes_ui,
+                ),
+                Err(err) => {
+                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
+                }
+            }
+            result
+        }
         Method::EventsSubscribe(params) => {
             let result = stream_subscriptions(
-                stream,
+                transport,
                 request_id.clone(),
                 params,
                 api_tx,
@@ -244,39 +335,39 @@ fn handle_connection_with_stop(
             let response = wait_for_event(
                 request_id.clone(),
                 params,
-                &mut stream,
+                transport,
                 api_tx,
                 event_hub,
                 running,
             )?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         Method::AgentPrompt(params) => {
             let response = prompt_agent(
                 request_id.clone(),
                 params,
-                &mut stream,
+                transport,
                 api_tx,
                 event_hub,
                 running,
             )?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         Method::AgentWait(params) => {
             let response = wait_for_agent(
                 request_id.clone(),
                 params,
-                &mut stream,
+                transport,
                 api_tx,
                 event_hub,
                 running,
             )?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+            finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         Method::PaneWaitForOutput(params) => {
             let response =
-                wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?;
-            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+                wait_for_output(request_id.clone(), params, transport, api_tx, running)?;
+            finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         method_body => {
             let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
@@ -290,7 +381,7 @@ fn handle_connection_with_stop(
                 server_stop,
                 Some(response_write_rx),
             );
-            let result = write_text_line_allow_disconnect(&mut stream, &response);
+            let result = write_message_allow_disconnect(transport, &response);
             let _ = response_write_tx.send(());
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -308,8 +399,8 @@ fn handle_connection_with_stop(
     }
 }
 
-fn finish_wait_response(
-    stream: &mut LocalStream,
+fn finish_wait_response<T: ApiTransport>(
+    transport: &mut T,
     response: Option<String>,
     request_id: &str,
     method: &'static str,
@@ -324,7 +415,7 @@ fn finish_wait_response(
         );
         return Ok(());
     };
-    let result = write_text_line_allow_disconnect(stream, &response);
+    let result = write_message_allow_disconnect(transport, &response);
     match &result {
         Ok(()) => crate::logging::api_request_completed(
             request_id,
@@ -683,8 +774,8 @@ mod windows_tests {
     }
 }
 
-fn stream_subscriptions(
-    mut stream: LocalStream,
+fn stream_subscriptions<T: ApiTransport>(
+    transport: &mut T,
     request_id: String,
     params: crate::api::schema::EventsSubscribeParams,
     api_tx: &ApiRequestSender,
@@ -704,7 +795,7 @@ fn stream_subscriptions(
         ) {
             Ok(active) => active,
             Err(response) => {
-                if let Err(err) = write_json_line(&mut stream, &response) {
+                if let Err(err) = write_json_message(transport, &response) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
                     }
@@ -716,8 +807,8 @@ fn stream_subscriptions(
         subscriptions.push(active);
     }
 
-    if let Err(err) = write_json_line(
-        &mut stream,
+    if let Err(err) = write_json_message(
+        transport,
         &SuccessResponse {
             id: request_id,
             result: ResponseResult::SubscriptionStarted {},
@@ -730,13 +821,13 @@ fn stream_subscriptions(
     }
 
     loop {
-        if should_stop_connection(&mut stream, running)? {
+        if should_stop_connection(transport, running)? {
             return Ok(());
         }
 
         for subscription in &mut subscriptions {
             if let Some(event) = subscription.poll(api_tx, event_hub) {
-                if let Err(err) = write_json_line(&mut stream, &event) {
+                if let Err(err) = write_json_message(transport, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
                     }
@@ -754,40 +845,43 @@ fn write_text_line(stream: &mut LocalStream, value: &str) -> std::io::Result<()>
     stream.flush()
 }
 
-fn write_text_line_allow_disconnect(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
-    match write_text_line(stream, value) {
+fn write_message_allow_disconnect<T: ApiTransport>(
+    transport: &mut T,
+    value: &str,
+) -> std::io::Result<()> {
+    match transport.write_message(value) {
         Err(err) if is_connection_closed_error(&err) => Ok(()),
         result => result,
     }
 }
 
-fn write_json_line<T: serde::Serialize>(
-    stream: &mut LocalStream,
-    value: &T,
+fn write_json_message<T: ApiTransport, V: serde::Serialize>(
+    transport: &mut T,
+    value: &V,
 ) -> std::io::Result<()> {
     let encoded = serde_json::to_string(value)
         .map_err(|err| std::io::Error::other(format!("failed to encode json: {err}")))?;
-    write_text_line(stream, &encoded)
+    transport.write_message(&encoded)
 }
 
-fn write_json_line_allow_disconnect<T: serde::Serialize>(
-    stream: &mut LocalStream,
-    value: &T,
+fn write_json_message_allow_disconnect<T: ApiTransport, V: serde::Serialize>(
+    transport: &mut T,
+    value: &V,
 ) -> std::io::Result<()> {
     let encoded = serde_json::to_string(value)
         .map_err(|err| std::io::Error::other(format!("failed to encode json: {err}")))?;
-    write_text_line_allow_disconnect(stream, &encoded)
+    write_message_allow_disconnect(transport, &encoded)
 }
 
-pub(super) fn should_stop_connection(
-    stream: &mut LocalStream,
+pub(super) fn should_stop_connection<T: ApiTransport>(
+    transport: &mut T,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
     if !running.load(Ordering::Relaxed) {
         return Ok(true);
     }
 
-    local_stream_peer_closed(stream)
+    transport.probe_closed()
 }
 
 pub(super) fn dispatch_to_app_with_timeout(

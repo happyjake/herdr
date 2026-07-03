@@ -9,20 +9,19 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 use crate::api::server::{
-    dispatch_to_app_with_timeout, should_stop_connection, APP_RESPONSE_TIMEOUT,
+    dispatch_to_app_with_timeout, should_stop_connection, ApiTransport, APP_RESPONSE_TIMEOUT,
     CONNECTION_POLL_INTERVAL,
 };
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::subscriptions::{match_output, output_match_read_source};
 use crate::api::{ApiRequestSender, EventHub};
-use crate::ipc::LocalStream;
 
 const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
 
-pub(super) fn wait_for_output(
+pub(super) fn wait_for_output<T: ApiTransport>(
     request_id: String,
     params: crate::api::schema::PaneWaitForOutputParams,
-    stream: &mut LocalStream,
+    transport: &mut T,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
@@ -51,7 +50,7 @@ pub(super) fn wait_for_output(
     };
 
     loop {
-        if should_stop_connection(stream, running)? {
+        if should_stop_connection(transport, running)? {
             crate::logging::api_wait_completed(&request_id, &params.pane_id, "client_disconnected");
             return Ok(None);
         }
@@ -129,10 +128,10 @@ pub(super) fn wait_for_output(
     }
 }
 
-pub(super) fn wait_for_agent(
+pub(super) fn wait_for_agent<T: ApiTransport>(
     request_id: String,
     params: crate::api::schema::AgentWaitParams,
-    stream: &mut LocalStream,
+    transport: &mut T,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -163,7 +162,7 @@ pub(super) fn wait_for_agent(
             accept_transient_status: true,
             timeout_kind: AgentWaitTimeoutKind::Status,
         },
-        stream,
+        transport,
         api_tx,
         event_hub,
         running,
@@ -174,10 +173,10 @@ pub(super) fn wait_for_agent(
     }
 }
 
-pub(super) fn prompt_agent(
+pub(super) fn prompt_agent<T: ApiTransport>(
     request_id: String,
     params: crate::api::schema::AgentPromptParams,
-    stream: &mut LocalStream,
+    transport: &mut T,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -258,7 +257,7 @@ pub(super) fn prompt_agent(
                 accept_transient_status: false,
                 timeout_kind,
             },
-            stream,
+            transport,
             api_tx,
             event_hub,
             running,
@@ -290,7 +289,7 @@ pub(super) fn prompt_agent(
             accept_transient_status: false,
             timeout_kind: AgentWaitTimeoutKind::Status,
         },
-        stream,
+        transport,
         api_tx,
         event_hub,
         running,
@@ -345,10 +344,10 @@ enum AgentWaitOutcome {
     Response(String),
 }
 
-fn wait_for_resolved_agent(
+fn wait_for_resolved_agent<T: ApiTransport>(
     request_id: String,
     wait: ResolvedAgentWait,
-    stream: &mut LocalStream,
+    transport: &mut T,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -368,7 +367,7 @@ fn wait_for_resolved_agent(
     let mut last_event_sequence = wait.last_event_sequence;
 
     loop {
-        if should_stop_connection(stream, running)? {
+        if should_stop_connection(transport, running)? {
             return Ok(None);
         }
 
@@ -658,10 +657,10 @@ fn agent_wait_probe_error(response: ErrorResponse) -> std::io::Result<String> {
     serde_json::to_string(&response).map_err(std::io::Error::other)
 }
 
-pub(super) fn wait_for_event(
+pub(super) fn wait_for_event<T: ApiTransport>(
     request_id: String,
     params: EventsWaitParams,
-    stream: &mut LocalStream,
+    transport: &mut T,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -687,7 +686,7 @@ pub(super) fn wait_for_event(
     };
 
     loop {
-        if should_stop_connection(stream, running)? {
+        if should_stop_connection(transport, running)? {
             return Ok(None);
         }
 
