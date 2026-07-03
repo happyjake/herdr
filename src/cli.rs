@@ -27,6 +27,7 @@ mod api;
 mod completion;
 mod integration;
 mod notification;
+mod pair;
 mod pane;
 mod plugin;
 mod protocol_guard;
@@ -117,6 +118,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
         "notification" => notification::run_notification_command(&args[2..])?,
+        "pair" => pair::run_pair_command(&args[2..])?,
         "agent" => agent::run_agent_command(&args[2..])?,
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,

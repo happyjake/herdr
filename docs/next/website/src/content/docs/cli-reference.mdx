@@ -93,6 +93,14 @@ herdr server reload-agent-manifests
 
 `herdr server` runs the headless server explicitly. Use it for supervised or service-style setups. `reload-config` applies reloadable settings without restarting panes. `agent-manifests` shows the active agent detection manifest sources, cached remote versions, and last remote update results. `update-agent-manifests` fetches remote manifest updates immediately, reloads them into the running server, and prints the updated manifest status; pass `--json` for the raw status response. `reload-agent-manifests` reloads agent detection manifests into the running server after local override edits.
 
+## Pairing
+
+```bash
+herdr pair
+```
+
+`pair` mints a fresh bearer token for the [WebSocket API listener](/docs/socket-api/#websocket-transport), stores it as `[websocket_api].token` in config.toml, and prints the pairing payload — the endpoint URL plus token — as a terminal QR code and as plaintext. The QR encodes the directly connectable form `ws://<bind>/?token=<token>`. A running server picks the new token up immediately through a config reload. Re-running the command rotates the token: the previous one stops authenticating. It requires `[websocket_api].bind` to be configured and explains what to enable when it is not.
+
 ## Notifications
 
 ```bash

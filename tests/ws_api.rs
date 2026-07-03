@@ -593,6 +593,198 @@ fn websocket_handshake_is_rejected_without_a_valid_token() {
     cleanup_spawned_herdr(server.child, server.base);
 }
 
+// ---- Pairing CLI ----
+
+struct PairOutcome {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run `herdr pair` against the same config dir and API socket a spawned
+/// test server uses, with inherited herdr overrides cleared.
+fn run_pair_cli(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> PairOutcome {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("pair")
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("HERDR_SOCKET_PATH", socket_path)
+        .env_remove("HERDR_CONFIG_PATH")
+        .env_remove("HERDR_CLIENT_SOCKET_PATH")
+        .env_remove("HERDR_ENV")
+        .output()
+        .expect("run herdr pair");
+    PairOutcome {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    }
+}
+
+fn minted_token_from_pair_stdout(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("token ")
+                .map(|token| token.trim().to_string())
+        })
+        .unwrap_or_else(|| panic!("pair output must contain a token line:\n{stdout}"))
+}
+
+/// The stored token survives for the next server start. The pair CLI writes
+/// the config dir matching its build profile, so accept either variant.
+fn stored_config_contains(config_home: &Path, needle: &str) -> bool {
+    ["herdr", "herdr-dev"].iter().any(|dir| {
+        fs::read_to_string(config_home.join(dir).join("config.toml"))
+            .is_ok_and(|content| content.contains(needle))
+    })
+}
+
+fn expect_handshake_rejected(addr: SocketAddr, token: &str) {
+    let mut request = format!("ws://{addr}").into_client_request().unwrap();
+    request.headers_mut().insert(
+        tungstenite::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    match tungstenite::connect(request).unwrap_err() {
+        tungstenite::Error::Http(response) => assert_eq!(response.status().as_u16(), 401),
+        other => panic!("expected http 401 for token {token:?}, got: {other:?}"),
+    }
+}
+
+#[test]
+fn pair_cli_rotates_the_token_and_the_live_listener_enforces_it() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let config_home = server.base.join("config");
+    let runtime_dir = server.base.join("runtime");
+
+    // Baseline: the initially configured token authenticates.
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let pong = ws.request(r#"{"id":"req_pair_base","method":"ping","params":{}}"#);
+    assert_eq!(pong["result"]["type"], "pong");
+
+    let pair = run_pair_cli(&config_home, &runtime_dir, &server.socket_path);
+    assert_eq!(
+        pair.exit_code, 0,
+        "stdout:\n{}\nstderr:\n{}",
+        pair.stdout, pair.stderr
+    );
+    let minted = minted_token_from_pair_stdout(&pair.stdout);
+
+    // The payload carries the endpoint and token in connectable form, plus a
+    // terminal QR rendering of the same URL.
+    assert!(
+        pair.stdout
+            .contains(&format!("ws://{}/?token={minted}", server.ws_addr)),
+        "payload url missing:\n{}",
+        pair.stdout
+    );
+    assert!(
+        pair.stdout
+            .contains(&format!("endpoint  ws://{}", server.ws_addr)),
+        "plaintext endpoint missing:\n{}",
+        pair.stdout
+    );
+    assert!(
+        pair.stdout.contains('█') || pair.stdout.contains('▀') || pair.stdout.contains('▄'),
+        "terminal qr missing:\n{}",
+        pair.stdout
+    );
+
+    // The freshly minted token authenticates against the live listener; the
+    // previous token is rejected without a server restart.
+    expect_handshake_rejected(server.ws_addr, TEST_TOKEN);
+    let mut ws = WsClient::connect(server.ws_addr, &minted);
+    let pong = ws.request(r#"{"id":"req_pair_new","method":"ping","params":{}}"#);
+    assert_eq!(pong["result"]["type"], "pong");
+
+    // Re-running rotates again: the earlier mint stops authenticating.
+    let second = run_pair_cli(&config_home, &runtime_dir, &server.socket_path);
+    assert_eq!(second.exit_code, 0, "stderr:\n{}", second.stderr);
+    let minted_again = minted_token_from_pair_stdout(&second.stdout);
+    assert_ne!(minted, minted_again);
+
+    expect_handshake_rejected(server.ws_addr, &minted);
+    let mut ws = WsClient::connect(server.ws_addr, &minted_again);
+    let pong = ws.request(r#"{"id":"req_pair_second","method":"ping","params":{}}"#);
+    assert_eq!(pong["result"]["type"], "pong");
+
+    // The rotation is persisted: only the latest token is stored.
+    assert!(stored_config_contains(&config_home, &minted_again));
+    assert!(!stored_config_contains(&config_home, &minted));
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn pair_cli_explains_required_config_when_listener_is_not_configured() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    for dir in ["herdr", "herdr-dev"] {
+        fs::create_dir_all(config_home.join(dir)).unwrap();
+        fs::write(
+            config_home.join(dir).join("config.toml"),
+            "onboarding = false\n",
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(&runtime_dir).unwrap();
+
+    let pair = run_pair_cli(&config_home, &runtime_dir, &runtime_dir.join("herdr.sock"));
+
+    assert_ne!(pair.exit_code, 0, "stdout:\n{}", pair.stdout);
+    assert!(
+        pair.stderr.contains("[websocket_api]") && pair.stderr.contains("bind"),
+        "explanation must name the required config:\n{}",
+        pair.stderr
+    );
+    assert!(
+        !pair.stdout.contains("ws://") && !pair.stdout.contains("token"),
+        "no payload may be printed without a configured listener:\n{}",
+        pair.stdout
+    );
+
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn pair_cli_provisions_the_token_before_the_first_server_start() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let port = pick_free_port();
+    for dir in ["herdr", "herdr-dev"] {
+        fs::create_dir_all(config_home.join(dir)).unwrap();
+        fs::write(
+            config_home.join(dir).join("config.toml"),
+            format!("onboarding = false\n[websocket_api]\nbind = \"127.0.0.1:{port}\"\n"),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(&runtime_dir).unwrap();
+
+    let pair = run_pair_cli(&config_home, &runtime_dir, &runtime_dir.join("herdr.sock"));
+
+    assert_eq!(pair.exit_code, 0, "stderr:\n{}", pair.stderr);
+    let minted = minted_token_from_pair_stdout(&pair.stdout);
+    assert!(pair
+        .stdout
+        .contains(&format!("ws://127.0.0.1:{port}/?token={minted}")));
+    assert!(
+        pair.stdout.contains("No running herdr server"),
+        "must say the token applies at next start:\n{}",
+        pair.stdout
+    );
+    assert!(stored_config_contains(&config_home, &minted));
+
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn no_websocket_config_opens_no_port_and_keeps_unix_socket_working() {
     let _lock = test_lock();

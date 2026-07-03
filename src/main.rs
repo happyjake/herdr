@@ -449,11 +449,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # The listener binds exactly this address; prefer a tailnet or loopback
 # address. The transport is plain ws:// — the network layer (e.g. your
 # tailnet's WireGuard encryption) is the transport security.
-# Changes require a server restart.
+# Changing bind requires a server restart.
 # bind = "100.64.0.5:4433"
 # Bearer token clients must present during the WebSocket handshake, via an
 # "Authorization: Bearer <token>" header or a "token" query parameter.
 # Required when bind is set. ASCII letters, digits, and -._~ only.
+# `herdr pair` mints and stores this token and prints a QR pairing payload;
+# re-running it rotates the token. Token changes apply on config reload.
 # token = ""
 
 [experimental]
@@ -656,6 +658,7 @@ fn main() -> io::Result<()> {
         println!("       herdr worktree <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
         println!("       herdr notification <subcommand> ...");
+        println!("       herdr pair");
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
         println!("       herdr session <subcommand> ...");
@@ -706,6 +709,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr notification <subcommand>",
                 "Notification helpers over the socket API",
+            ),
+            (
+                "herdr pair",
+                "Mint the websocket api token and print a QR pairing payload",
             ),
             (
                 "herdr agent <subcommand>",
@@ -800,6 +807,7 @@ fn main() -> io::Result<()> {
                 "channel",
                 "workspace",
                 "worktree",
+                "pair",
                 "pane",
                 "session",
                 "integration",
@@ -855,8 +863,9 @@ fn main() -> io::Result<()> {
             Err(err) => return Err(err),
         };
     // Optional WebSocket API listener; off unless configured. Uses the same
-    // capabilities as the socket server above so ping responses match.
-    let _websocket_server = match api::start_websocket_server_with_capabilities(
+    // capabilities as the socket server above so ping responses match. The
+    // handle must stay alive until shutdown: dropping it stops the listener.
+    let websocket_server = match api::start_websocket_server_with_capabilities(
         &loaded_config.config.websocket_api,
         api_tx,
         event_hub.clone(),
@@ -868,6 +877,9 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
     };
+    let websocket_api_token = websocket_server
+        .as_ref()
+        .map(api::WebSocketServerHandle::shared_token);
 
     let modify_other_keys_mode = crate::input::host_modify_other_keys_mode();
 
@@ -935,6 +947,7 @@ fn main() -> io::Result<()> {
             api_rx,
             event_hub,
         );
+        app.set_websocket_api_token(websocket_api_token);
         let result = app.run(&mut terminal).await;
 
         // Reset modifyOtherKeys if we enabled it.

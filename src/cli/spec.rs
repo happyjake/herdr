@@ -37,6 +37,7 @@ pub(super) fn command() -> Command {
         .subcommand(worktree_command())
         .subcommand(tab_command())
         .subcommand(notification_command())
+        .subcommand(pair_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
         .subcommand(terminal_command())
@@ -107,6 +108,10 @@ fn write_requested_help(
     selected.write_long_help(&mut *output)?;
     writeln!(output)?;
     Ok(true)
+}
+
+fn pair_command() -> Command {
+    Command::new("pair").about("Mint the websocket api bearer token and print a QR pairing payload")
 }
 
 fn completion_command() -> Command {

@@ -978,6 +978,8 @@ pub struct WebSocketApiConfig {
     /// without it. Restricted to ASCII letters, digits, and `-._~` so the
     /// query form never needs URL escaping. Handshakes with a missing or
     /// wrong token are rejected before any API request is processed.
+    /// `herdr pair` mints and rotates this token; unlike `bind`, a changed
+    /// token is applied by `server.reload_config` without a restart.
     pub token: Option<String>,
 }
 

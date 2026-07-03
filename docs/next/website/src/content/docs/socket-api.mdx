@@ -690,6 +690,8 @@ const ws = new WebSocket("ws://100.64.0.5:4433/?token=" + token);
 
 Handshakes with a missing or invalid token are rejected with HTTP 401 before any API processing.
 
+`herdr pair` provisions the token: it mints a fresh one, stores it in config.toml, applies it to a running server, and prints the endpoint + token as a QR code and plaintext for client setup. Re-running it rotates the token and invalidates the previous one. See the [CLI reference](/docs/cli-reference/#pairing).
+
 ## Socket paths
 
 The default socket lives under your Herdr config directory.
