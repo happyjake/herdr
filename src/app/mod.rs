@@ -1842,17 +1842,15 @@ impl App {
                     if self.try_route_paste_to_popup(&text) {
                     } else if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
-                    } else {
-                        if let Some(ws_idx) = self.state.active {
-                            if let Some(ws) = self.state.workspaces.get(ws_idx) {
-                                if let Some(focused) = ws.focused_pane_id() {
-                                    if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
-                                        &self.terminal_runtimes,
-                                        ws_idx,
-                                        focused,
-                                    ) {
-                                        let _ = runtime.try_send_paste(text);
-                                    }
+                    } else if let Some(ws_idx) = self.state.active {
+                        if let Some(ws) = self.state.workspaces.get(ws_idx) {
+                            if let Some(focused) = ws.focused_pane_id() {
+                                if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                                    &self.terminal_runtimes,
+                                    ws_idx,
+                                    focused,
+                                ) {
+                                    let _ = runtime.try_send_paste(text);
                                 }
                             }
                         }
