@@ -11,8 +11,10 @@ pub use event_hub::EventHub;
 pub(crate) use server::start_server_with_stop_control;
 pub use server::{start_server_with_capabilities, ServerHandle};
 pub use status::{read_runtime_status_at, RuntimeStatus};
+pub(crate) use websocket::valid_token_chars as valid_websocket_token_chars;
 pub use websocket::{
-    start_websocket_server, start_websocket_server_with_capabilities, WebSocketServerHandle,
+    start_websocket_server, start_websocket_server_with_capabilities, SharedWebSocketToken,
+    WebSocketServerHandle,
 };
 
 use std::path::PathBuf;

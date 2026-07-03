@@ -1406,7 +1406,8 @@ impl HeadlessServer {
         // Live websocket clients are disconnected here and reconnect to the
         // replacement server; restore_public_sockets_after_failed_handoff
         // rebinds on rollback.
-        self.websocket_server = None;
+        let websocket_api_config = self.websocket_api_config.clone();
+        self.set_websocket_api(websocket_api_config, None);
         if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             match self.wait_then_restore_public_sockets_after_failed_handoff() {
@@ -1469,11 +1470,18 @@ impl HeadlessServer {
 
     /// Attach the optional WebSocket API listener started for this server,
     /// with the config used to start it so a failed live handoff can rebind.
+    /// Also hands the listener's expected-token slot to the app so config
+    /// reloads rotate the bearer token on the live listener.
     pub(crate) fn set_websocket_api(
         &mut self,
         config: crate::config::WebSocketApiConfig,
         server: Option<api::WebSocketServerHandle>,
     ) {
+        self.app.set_websocket_api_token(
+            server
+                .as_ref()
+                .map(api::WebSocketServerHandle::shared_token),
+        );
         self.websocket_api_config = config;
         self.websocket_server = server;
     }
@@ -1516,7 +1524,8 @@ impl HeadlessServer {
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
         self.api_server = Some(api_server);
-        self.websocket_server = websocket_server;
+        let websocket_api_config = self.websocket_api_config.clone();
+        self.set_websocket_api(websocket_api_config, websocket_server);
         self.client_listener = listener;
         self.client_socket_path = client_path;
         self.client_socket_identity = client_socket_identity;

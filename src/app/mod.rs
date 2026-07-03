@@ -164,6 +164,10 @@ pub struct App {
     /// even when an App-internal drain consumes the event before the forwarding drain.
     pub(crate) local_input_source_switch: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    /// Live expected-token slot of the WebSocket API listener, when one is
+    /// bound. Config reload rotates the token through this without touching
+    /// the listener itself.
+    pub(crate) websocket_api_token: Option<crate::api::SharedWebSocketToken>,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -818,6 +822,7 @@ impl App {
             local_terminal_notifications: true,
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
+            websocket_api_token: None,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
@@ -1401,6 +1406,15 @@ impl App {
         self.apply_config_from_disk(true)
     }
 
+    /// Attach (or detach) the WebSocket listener's expected-token slot so
+    /// config reloads can rotate the bearer token on the live listener.
+    pub(crate) fn set_websocket_api_token(
+        &mut self,
+        token: Option<crate::api::SharedWebSocketToken>,
+    ) {
+        self.websocket_api_token = token;
+    }
+
     pub(crate) fn take_config_reloaded_from_disk(&mut self) -> bool {
         let reloaded = self.config_reloaded_from_disk;
         self.config_reloaded_from_disk = false;
@@ -1615,6 +1629,17 @@ impl App {
         if !invalid_section("worktrees") {
             self.state.worktree_directory =
                 crate::worktree::expand_tilde_absolute_path(&config.worktrees.directory);
+        }
+
+        if !invalid_section("websocket_api") {
+            // Only the token is live-reloadable; the bind address stays fixed
+            // until the server restarts. A reload that would leave the bound
+            // listener without a usable token keeps the current one instead.
+            if let Some(token) = &self.websocket_api_token {
+                if let Err(reason) = token.apply_reloaded_config(&config.websocket_api) {
+                    diagnostics.push(reason);
+                }
+            }
         }
 
         if !invalid_section("theme") {
@@ -3158,6 +3183,60 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_rotates_live_websocket_api_token() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-websocket-token");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[websocket_api]\nbind = \"127.0.0.1:4433\"\ntoken = \"rotated-token\"\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let token_slot = crate::api::SharedWebSocketToken::new("old-token".to_string());
+        app.set_websocket_api_token(Some(token_slot.clone()));
+
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(token_slot.current(), "rotated-token");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_keeps_live_websocket_api_token_when_new_token_is_unusable() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-websocket-token-invalid");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[websocket_api]\nbind = \"127.0.0.1:4433\"\ntoken = \"has space\"\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let token_slot = crate::api::SharedWebSocketToken::new("old-token".to_string());
+        app.set_websocket_api_token(Some(token_slot.clone()));
+
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("keeps its current token")));
+        assert_eq!(token_slot.current(), "old-token");
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

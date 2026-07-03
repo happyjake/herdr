@@ -20,7 +20,7 @@
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use tracing::{debug, error, info, warn};
@@ -111,10 +111,84 @@ pub(crate) fn websocket_api_spec(
 /// whether or not a client percent-encodes, and base64url-shaped tokens fit
 /// as-is. Anything needing escaping is rejected at config time instead of
 /// mismatching at the handshake.
-fn valid_token_chars(token: &str) -> bool {
+pub(crate) fn valid_token_chars(token: &str) -> bool {
     token
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte))
+}
+
+/// The listener's expected bearer token, shared between the accept loop and
+/// the owner of the [`WebSocketServerHandle`]. Every handshake reads the
+/// current value, so replacing the token takes effect for the next connection
+/// attempt without rebinding the listener; connections authorized before a
+/// rotation stay connected, exactly like a Unix socket client that already
+/// passed its permission check.
+#[derive(Debug, Clone)]
+pub struct SharedWebSocketToken {
+    token: Arc<RwLock<String>>,
+}
+
+impl SharedWebSocketToken {
+    pub(crate) fn new(token: String) -> Self {
+        Self {
+            token: Arc::new(RwLock::new(token)),
+        }
+    }
+
+    /// Snapshot of the currently accepted token.
+    pub(crate) fn current(&self) -> String {
+        self.token
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn replace(&self, token: String) -> bool {
+        let mut current = self.token.write().unwrap_or_else(PoisonError::into_inner);
+        if *current == token {
+            return false;
+        }
+        *current = token;
+        true
+    }
+
+    /// Apply a reloaded `[websocket_api]` section to the live listener.
+    ///
+    /// Only the token can change without a restart; the bind address is fixed
+    /// for the lifetime of the listener. Returns `Ok(changed)`. On error the
+    /// current token stays in effect — the listener never runs without a
+    /// token and never accepts one that would need URL escaping.
+    pub(crate) fn apply_reloaded_config(
+        &self,
+        config: &WebSocketApiConfig,
+    ) -> Result<bool, String> {
+        if matches!(config.bind.as_deref(), None | Some("")) {
+            return Err(
+                "websocket_api.bind was removed; the websocket listener stays bound \
+                 and keeps its current token until the server restarts"
+                    .to_string(),
+            );
+        }
+
+        let token = match config.token.as_deref() {
+            None | Some("") => {
+                return Err("websocket_api.token is missing; the websocket listener \
+                            keeps its current token"
+                    .to_string());
+            }
+            Some(token) => token,
+        };
+
+        if !valid_token_chars(token) {
+            return Err(
+                "websocket_api.token must contain only ASCII letters, digits, or -._~; \
+                 the websocket listener keeps its current token"
+                    .to_string(),
+            );
+        }
+
+        Ok(self.replace(token.to_string()))
+    }
 }
 
 /// Why a WebSocket handshake was rejected. Auth runs inside the HTTP upgrade
@@ -209,6 +283,7 @@ pub struct WebSocketServerHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
     local_addr: SocketAddr,
+    token: SharedWebSocketToken,
 }
 
 impl WebSocketServerHandle {
@@ -216,6 +291,12 @@ impl WebSocketServerHandle {
     /// when the configured port is 0.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The live expected-token slot. Config reload uses this to rotate the
+    /// bearer token without rebinding the listener.
+    pub fn shared_token(&self) -> SharedWebSocketToken {
+        self.token.clone()
     }
 }
 
@@ -269,7 +350,8 @@ pub fn start_websocket_server_with_capabilities(
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
-    let token = Arc::new(spec.token);
+    let token = SharedWebSocketToken::new(spec.token);
+    let accept_token = token.clone();
 
     let thread = std::thread::spawn(move || {
         loop {
@@ -282,7 +364,7 @@ pub fn start_websocket_server_with_capabilities(
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let connection_running = Arc::clone(&listener_running);
-                    let token = Arc::clone(&token);
+                    let token = accept_token.clone();
                     std::thread::spawn(move || {
                         if let Err(err) = handle_ws_connection(
                             stream,
@@ -318,6 +400,7 @@ pub fn start_websocket_server_with_capabilities(
         thread: Some(thread),
         running,
         local_addr,
+        token,
     };
     info!(addr = %handle.local_addr(), "websocket api server listening");
     Ok(Some(handle))
@@ -343,7 +426,7 @@ fn bind_with_addr_in_use_retry(addr: SocketAddr) -> io::Result<TcpListener> {
 
 fn handle_ws_connection(
     stream: TcpStream,
-    expected_token: &str,
+    expected_token: &SharedWebSocketToken,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -400,7 +483,7 @@ fn format_peer(peer: Option<SocketAddr>) -> String {
 
 fn accept_websocket(
     stream: TcpStream,
-    expected_token: &str,
+    expected_token: &SharedWebSocketToken,
     auth_error: &mut Option<WsAuthError>,
 ) -> Result<WebSocket<TcpStream>, tungstenite::Error> {
     let callback = |request: &WsUpgradeRequest, response: WsUpgradeResponse| {
@@ -418,7 +501,10 @@ fn accept_websocket(
             None => None,
         };
 
-        match authorize_ws_request(authorization, request.uri().query(), expected_token) {
+        // Read the expected token at handshake time, not listener start, so a
+        // rotated token is enforced on the very next connection attempt.
+        let expected_token = expected_token.current();
+        match authorize_ws_request(authorization, request.uri().query(), &expected_token) {
             Ok(()) => Ok(response),
             Err(reason) => {
                 *auth_error = Some(reason);
@@ -834,6 +920,57 @@ mod tests {
     }
 
     #[test]
+    fn shared_token_applies_a_valid_reloaded_token() {
+        let shared = SharedWebSocketToken::new("old-token".to_string());
+
+        let changed = shared
+            .apply_reloaded_config(&spec_config(Some("127.0.0.1:4433"), Some("new-token")))
+            .unwrap();
+
+        assert!(changed);
+        assert_eq!(shared.current(), "new-token");
+    }
+
+    #[test]
+    fn shared_token_reports_unchanged_for_the_same_token() {
+        let shared = SharedWebSocketToken::new("same-token".to_string());
+
+        let changed = shared
+            .apply_reloaded_config(&spec_config(Some("127.0.0.1:4433"), Some("same-token")))
+            .unwrap();
+
+        assert!(!changed);
+        assert_eq!(shared.current(), "same-token");
+    }
+
+    #[test]
+    fn shared_token_keeps_current_token_when_reload_removes_the_section() {
+        let shared = SharedWebSocketToken::new("kept-token".to_string());
+
+        for config in [
+            spec_config(None, Some("new-token")),
+            spec_config(Some(""), Some("new-token")),
+        ] {
+            let err = shared.apply_reloaded_config(&config).unwrap_err();
+            assert!(err.contains("until the server restarts"), "{err}");
+            assert_eq!(shared.current(), "kept-token");
+        }
+    }
+
+    #[test]
+    fn shared_token_keeps_current_token_when_reload_omits_or_breaks_the_token() {
+        let shared = SharedWebSocketToken::new("kept-token".to_string());
+
+        for token in [None, Some(""), Some("has space"), Some("has+plus")] {
+            let err = shared
+                .apply_reloaded_config(&spec_config(Some("127.0.0.1:4433"), token))
+                .unwrap_err();
+            assert!(err.contains("keeps its current token"), "{token:?}: {err}");
+            assert_eq!(shared.current(), "kept-token");
+        }
+    }
+
+    #[test]
     fn start_returns_none_when_not_configured() {
         let (api_tx, _api_rx) = mpsc::unbounded_channel();
         let handle = start_websocket_server_with_capabilities(
@@ -1030,5 +1167,57 @@ mod tests {
 
         let rebound = TcpListener::bind(addr);
         assert!(rebound.is_ok(), "port should be released: {rebound:?}");
+    }
+
+    #[test]
+    fn rotating_the_token_rejects_the_old_token_without_rebinding() {
+        let server = start_test_server();
+
+        // A connection authorized before the rotation stays usable: auth
+        // happens at the handshake, like a Unix socket permission check.
+        let mut pre_rotation = connect_authorized(&server);
+
+        let rotated = server
+            .handle
+            .shared_token()
+            .apply_reloaded_config(&spec_config(Some("127.0.0.1:0"), Some("rotated-token")))
+            .unwrap();
+        assert!(rotated);
+
+        // The previous token is rejected at the very next handshake.
+        let url = format!("ws://{}", server.handle.local_addr());
+        let mut request = url.clone().into_client_request().unwrap();
+        request.headers_mut().insert(
+            tungstenite::http::header::AUTHORIZATION,
+            format!("Bearer {TEST_TOKEN}").parse().unwrap(),
+        );
+        match tungstenite::connect(request).unwrap_err() {
+            tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+            other => panic!("expected http 401 rejection, got: {other:?}"),
+        }
+
+        // The rotated token authenticates.
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            tungstenite::http::header::AUTHORIZATION,
+            "Bearer rotated-token".parse().unwrap(),
+        );
+        let (mut websocket, _response) = tungstenite::connect(request).unwrap();
+        set_client_read_timeout(&websocket);
+        websocket
+            .send(Message::text(
+                r#"{"id":"req_rotated","method":"ping","params":{}}"#,
+            ))
+            .unwrap();
+        assert_eq!(read_json(&mut websocket)["result"]["type"], "pong");
+
+        pre_rotation
+            .send(Message::text(
+                r#"{"id":"req_pre","method":"ping","params":{}}"#,
+            ))
+            .unwrap();
+        assert_eq!(read_json(&mut pre_rotation)["result"]["type"], "pong");
     }
 }
