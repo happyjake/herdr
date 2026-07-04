@@ -11,6 +11,7 @@ mod websocket;
 pub use event_hub::EventHub;
 pub(crate) use server::start_server_with_stop_control;
 pub use server::{start_server_with_capabilities, ServerHandle};
+pub(crate) use server_name::resolve_server_name;
 pub use server_name::SharedServerName;
 pub use status::{read_runtime_status_at, RuntimeStatus};
 pub(crate) use websocket::valid_token_chars as valid_websocket_token_chars;
