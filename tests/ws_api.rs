@@ -771,19 +771,25 @@ fn pair_cli_rotates_the_token_and_the_live_listener_enforces_it() {
     );
     let minted = minted_token_from_pair_stdout(&pair.stdout);
 
-    // The payload carries the endpoint and token in connectable form, plus a
-    // terminal QR rendering of the same URL.
+    // The payload carries the endpoint, token, and configured server name in
+    // connectable form, plus a terminal QR rendering of the same URL.
     assert!(
-        pair.stdout
-            .contains(&format!("ws://{}/?token={minted}", server.ws_addr)),
+        pair.stdout.contains(&format!(
+            "ws://{}/?token={minted}&name={TEST_SERVER_NAME}",
+            server.ws_addr
+        )),
         "payload url missing:\n{}",
         pair.stdout
     );
-    assert!(
-        pair.stdout
-            .contains(&format!("endpoint  ws://{}", server.ws_addr)),
-        "plaintext endpoint missing:\n{}",
-        pair.stdout
+    // The plaintext endpoint stays bare: no token, no name.
+    let endpoint_line = pair
+        .stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("endpoint"))
+        .unwrap_or_else(|| panic!("plaintext endpoint missing:\n{}", pair.stdout));
+    assert_eq!(
+        endpoint_line.trim(),
+        format!("endpoint  ws://{}", server.ws_addr)
     );
     assert!(
         pair.stdout.contains('█') || pair.stdout.contains('▀') || pair.stdout.contains('▄'),
@@ -870,9 +876,10 @@ fn pair_cli_provisions_the_token_before_the_first_server_start() {
 
     assert_eq!(pair.exit_code, 0, "stderr:\n{}", pair.stderr);
     let minted = minted_token_from_pair_stdout(&pair.stdout);
+    // No configured name: the URL still carries one — the hostname default.
     assert!(pair
         .stdout
-        .contains(&format!("ws://127.0.0.1:{port}/?token={minted}")));
+        .contains(&format!("ws://127.0.0.1:{port}/?token={minted}&name=")));
     assert!(
         pair.stdout.contains("No running herdr server"),
         "must say the token applies at next start:\n{}",

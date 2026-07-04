@@ -1,5 +1,6 @@
 //! `herdr pair` — mint the WebSocket API bearer token and print the pairing
-//! payload (endpoint URL + token) as a terminal QR code and as plaintext.
+//! payload (endpoint URL + token + server name) as a terminal QR code and as
+//! plaintext.
 //!
 //! The token is stored in `[websocket_api].token` in config.toml, so the
 //! server honors it across restarts. Re-running the command mints a fresh
@@ -68,6 +69,8 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
+    let name = crate::api::resolve_server_name(&config.websocket_api);
+
     let token = mint_token()?;
     if !crate::api::valid_websocket_token_chars(&token) {
         return Err(std::io::Error::other(
@@ -95,7 +98,7 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
         .is_some_and(|token| !token.is_empty());
     let activation = apply_token_to_running_server(addr);
 
-    let payload = PairingPayload { addr, token };
+    let payload = PairingPayload { addr, token, name };
     match qr_code_text(&payload.url()) {
         Ok(qr) => {
             println!("Scan with the herdr mobile client:");
@@ -105,6 +108,7 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
         Err(err) => eprintln!("warning: {err}; use the plaintext payload below"),
     }
     println!("  endpoint  {}", payload.endpoint());
+    println!("  name      {}", payload.name);
     println!("  token     {}", payload.token);
     println!();
     println!("  {}", payload.url());
@@ -115,13 +119,17 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     Ok(exit_code)
 }
 
-/// The pairing payload: the WebSocket endpoint plus the bearer token. The QR
-/// encodes [`Self::url`], a directly connectable form — the listener accepts
-/// the token as a query parameter — that also carries both fields for
-/// clients that prefer `Authorization: Bearer` header auth.
+/// The pairing payload: the WebSocket endpoint, the bearer token, and the
+/// server's display name. The QR encodes [`Self::url`], a directly
+/// connectable form — the listener accepts the token as a query parameter
+/// and ignores the rest — that also carries the fields for clients that
+/// prefer `Authorization: Bearer` header auth. The name and token ride only
+/// the scannable URL: [`Self::endpoint`] stays bare, so pasting it never
+/// leaks a credential and renaming never changes a server's identity.
 struct PairingPayload {
     addr: SocketAddr,
     token: String,
+    name: String,
 }
 
 impl PairingPayload {
@@ -131,9 +139,30 @@ impl PairingPayload {
 
     fn url(&self) -> String {
         // The token charset is URL-unreserved by construction, so the query
-        // form needs no percent-encoding.
-        format!("ws://{}/?token={}", self.addr, self.token)
+        // form needs no percent-encoding; the free-form name does.
+        format!(
+            "ws://{}/?token={}&name={}",
+            self.addr,
+            self.token,
+            percent_encode_query_value(&self.name)
+        )
     }
+}
+
+/// Percent-encode a query parameter value: every byte outside the
+/// URL-unreserved set (RFC 3986: ALPHA, DIGIT, `-._~`) is escaped, UTF-8
+/// bytewise. Stricter than strictly necessary for a query, so the value
+/// survives any spec-conforming decoder unchanged.
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// Why `herdr pair` refuses to print a payload.
@@ -346,6 +375,10 @@ fn print_pair_help() {
     eprintln!("(endpoint + token) as a QR code and as plaintext. Requires");
     eprintln!("[websocket_api].bind to be configured. Re-running rotates the token");
     eprintln!("and invalidates the previous one.");
+    eprintln!();
+    eprintln!("The scannable URL also carries the server's display name so clients");
+    eprintln!("can label the server before first connect: [websocket_api].name,");
+    eprintln!("or the machine's hostname when unset. Display only, never identity.");
 }
 
 #[cfg(test)]
@@ -415,19 +448,53 @@ mod tests {
     }
 
     #[test]
-    fn payload_url_carries_endpoint_and_token_in_connectable_form() {
+    fn payload_url_carries_endpoint_token_and_name_in_connectable_form() {
         let payload = PairingPayload {
             addr: addr("100.64.0.5:4433"),
             token: "abcDEF123-_".to_string(),
+            name: "the-mini".to_string(),
         };
         assert_eq!(payload.endpoint(), "ws://100.64.0.5:4433");
-        assert_eq!(payload.url(), "ws://100.64.0.5:4433/?token=abcDEF123-_");
+        assert_eq!(
+            payload.url(),
+            "ws://100.64.0.5:4433/?token=abcDEF123-_&name=the-mini"
+        );
 
         let ipv6 = PairingPayload {
             addr: addr("[::1]:4433"),
             token: "t".to_string(),
+            name: "n".to_string(),
         };
-        assert_eq!(ipv6.url(), "ws://[::1]:4433/?token=t");
+        assert_eq!(ipv6.url(), "ws://[::1]:4433/?token=t&name=n");
+    }
+
+    #[test]
+    fn payload_percent_encodes_the_name_and_keeps_the_endpoint_bare() {
+        let payload = PairingPayload {
+            addr: addr("100.64.0.5:4433"),
+            token: "tok".to_string(),
+            name: "Can's Mini (büro)".to_string(),
+        };
+
+        // The name rides only the scannable URL, percent-encoded.
+        assert_eq!(
+            payload.url(),
+            "ws://100.64.0.5:4433/?token=tok&name=Can%27s%20Mini%20%28b%C3%BCro%29"
+        );
+        // The plaintext endpoint carries neither name nor token.
+        assert_eq!(payload.endpoint(), "ws://100.64.0.5:4433");
+    }
+
+    #[test]
+    fn percent_encoding_escapes_everything_outside_the_unreserved_set() {
+        assert_eq!(
+            percent_encode_query_value("plain-Name_0.~"),
+            "plain-Name_0.~"
+        );
+        assert_eq!(percent_encode_query_value("a b"), "a%20b");
+        assert_eq!(percent_encode_query_value("a&b=c?d#e"), "a%26b%3Dc%3Fd%23e");
+        assert_eq!(percent_encode_query_value("naïve"), "na%C3%AFve");
+        assert_eq!(percent_encode_query_value(""), "");
     }
 
     #[test]
