@@ -168,6 +168,10 @@ pub struct App {
     /// bound. Config reload rotates the token through this without touching
     /// the listener itself.
     pub(crate) websocket_api_token: Option<crate::api::SharedWebSocketToken>,
+    /// Live declared-name slot shared with the API listeners. Config reload
+    /// renames the server through this; every subsequent pong carries the
+    /// new name on both transports without a restart.
+    pub(crate) server_name: Option<crate::api::SharedServerName>,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -823,6 +827,7 @@ impl App {
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
             websocket_api_token: None,
+            server_name: None,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
@@ -1415,6 +1420,12 @@ impl App {
         self.websocket_api_token = token;
     }
 
+    /// Attach the declared-name slot shared with the API listeners so config
+    /// reloads rename the server for every subsequent pong.
+    pub(crate) fn set_server_name(&mut self, server_name: Option<crate::api::SharedServerName>) {
+        self.server_name = server_name;
+    }
+
     pub(crate) fn take_config_reloaded_from_disk(&mut self) -> bool {
         let reloaded = self.config_reloaded_from_disk;
         self.config_reloaded_from_disk = false;
@@ -1632,13 +1643,19 @@ impl App {
         }
 
         if !invalid_section("websocket_api") {
-            // Only the token is live-reloadable; the bind address stays fixed
-            // until the server restarts. A reload that would leave the bound
-            // listener without a usable token keeps the current one instead.
+            // Only the token and the name are live-reloadable; the bind
+            // address stays fixed until the server restarts. A reload that
+            // would leave the bound listener without a usable token keeps
+            // the current one instead.
             if let Some(token) = &self.websocket_api_token {
                 if let Err(reason) = token.apply_reloaded_config(&config.websocket_api) {
                     diagnostics.push(reason);
                 }
+            }
+            // Renaming never fails: an absent or empty name falls back to
+            // the machine hostname.
+            if let Some(server_name) = &self.server_name {
+                server_name.apply_reloaded_config(&config.websocket_api);
             }
         }
 
@@ -3208,6 +3225,34 @@ mod tests {
 
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(token_slot.current(), "rotated-token");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_renames_the_live_server() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-server-name");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[websocket_api]\nname = \"renamed-server\"\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        let name_slot = crate::api::SharedServerName::new("old-name".to_string());
+        app.set_server_name(Some(name_slot.clone()));
+
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(name_slot.current(), "renamed-server");
+
+        // Removing the name falls back to the hostname, never to emptiness.
+        std::fs::write(&path, "").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_ne!(name_slot.current(), "renamed-server");
+        assert!(!name_slot.current().is_empty());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

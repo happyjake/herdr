@@ -1505,15 +1505,24 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
+        // Keep the live name slot across the failed handoff so an earlier
+        // reload-applied rename survives the restored listeners.
+        let server_name = self
+            .app
+            .server_name
+            .clone()
+            .unwrap_or_else(|| api::SharedServerName::from_config(&self.websocket_api_config));
         let api_server = api::start_server_with_stop_control(
             api_tx.clone(),
             self.app.event_hub.clone(),
             self.should_quit.clone(),
+            server_name.clone(),
         )?;
         let websocket_server = api::start_websocket_server(
             &self.websocket_api_config,
             api_tx,
             self.app.event_hub.clone(),
+            server_name,
         )?;
 
         let client_path = client_socket_path();
@@ -5107,11 +5116,16 @@ pub fn run_server() -> io::Result<()> {
     let event_hub = api::EventHub::default();
     let should_quit = Arc::new(AtomicBool::new(false));
 
+    // The declared server name, shared by both API transports so their pongs
+    // match and by the app so config reloads rename the live server.
+    let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+
     // Start the JSON API socket server.
     let _api_server = match api::start_server_with_stop_control(
         api_tx.clone(),
         event_hub.clone(),
         should_quit.clone(),
+        server_name.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -5128,6 +5142,7 @@ pub fn run_server() -> io::Result<()> {
         &loaded_config.config.websocket_api,
         api_tx.clone(),
         event_hub.clone(),
+        server_name.clone(),
     ) {
         Ok(server) => server,
         Err(err) => {
@@ -5152,6 +5167,7 @@ pub fn run_server() -> io::Result<()> {
             api_rx,
             event_hub,
         );
+        app.set_server_name(Some(server_name));
         seed_startup_workspace_if_empty(&mut app);
 
         // The server runs headless — disable local notification side effects.
@@ -5274,10 +5290,13 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
+        let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+        app.set_server_name(Some(server_name.clone()));
         let api_server = api::start_server_with_stop_control(
             api_tx.clone(),
             event_hub.clone(),
             should_quit.clone(),
+            server_name.clone(),
         )?;
         // The old server released the websocket port with its socket files;
         // bind it here so a committed handoff keeps the listener alive.
@@ -5286,6 +5305,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             &loaded_config.config.websocket_api,
             api_tx.clone(),
             event_hub.clone(),
+            server_name,
         )?;
         let mut server = HeadlessServer::new(
             app,

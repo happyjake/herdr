@@ -981,6 +981,12 @@ pub struct WebSocketApiConfig {
     /// `herdr pair` mints and rotates this token; unlike `bind`, a changed
     /// token is applied by `server.reload_config` without a restart.
     pub token: Option<String>,
+    /// Display name this server declares about itself: returned in the
+    /// `ping` pong on every transport and embedded in the pairing QR
+    /// payload. Unset or empty means the machine's hostname. Display only,
+    /// never identity — clients compare servers by endpoint. A changed name
+    /// is applied by `server.reload_config` without a restart.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

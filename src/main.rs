@@ -852,24 +852,31 @@ fn main() -> io::Result<()> {
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
-    let _api_server =
-        match api::start_server_with_capabilities(api_tx.clone(), event_hub.clone(), None) {
-            Ok(server) => server,
-            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("error: herdr is already running");
-                eprintln!("socket: {}", api::socket_path().display());
-                std::process::exit(1);
-            }
-            Err(err) => return Err(err),
-        };
+    let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+    let _api_server = match api::start_server_with_capabilities(
+        api_tx.clone(),
+        event_hub.clone(),
+        None,
+        server_name.clone(),
+    ) {
+        Ok(server) => server,
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            eprintln!("error: herdr is already running");
+            eprintln!("socket: {}", api::socket_path().display());
+            std::process::exit(1);
+        }
+        Err(err) => return Err(err),
+    };
     // Optional WebSocket API listener; off unless configured. Uses the same
-    // capabilities as the socket server above so ping responses match. The
-    // handle must stay alive until shutdown: dropping it stops the listener.
+    // capabilities and name slot as the socket server above so ping responses
+    // match. The handle must stay alive until shutdown: dropping it stops the
+    // listener.
     let websocket_server = match api::start_websocket_server_with_capabilities(
         &loaded_config.config.websocket_api,
         api_tx,
         event_hub.clone(),
         None,
+        server_name.clone(),
     ) {
         Ok(server) => server,
         Err(err) => {
@@ -948,6 +955,7 @@ fn main() -> io::Result<()> {
             event_hub,
         );
         app.set_websocket_api_token(websocket_api_token);
+        app.set_server_name(Some(server_name));
         let result = app.run(&mut terminal).await;
 
         // Reset modifyOtherKeys if we enabled it.

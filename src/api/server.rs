@@ -88,16 +88,24 @@ pub(crate) fn start_server_with_stop_control(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     server_stop: Arc<AtomicBool>,
+    server_name: crate::api::SharedServerName,
 ) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
+    start_server_inner(
+        api_tx,
+        event_hub,
+        default_capabilities(),
+        Some(server_stop),
+        server_name,
+    )
 }
 
 pub fn start_server_with_capabilities(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
+    server_name: crate::api::SharedServerName,
 ) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, capabilities, None)
+    start_server_inner(api_tx, event_hub, capabilities, None, server_name)
 }
 
 fn default_capabilities() -> Option<ServerCapabilities> {
@@ -112,6 +120,7 @@ fn start_server_inner(
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
+    server_name: crate::api::SharedServerName,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -131,6 +140,7 @@ fn start_server_inner(
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
+                    let server_name = server_name.clone();
                     let connection_running = Arc::clone(&listener_running);
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection_with_stop(
@@ -140,6 +150,7 @@ fn start_server_inner(
                             &connection_running,
                             capabilities,
                             server_stop.as_ref(),
+                            &server_name,
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -193,6 +204,7 @@ fn handle_connection_with_stop(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
+    server_name: &crate::api::SharedServerName,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -240,6 +252,8 @@ fn handle_connection_with_stop(
             event_hub,
             running,
             capabilities,
+            server_stop,
+            server_name,
         ),
     }
 }
@@ -282,6 +296,8 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+    server_name: &crate::api::SharedServerName,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -386,6 +402,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
                 capabilities,
                 server_stop,
                 Some(response_write_rx),
+                server_name,
             );
             let result = write_message_allow_disconnect(transport, &response);
             let _ = response_write_tx.send(());
@@ -440,7 +457,10 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
+    server_name: &crate::api::SharedServerName,
 ) -> String {
+    // The name is read per request, not captured at listener start, so a
+    // reloaded name shows up in the next pong on every transport.
     if matches!(&request.method, Method::Ping(_)) {
         return serde_json::to_string(&SuccessResponse {
             id: request.id,
@@ -448,6 +468,7 @@ fn handle_request(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
+                name: Some(server_name.current()),
             },
         })
         .unwrap_or_else(|_| {
@@ -1177,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn ping_request_returns_pong() {
+    fn ping_request_returns_pong_with_the_declared_server_name() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let response = handle_request(
             Request {
@@ -1191,17 +1212,52 @@ mod tests {
             }),
             None,
             None,
+            &crate::api::SharedServerName::new("the-mini".to_string()),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
-        assert!(matches!(parsed.result, ResponseResult::Pong { .. }));
+        match parsed.result {
+            ResponseResult::Pong { name, .. } => assert_eq!(name.as_deref(), Some("the-mini")),
+            other => panic!("expected pong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pong_reflects_a_renamed_server_without_restarting_anything() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let server_name = crate::api::SharedServerName::new("before".to_string());
+        let ping = |id: &str| {
+            handle_request(
+                Request {
+                    id: id.into(),
+                    method: Method::Ping(crate::api::schema::PingParams::default()),
+                },
+                &tx,
+                None,
+                None,
+                None,
+                &server_name,
+            )
+        };
+
+        assert!(ping("req_before").contains(r#""name":"before""#));
+
+        // The same reload path token rotation uses (see app config reload).
+        let changed = server_name.apply_reloaded_config(&crate::config::WebSocketApiConfig {
+            name: Some("after".to_string()),
+            ..crate::config::WebSocketApiConfig::default()
+        });
+        assert!(changed);
+
+        assert!(ping("req_after").contains(r#""name":"after""#));
     }
 
     #[test]
     fn server_stop_control_bypasses_app_channel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let server_name = crate::api::SharedServerName::new("test".to_string());
         let response = handle_request(
             Request {
                 id: "priority_stop".into(),
@@ -1211,6 +1267,7 @@ mod tests {
             None,
             Some(&stop),
             None,
+            &server_name,
         );
 
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1227,6 +1284,7 @@ mod tests {
             None,
             Some(&stop),
             None,
+            &server_name,
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
@@ -1242,8 +1300,16 @@ mod tests {
         };
 
         let request_for_thread = request.clone();
-        let thread =
-            std::thread::spawn(move || handle_request(request_for_thread, &tx, None, None, None));
+        let thread = std::thread::spawn(move || {
+            handle_request(
+                request_for_thread,
+                &tx,
+                None,
+                None,
+                None,
+                &crate::api::SharedServerName::new("test".to_string()),
+            )
+        });
 
         let msg = rx.blocking_recv().unwrap();
         assert_eq!(msg.request.id, "req_2");
@@ -1460,7 +1526,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &crate::api::SharedServerName::new("test".to_string()),
+            );
             done_tx.send(result).unwrap();
         });
 
@@ -1492,7 +1565,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &crate::api::SharedServerName::new("test".to_string()),
+            );
             done_tx.send(result).unwrap();
         });
 
@@ -1524,7 +1604,14 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &crate::api::SharedServerName::new("test".to_string()),
+            );
             done_tx.send(result).unwrap();
         });
 

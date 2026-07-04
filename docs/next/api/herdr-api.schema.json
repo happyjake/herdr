@@ -8662,6 +8662,13 @@
                   ],
                   "default": null
                 },
+                "name": {
+                  "description": "Display name the server declares (`websocket_api.name`, falling\nback to the machine hostname). Additive: absent from pongs of\nolder servers, so the protocol version is unchanged. Display\nonly, never identity.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "protocol": {
                   "format": "uint32",
                   "minimum": 0,

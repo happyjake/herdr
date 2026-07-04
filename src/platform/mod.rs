@@ -132,6 +132,32 @@ pub(crate) fn take_terminal_resize_signal() -> bool {
     false
 }
 
+/// The machine's hostname, used as the default server display name.
+/// `None` when the OS reports no usable name.
+#[cfg(unix)]
+pub fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    let result = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if result != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&byte| byte == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..len]).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(windows)]
+pub fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardCommand {

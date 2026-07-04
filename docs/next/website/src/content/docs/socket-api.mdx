@@ -665,6 +665,8 @@ A successful response includes the same `id`:
 {"id":"req_1","result":{"type":"pong"}}
 ```
 
+The `ping` response also carries the server's version, protocol, capabilities, and its declared display name (`websocket_api.name`, defaulting to the machine hostname) — identical over the Unix socket and the WebSocket transport. The `name` field is additive: clients talking to older servers must treat it as optional.
+
 Event subscriptions keep the connection open after the initial response.
 
 ## WebSocket transport

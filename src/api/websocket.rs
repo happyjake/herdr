@@ -319,6 +319,7 @@ pub fn start_websocket_server(
     config: &WebSocketApiConfig,
     api_tx: ApiRequestSender,
     event_hub: EventHub,
+    server_name: crate::api::SharedServerName,
 ) -> io::Result<Option<WebSocketServerHandle>> {
     start_websocket_server_with_capabilities(
         config,
@@ -328,17 +329,19 @@ pub fn start_websocket_server(
             live_handoff: crate::platform::capabilities().live_handoff,
             detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         }),
+        server_name,
     )
 }
 
 /// Like [`start_websocket_server`], with explicit ping capabilities. Call
-/// sites must pass the same capabilities as their Unix socket listener so
-/// `ping` responses are identical over both transports.
+/// sites must pass the same capabilities and shared name slot as their Unix
+/// socket listener so `ping` responses are identical over both transports.
 pub fn start_websocket_server_with_capabilities(
     config: &WebSocketApiConfig,
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
+    server_name: crate::api::SharedServerName,
 ) -> io::Result<Option<WebSocketServerHandle>> {
     let Some(spec) = websocket_api_spec(config)? else {
         return Ok(None);
@@ -363,6 +366,7 @@ pub fn start_websocket_server_with_capabilities(
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
+                    let server_name = server_name.clone();
                     let connection_running = Arc::clone(&listener_running);
                     let token = accept_token.clone();
                     std::thread::spawn(move || {
@@ -373,6 +377,7 @@ pub fn start_websocket_server_with_capabilities(
                             &event_hub,
                             &connection_running,
                             capabilities,
+                            &server_name,
                         ) {
                             warn!(peer = %peer, err = %err, "websocket api connection failed");
                         }
@@ -431,6 +436,7 @@ fn handle_ws_connection(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
+    server_name: &crate::api::SharedServerName,
 ) -> io::Result<()> {
     let peer = stream.peer_addr().ok();
     stream.set_read_timeout(Some(HANDSHAKE_IO_TIMEOUT))?;
@@ -464,7 +470,14 @@ fn handle_ws_connection(
     websocket.get_ref().set_nonblocking(true)?;
     let mut transport = WsTransport { websocket };
 
-    let result = ws_request_loop(&mut transport, api_tx, event_hub, running, capabilities);
+    let result = ws_request_loop(
+        &mut transport,
+        api_tx,
+        event_hub,
+        running,
+        capabilities,
+        server_name,
+    );
 
     // Best effort: tell well-behaved clients the server is done.
     let _ = transport.websocket.close(None);
@@ -554,6 +567,7 @@ fn ws_request_loop(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
+    server_name: &crate::api::SharedServerName,
 ) -> io::Result<()> {
     // Parity with the Unix socket: a client that completes the handshake
     // gets a bounded window to send its first request. Once the connection
@@ -578,6 +592,8 @@ fn ws_request_loop(
                     event_hub,
                     running,
                     capabilities.clone(),
+                    None,
+                    server_name,
                 )?;
             }
             Ok(Message::Binary(_)) => {
@@ -722,10 +738,13 @@ mod tests {
 
     const TEST_TOKEN: &str = "test-token-1234";
 
+    const TEST_SERVER_NAME: &str = "ws-test-server";
+
     fn spec_config(bind: Option<&str>, token: Option<&str>) -> WebSocketApiConfig {
         WebSocketApiConfig {
             bind: bind.map(str::to_string),
             token: token.map(str::to_string),
+            name: None,
         }
     }
 
@@ -981,6 +1000,7 @@ mod tests {
             api_tx,
             EventHub::default(),
             None,
+            crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string()),
         )
         .unwrap();
         assert!(handle.is_none());
@@ -988,6 +1008,7 @@ mod tests {
 
     struct TestServer {
         handle: WebSocketServerHandle,
+        server_name: crate::api::SharedServerName,
         _api_rx: mpsc::UnboundedReceiver<ApiRequestMessage>,
         event_hub: EventHub,
     }
@@ -995,16 +1016,19 @@ mod tests {
     fn start_test_server() -> TestServer {
         let (api_tx, api_rx) = mpsc::unbounded_channel();
         let event_hub = EventHub::default();
+        let server_name = crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string());
         let handle = start_websocket_server_with_capabilities(
             &spec_config(Some("127.0.0.1:0"), Some(TEST_TOKEN)),
             api_tx,
             event_hub.clone(),
             None,
+            server_name.clone(),
         )
         .unwrap()
         .expect("listener should start when configured");
         TestServer {
             handle,
+            server_name,
             _api_rx: api_rx,
             event_hub,
         }
@@ -1096,7 +1120,67 @@ mod tests {
                 response["result"]["protocol"],
                 crate::protocol::PROTOCOL_VERSION
             );
+            assert_eq!(response["result"]["name"], TEST_SERVER_NAME);
         }
+    }
+
+    #[test]
+    fn query_with_unknown_parameters_still_authenticates() {
+        // The pairing URL gained a `name` parameter after the first fork
+        // release. The listener reads only the token from the query, so a
+        // client that replays the whole query — or a payload that grows more
+        // parameters later — must keep connecting. Regression pin.
+        let server = start_test_server();
+
+        let url = format!(
+            "ws://{}/?token={TEST_TOKEN}&name=some%20server&future=1",
+            server.handle.local_addr()
+        );
+        let (mut websocket, _response) = tungstenite::connect(url).unwrap();
+        set_client_read_timeout(&websocket);
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"req_extra","method":"ping","params":{}}"#,
+            ))
+            .unwrap();
+        let response = read_json(&mut websocket);
+        assert_eq!(response["id"], "req_extra");
+        assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
+    fn renaming_the_server_shows_in_the_next_pong_without_rebinding() {
+        let server = start_test_server();
+        let mut websocket = connect_authorized(&server);
+
+        let pong = |websocket: &mut WebSocket<MaybeTlsStream<TcpStream>>, id: &str| {
+            websocket
+                .send(Message::text(format!(
+                    r#"{{"id":"{id}","method":"ping","params":{{}}}}"#
+                )))
+                .unwrap();
+            read_json(websocket)
+        };
+
+        assert_eq!(
+            pong(&mut websocket, "req_named")["result"]["name"],
+            TEST_SERVER_NAME
+        );
+
+        let changed = server
+            .server_name
+            .apply_reloaded_config(&WebSocketApiConfig {
+                name: Some("renamed-server".to_string()),
+                ..spec_config(Some("127.0.0.1:0"), Some(TEST_TOKEN))
+            });
+        assert!(changed);
+
+        // Even the connection opened before the rename sees the new name.
+        assert_eq!(
+            pong(&mut websocket, "req_renamed")["result"]["name"],
+            "renamed-server"
+        );
     }
 
     #[test]

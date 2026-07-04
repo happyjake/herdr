@@ -669,12 +669,25 @@ fn success_response_round_trips() {
                 live_handoff: true,
                 detached_server_daemon: true,
             }),
+            name: Some("the-mini".into()),
         },
     };
 
     let json = serde_json::to_string(&response).unwrap();
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
+}
+
+#[test]
+fn pong_name_is_additive_for_older_peers() {
+    // A pong from a server that predates the name field must still parse —
+    // the field is additive and the protocol version did not bump.
+    let old_pong = r#"{"id":"req_old","result":{"type":"pong","version":"0.1.0","protocol":6}}"#;
+    let restored: SuccessResponse = serde_json::from_str(old_pong).unwrap();
+    match restored.result {
+        ResponseResult::Pong { name, .. } => assert_eq!(name, None),
+        other => panic!("expected pong, got {other:?}"),
+    }
 }
 
 #[test]

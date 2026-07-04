@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn live_reload_parses_websocket_api_section_without_diagnostics() {
         let loaded = load_live_config_from_str(
-            "[websocket_api]\nbind = \"127.0.0.1:4433\"\ntoken = \"secret\"\n",
+            "[websocket_api]\nbind = \"127.0.0.1:4433\"\ntoken = \"secret\"\nname = \"the-mini\"\n",
         )
         .unwrap();
 
@@ -748,6 +748,23 @@ mod tests {
             Some("127.0.0.1:4433")
         );
         assert_eq!(loaded.config.websocket_api.token.as_deref(), Some("secret"));
+        assert_eq!(
+            loaded.config.websocket_api.name.as_deref(),
+            Some("the-mini")
+        );
+    }
+
+    #[test]
+    fn websocket_api_name_parses_absent_and_empty_as_unset_and_empty() {
+        // Absent: the name resolution falls back to the hostname downstream.
+        let absent =
+            load_live_config_from_str("[websocket_api]\nbind = \"127.0.0.1:4433\"\n").unwrap();
+        assert_eq!(absent.config.websocket_api.name, None);
+
+        // Empty: parses as an empty string (also a hostname fallback case).
+        let empty = load_live_config_from_str("[websocket_api]\nname = \"\"\n").unwrap();
+        assert_eq!(empty.config.websocket_api.name.as_deref(), Some(""));
+        assert!(empty.diagnostics.is_empty(), "{:?}", empty.diagnostics);
     }
 
     #[test]
