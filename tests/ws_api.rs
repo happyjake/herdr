@@ -28,6 +28,7 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::{Message, WebSocket};
 
 const TEST_TOKEN: &str = "ws-api-test-token";
+const TEST_SERVER_NAME: &str = "ws-test-server";
 
 fn test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -128,6 +129,9 @@ fn spawn_herdr_with_config(
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", socket_path);
+    // An inherited config override (tests running inside a herdr pane) would
+    // make the spawned server read the real config instead of the fixture.
+    cmd.env_remove("HERDR_CONFIG_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
@@ -142,7 +146,9 @@ fn spawn_herdr_with_config(
 }
 
 fn websocket_section(port: u16) -> String {
-    format!("[websocket_api]\nbind = \"127.0.0.1:{port}\"\ntoken = \"{TEST_TOKEN}\"\n")
+    format!(
+        "[websocket_api]\nbind = \"127.0.0.1:{port}\"\ntoken = \"{TEST_TOKEN}\"\nname = \"{TEST_SERVER_NAME}\"\n"
+    )
 }
 
 fn wait_for_ws_listener(addr: SocketAddr, timeout: Duration) {
@@ -405,6 +411,98 @@ fn ping_response_is_identical_over_unix_socket_and_websocket() {
     let ws_response: serde_json::Value = serde_json::from_str(&ws_raw).unwrap();
     assert_eq!(ws_response["result"]["type"], "pong");
     assert_eq!(ws_response["result"]["version"], env!("CARGO_PKG_VERSION"));
+    // The declared server name rides the same pong on both transports (the
+    // raw equality above already proves they match).
+    assert_eq!(ws_response["result"]["name"], TEST_SERVER_NAME);
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+/// Rewrite the spawned server's config with a different `[websocket_api]`
+/// section body, matching the layout `spawn_herdr_with_config` wrote.
+fn rewrite_herdr_config(config_home: &Path, websocket_section: &str) {
+    for dir in ["herdr", "herdr-dev"] {
+        fs::write(
+            config_home.join(dir).join("config.toml"),
+            format!("onboarding = false\n{websocket_section}"),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn pong_name_defaults_to_the_hostname_and_follows_config_reload() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let ws_port = pick_free_port();
+    let ws_addr: SocketAddr = format!("127.0.0.1:{ws_port}").parse().unwrap();
+
+    // No `name` in the config: the server declares the machine hostname.
+    let nameless_section =
+        format!("[websocket_api]\nbind = \"127.0.0.1:{ws_port}\"\ntoken = \"{TEST_TOKEN}\"\n");
+    let child =
+        spawn_herdr_with_config(&config_home, &runtime_dir, &socket_path, &nameless_section);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    wait_for_ws_listener(ws_addr, Duration::from_secs(5));
+
+    let ping = r#"{"id":"req_name","method":"ping","params":{}}"#;
+    let default_pong = unix_request(&socket_path, ping);
+    let default_name = default_pong["result"]["name"]
+        .as_str()
+        .expect("pong must declare a name even without one configured")
+        .to_string();
+    assert!(!default_name.is_empty());
+
+    let mut ws = WsClient::connect(ws_addr, TEST_TOKEN);
+    assert_eq!(ws.request(ping)["result"]["name"], default_name.as_str());
+
+    // Rename via config reload — the same path token rotation uses. No
+    // restart: the websocket connection opened above keeps working and the
+    // very next pong carries the new name on both transports.
+    rewrite_herdr_config(
+        &config_home,
+        &format!("{nameless_section}name = \"renamed-server\"\n"),
+    );
+    let reloaded = unix_request(
+        &socket_path,
+        r#"{"id":"req_name_reload","method":"server.reload_config","params":{}}"#,
+    );
+    assert_eq!(reloaded["result"]["type"], "config_reload");
+
+    let renamed_pong = unix_request(&socket_path, ping);
+    assert_eq!(renamed_pong["result"]["name"], "renamed-server");
+    assert_eq!(ws.request(ping)["result"]["name"], "renamed-server");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn websocket_handshake_tolerates_unknown_query_parameters() {
+    // A client that reads only the token from the pairing URL's query — or
+    // replays the whole query including the name and any future parameters —
+    // must keep connecting. Pins the QR-compatibility contract.
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+
+    let url = format!(
+        "ws://{}/?token={TEST_TOKEN}&name=some%20server&future=1",
+        server.ws_addr
+    );
+    let stream = TcpStream::connect(server.ws_addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let request = url.into_client_request().unwrap();
+    let mut ws = WsClient {
+        websocket: complete_client_handshake(request, stream),
+    };
+
+    let pong = ws.request(r#"{"id":"req_query_extra","method":"ping","params":{}}"#);
+    assert_eq!(pong["result"]["type"], "pong");
+    assert_eq!(pong["result"]["name"], TEST_SERVER_NAME);
 
     cleanup_spawned_herdr(server.child, server.base);
 }

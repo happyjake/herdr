@@ -47,6 +47,12 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+        /// Display name the server declares (`websocket_api.name`, falling
+        /// back to the machine hostname). Additive: absent from pongs of
+        /// older servers, so the protocol version is unchanged. Display
+        /// only, never identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,

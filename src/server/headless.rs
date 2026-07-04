@@ -1376,11 +1376,23 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        let api_server = api::start_server(api_tx.clone(), self.app.event_hub.clone())?;
+        // Keep the live name slot across the failed handoff so an earlier
+        // reload-applied rename survives the restored listeners.
+        let server_name = self
+            .app
+            .server_name
+            .clone()
+            .unwrap_or_else(|| api::SharedServerName::from_config(&self.websocket_api_config));
+        let api_server = api::start_server(
+            api_tx.clone(),
+            self.app.event_hub.clone(),
+            server_name.clone(),
+        )?;
         let websocket_server = api::start_websocket_server(
             &self.websocket_api_config,
             api_tx,
             self.app.event_hub.clone(),
+            server_name,
         )?;
 
         let client_path = client_socket_path();
@@ -4428,16 +4440,21 @@ pub fn run_server() -> io::Result<()> {
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
 
+    // The declared server name, shared by both API transports so their pongs
+    // match and by the app so config reloads rename the live server.
+    let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+
     // Start the JSON API socket server.
-    let _api_server = match api::start_server(api_tx.clone(), event_hub.clone()) {
-        Ok(server) => server,
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: herdr server is already running");
-            eprintln!("api socket: {}", api::socket_path().display());
-            std::process::exit(1);
-        }
-        Err(err) => return Err(err),
-    };
+    let _api_server =
+        match api::start_server(api_tx.clone(), event_hub.clone(), server_name.clone()) {
+            Ok(server) => server,
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+                eprintln!("error: herdr server is already running");
+                eprintln!("api socket: {}", api::socket_path().display());
+                std::process::exit(1);
+            }
+            Err(err) => return Err(err),
+        };
 
     // Start the optional WebSocket API listener. Off unless configured; an
     // explicitly configured listener that cannot start is a startup error.
@@ -4445,6 +4462,7 @@ pub fn run_server() -> io::Result<()> {
         &loaded_config.config.websocket_api,
         api_tx.clone(),
         event_hub.clone(),
+        server_name.clone(),
     ) {
         Ok(server) => server,
         Err(err) => {
@@ -4469,6 +4487,7 @@ pub fn run_server() -> io::Result<()> {
             api_rx,
             event_hub,
         );
+        app.set_server_name(Some(server_name));
         seed_startup_workspace_if_empty(&mut app);
 
         // The server runs headless — disable local notification side effects.
@@ -4589,7 +4608,9 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
-        let api_server = api::start_server(api_tx.clone(), event_hub.clone())?;
+        let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+        app.set_server_name(Some(server_name.clone()));
+        let api_server = api::start_server(api_tx.clone(), event_hub.clone(), server_name.clone())?;
         // The old server released the websocket port with its socket files;
         // bind it here so a committed handoff keeps the listener alive.
         // Failure fails the handoff and the old server restores its sockets.
@@ -4597,6 +4618,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             &loaded_config.config.websocket_api,
             api_tx.clone(),
             event_hub.clone(),
+            server_name,
         )?;
         let mut server = HeadlessServer::new(
             app,
