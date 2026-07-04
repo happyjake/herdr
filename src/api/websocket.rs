@@ -486,6 +486,9 @@ fn accept_websocket(
     expected_token: &SharedWebSocketToken,
     auth_error: &mut Option<WsAuthError>,
 ) -> Result<WebSocket<TcpStream>, tungstenite::Error> {
+    // The Err type is tungstenite's `ErrorResponse`; the `Callback` trait
+    // fixes this signature, so the variant cannot be boxed away.
+    #[allow(clippy::result_large_err)]
     let callback = |request: &WsUpgradeRequest, response: WsUpgradeResponse| {
         let authorization = match request
             .headers()
