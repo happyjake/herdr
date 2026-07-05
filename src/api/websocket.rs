@@ -17,7 +17,7 @@
 //! - `events.subscribe` dedicates the connection to the event stream until
 //!   the client disconnects, exactly like the Unix socket.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -29,16 +29,18 @@ use tungstenite::handshake::server::{
 };
 use tungstenite::handshake::HandshakeError;
 use tungstenite::http::StatusCode;
-use tungstenite::protocol::WebSocketConfig;
+use tungstenite::protocol::frame::coding::CloseCode;
+use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::{Message, WebSocket};
 
 use crate::api::schema::ServerCapabilities;
 use crate::api::server::{
-    handle_parsed_request, is_connection_closed_error, parse_api_request, ApiTransport,
-    CONNECTION_POLL_INTERVAL, INITIAL_REQUEST_TIMEOUT, MAX_INITIAL_REQUEST_BYTES,
+    handle_parsed_request, parse_api_request, ApiTransport, CONNECTION_POLL_INTERVAL,
+    INITIAL_REQUEST_TIMEOUT, MAX_INITIAL_REQUEST_BYTES,
 };
 use crate::api::{ApiRequestSender, EventHub};
 use crate::config::WebSocketApiConfig;
+use crate::ipc::is_connection_closed_error;
 
 /// Overall budget for completing the HTTP upgrade, including auth.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,6 +48,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for flushing one outgoing frame to a slow client.
 const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Send a protocol ping once a proven WebSocket client has been inbound-idle
+/// for this long.
+const WS_IDLE_PING_AFTER: Duration = Duration::from_secs(30);
+/// Close a proven WebSocket client that stays fully silent this long.
+const WS_IDLE_CLOSE_AFTER: Duration = Duration::from_secs(90);
+const WS_IDLE_REAP_ERROR: &str = "timed out waiting for websocket pong after idle ping";
 /// How long a bind retries while the previous owner releases the port. A
 /// live handoff frees the TCP port only when the old server drops its
 /// listener, so the replacement server may briefly race it.
@@ -443,6 +451,7 @@ fn handle_ws_connection(
     let peer = stream.peer_addr().ok();
     stream.set_read_timeout(Some(HANDSHAKE_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(HANDSHAKE_IO_TIMEOUT))?;
+    let stream = WsTcpStream::new(stream);
 
     let mut auth_error = None;
     let websocket = match accept_websocket(stream, expected_token, &mut auth_error) {
@@ -467,11 +476,11 @@ fn handle_ws_connection(
         }
     };
 
-    // Handshake done; use a read timeout instead of non-blocking polling so
-    // sparse frames wake the connection thread immediately while shutdown is
+    // Handshake done; use bounded blocking reads so sparse frames wake the
+    // connection thread immediately while shutdown and liveness checks are
     // still observed within one poll interval.
-    configure_established_ws_stream(websocket.get_ref())?;
-    let mut transport = WsTransport { websocket };
+    let mut transport = WsTransport::new(websocket, peer);
+    configure_established_ws_stream(transport.websocket.get_mut())?;
 
     let result = ws_request_loop(
         &mut transport,
@@ -483,8 +492,9 @@ fn handle_ws_connection(
     );
 
     // Best effort: tell well-behaved clients the server is done.
-    let _ = transport.websocket.close(None);
-    let _ = transport.websocket.flush();
+    let deadline = Instant::now() + FRAME_WRITE_TIMEOUT;
+    let _ = transport.close_with_deadline(None, deadline);
+    let _ = transport.flush_with_deadline(deadline);
 
     match result {
         Err(err) if is_connection_closed_error(&err) => Ok(()),
@@ -497,11 +507,118 @@ fn configure_accepted_ws_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)
 }
 
-fn configure_established_ws_stream(stream: &TcpStream) -> io::Result<()> {
+fn configure_established_ws_stream(stream: &mut WsTcpStream) -> io::Result<()> {
+    stream.clear_deadlines();
     stream.set_nodelay(true)?;
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(CONNECTION_POLL_INTERVAL))?;
     stream.set_write_timeout(Some(FRAME_WRITE_TIMEOUT))
+}
+
+struct WsTcpStream {
+    stream: TcpStream,
+    read_deadline: Option<Instant>,
+    write_deadline: Option<Instant>,
+}
+
+impl WsTcpStream {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            read_deadline: None,
+            write_deadline: None,
+        }
+    }
+
+    fn clear_deadlines(&mut self) {
+        self.read_deadline = None;
+        self.write_deadline = None;
+    }
+
+    fn begin_read_budget(&mut self, budget: Duration) {
+        self.read_deadline = Some(Instant::now() + budget.max(Duration::from_millis(1)));
+    }
+
+    fn begin_write_deadline(&mut self, deadline: Instant) {
+        self.write_deadline = Some(deadline);
+    }
+
+    fn clear_write_deadline(&mut self) -> io::Result<()> {
+        self.write_deadline = None;
+        self.set_write_timeout(Some(FRAME_WRITE_TIMEOUT))
+    }
+
+    fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.stream.set_nodelay(nodelay)
+    }
+
+    #[cfg(test)]
+    fn nodelay(&self) -> io::Result<bool> {
+        self.stream.nodelay()
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    #[cfg(test)]
+    fn read_timeout(&self) -> io::Result<Option<Duration>> {
+        self.stream.read_timeout()
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(timeout)
+    }
+
+    #[cfg(test)]
+    fn write_timeout(&self) -> io::Result<Option<Duration>> {
+        self.stream.write_timeout()
+    }
+
+    fn timeout_until(deadline: Instant, kind: &'static str) -> io::Result<Duration> {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("websocket {kind} budget expired"),
+            ));
+        }
+        Ok(deadline
+            .saturating_duration_since(now)
+            .max(Duration::from_millis(1)))
+    }
+}
+
+impl Read for WsTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.read_deadline {
+            self.stream
+                .set_read_timeout(Some(Self::timeout_until(deadline, "read")?))?;
+        }
+        self.stream.read(buf)
+    }
+}
+
+impl Write for WsTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.write_deadline {
+            self.stream
+                .set_write_timeout(Some(Self::timeout_until(deadline, "write")?))?;
+        }
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(deadline) = self.write_deadline {
+            self.stream
+                .set_write_timeout(Some(Self::timeout_until(deadline, "write")?))?;
+        }
+        self.stream.flush()
+    }
 }
 
 fn format_peer(peer: Option<SocketAddr>) -> String {
@@ -510,10 +627,10 @@ fn format_peer(peer: Option<SocketAddr>) -> String {
 }
 
 fn accept_websocket(
-    stream: TcpStream,
+    stream: WsTcpStream,
     expected_token: &SharedWebSocketToken,
     auth_error: &mut Option<WsAuthError>,
-) -> Result<WebSocket<TcpStream>, tungstenite::Error> {
+) -> Result<WebSocket<WsTcpStream>, tungstenite::Error> {
     // The Err type is tungstenite's `ErrorResponse`; the `Callback` trait
     // fixes this signature, so the variant cannot be boxed away.
     #[allow(clippy::result_large_err)]
@@ -586,7 +703,7 @@ fn ws_request_loop(
 ) -> io::Result<()> {
     // Parity with the Unix socket: a client that completes the handshake
     // gets a bounded window to send its first request. Once the connection
-    // has proven itself it may idle between requests.
+    // has proven itself, protocol ping/pong liveness covers later idle time.
     let mut first_request_deadline = Some(Instant::now() + INITIAL_REQUEST_TIMEOUT);
 
     loop {
@@ -594,8 +711,9 @@ fn ws_request_loop(
             return Ok(());
         }
 
-        match transport.websocket.read() {
+        match transport.read_message(first_request_deadline) {
             Ok(Message::Text(text)) => {
+                transport.mark_inbound();
                 first_request_deadline = None;
                 let Some(request) = parse_api_request(transport, text.as_str())? else {
                     continue;
@@ -612,14 +730,16 @@ fn ws_request_loop(
                 )?;
             }
             Ok(Message::Binary(_)) => {
+                transport.mark_inbound();
                 first_request_deadline = None;
                 transport.write_message(
                     r#"{"id":"","error":{"code":"invalid_request","message":"invalid request: binary frames are not supported; send one JSON message per text frame"}}"#,
                 )?;
             }
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                transport.mark_inbound();
                 // tungstenite queues the pong reply internally; flush it.
-                flush_ignore_would_block(&mut transport.websocket)?;
+                transport.flush_ignore_would_block()?;
             }
             Ok(Message::Close(_)) => return Ok(()),
             Ok(Message::Frame(_)) => {}
@@ -630,6 +750,9 @@ fn ws_request_loop(
                             io::ErrorKind::TimedOut,
                             "timed out reading api request",
                         ));
+                    }
+                    if first_request_deadline.is_none() {
+                        transport.poll_liveness()?;
                     }
                 }
                 WsErrorClass::Closed => return Ok(()),
@@ -667,28 +790,261 @@ fn classify_ws_error(err: tungstenite::Error) -> WsErrorClass {
     }
 }
 
-fn flush_ignore_would_block(websocket: &mut WebSocket<TcpStream>) -> io::Result<()> {
-    match websocket.flush() {
-        Ok(()) => Ok(()),
-        Err(err) => match classify_ws_error(err) {
-            WsErrorClass::WouldBlock => Ok(()),
-            WsErrorClass::Closed => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "websocket connection closed",
-            )),
-            WsErrorClass::Failed(err) => Err(err),
-        },
+fn first_request_timeout_error() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "timed out reading api request")
+}
+
+fn restore_tungstenite_result<T>(
+    result: Result<T, tungstenite::Error>,
+    restore: io::Result<()>,
+) -> Result<T, tungstenite::Error> {
+    match result {
+        Ok(value) => {
+            restore.map_err(tungstenite::Error::Io)?;
+            Ok(value)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn restore_io_result<T>(result: io::Result<T>, restore: io::Result<()>) -> io::Result<T> {
+    match result {
+        Ok(value) => {
+            restore?;
+            Ok(value)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WsLivenessTiming {
+    ping_after: Duration,
+    close_after: Duration,
+}
+
+fn ws_liveness_timing() -> WsLivenessTiming {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(timing) = ws_liveness_timing_from_env() {
+            return timing;
+        }
+    }
+
+    WsLivenessTiming {
+        ping_after: WS_IDLE_PING_AFTER,
+        close_after: WS_IDLE_CLOSE_AFTER,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn ws_liveness_timing_from_env() -> Option<WsLivenessTiming> {
+    let ping_after = std::env::var("HERDR_TEST_WS_IDLE_PING_AFTER_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    let close_after = std::env::var("HERDR_TEST_WS_IDLE_CLOSE_AFTER_MS")
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+
+    if ping_after == 0 || close_after <= ping_after {
+        return None;
+    }
+
+    Some(WsLivenessTiming {
+        ping_after: Duration::from_millis(ping_after),
+        close_after: Duration::from_millis(close_after),
+    })
+}
+
+#[derive(Debug)]
+struct WsLiveness {
+    timing: WsLivenessTiming,
+    last_inbound: Instant,
+    ping_sent_at: Option<Instant>,
+}
+
+impl WsLiveness {
+    fn new(timing: WsLivenessTiming) -> Self {
+        Self {
+            timing,
+            last_inbound: Instant::now(),
+            ping_sent_at: None,
+        }
+    }
+
+    fn mark_inbound(&mut self, now: Instant) {
+        self.last_inbound = now;
+        self.ping_sent_at = None;
+    }
+
+    fn should_ping(&self, now: Instant) -> bool {
+        self.ping_sent_at.is_none()
+            && now.saturating_duration_since(self.last_inbound) >= self.timing.ping_after
+    }
+
+    fn mark_ping_sent(&mut self, now: Instant) {
+        self.ping_sent_at = Some(now);
+    }
+
+    fn should_reap(&self, now: Instant) -> bool {
+        self.ping_sent_at.is_some()
+            && now.saturating_duration_since(self.last_inbound) >= self.timing.close_after
     }
 }
 
 struct WsTransport {
-    websocket: WebSocket<TcpStream>,
+    websocket: WebSocket<WsTcpStream>,
+    peer: Option<SocketAddr>,
+    liveness: WsLiveness,
+}
+
+impl WsTransport {
+    fn new(websocket: WebSocket<WsTcpStream>, peer: Option<SocketAddr>) -> Self {
+        Self {
+            websocket,
+            peer,
+            liveness: WsLiveness::new(ws_liveness_timing()),
+        }
+    }
+
+    fn read_message(
+        &mut self,
+        first_request_deadline: Option<Instant>,
+    ) -> Result<Message, tungstenite::Error> {
+        let budget = self
+            .read_budget(first_request_deadline)
+            .map_err(tungstenite::Error::Io)?;
+        self.websocket.get_mut().begin_read_budget(budget);
+        let result = self.websocket.read();
+        let restore = configure_established_ws_stream(self.websocket.get_mut());
+        restore_tungstenite_result(result, restore)
+    }
+
+    fn read_budget(&self, first_request_deadline: Option<Instant>) -> io::Result<Duration> {
+        let Some(deadline) = first_request_deadline else {
+            return Ok(CONNECTION_POLL_INTERVAL);
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(first_request_timeout_error());
+        }
+        Ok(CONNECTION_POLL_INTERVAL.min(
+            deadline
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1)),
+        ))
+    }
+
+    fn mark_inbound(&mut self) {
+        self.liveness.mark_inbound(Instant::now());
+    }
+
+    fn poll_liveness(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        if self.liveness.should_reap(now) {
+            let idle_for = now.saturating_duration_since(self.liveness.last_inbound);
+            warn!(
+                peer = %format_peer(self.peer),
+                reason = WS_IDLE_REAP_ERROR,
+                idle_ms = idle_for.as_millis(),
+                close_after_ms = self.liveness.timing.close_after.as_millis(),
+                "websocket api connection reaped after idle ping timeout"
+            );
+            let deadline = Instant::now() + FRAME_WRITE_TIMEOUT;
+            let _ = self.close_with_deadline(
+                Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "idle ping timeout".into(),
+                }),
+                deadline,
+            );
+            let _ = self.flush_with_deadline(deadline);
+            return Err(io::Error::new(io::ErrorKind::TimedOut, WS_IDLE_REAP_ERROR));
+        }
+
+        if self.liveness.should_ping(now) {
+            self.send_liveness_ping()?;
+            self.liveness.mark_ping_sent(now);
+            debug!(
+                peer = %format_peer(self.peer),
+                ping_after_ms = self.liveness.timing.ping_after.as_millis(),
+                close_after_ms = self.liveness.timing.close_after.as_millis(),
+                "websocket api idle ping sent"
+            );
+        } else if self.liveness.ping_sent_at.is_some() {
+            self.flush_ignore_would_block()?;
+        }
+
+        Ok(())
+    }
+
+    fn send_liveness_ping(&mut self) -> io::Result<()> {
+        match self.send_with_deadline(
+            Message::Ping(Vec::new().into()),
+            Instant::now() + FRAME_WRITE_TIMEOUT,
+        ) {
+            Ok(()) => Ok(()),
+            Err(err) => match classify_ws_error(err) {
+                WsErrorClass::WouldBlock => Ok(()),
+                WsErrorClass::Closed => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "websocket connection closed",
+                )),
+                WsErrorClass::Failed(err) => Err(err),
+            },
+        }
+    }
+
+    fn send_with_deadline(
+        &mut self,
+        message: Message,
+        deadline: Instant,
+    ) -> Result<(), tungstenite::Error> {
+        self.websocket.get_mut().begin_write_deadline(deadline);
+        let result = self.websocket.send(message);
+        let restore = self.websocket.get_mut().clear_write_deadline();
+        restore_tungstenite_result(result, restore)
+    }
+
+    fn close_with_deadline(
+        &mut self,
+        frame: Option<CloseFrame>,
+        deadline: Instant,
+    ) -> Result<(), tungstenite::Error> {
+        self.websocket.get_mut().begin_write_deadline(deadline);
+        let result = self.websocket.close(frame);
+        let restore = self.websocket.get_mut().clear_write_deadline();
+        restore_tungstenite_result(result, restore)
+    }
+
+    fn flush_with_deadline(&mut self, deadline: Instant) -> Result<(), tungstenite::Error> {
+        self.websocket.get_mut().begin_write_deadline(deadline);
+        let result = self.websocket.flush();
+        let restore = self.websocket.get_mut().clear_write_deadline();
+        restore_tungstenite_result(result, restore)
+    }
+
+    fn flush_ignore_would_block(&mut self) -> io::Result<()> {
+        match self.flush_with_deadline(Instant::now() + FRAME_WRITE_TIMEOUT) {
+            Ok(()) => Ok(()),
+            Err(err) => match classify_ws_error(err) {
+                WsErrorClass::WouldBlock => Ok(()),
+                WsErrorClass::Closed => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "websocket connection closed",
+                )),
+                WsErrorClass::Failed(err) => Err(err),
+            },
+        }
+    }
 }
 
 impl ApiTransport for WsTransport {
     fn write_message(&mut self, message: &str) -> io::Result<()> {
         let deadline = Instant::now() + FRAME_WRITE_TIMEOUT;
-        let mut result = self.websocket.send(Message::text(message));
+        let mut result = self.send_with_deadline(Message::text(message), deadline);
         loop {
             match result {
                 Ok(()) => return Ok(()),
@@ -703,8 +1059,9 @@ impl ApiTransport for WsTransport {
                                 "timed out writing websocket api message",
                             ));
                         }
-                        std::thread::sleep(Duration::from_millis(10));
-                        result = self.websocket.flush();
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                        result = self.flush_with_deadline(deadline);
                     }
                     WsErrorClass::Closed => {
                         return Err(io::Error::new(
@@ -720,26 +1077,34 @@ impl ApiTransport for WsTransport {
 
     fn probe_closed(&mut self) -> io::Result<bool> {
         self.websocket.get_mut().set_nonblocking(true)?;
+        let status = self.probe_closed_nonblocking();
+        let restore = configure_established_ws_stream(self.websocket.get_mut());
+        restore_io_result(status, restore)
+    }
+}
+
+impl WsTransport {
+    fn probe_closed_nonblocking(&mut self) -> io::Result<bool> {
         loop {
             match self.websocket.read() {
                 // Control frames keep the connection alive; anything else
                 // from a client that started a stream forfeits the
                 // connection, matching the Unix socket probe.
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
-                    flush_ignore_would_block(&mut self.websocket)?;
+                    self.mark_inbound();
+                    self.flush_ignore_would_block()?;
                 }
                 Ok(Message::Close(_)) => return Ok(true),
                 Ok(_) => return Ok(true),
                 Err(err) => {
-                    let status = match classify_ws_error(err) {
-                        WsErrorClass::WouldBlock => Ok(false),
+                    return match classify_ws_error(err) {
+                        WsErrorClass::WouldBlock => {
+                            self.poll_liveness()?;
+                            Ok(false)
+                        }
                         WsErrorClass::Closed => Ok(true),
                         WsErrorClass::Failed(err) => Err(err),
                     };
-                    if matches!(status, Ok(false)) {
-                        configure_established_ws_stream(self.websocket.get_mut())?;
-                    }
-                    return status;
                 }
             }
         }
@@ -870,7 +1235,8 @@ mod tests {
         let client = std::thread::spawn(move || TcpStream::connect(addr).unwrap());
 
         let (stream, _) = listener.accept().unwrap();
-        configure_established_ws_stream(&stream).unwrap();
+        let mut stream = WsTcpStream::new(stream);
+        configure_established_ws_stream(&mut stream).unwrap();
 
         assert!(stream.nodelay().unwrap());
         assert_eq!(
@@ -880,6 +1246,101 @@ mod tests {
         assert_eq!(stream.write_timeout().unwrap(), Some(FRAME_WRITE_TIMEOUT));
         drop(stream);
         drop(client.join().unwrap());
+    }
+
+    #[test]
+    fn read_budget_is_total_across_partial_socket_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        client.write_all(&[1]).unwrap();
+
+        let trickle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            let _ = client.write_all(&[2]);
+        });
+
+        let mut stream = WsTcpStream::new(stream);
+        stream.begin_read_budget(Duration::from_millis(30));
+
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte[0], 1);
+
+        let err = stream.read(&mut byte).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "{err:?}"
+        );
+        trickle.join().unwrap();
+    }
+
+    #[test]
+    fn write_deadline_expires_before_next_socket_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let mut stream = WsTcpStream::new(stream);
+
+        stream.begin_write_deadline(Instant::now());
+        let err = stream.write(&[1]).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        drop(stream);
+        drop(client);
+    }
+
+    #[test]
+    fn probe_closed_restores_blocking_mode_after_non_control_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let (mut websocket, _) = tungstenite::connect(format!("ws://{addr}")).unwrap();
+            websocket.send(Message::text("unexpected")).unwrap();
+            sent_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+
+        let (stream, peer) = listener.accept().unwrap();
+        configure_accepted_ws_stream(&stream).unwrap();
+        let mut websocket = tungstenite::accept(WsTcpStream::new(stream)).unwrap();
+        configure_established_ws_stream(websocket.get_mut()).unwrap();
+        let mut transport = WsTransport::new(websocket, Some(peer));
+
+        sent_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut saw_non_control = false;
+        for _ in 0..10 {
+            if transport.probe_closed().unwrap() {
+                saw_non_control = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(saw_non_control);
+
+        let started = Instant::now();
+        let mut byte = [0];
+        let err = transport
+            .websocket
+            .get_mut()
+            .stream
+            .peek(&mut byte)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "{err:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        client.join().unwrap();
     }
 
     #[test]
