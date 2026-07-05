@@ -665,12 +665,13 @@ fn events_subscription_payloads_are_identical_over_unix_socket_and_websocket() {
 const ATTACHMENT_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// The scratch dir the spawned server derives: its TMPDIR is the test
-/// runtime dir (see `spawn_herdr_with_config`), plus the uid-scoped name.
+/// runtime dir (see `spawn_herdr_with_config`), canonicalized — the server
+/// resolves the temp root so returned paths are absolute and symlink-free —
+/// plus the uid-scoped name.
 fn attachment_scratch_dir(server: &WsTestServer) -> PathBuf {
     let user_id = unsafe { libc::geteuid() };
-    server
-        .base
-        .join("runtime")
+    fs::canonicalize(server.base.join("runtime"))
+        .unwrap()
         .join(format!("herdr-attachments-{user_id}"))
 }
 

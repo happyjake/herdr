@@ -86,7 +86,8 @@ pub(super) fn handle_create(id: String, params: &AttachmentCreateParams) -> Stri
 }
 
 fn create_attachment(bytes_b64: &str) -> Result<CreatedAttachment, AttachmentError> {
-    create_attachment_in(&scratch_dir(), bytes_b64)
+    let dir = scratch_dir().map_err(AttachmentError::Storage)?;
+    create_attachment_in(&dir, bytes_b64)
 }
 
 /// Validation order per the contract: decode base64, enforce the size cap,
@@ -179,7 +180,23 @@ fn sniff_image_extension(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn scratch_dir() -> PathBuf {
+fn scratch_dir() -> io::Result<PathBuf> {
+    scratch_dir_under(&std::env::temp_dir())
+}
+
+/// The scratch dir under a given temp root, holding the path half of the
+/// contract: the returned dir — and so every `AttachmentCreated.path` under
+/// it — is absolute and whitespace-free, safe to paste unquoted.
+fn scratch_dir_under(root: &Path) -> io::Result<PathBuf> {
+    // Canonicalize so a relative TMPDIR (or one behind a symlink, like
+    // macOS /tmp) still yields the absolute path the contract promises.
+    let root = fs::canonicalize(root).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot resolve temp dir {}: {err}", root.display()),
+        )
+    })?;
+
     // Unix temp dirs are shared across users, so the euid keeps scratch dirs
     // apart; Windows %TEMP% is already per-user, and a stable name lets the
     // hourly sweeper find files from earlier server runs.
@@ -187,15 +204,25 @@ fn scratch_dir() -> PathBuf {
     let name = format!("herdr-attachments-{}", unsafe { libc::geteuid() });
     #[cfg(windows)]
     let name = "herdr-attachments".to_string();
-    std::env::temp_dir().join(name)
+    let dir = root.join(name);
+
+    if dir.to_string_lossy().contains(char::is_whitespace) {
+        return Err(io::Error::other(format!(
+            "attachment scratch dir {} contains whitespace, so returned paths \
+             would not be paste-safe; point the temp dir at a whitespace-free \
+             location",
+            dir.display()
+        )));
+    }
+    Ok(dir)
 }
 
-fn ensure_scratch_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    // symlink_metadata so a pre-planted symlink at the predictable path is
-    // seen as a symlink (not a directory) and refused — otherwise a hostile
-    // local user could redirect the chmod and the photo writes below it.
-    let metadata = fs::symlink_metadata(dir)?;
+/// Refuse a scratch path that is not a plain directory owned by herdr's own
+/// user. `metadata` must come from `symlink_metadata`, so a pre-planted
+/// symlink at the predictable path shows up as a symlink (not a directory)
+/// and is refused — otherwise a hostile local user could redirect the chmod,
+/// the photo writes, and the sweep's deletions anywhere they like.
+fn verify_scratch_dir(dir: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_dir() {
         return Err(io::Error::other(format!(
             "attachment scratch path is not a directory: {}",
@@ -215,6 +242,12 @@ fn ensure_scratch_dir(dir: &Path) -> io::Result<()> {
             )));
         }
     }
+    Ok(())
+}
+
+fn ensure_scratch_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    verify_scratch_dir(dir, &fs::symlink_metadata(dir)?)?;
     restrict_dir_permissions(dir)
 }
 
@@ -246,18 +279,33 @@ pub(crate) fn spawn_ttl_sweeper() {
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
         std::thread::spawn(|| loop {
-            sweep_expired(&scratch_dir());
+            match scratch_dir() {
+                Ok(dir) => sweep_expired(&dir),
+                Err(err) => debug!(err = %err, "attachment sweep skipped"),
+            }
             std::thread::sleep(SWEEP_INTERVAL);
         });
     });
 }
 
 /// Remove scratch-dir files older than the TTL by mtime. Only files directly
-/// inside the scratch dir are touched — never anything outside it.
+/// inside the scratch dir are touched — never anything outside it: the path
+/// passes the same symlink/ownership guard as writes before it is read.
 fn sweep_expired(dir: &Path) {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            debug!(dir = %dir.display(), err = %err, "attachment sweep skipped");
+            return;
+        }
+    };
+    if let Err(err) = verify_scratch_dir(dir, &metadata) {
+        warn!(err = %err, "attachment sweep refused an untrusted scratch path");
+        return;
+    }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
         Err(err) => {
             debug!(dir = %dir.display(), err = %err, "attachment sweep skipped");
             return;
@@ -489,6 +537,75 @@ mod tests {
     #[test]
     fn sweep_tolerates_a_missing_scratch_dir() {
         sweep_expired(&unique_test_dir("sweep-missing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_refuses_a_scratch_path_behind_a_pre_planted_symlink() {
+        let base = unique_test_dir("sweep-symlink");
+        let target = base.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let victim = target.join("victim.png");
+        fs::write(&victim, b"precious").unwrap();
+        // Old enough that a sweep which followed the link would delete it.
+        fs::File::options()
+            .write(true)
+            .open(&victim)
+            .unwrap()
+            .set_modified(SystemTime::now() - (ATTACHMENT_TTL + Duration::from_secs(3600)))
+            .unwrap();
+        let link = base.join("scratch");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        sweep_expired(&link);
+
+        assert!(
+            victim.exists(),
+            "the sweep must never follow a symlinked scratch path"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scratch_dir_under_a_relative_temp_root_is_absolute() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let name = format!("herdr-attachment-relroot-{}-{nanos}", std::process::id());
+        let absolute = std::env::current_dir().unwrap().join("target").join(&name);
+        fs::create_dir_all(&absolute).unwrap();
+        let relative = Path::new("target").join(&name);
+        assert!(relative.is_relative());
+
+        let dir = scratch_dir_under(&relative).unwrap_or_else(|err| {
+            panic!("a relative temp root must resolve: {err}");
+        });
+
+        assert!(
+            dir.is_absolute(),
+            "scratch dir must be absolute, got {}",
+            dir.display()
+        );
+        assert!(dir.starts_with(fs::canonicalize(&absolute).unwrap()));
+
+        let _ = fs::remove_dir_all(&absolute);
+    }
+
+    #[test]
+    fn scratch_dir_under_a_whitespace_temp_root_is_refused() {
+        let base = unique_test_dir("whitespace-root");
+        let root = base.join("with space");
+        fs::create_dir_all(&root).unwrap();
+
+        let err = scratch_dir_under(&root).expect_err("a whitespace root breaks paste-safety");
+        assert!(
+            err.to_string().contains("whitespace"),
+            "unexpected error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]

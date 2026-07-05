@@ -43,8 +43,8 @@
       "frame": {
         "id": "req_attach_png",
         "result": {
-          "expires_at": 1783320943,
-          "path": "/tmp/hws-29968-1783234543107866000/runtime/herdr-attachments-501/attachment-1783234543382461000-0.png",
+          "expires_at": 1783323107,
+          "path": "/private/tmp/hws-96460-1783236707443724000/runtime/herdr-attachments-501/attachment-1783236707722239000-0.png",
           "type": "attachment_created"
         }
       },
@@ -66,8 +66,8 @@
       "frame": {
         "id": "req_attach_jpeg",
         "result": {
-          "expires_at": 1783320943,
-          "path": "/tmp/hws-29968-1783234543107866000/runtime/herdr-attachments-501/attachment-1783234543487561000-0.jpg",
+          "expires_at": 1783323107,
+          "path": "/private/tmp/hws-96460-1783236707443724000/runtime/herdr-attachments-501/attachment-1783236707832919000-0.jpg",
           "type": "attachment_created"
         }
       },
