@@ -2120,6 +2120,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_pane_send_keys_shift_tab_sends_backtab_bytes() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendKeys(PaneSendKeysParams {
+                pane_id,
+                keys: vec!["shift+tab".into(), "tab".into()],
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "req");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        // BackTab must reach the child as CSI Z, distinct from plain Tab —
+        // the key-combo normalizer folds shift+tab into BackTab with the
+        // SHIFT modifier stripped, and the ghostty encoder must not then
+        // see it as a bare Tab (that made shift+tab a plain 0x09).
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\x1b[Z"));
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\t"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn api_pane_send_keys_accepts_literal_plus() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
 
