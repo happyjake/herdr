@@ -135,6 +135,9 @@ fn spawn_herdr_with_config(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    // Point the server's temp dir into the test base so its attachment
+    // scratch dir is per-test and cleaned up with everything else.
+    cmd.env("TMPDIR", runtime_dir);
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -653,6 +656,455 @@ fn events_subscription_payloads_are_identical_over_unix_socket_and_websocket() {
             true
         });
     assert_eq!(unix_event, ws_event, "live tab_created diverged");
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+// ---- Attachments ----
+
+const ATTACHMENT_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// The scratch dir the spawned server derives: its TMPDIR is the test
+/// runtime dir (see `spawn_herdr_with_config`), plus the uid-scoped name.
+fn attachment_scratch_dir(server: &WsTestServer) -> PathBuf {
+    let user_id = unsafe { libc::geteuid() };
+    server
+        .base
+        .join("runtime")
+        .join(format!("herdr-attachments-{user_id}"))
+}
+
+fn scratch_entries(dir: &Path) -> Vec<PathBuf> {
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+            paths.sort();
+            paths
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn base64_of(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn test_png_bytes() -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    bytes.extend_from_slice(b"herdr-ws-api-test-png-payload");
+    bytes
+}
+
+fn test_jpeg_bytes() -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    bytes.extend_from_slice(b"JFIF\0herdr-ws-api-test-jpeg-payload");
+    bytes.extend_from_slice(&[0xFF, 0xD9]);
+    bytes
+}
+
+/// Assert one successful attachment.create response against the observable
+/// contract: a fully written owner-only file with a server-generated
+/// space-free name, the extension the magic bytes dictate, and an expiry of
+/// about now + TTL. Returns the created path.
+fn assert_created_attachment(
+    response: &serde_json::Value,
+    scratch_dir: &Path,
+    sent_bytes: &[u8],
+    extension: &str,
+) -> PathBuf {
+    assert_eq!(
+        response["result"]["type"], "attachment_created",
+        "unexpected response: {response}"
+    );
+    let path = PathBuf::from(response["result"]["path"].as_str().unwrap());
+    assert!(
+        path.is_absolute(),
+        "path must be absolute: {}",
+        path.display()
+    );
+    assert_eq!(path.parent(), Some(scratch_dir));
+    assert_eq!(fs::read(&path).unwrap(), sent_bytes, "bytes must match");
+
+    let name = path.file_name().unwrap().to_string_lossy();
+    assert!(!name.contains(' '), "name must be space-free: {name}");
+    assert!(
+        name.ends_with(&format!(".{extension}")),
+        "extension must follow the magic bytes: {name}"
+    );
+
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "attachment file must be owner-only");
+        let dir_mode = fs::metadata(scratch_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "scratch dir must be owner-only");
+    }
+
+    let expires_at = response["result"]["expires_at"].as_u64().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        expires_at >= now + ATTACHMENT_TTL_SECS - 120
+            && expires_at <= now + ATTACHMENT_TTL_SECS + 120,
+        "expires_at must be about now + 24h, got {expires_at} (now {now})"
+    );
+
+    path
+}
+
+#[test]
+fn attachment_create_behaves_identically_over_unix_socket_and_websocket() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let scratch_dir = attachment_scratch_dir(&server);
+
+    // Happy path over the unix socket.
+    let png = test_png_bytes();
+    let unix_response = unix_request(
+        &server.socket_path,
+        &format!(
+            r#"{{"id":"req_attach_unix","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+            base64_of(&png)
+        ),
+    );
+    let unix_path = assert_created_attachment(&unix_response, &scratch_dir, &png, "png");
+
+    // Happy path over the websocket, same observable contract.
+    let jpeg = test_jpeg_bytes();
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let ws_response = ws.request(&format!(
+        r#"{{"id":"req_attach_ws","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+        base64_of(&jpeg)
+    ));
+    let ws_path = assert_created_attachment(&ws_response, &scratch_dir, &jpeg, "jpg");
+    assert_ne!(unix_path, ws_path, "the server names every file uniquely");
+
+    // Rejections are deterministic, so the raw error payloads must be
+    // byte-identical across transports — identical modulo framing, the same
+    // pin the ping test holds.
+    let bad_format = format!(
+        r#"{{"id":"req_attach_eq_err","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+        base64_of(b"GIF89a not a supported image")
+    );
+    let mut unix_reader = JsonLineReader::connect(&server.socket_path);
+    unix_reader.send_line(&bad_format);
+    let unix_raw = unix_reader.read_raw_line(Duration::from_secs(5));
+    ws.send(&bad_format);
+    let ws_raw = ws.read_raw(Duration::from_secs(5));
+    assert_eq!(unix_raw, ws_raw, "raw rejection payloads must be identical");
+    let error: serde_json::Value = serde_json::from_str(&unix_raw).unwrap();
+    assert_eq!(error["error"]["code"], "attachment_unsupported_format");
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn attachment_create_rejections_leave_no_file_or_temp_artifact() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let scratch_dir = attachment_scratch_dir(&server);
+
+    // One successful upload first, so the assertion below proves rejections
+    // add nothing to a live scratch dir rather than to a missing one.
+    let png = test_png_bytes();
+    let created = unix_request(
+        &server.socket_path,
+        &format!(
+            r#"{{"id":"req_attach_seed","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+            base64_of(&png)
+        ),
+    );
+    assert_eq!(created["result"]["type"], "attachment_created");
+    let baseline = scratch_entries(&scratch_dir);
+    assert_eq!(baseline.len(), 1);
+
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    for (id, bytes_b64, code) in [
+        (
+            "req_reject_format",
+            base64_of(b"plain text, not an image"),
+            "attachment_unsupported_format",
+        ),
+        (
+            "req_reject_b64",
+            "definitely %% not base64".to_string(),
+            "invalid_params",
+        ),
+    ] {
+        let request = format!(
+            r#"{{"id":"{id}","method":"attachment.create","params":{{"bytes_b64":"{bytes_b64}"}}}}"#
+        );
+        for response in [
+            unix_request(&server.socket_path, &request),
+            ws.request(&request),
+        ] {
+            assert_eq!(response["error"]["code"], code, "response: {response}");
+        }
+    }
+
+    assert_eq!(
+        scratch_entries(&scratch_dir),
+        baseline,
+        "rejections must leave no file or temp artifact behind"
+    );
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn attachment_sweep_removes_expired_files_at_listener_start_and_spares_fresh_ones() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let ws_port = pick_free_port();
+
+    // Plant the scratch dir before the server exists: one file past the TTL,
+    // one fresh, exactly what a listener restart finds after downtime.
+    let user_id = unsafe { libc::geteuid() };
+    let scratch_dir = runtime_dir.join(format!("herdr-attachments-{user_id}"));
+    fs::create_dir_all(&scratch_dir).unwrap();
+    let expired = scratch_dir.join("attachment-1-0.png");
+    fs::write(&expired, b"expired").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&expired)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(ATTACHMENT_TTL_SECS + 3600))
+        .unwrap();
+    let fresh = scratch_dir.join("attachment-2-0.png");
+    fs::write(&fresh, b"fresh").unwrap();
+
+    let child = spawn_herdr_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        &websocket_section(ws_port),
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while expired.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !expired.exists(),
+        "the sweep must remove expired files at listener start"
+    );
+    assert!(fresh.exists(), "the sweep must spare files within the TTL");
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn oversize_attachment_requests_die_at_the_unchanged_transport_cap() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let scratch_dir = attachment_scratch_dir(&server);
+
+    // ~900 KiB of payload encodes past the 1 MiB per-message cap. The cap is
+    // deliberately untouched, so both transports must refuse the request at
+    // the framing layer — no response, no file.
+    let oversize_request = format!(
+        r#"{{"id":"req_attach_oversize","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+        base64_of(&vec![0u8; 900 * 1024])
+    );
+    assert!(oversize_request.len() > 1024 * 1024);
+
+    // Unix socket: the server drops the connection without answering. The
+    // write itself may fail once the server hangs up mid-payload.
+    let mut stream = UnixStream::connect(&server.socket_path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let written = stream
+        .write_all(oversize_request.as_bytes())
+        .and_then(|()| stream.write_all(b"\n"))
+        .and_then(|()| stream.flush());
+    if written.is_ok() {
+        let mut response = Vec::new();
+        match stream.read_to_end(&mut response) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(err) => panic!("unexpected unix read failure: {err}"),
+        }
+        assert!(
+            response.is_empty(),
+            "an oversize request must get no response, got: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    // WebSocket: the listener's message-size limit kills the connection.
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    ws.websocket
+        .send(Message::text(oversize_request.clone()))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match ws.websocket.read() {
+            Ok(Message::Text(text)) => panic!("oversize request must not be answered: {text}"),
+            Ok(_) => continue,
+            Err(tungstenite::Error::Io(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "connection must close on oversize"
+                );
+            }
+            Err(_) => break,
+        }
+    }
+
+    // The server keeps serving within-cap requests, and nothing landed.
+    let png = test_png_bytes();
+    let recovered = unix_request(
+        &server.socket_path,
+        &format!(
+            r#"{{"id":"req_attach_after_oversize","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+            base64_of(&png)
+        ),
+    );
+    assert_eq!(recovered["result"]["type"], "attachment_created");
+    assert_eq!(
+        scratch_entries(&scratch_dir).len(),
+        1,
+        "only the within-cap upload may exist"
+    );
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+/// Recorded wire fixture for the mobile repo's fake herdr server — the same
+/// discipline as its pane-read recordings: real request/response frames in
+/// the `{firstLiveFrameIndex, recording: [{dir, ms, frame}]}` envelope.
+///
+/// Validate mode (default) checks the committed fixture still matches the
+/// contract this branch serves. Record mode re-captures it from a real
+/// server over the WebSocket transport:
+///
+/// ```bash
+/// HERDR_UPDATE_ATTACHMENT_FIXTURE=1 just test-one attachment_fixture
+/// ```
+#[test]
+fn attachment_fixture_for_the_mobile_fake_server_is_current() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/attachment/attachment-recording.json");
+
+    if std::env::var_os("HERDR_UPDATE_ATTACHMENT_FIXTURE").is_some() {
+        let _lock = test_lock();
+        record_attachment_fixture(&fixture_path);
+        return;
+    }
+
+    let content = fs::read_to_string(&fixture_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read {}; run `HERDR_UPDATE_ATTACHMENT_FIXTURE=1 just test-one attachment_fixture`: {err}",
+            fixture_path.display()
+        )
+    });
+    let fixture: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(fixture["firstLiveFrameIndex"], 0);
+    let frames = fixture["recording"].as_array().unwrap();
+
+    let recv_frame = |id: &str| -> &serde_json::Value {
+        frames
+            .iter()
+            .find(|entry| entry["dir"] == "recv" && entry["frame"]["id"] == id)
+            .unwrap_or_else(|| panic!("fixture has no recv frame for {id}"))
+    };
+    let send_frame = |id: &str| -> &serde_json::Value {
+        frames
+            .iter()
+            .find(|entry| entry["dir"] == "send" && entry["frame"]["id"] == id)
+            .unwrap_or_else(|| panic!("fixture has no send frame for {id}"))
+    };
+
+    assert_eq!(recv_frame("req_ping")["frame"]["result"]["type"], "pong");
+
+    for (id, extension) in [("req_attach_png", ".png"), ("req_attach_jpeg", ".jpg")] {
+        let sent = send_frame(id);
+        assert_eq!(sent["frame"]["method"], "attachment.create");
+        assert!(sent["frame"]["params"]["bytes_b64"].is_string());
+
+        let result = &recv_frame(id)["frame"]["result"];
+        assert_eq!(result["type"], "attachment_created");
+        let path = result["path"].as_str().unwrap();
+        assert!(path.starts_with('/'), "path must be absolute: {path}");
+        assert!(!path.contains(' '), "path must be space-free: {path}");
+        assert!(path.ends_with(extension), "wrong extension: {path}");
+        assert!(result["expires_at"].as_u64().unwrap() > 0);
+    }
+
+    assert_eq!(
+        recv_frame("req_attach_bad_format")["frame"]["error"]["code"],
+        "attachment_unsupported_format"
+    );
+    assert_eq!(
+        recv_frame("req_attach_bad_b64")["frame"]["error"]["code"],
+        "invalid_params"
+    );
+}
+
+fn record_attachment_fixture(fixture_path: &Path) {
+    let server = start_ws_test_server();
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+
+    let mut frames = Vec::new();
+    let mut seq = 0u64;
+    // A monotonic tick instead of wall-clock keeps the fixture deterministic
+    // while preserving order — same convention as the mobile repo captures.
+    let mut record = |dir: &str, raw: &str, frames: &mut Vec<serde_json::Value>| {
+        frames.push(serde_json::json!({
+            "dir": dir,
+            "ms": seq,
+            "frame": serde_json::from_str::<serde_json::Value>(raw).unwrap(),
+        }));
+        seq += 1;
+    };
+
+    let requests = [
+        (r#"{"id":"req_ping","method":"ping","params":{}}"#).to_string(),
+        format!(
+            r#"{{"id":"req_attach_png","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+            base64_of(&test_png_bytes())
+        ),
+        format!(
+            r#"{{"id":"req_attach_jpeg","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+            base64_of(&test_jpeg_bytes())
+        ),
+        format!(
+            r#"{{"id":"req_attach_bad_format","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+            base64_of(b"GIF89a not a supported image")
+        ),
+        (r#"{"id":"req_attach_bad_b64","method":"attachment.create","params":{"bytes_b64":"definitely %% not base64"}}"#)
+            .to_string(),
+    ];
+    for request in requests {
+        record("send", &request, &mut frames);
+        ws.send(&request);
+        let response = ws.read_raw(Duration::from_secs(5));
+        record("recv", &response, &mut frames);
+    }
+
+    let fixture = serde_json::json!({
+        "firstLiveFrameIndex": 0,
+        "recording": frames,
+    });
+    fs::create_dir_all(fixture_path.parent().unwrap()).unwrap();
+    fs::write(
+        fixture_path,
+        format!("{}\n", serde_json::to_string_pretty(&fixture).unwrap()),
+    )
+    .unwrap();
 
     cleanup_spawned_herdr(server.child, server.base);
 }

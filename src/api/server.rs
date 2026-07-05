@@ -114,6 +114,7 @@ pub fn start_server_with_capabilities(
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
     info!(path = %path.display(), "api server listening");
+    crate::api::attachment::spawn_ttl_sweeper();
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
@@ -442,6 +443,11 @@ fn handle_request(
             r#"{"id":"","error":{"code":"internal_error","message":"failed to encode response"}}"#
                 .to_string()
         }),
+        // Pure file I/O on the connection thread: no app state involved, so
+        // the method behaves identically over every transport and mode.
+        Method::AttachmentCreate(params) => {
+            crate::api::attachment::handle_create(request.id, &params)
+        }
         _ => dispatch_to_app_with_timeout_and_write_completion(
             request,
             api_tx,
@@ -459,6 +465,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ServerReloadConfig(_) => "server.reload_config",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
+        Method::AttachmentCreate(_) => "attachment.create",
         Method::NotificationShow(_) => "notification.show",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
@@ -913,7 +920,7 @@ fn dispatch_to_app_with_timeout_and_write_completion(
     }
 }
 
-fn error_response_json(id: String, code: &str, message: String) -> String {
+pub(super) fn error_response_json(id: String, code: &str, message: String) -> String {
     serde_json::to_string(&ErrorResponse {
         id,
         error: ErrorBody {
@@ -1160,6 +1167,70 @@ mod tests {
         assert!(changed);
 
         assert!(ping("req_after").contains(r#""name":"after""#));
+    }
+
+    #[test]
+    fn attachment_create_is_answered_in_process_with_distinct_error_codes() {
+        use base64::Engine as _;
+
+        // The channel receiver is dropped up front: if attachment.create ever
+        // dispatched to the app, handle_request would fail, so these
+        // assertions also pin that the method is served on the connection
+        // thread — identically for every transport and server mode.
+        let (tx, _) = mpsc::unbounded_channel();
+        let server_name = crate::api::SharedServerName::new("test".to_string());
+        let create = |id: &str, bytes_b64: String| {
+            handle_request(
+                Request {
+                    id: id.into(),
+                    method: Method::AttachmentCreate(crate::api::schema::AttachmentCreateParams {
+                        bytes_b64,
+                    }),
+                },
+                &tx,
+                None,
+                &server_name,
+            )
+        };
+        let error_code = |response: &str| {
+            serde_json::from_str::<ErrorResponse>(response)
+                .map(|parsed| parsed.error.code)
+                .unwrap_or_else(|_| panic!("expected error response, got: {response}"))
+        };
+
+        let mut oversize = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        oversize.resize(crate::api::attachment::MAX_ATTACHMENT_BYTES + 1, 0);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&oversize);
+        assert_eq!(
+            error_code(&create("req_big", encoded)),
+            "attachment_too_large"
+        );
+
+        let text = base64::engine::general_purpose::STANDARD.encode(b"not an image");
+        assert_eq!(
+            error_code(&create("req_text", text)),
+            "attachment_unsupported_format"
+        );
+
+        assert_eq!(
+            error_code(&create("req_bad_b64", "%%%".into())),
+            "invalid_params"
+        );
+
+        let png = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3]);
+        let response = create("req_ok", png);
+        let parsed: SuccessResponse = serde_json::from_str(&response)
+            .unwrap_or_else(|_| panic!("expected success response, got: {response}"));
+        match parsed.result {
+            ResponseResult::AttachmentCreated { path, expires_at } => {
+                let path = PathBuf::from(path);
+                assert!(path.is_file(), "success response must name a readable file");
+                assert!(expires_at > 0);
+                let _ = fs::remove_file(path);
+            }
+            other => panic!("expected attachment_created, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,0 +1,121 @@
+{
+  "firstLiveFrameIndex": 0,
+  "recording": [
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_ping",
+        "method": "ping",
+        "params": {}
+      },
+      "ms": 0
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "id": "req_ping",
+        "result": {
+          "capabilities": {
+            "detached_server_daemon": true,
+            "live_handoff": true
+          },
+          "name": "ws-test-server",
+          "protocol": 15,
+          "type": "pong",
+          "version": "0.7.1"
+        }
+      },
+      "ms": 1
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_attach_png",
+        "method": "attachment.create",
+        "params": {
+          "bytes_b64": "iVBORw0KGgpoZXJkci13cy1hcGktdGVzdC1wbmctcGF5bG9hZA=="
+        }
+      },
+      "ms": 2
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "id": "req_attach_png",
+        "result": {
+          "expires_at": 1783320943,
+          "path": "/tmp/hws-29968-1783234543107866000/runtime/herdr-attachments-501/attachment-1783234543382461000-0.png",
+          "type": "attachment_created"
+        }
+      },
+      "ms": 3
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_attach_jpeg",
+        "method": "attachment.create",
+        "params": {
+          "bytes_b64": "/9j/4AAQSkZJRgBoZXJkci13cy1hcGktdGVzdC1qcGVnLXBheWxvYWT/2Q=="
+        }
+      },
+      "ms": 4
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "id": "req_attach_jpeg",
+        "result": {
+          "expires_at": 1783320943,
+          "path": "/tmp/hws-29968-1783234543107866000/runtime/herdr-attachments-501/attachment-1783234543487561000-0.jpg",
+          "type": "attachment_created"
+        }
+      },
+      "ms": 5
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_attach_bad_format",
+        "method": "attachment.create",
+        "params": {
+          "bytes_b64": "R0lGODlhIG5vdCBhIHN1cHBvcnRlZCBpbWFnZQ=="
+        }
+      },
+      "ms": 6
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "error": {
+          "code": "attachment_unsupported_format",
+          "message": "attachment bytes are not a recognized image format (JPEG, PNG, or WebP)"
+        },
+        "id": "req_attach_bad_format"
+      },
+      "ms": 7
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_attach_bad_b64",
+        "method": "attachment.create",
+        "params": {
+          "bytes_b64": "definitely %% not base64"
+        }
+      },
+      "ms": 8
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "error": {
+          "code": "invalid_params",
+          "message": "bytes_b64 is not valid base64: Invalid symbol 32, offset 10."
+        },
+        "id": "req_attach_bad_b64"
+      },
+      "ms": 9
+    }
+  ]
+}

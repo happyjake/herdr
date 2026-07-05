@@ -14,6 +14,12 @@ pub struct ServerLiveHandoffParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AttachmentCreateParams {
+    /// Image bytes encoded as standard base64 (RFC 4648, padding accepted).
+    pub bytes_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
     pub live_handoff: bool,
     #[serde(default)]
