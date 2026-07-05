@@ -22,11 +22,18 @@ use crate::api::schema::{AttachmentCreateParams, ResponseResult, SuccessResponse
 pub(crate) const ATTACHMENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
-/// Decoded size cap: 3/4 of `MAX_INITIAL_REQUEST_BYTES`, the most base64
-/// payload that can ride a request under the unchanged 1 MiB message cap.
-/// The transport cap rejects anything larger before dispatch; this in-band
-/// check keeps an honest, distinct error code if the caps ever diverge.
-pub(crate) const MAX_ATTACHMENT_BYTES: usize = super::server::MAX_INITIAL_REQUEST_BYTES / 4 * 3;
+/// Room reserved out of the message cap for the request JSON around the
+/// payload (id, method, params key) — generous on purpose.
+const REQUEST_ENVELOPE_HEADROOM_BYTES: usize = 4096;
+
+/// Decoded size cap, derived so that a max-size attachment still fits the
+/// unchanged 1 MiB message cap after base64's 4/3 expansion plus the request
+/// envelope. The headroom keeps a real band of payloads that are over this
+/// cap yet under the transport cap, so an oversize upload reaches the method
+/// and earns its distinct `attachment_too_large` error in-band instead of
+/// always dying as a framing-level connection drop.
+pub(crate) const MAX_ATTACHMENT_BYTES: usize =
+    (super::server::MAX_INITIAL_REQUEST_BYTES - REQUEST_ENVELOPE_HEADROOM_BYTES) / 4 * 3;
 
 pub(super) enum AttachmentError {
     InvalidBase64(String),
@@ -120,20 +127,42 @@ fn write_atomically(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+    write_atomically_with_unique(dir, unique, extension, bytes)
+}
 
+/// The final name is reserved exclusively (`create_new`) before the bytes
+/// are staged, so two creates that share a timestamp stem can never receive
+/// the same path, and a path already handed to one client is never silently
+/// replaced by a later upload — the rename only ever lands on this call's
+/// own zero-byte reservation.
+fn write_atomically_with_unique(
+    dir: &Path,
+    unique: u128,
+    extension: &'static str,
+    bytes: &[u8],
+) -> io::Result<CreatedAttachment> {
     for attempt in 0..100 {
         let stem = format!("attachment-{unique}-{attempt}");
-        let partial_path = dir.join(format!("{stem}.{extension}.partial"));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        restrict_file_options(&mut options);
-        let mut file = match options.open(&partial_path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
-        };
 
         let path = dir.join(format!("{stem}.{extension}"));
+        match open_exclusive(&path) {
+            Ok(reservation) => drop(reservation),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+
+        let partial_path = dir.join(format!("{stem}.{extension}.partial"));
+        let mut file = match open_exclusive(&partial_path) {
+            Ok(file) => file,
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(err);
+            }
+        };
+
         let written = file
             .write_all(bytes)
             .and_then(|()| file.flush())
@@ -143,6 +172,7 @@ fn write_atomically(
             });
         if let Err(err) = written {
             let _ = fs::remove_file(&partial_path);
+            let _ = fs::remove_file(&path);
             return Err(err);
         }
 
@@ -249,6 +279,14 @@ fn ensure_scratch_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     verify_scratch_dir(dir, &fs::symlink_metadata(dir)?)?;
     restrict_dir_permissions(dir)
+}
+
+/// Create a brand-new owner-only file, failing if the name is taken.
+fn open_exclusive(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    restrict_file_options(&mut options);
+    options.open(path)
 }
 
 #[cfg(unix)]
@@ -478,6 +516,56 @@ mod tests {
         ));
 
         assert_eq!(dir_entries(&dir), Vec::<PathBuf>::new());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_size_requests_fit_the_transport_and_an_in_band_oversize_band_exists() {
+        let envelope =
+            r#"{"id":"req_attach_max","method":"attachment.create","params":{"bytes_b64":""}}"#
+                .len();
+        let encoded_len = |decoded: usize| decoded.div_ceil(3) * 4;
+
+        // A payload at the cap must ride the unchanged 1 MiB message cap.
+        assert!(
+            encoded_len(MAX_ATTACHMENT_BYTES) + envelope
+                <= crate::api::server::MAX_INITIAL_REQUEST_BYTES,
+            "a max-size attachment request must fit the transport cap"
+        );
+        // And one just past the cap must fit too, so attachment_too_large is
+        // reachable in-band rather than only ever a framing-level drop.
+        assert!(
+            encoded_len(MAX_ATTACHMENT_BYTES + 1) + envelope
+                <= crate::api::server::MAX_INITIAL_REQUEST_BYTES,
+            "an over-cap payload must be deliverable to earn the distinct error"
+        );
+    }
+
+    #[test]
+    fn creates_sharing_a_timestamp_stem_get_distinct_paths_and_never_clobber() {
+        let dir = unique_test_dir("stem-collision");
+        fs::create_dir_all(&dir).unwrap();
+
+        let first = write_atomically_with_unique(&dir, 42, "png", b"first").unwrap();
+        let second = write_atomically_with_unique(&dir, 42, "png", b"second").unwrap();
+
+        assert_ne!(
+            first.path, second.path,
+            "two creates must never receive the same path"
+        );
+        assert_eq!(
+            fs::read(&first.path).unwrap(),
+            b"first",
+            "an already-returned path must never be silently replaced"
+        );
+        assert_eq!(fs::read(&second.path).unwrap(), b"second");
+        // No reservation or partial artifacts stay behind.
+        let mut entries = dir_entries(&dir);
+        entries.sort();
+        let mut expected = vec![first.path.clone(), second.path.clone()];
+        expected.sort();
+        assert_eq!(entries, expected);
+
         let _ = fs::remove_dir_all(&dir);
     }
 

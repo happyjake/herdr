@@ -856,6 +856,47 @@ fn attachment_create_rejections_leave_no_file_or_temp_artifact() {
 }
 
 #[test]
+fn an_over_cap_attachment_that_fits_the_transport_gets_the_distinct_error() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let scratch_dir = attachment_scratch_dir(&server);
+
+    // Mirrors MAX_ATTACHMENT_BYTES in src/api/attachment.rs: the decoded cap
+    // leaves envelope headroom below the 1 MiB message cap, so a payload one
+    // byte over it still rides the transport and must earn the distinct
+    // in-band error — not a framing-level connection drop.
+    const MAX_ATTACHMENT_BYTES: usize = (1024 * 1024 - 4096) / 4 * 3;
+    let request = format!(
+        r#"{{"id":"req_attach_over_cap","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+        base64_of(&vec![0u8; MAX_ATTACHMENT_BYTES + 1])
+    );
+    assert!(
+        request.len() <= 1024 * 1024,
+        "the over-cap request must fit the transport cap ({} bytes)",
+        request.len()
+    );
+
+    let mut unix_reader = JsonLineReader::connect(&server.socket_path);
+    unix_reader.send_line(&request);
+    let unix_raw = unix_reader.read_raw_line(Duration::from_secs(5));
+
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    ws.send(&request);
+    let ws_raw = ws.read_raw(Duration::from_secs(5));
+
+    assert_eq!(unix_raw, ws_raw, "raw oversize payloads must be identical");
+    let error: serde_json::Value = serde_json::from_str(&unix_raw).unwrap();
+    assert_eq!(error["error"]["code"], "attachment_too_large");
+    assert_eq!(
+        scratch_entries(&scratch_dir),
+        Vec::<PathBuf>::new(),
+        "an oversize rejection must leave no file behind"
+    );
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
 fn attachment_sweep_removes_expired_files_at_listener_start_and_spares_fresh_ones() {
     let _lock = test_lock();
     let base = unique_test_dir();
