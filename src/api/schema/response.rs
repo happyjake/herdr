@@ -57,6 +57,14 @@ pub enum ResponseResult {
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
     },
+    AttachmentCreated {
+        /// Absolute, space-free path of the fully written attachment file.
+        /// The success response is encoded only after the file is renamed
+        /// into place, so this path always names a complete, readable file.
+        path: String,
+        /// Unix seconds after which the TTL sweep may remove the file.
+        expires_at: u64,
+    },
     WorkspaceInfo {
         workspace: WorkspaceInfo,
     },
