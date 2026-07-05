@@ -827,8 +827,13 @@ fn stream_subscriptions<T: ApiTransport>(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    // Every subscription starts from the live sequence (upstream #1270).
+    // `params.live_only` remains an accepted request field: clients that
+    // opted out of ring replay when replay existed now get this default,
+    // and the flag must keep parsing so their subscribes keep working.
     let event_start_sequence = event_hub.current_sequence();
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
+    let _ = params.live_only;
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
         let active = match ActiveSubscription::new(
             subscription,
@@ -1132,6 +1137,47 @@ mod tests {
             }
         });
         (api_tx, responder)
+    }
+
+    fn workspace_created_event(workspace_id: &str) -> crate::api::schema::EventEnvelope {
+        crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceCreated,
+            data: crate::api::schema::EventData::WorkspaceCreated {
+                workspace: crate::api::schema::WorkspaceInfo {
+                    workspace_id: workspace_id.into(),
+                    number: 1,
+                    label: workspace_id.into(),
+                    focused: false,
+                    pane_count: 0,
+                    tab_count: 0,
+                    active_tab_id: String::new(),
+                    agent_status: crate::api::schema::AgentStatus::Unknown,
+                    worktree: None,
+                },
+            },
+        }
+    }
+
+    fn layout_updated_event(tab_id: &str) -> crate::api::schema::EventEnvelope {
+        crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::LayoutUpdated,
+            data: crate::api::schema::EventData::LayoutUpdated {
+                layout: crate::api::schema::PaneLayoutSnapshot {
+                    workspace_id: "ws_1".into(),
+                    tab_id: tab_id.into(),
+                    zoomed: false,
+                    area: crate::api::schema::PaneLayoutRect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    focused_pane_id: "pane_1".into(),
+                    panes: Vec::new(),
+                    splits: Vec::new(),
+                },
+            },
+        }
     }
 
     #[test]
@@ -1465,7 +1511,15 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = EventHub::default();
-        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        handle_connection(
+            server,
+            &api_tx,
+            &event_hub,
+            &running,
+            None,
+            &crate::api::SharedServerName::new("test".to_string()),
+        )
+        .unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_1");
@@ -1492,7 +1546,15 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = EventHub::default();
-        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        handle_connection(
+            server,
+            &api_tx,
+            &event_hub,
+            &running,
+            None,
+            &crate::api::SharedServerName::new("test".to_string()),
+        )
+        .unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_2");
@@ -1666,6 +1728,118 @@ mod tests {
 
         drop(client);
 
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn live_only_subscribe_skips_ring_replay_and_streams_post_subscribe_events() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-sub-live-only");
+        client
+            .set_recv_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(
+                br#"{"id":"sub_live","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"}],"live_only":true}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        event_hub.push(workspace_created_event("ring-before-subscribe"));
+        let server_event_hub = event_hub.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &server_event_hub,
+                &server_running,
+                None,
+                &crate::api::SharedServerName::new("test".to_string()),
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        let mut reader = BufReader::new(&mut client);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let ack: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+
+        event_hub.push(workspace_created_event("live-after-subscribe"));
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(event["event"], "workspace_created");
+        assert_eq!(
+            event["data"]["workspace"]["workspace_id"],
+            "live-after-subscribe"
+        );
+
+        drop(reader);
+        drop(client);
+        let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(result.is_ok());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn live_only_subscribe_skips_ring_replay_for_layout_updated() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-sub-live-only-layout");
+        client
+            .set_recv_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(
+                br#"{"id":"sub_live_layout","method":"events.subscribe","params":{"subscriptions":[{"type":"layout.updated"}],"live_only":true}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        event_hub.push(layout_updated_event("tab-ring-before-subscribe"));
+        let server_event_hub = event_hub.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result = handle_connection(
+                server,
+                &api_tx,
+                &server_event_hub,
+                &server_running,
+                None,
+                &crate::api::SharedServerName::new("test".to_string()),
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        let mut reader = BufReader::new(&mut client);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let ack: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+
+        event_hub.push(layout_updated_event("tab-live-after-subscribe"));
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(event["event"], "layout_updated");
+        assert_eq!(
+            event["data"]["layout"]["tab_id"],
+            "tab-live-after-subscribe"
+        );
+
+        drop(reader);
+        drop(client);
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();

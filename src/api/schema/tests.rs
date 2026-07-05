@@ -620,6 +620,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
     let Method::EventsSubscribe(params) = request.method else {
         panic!("wrong method parsed");
     };
+    assert!(!params.live_only);
     assert_eq!(params.subscriptions.len(), 3);
     assert!(matches!(
         &params.subscriptions[0],
@@ -642,6 +643,32 @@ fn subscribe_request_parses_parameterized_subscriptions() {
         &params.subscriptions[2],
         Subscription::PaneScrollChanged { pane_id } if pane_id == "p_1_1"
     ));
+}
+
+#[test]
+fn subscribe_request_parses_live_only_replay_opt_out() {
+    let json = r#"
+    {
+        "id": "sub_1",
+        "method": "events.subscribe",
+        "params": {
+            "subscriptions": [
+                { "type": "workspace.created" }
+            ],
+            "live_only": true
+        }
+    }
+    "#;
+
+    let request: Request = serde_json::from_str(json).unwrap();
+    let Method::EventsSubscribe(params) = request.method else {
+        panic!("wrong method parsed");
+    };
+    assert!(params.live_only);
+    assert_eq!(
+        params.subscriptions,
+        vec![Subscription::WorkspaceCreated {}]
+    );
 }
 
 #[test]
@@ -855,6 +882,7 @@ fn worktree_lifecycle_events_round_trip() {
                 Subscription::WorktreeOpened {},
                 Subscription::WorktreeRemoved {},
             ],
+            live_only: false,
         }),
     };
     let json = serde_json::to_string(&subscription).unwrap();
@@ -1208,6 +1236,7 @@ fn authority_mutation_requests_round_trip() {
                 Subscription::TabMoved {},
                 Subscription::LayoutUpdated {},
             ],
+            live_only: false,
         }),
     };
     let json = serde_json::to_string(&subscription).unwrap();

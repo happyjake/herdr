@@ -11,6 +11,12 @@ use super::worktrees::WorktreeInfo;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub live_only: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
