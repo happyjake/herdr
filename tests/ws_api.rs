@@ -983,27 +983,44 @@ fn oversize_attachment_requests_die_at_the_unchanged_transport_cap() {
 
     // WebSocket: the listener's message-size limit kills the connection.
     let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
-    ws.websocket
-        .send(Message::text(oversize_request.clone()))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match ws.websocket.read() {
-            Ok(Message::Text(text)) => panic!("oversize request must not be answered: {text}"),
-            Ok(_) => continue,
-            Err(tungstenite::Error::Io(err))
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                assert!(
-                    Instant::now() < deadline,
-                    "connection must close on oversize"
-                );
+    let sent = ws.websocket.send(Message::text(oversize_request.clone()));
+    match sent {
+        Ok(()) => {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match ws.websocket.read() {
+                    Ok(Message::Text(text)) => {
+                        panic!("oversize request must not be answered: {text}")
+                    }
+                    Ok(_) => continue,
+                    Err(tungstenite::Error::Io(err))
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        assert!(
+                            Instant::now() < deadline,
+                            "connection must close on oversize"
+                        );
+                    }
+                    Err(_) => break,
+                }
             }
-            Err(_) => break,
         }
+        Err(tungstenite::Error::Io(err)) if is_closed_during_oversize_write(&err) => {}
+        Err(err) => panic!("unexpected websocket send failure: {err}"),
+    }
+
+    fn is_closed_during_oversize_write(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::WriteZero
+        )
     }
 
     // The server keeps serving within-cap requests, and nothing landed.
