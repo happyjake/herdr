@@ -21,10 +21,12 @@ Choreography:
 
 The image payloads are minimal magic-byte-valid byte strings, not decodable
 pictures — the contract under test is the JSON exchange and the path/expiry
-semantics, which is all the fake server replays. `attachment_too_large`
-does not appear here because a payload past the decoded cap cannot fit the
-unchanged 1 MiB per-message transport cap; the code exists as defense in
-depth and is pinned by unit tests in the fork.
+semantics, which is all the fake server replays. `attachment_too_large` is
+not recorded here only because its request frame would be ~1 MiB of base64
+noise: the decoded cap leaves envelope headroom under the unchanged 1 MiB
+message cap, so a payload past the cap does reach the method and earns the
+distinct error in-band — pinned by the fork's both-transport test
+(`an_over_cap_attachment_that_fits_the_transport_gets_the_distinct_error`).
 
 To re-record against a live server (paths and expiries will change; the
 validating test only checks contract shape):
