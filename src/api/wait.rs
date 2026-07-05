@@ -672,11 +672,11 @@ pub(super) fn wait_for_event<T: ApiTransport>(
         Ok(subscription) => subscription,
         Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
     };
-    let mut active = match ActiveSubscription::new(subscription, &request_id, 0, api_tx, event_hub)
-    {
-        Ok(active) => active,
-        Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
-    };
+    let mut active =
+        match ActiveSubscription::new(subscription, &request_id, 0, api_tx, event_hub, 0) {
+            Ok(active) => active,
+            Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
+        };
 
     loop {
         if should_stop_connection(transport, running)? {
