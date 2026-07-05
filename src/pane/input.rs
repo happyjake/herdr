@@ -13,7 +13,16 @@ pub(super) fn ghostty_key_event_from_terminal_key(
             crate::ghostty::ffi::GhosttyKeyAction_GHOSTTY_KEY_ACTION_REPEAT
         }
     });
-    event.set_mods(ghostty_mods_from_key_modifiers(key.modifiers));
+    // BackTab IS Shift+Tab: the key-combo normalizer strips the SHIFT
+    // modifier when it folds shift+tab into BackTab, and the ghostty key
+    // table only has Tab — without restoring SHIFT here the encoder sees
+    // a bare Tab and emits 0x09 instead of CSI Z.
+    let modifiers = if matches!(key.code, crossterm::event::KeyCode::BackTab) {
+        key.modifiers | crossterm::event::KeyModifiers::SHIFT
+    } else {
+        key.modifiers
+    };
+    event.set_mods(ghostty_mods_from_key_modifiers(modifiers));
     event.set_key(ghostty_key_from_crossterm_key_code(
         key.code,
         key.shifted_codepoint,
