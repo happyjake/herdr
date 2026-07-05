@@ -62,7 +62,7 @@ headless_cols = 160
 headless_rows = 50
 ```
 
-With one attached client, all tabs follow its size. With multiple clients, each viewed tab follows the client that most recently focused, selected, or interacted with it. When all but one client detach, all tabs immediately return to the remaining client's size. When no clients remain, existing pane PTYs retain their last size and new headless layout uses the configured fallback.
+With one attached client, all tabs follow its size. With multiple clients, each viewed tab follows the client that most recently focused, selected, or interacted with it. When all but one client detach, all tabs immediately return to the remaining client's size. When no clients remain, existing pane PTYs retain their last size and new headless layout uses the configured fallback. A last client smaller than the fallback in either dimension does not shrink them for good: on its detach, tabs grow to the fallback in whichever dimension fell short, so API readers of repainting agents are not capped at that client's height.
 
 ## Terminal defaults
 
