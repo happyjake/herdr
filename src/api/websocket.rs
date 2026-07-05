@@ -439,6 +439,7 @@ fn handle_ws_connection(
     capabilities: Option<ServerCapabilities>,
     server_name: &crate::api::SharedServerName,
 ) -> io::Result<()> {
+    configure_accepted_ws_stream(&stream)?;
     let peer = stream.peer_addr().ok();
     stream.set_read_timeout(Some(HANDSHAKE_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(HANDSHAKE_IO_TIMEOUT))?;
@@ -466,9 +467,10 @@ fn handle_ws_connection(
         }
     };
 
-    // Handshake done; switch to non-blocking polling like the rest of the
-    // API server so the connection observes server shutdown promptly.
-    websocket.get_ref().set_nonblocking(true)?;
+    // Handshake done; use a read timeout instead of non-blocking polling so
+    // sparse frames wake the connection thread immediately while shutdown is
+    // still observed within one poll interval.
+    configure_established_ws_stream(websocket.get_ref())?;
     let mut transport = WsTransport { websocket };
 
     let result = ws_request_loop(
@@ -488,6 +490,18 @@ fn handle_ws_connection(
         Err(err) if is_connection_closed_error(&err) => Ok(()),
         result => result,
     }
+}
+
+/// Avoid Nagle/delayed-ACK latency cliffs for sparse API frames.
+fn configure_accepted_ws_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)
+}
+
+fn configure_established_ws_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)?;
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(CONNECTION_POLL_INTERVAL))?;
+    stream.set_write_timeout(Some(FRAME_WRITE_TIMEOUT))
 }
 
 fn format_peer(peer: Option<SocketAddr>) -> String {
@@ -617,7 +631,6 @@ fn ws_request_loop(
                             "timed out reading api request",
                         ));
                     }
-                    std::thread::sleep(CONNECTION_POLL_INTERVAL);
                 }
                 WsErrorClass::Closed => return Ok(()),
                 WsErrorClass::Failed(err) => return Err(err),
@@ -706,6 +719,7 @@ impl ApiTransport for WsTransport {
     }
 
     fn probe_closed(&mut self) -> io::Result<bool> {
+        self.websocket.get_mut().set_nonblocking(true)?;
         loop {
             match self.websocket.read() {
                 // Control frames keep the connection alive; anything else
@@ -717,11 +731,15 @@ impl ApiTransport for WsTransport {
                 Ok(Message::Close(_)) => return Ok(true),
                 Ok(_) => return Ok(true),
                 Err(err) => {
-                    return match classify_ws_error(err) {
+                    let status = match classify_ws_error(err) {
                         WsErrorClass::WouldBlock => Ok(false),
                         WsErrorClass::Closed => Ok(true),
                         WsErrorClass::Failed(err) => Err(err),
+                    };
+                    if matches!(status, Ok(false)) {
+                        configure_established_ws_stream(self.websocket.get_mut())?;
                     }
+                    return status;
                 }
             }
         }
@@ -829,6 +847,39 @@ mod tests {
         let rebound = bind_with_addr_in_use_retry(addr);
         release.join().unwrap();
         assert!(rebound.is_ok(), "{rebound:?}");
+    }
+
+    #[test]
+    fn accepted_streams_enable_tcp_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || TcpStream::connect(addr).unwrap());
+
+        let (stream, _) = listener.accept().unwrap();
+        configure_accepted_ws_stream(&stream).unwrap();
+
+        assert!(stream.nodelay().unwrap());
+        drop(stream);
+        drop(client.join().unwrap());
+    }
+
+    #[test]
+    fn established_streams_use_read_timeout_instead_of_nonblocking_polling() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || TcpStream::connect(addr).unwrap());
+
+        let (stream, _) = listener.accept().unwrap();
+        configure_established_ws_stream(&stream).unwrap();
+
+        assert!(stream.nodelay().unwrap());
+        assert_eq!(
+            stream.read_timeout().unwrap(),
+            Some(CONNECTION_POLL_INTERVAL)
+        );
+        assert_eq!(stream.write_timeout().unwrap(), Some(FRAME_WRITE_TIMEOUT));
+        drop(stream);
+        drop(client.join().unwrap());
     }
 
     #[test]
