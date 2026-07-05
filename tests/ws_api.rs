@@ -29,6 +29,8 @@ use tungstenite::{Message, WebSocket};
 
 const TEST_TOKEN: &str = "ws-api-test-token";
 const TEST_SERVER_NAME: &str = "ws-test-server";
+const TEST_WS_IDLE_PING_AFTER_MS: &str = "250";
+const TEST_WS_IDLE_CLOSE_AFTER_MS: &str = "900";
 
 fn test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -102,6 +104,22 @@ fn spawn_herdr_with_config(
     socket_path: &Path,
     websocket_section: &str,
 ) -> SpawnedHerdr {
+    spawn_herdr_with_config_and_env(
+        config_home,
+        runtime_dir,
+        socket_path,
+        websocket_section,
+        &[],
+    )
+}
+
+fn spawn_herdr_with_config_and_env(
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+    websocket_section: &str,
+    extra_env: &[(&str, &str)],
+) -> SpawnedHerdr {
     // Debug builds read the herdr-dev config dir; write the release dir too
     // so the fixture does not depend on the build profile.
     for dir in ["herdr", "herdr-dev"] {
@@ -133,11 +151,15 @@ fn spawn_herdr_with_config(
     // make the spawned server read the real config instead of the fixture.
     cmd.env_remove("HERDR_CONFIG_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
+    cmd.env_remove("HERDR_SESSION");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
     // Point the server's temp dir into the test base so its attachment
     // scratch dir is per-test and cleaned up with everything else.
     cmd.env("TMPDIR", runtime_dir);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -163,6 +185,26 @@ fn wait_for_ws_listener(addr: SocketAddr, timeout: Duration) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("websocket listener did not appear at {addr}");
+}
+
+fn server_log_path(config_home: &Path) -> PathBuf {
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    config_home.join(app_dir).join("herdr-server.log")
+}
+
+fn wait_for_log_contains(path: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if fs::read_to_string(path).is_ok_and(|content| content.contains(needle)) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
 }
 
 // ---- Unix socket client (same shape as tests/api_ping.rs) ----
@@ -362,12 +404,30 @@ fn assert_eventually_identical(
 
 struct WsTestServer {
     base: PathBuf,
+    config_home: PathBuf,
     socket_path: PathBuf,
     ws_addr: SocketAddr,
     child: SpawnedHerdr,
 }
 
 fn start_ws_test_server() -> WsTestServer {
+    start_ws_test_server_with_env(&[])
+}
+
+fn start_ws_test_server_with_short_liveness() -> WsTestServer {
+    start_ws_test_server_with_env(&[
+        (
+            "HERDR_TEST_WS_IDLE_PING_AFTER_MS",
+            TEST_WS_IDLE_PING_AFTER_MS,
+        ),
+        (
+            "HERDR_TEST_WS_IDLE_CLOSE_AFTER_MS",
+            TEST_WS_IDLE_CLOSE_AFTER_MS,
+        ),
+    ])
+}
+
+fn start_ws_test_server_with_env(extra_env: &[(&str, &str)]) -> WsTestServer {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
@@ -375,21 +435,64 @@ fn start_ws_test_server() -> WsTestServer {
     let ws_port = pick_free_port();
     let ws_addr: SocketAddr = format!("127.0.0.1:{ws_port}").parse().unwrap();
 
-    let child = spawn_herdr_with_config(
+    let child = spawn_herdr_with_config_and_env(
         &config_home,
         &runtime_dir,
         &socket_path,
         &websocket_section(ws_port),
+        extra_env,
     );
     wait_for_socket(&socket_path, Duration::from_secs(5));
     wait_for_ws_listener(ws_addr, Duration::from_secs(5));
 
     WsTestServer {
         base,
+        config_home,
         socket_path,
         ws_addr,
         child,
     }
+}
+
+fn wait_for_websocket_close(websocket: &mut WebSocket<TcpStream>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match websocket.read() {
+            Ok(Message::Close(_)) => return,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+            Ok(other) => panic!("unexpected websocket message while waiting for close: {other:?}"),
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                return;
+            }
+            Err(tungstenite::Error::Io(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return;
+            }
+            Err(tungstenite::Error::Io(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for websocket close"
+                );
+            }
+            Err(err) => panic!("failed while waiting for websocket close: {err}"),
+        }
+    }
+}
+
+fn test_ws_idle_close_after() -> Duration {
+    Duration::from_millis(TEST_WS_IDLE_CLOSE_AFTER_MS.parse::<u64>().unwrap())
 }
 
 #[test]
@@ -417,6 +520,86 @@ fn ping_response_is_identical_over_unix_socket_and_websocket() {
     // The declared server name rides the same pong on both transports (the
     // raw equality above already proves they match).
     assert_eq!(ws_response["result"]["name"], TEST_SERVER_NAME);
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn websocket_reaps_silent_client_after_first_request_and_logs_reason() {
+    let _lock = test_lock();
+    let server = start_ws_test_server_with_short_liveness();
+    let log_path = server_log_path(&server.config_home);
+
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let response = ws.request(r#"{"id":"req_reap_seed","method":"ping","params":{}}"#);
+    assert_eq!(response["result"]["type"], "pong");
+
+    let reap_reason = "timed out waiting for websocket pong after idle ping";
+    let log_found = wait_for_log_contains(
+        &log_path,
+        reap_reason,
+        test_ws_idle_close_after() + Duration::from_secs(3),
+    );
+    assert!(
+        log_found,
+        "server log must record the reap reason {reap_reason:?}; log path: {}",
+        log_path.display()
+    );
+
+    wait_for_websocket_close(&mut ws.websocket, Duration::from_secs(2));
+
+    let recovered = unix_request(
+        &server.socket_path,
+        r#"{"id":"req_reap_recovered","method":"ping","params":{}}"#,
+    );
+    assert_eq!(recovered["result"]["type"], "pong");
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn websocket_idle_but_alive_client_survives_liveness_pings() {
+    let _lock = test_lock();
+    let server = start_ws_test_server_with_short_liveness();
+    let log_path = server_log_path(&server.config_home);
+
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let response = ws.request(r#"{"id":"req_alive_seed","method":"ping","params":{}}"#);
+    assert_eq!(response["result"]["type"], "pong");
+
+    let mut ping_count = 0;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while ping_count < 3 {
+        match ws.websocket.read() {
+            Ok(Message::Ping(_)) => {
+                ping_count += 1;
+                ws.websocket.flush().unwrap();
+            }
+            Ok(Message::Pong(_)) => {}
+            Ok(other) => panic!("idle client expected only protocol pings, got: {other:?}"),
+            Err(tungstenite::Error::Io(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for liveness pings"
+                );
+            }
+            Err(err) => panic!("idle-but-alive websocket closed unexpectedly: {err}"),
+        }
+    }
+
+    let response = ws.request(r#"{"id":"req_alive_after_cycles","method":"ping","params":{}}"#);
+    assert_eq!(response["result"]["type"], "pong");
+
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !log.contains("timed out waiting for websocket pong after idle ping"),
+        "idle-but-alive client must not be reaped; log:\n{log}"
+    );
 
     cleanup_spawned_herdr(server.child, server.base);
 }
