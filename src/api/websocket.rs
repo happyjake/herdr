@@ -350,6 +350,7 @@ pub fn start_websocket_server_with_capabilities(
     let listener = bind_with_addr_in_use_retry(spec.addr)?;
     listener.set_nonblocking(true)?;
     let local_addr = listener.local_addr()?;
+    crate::api::attachment::spawn_ttl_sweeper();
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);

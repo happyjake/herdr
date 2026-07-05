@@ -1,3 +1,4 @@
+mod attachment;
 pub mod client;
 mod event_hub;
 pub mod schema;

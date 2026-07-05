@@ -258,6 +258,39 @@ fn request_round_trips_for_server_agent_manifests() {
 }
 
 #[test]
+fn request_round_trips_for_attachment_create() {
+    let request = Request {
+        id: "req_attach".into(),
+        method: Method::AttachmentCreate(AttachmentCreateParams {
+            bytes_b64: "aGVyZHI=".into(),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "attachment.create");
+    assert_eq!(json["params"]["bytes_b64"], "aGVyZHI=");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
+fn attachment_created_response_round_trips() {
+    let response = SuccessResponse {
+        id: "req_attach".into(),
+        result: ResponseResult::AttachmentCreated {
+            path: "/tmp/herdr-attachments-501/attachment-17-0.png".into(),
+            expires_at: 1_800_000_000,
+        },
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"type\":\"attachment_created\""));
+    assert!(json.contains("\"expires_at\":1800000000"));
+    let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
 fn request_round_trips_for_agent_explain() {
     let request = Request {
         id: "req_agent_explain".into(),
