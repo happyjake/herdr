@@ -1146,30 +1146,32 @@ impl HeadlessServer {
         &mut self,
         start_pending_agent_resumes: bool,
     ) {
-        if self.foreground_client_id.is_none() {
-            return;
-        }
-        let Some(client_id) = self.foreground_client_id else {
-            return;
-        };
-        let Some(client) = self.clients.get(&client_id) else {
-            return;
-        };
+        // With no foreground client the panes still have to follow
+        // `effective_size`: detaching the last client can raise the
+        // headless size to the configured floor, and only this relayout
+        // makes API readers actually see floor-sized panes.
+        let foreground_cell_size = self
+            .foreground_client_id
+            .and_then(|client_id| self.clients.get(&client_id))
+            .map(|client| client.cell_size);
         let (cols, rows) = self.effective_size;
         let area = Rect::new(0, 0, cols, rows);
-        if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
-            crate::ui::compute_view_with_cell_size(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-                client.cell_size,
-            );
-        } else {
-            crate::ui::compute_view_with_runtime_registry(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-            );
+        match foreground_cell_size {
+            Some(cell_size) if self.app.state.kitty_graphics_enabled && cell_size.is_known() => {
+                crate::ui::compute_view_with_cell_size(
+                    &mut self.app.state,
+                    &self.app.terminal_runtimes,
+                    area,
+                    cell_size,
+                );
+            }
+            _ => {
+                crate::ui::compute_view_with_runtime_registry(
+                    &mut self.app.state,
+                    &self.app.terminal_runtimes,
+                    area,
+                );
+            }
         }
 
         // Shared runtime size changes affect pane wrapping and foreground-driven
@@ -6743,6 +6745,9 @@ next_tab = ""
     #[test]
     fn terminal_observe_allows_multiple_clients_without_attach_ownership() {
         with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+            // Bring the runtime in line with the shared headless layout
+            // first; observing must then leave its size untouched.
+            server.resize_shared_runtime_to_effective_size();
             let initial_size = server
                 .app
                 .terminal_runtimes
@@ -8342,6 +8347,37 @@ next_tab = ""
             (200, 60),
             "each dimension is independently the max of the retained client \
              size and the configured floor"
+        );
+    }
+
+    #[test]
+    fn detaching_a_client_below_the_floor_lays_headless_panes_out_at_the_floor() {
+        let mut server = test_headless_server();
+        server.app.state.headless_min_size = (180, 60);
+        let workspace = crate::workspace::Workspace::test_new("headless");
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
+
+        insert_test_client(&mut server, 1, (100, 30));
+        assert!(server.promote_client_to_foreground(1));
+        server.resize_shared_runtime_to_effective_size();
+        let attached_area = server.app.state.view.terminal_area;
+        assert!(
+            attached_area.width <= 100 && attached_area.height <= 30,
+            "panes must lay out for the attached client first, got {attached_area:?}"
+        );
+
+        server.remove_client_and_resize_if_needed(1);
+        assert_eq!(server.foreground_client_id, None);
+        assert_eq!(server.effective_size, (180, 60));
+        let headless_area = server.app.state.view.terminal_area;
+        assert!(
+            headless_area.width > attached_area.width
+                && headless_area.height > attached_area.height,
+            "detaching the last client must relay the panes out at the raised \
+             headless size, not leave them at the detached client's size, got \
+             {headless_area:?}"
         );
     }
 

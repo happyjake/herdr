@@ -786,9 +786,11 @@ fn detached_output_preserves_last_attached_pty_size() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
+    // Attach larger than the default 180x60 headless floor so the retained
+    // client size, not the floor, decides the detached layout.
     let mut stream = UnixStream::connect(&client_socket).expect("client should connect");
     let (version, error) =
-        client_handshake(&mut stream, CURRENT_PROTOCOL, 120, 40).expect("handshake should succeed");
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 200, 70).expect("handshake should succeed");
     assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
     drain_messages(&mut stream);
@@ -825,7 +827,68 @@ fn detached_output_preserves_last_attached_pty_size() {
 
     assert_eq!(
         while_detached, before,
-        "detached renders should not resize live pane PTYs to a fallback size"
+        "a retained client size above the headless floor must survive detach \
+         without resizing live pane PTYs"
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn detach_grows_live_ptys_to_the_headless_floor() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    // Attach smaller than the default 180x60 headless floor.
+    let mut stream = UnixStream::connect(&client_socket).expect("client should connect");
+    let (version, error) =
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 120, 40).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
+    assert!(error.is_none(), "{:?}", error);
+    drain_messages(&mut stream);
+
+    let create = workspace_create(&api_socket, "detached-floor");
+    let pane_id = create["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("root pane id")
+        .to_string();
+
+    let before = read_pane_tty_size_after_marker(
+        &api_socket,
+        &pane_id,
+        "SIZE_BEFORE_DETACH",
+        Duration::from_secs(5),
+    );
+
+    send_detach(&mut stream).expect("send detach");
+    drop(stream);
+
+    assert!(
+        wait_until(Duration::from_secs(2), Duration::from_millis(25), || {
+            ping_socket(&api_socket).contains("pong")
+        }),
+        "server should persist after detach"
+    );
+
+    let while_detached = read_pane_tty_size_after_marker(
+        &api_socket,
+        &pane_id,
+        "SIZE_WHILE_DETACHED",
+        Duration::from_secs(5),
+    );
+
+    assert!(
+        while_detached.0 > before.0 && while_detached.1 > before.1,
+        "detaching a client smaller than the headless floor must grow live \
+         pane PTYs to the floor layout, got {before:?} -> {while_detached:?}"
     );
 
     cleanup_spawned_herdr(spawned, base);
