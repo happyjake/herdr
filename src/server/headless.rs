@@ -328,9 +328,16 @@ pub struct HeadlessServer {
     next_activity_stamp: u64,
     /// Configured virtual terminal size used when no clients are connected.
     headless_size: (u16, u16),
-    /// Shared pane runtime size derived from the foreground client, or the
-    /// configured headless size when no clients are connected.
+    /// Shared pane runtime size derived from the foreground client. With no
+    /// clients connected it retains the last foreground client's size (or the
+    /// configured headless size if none ever attached), so detaching does not
+    /// collapse panes to the configured minimum — repainting agents redraw
+    /// only their current screen, and API readers (the mobile client) would
+    /// otherwise see their transcripts shrink to that window.
     effective_size: (u16, u16),
+    /// Terminal size of the most recent foreground client, kept across
+    /// detach as the headless `effective_size`.
+    last_foreground_terminal_size: Option<(u16, u16)>,
     /// Flag set when shutdown is initiated.
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
@@ -534,6 +541,7 @@ impl HeadlessServer {
             next_activity_stamp: 1,
             headless_size,
             effective_size: headless_size,
+            last_foreground_terminal_size: None,
             shutting_down: false,
             handoff_in_progress: false,
             #[cfg(unix)]
@@ -1182,8 +1190,11 @@ impl HeadlessServer {
         if !self.app.direct_graphics_available {
             self.retire_all_direct_graphics();
         }
+        let headless_size = self
+            .last_foreground_terminal_size
+            .unwrap_or(self.headless_size);
         let Some(client_id) = self.foreground_client_id else {
-            self.effective_size = self.headless_size;
+            self.effective_size = headless_size;
             self.app.state.outer_terminal_focus = None;
             self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             self.sync_headless_view_geometry();
@@ -1194,7 +1205,7 @@ impl HeadlessServer {
         };
         let Some(client) = self.clients.get(&client_id) else {
             self.foreground_client_id = None;
-            self.effective_size = self.headless_size;
+            self.effective_size = headless_size;
             self.app.state.outer_terminal_focus = None;
             self.app.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             self.sync_headless_view_geometry();
@@ -1223,6 +1234,7 @@ impl HeadlessServer {
             .clone();
 
         self.effective_size = terminal_size;
+        self.last_foreground_terminal_size = Some(terminal_size);
         self.app.state.outer_terminal_focus = outer_terminal_focus;
         self.app.state.host_cell_size = host_cell_size;
         apply_keybindings(&mut self.app, &keybindings);
@@ -5494,6 +5506,7 @@ mod tests {
             next_activity_stamp: 1,
             headless_size,
             effective_size: headless_size,
+            last_foreground_terminal_size: None,
             shutting_down: false,
             handoff_in_progress: false,
             #[cfg(unix)]
@@ -8221,6 +8234,43 @@ next_tab = ""
         assert_eq!(
             server.app.state.host_terminal_theme,
             server.clients[&1].host_terminal_theme
+        );
+    }
+
+    #[test]
+    fn headless_size_retains_last_foreground_client_after_detach() {
+        let mut server = test_headless_server();
+        assert_eq!(
+            server.effective_size,
+            (
+                crate::config::DEFAULT_HEADLESS_COLS,
+                crate::config::DEFAULT_HEADLESS_ROWS
+            )
+        );
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (183, 53),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+        assert!(server.promote_client_to_foreground(1));
+        assert_eq!(server.effective_size, (183, 53));
+
+        server.remove_client(1);
+        assert_eq!(server.foreground_client_id, None);
+        assert_eq!(
+            server.effective_size,
+            (183, 53),
+            "detaching the last client must not collapse the shared runtime \
+             size to the minimum; repainting agents redraw only their current \
+             screen, so API readers would lose their transcripts"
         );
     }
 
