@@ -1060,7 +1060,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+        // sun_path caps unix socket paths at ~104 bytes and the macOS temp
+        // dir already spends half of that, so keep the unique suffix to the
+        // sub-second nanos instead of the full 19-digit timestamp.
+        let suffix = nanos % 1_000_000_000;
+        std::env::temp_dir().join(format!("herdr-{name}-{}-{suffix}", std::process::id()))
     }
 
     fn read_line(stream: &mut LocalStream) -> String {
