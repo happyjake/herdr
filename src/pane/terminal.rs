@@ -2733,8 +2733,18 @@ fn ghostty_recent_read_range(
     if total_rows == 0 || cols == 0 || lines == 0 {
         return Ok(None);
     }
-    let end = ghostty_last_content_row(terminal, total_rows, cols)?;
-    let start = end.saturating_add(1).saturating_sub(lines);
+    let screen_rows = usize::from(terminal.rows()?).max(1);
+    let first_screen_row = total_rows.saturating_sub(screen_rows);
+    let end = ghostty_last_content_row(terminal, total_rows, first_screen_row, cols)?;
+    // Anchoring `end` at the last content row may only trim the blank
+    // screen tail below it, never lift the window into scrollback a
+    // bottom-anchored window of the same size could not reach: rows above
+    // the screen predate whatever cleared or repainted it, and an
+    // unclamped start would resurface that stale output to pane.read and
+    // output matchers. Reads of at most a screenful therefore never leave
+    // the visible screen; taller reads keep their usual history reach.
+    let start_floor = first_screen_row.min(total_rows.saturating_sub(lines));
+    let start = end.saturating_add(1).saturating_sub(lines).max(start_floor);
     Ok(Some((start, end, cols)))
 }
 
@@ -2749,11 +2759,10 @@ fn ghostty_recent_read_range(
 fn ghostty_last_content_row(
     terminal: &crate::ghostty::Terminal,
     total_rows: usize,
+    first_screen_row: usize,
     cols: u16,
 ) -> Result<usize, crate::ghostty::Error> {
     let last = total_rows.saturating_sub(1);
-    let screen_rows = usize::from(terminal.rows()?).max(1);
-    let first_screen_row = total_rows.saturating_sub(screen_rows);
     let mut y = last;
     loop {
         let row_text =
@@ -5262,6 +5271,55 @@ mod tests {
         assert!(pane.recent_unwrapped_text(10).contains("hello from socket"));
         assert!(pane.recent_text(10).contains("hello from socket"));
         assert!(pane.recent_ansi(10).contains("hello from socket"));
+    }
+
+    #[test]
+    fn recent_reads_after_a_clear_do_not_resurface_scrollback() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(20, 10, 1000).unwrap();
+        for i in 1..=30 {
+            terminal.write(format!("old line {i}\r\n").as_bytes());
+        }
+        // Clear the screen and repaint a prompt on the top row; the
+        // pre-clear transcript stays in scrollback right above the screen.
+        terminal.write(b"\x1b[2J\x1b[H> ");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        for text in [
+            pane.recent_unwrapped_text(8),
+            pane.recent_text(8),
+            pane.recent_ansi(8),
+        ] {
+            assert!(
+                text.contains('>'),
+                "current screen content must be read: {text:?}"
+            );
+            assert!(
+                !text.contains("old line"),
+                "anchoring at the last content row must not lift a screenful \
+                 read into pre-clear scrollback: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recent_reads_ending_at_the_screen_bottom_still_reach_scrollback() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(20, 10, 1000).unwrap();
+        for i in 1..=30 {
+            terminal.write(format!("line {i}\r\n").as_bytes());
+        }
+        terminal.write(b"> ");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        // Content flows to the bottom row, so a window taller than the
+        // screen keeps its bottom-anchored reach into scrollback.
+        let text = pane.recent_text(25);
+        assert!(text.contains('>'), "prompt row must be read: {text:?}");
+        assert!(
+            text.contains("line 10"),
+            "a read taller than the screen must still include scrollback: {text:?}"
+        );
     }
 
     #[test]
