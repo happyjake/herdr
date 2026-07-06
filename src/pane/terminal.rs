@@ -2733,9 +2733,40 @@ fn ghostty_recent_read_range(
     if total_rows == 0 || cols == 0 || lines == 0 {
         return Ok(None);
     }
-    let end = total_rows.saturating_sub(1);
+    let end = ghostty_last_content_row(terminal, total_rows, cols)?;
     let start = end.saturating_add(1).saturating_sub(lines);
     Ok(Some((start, end, cols)))
+}
+
+/// Absolute row of the last screen row with visible content, so the
+/// `lines` window of a recent read ends at content instead of the blank
+/// screen tail below the cursor. On tall panes that tail can swallow a
+/// window smaller than the screen, hiding output near the top from small
+/// reads and output matchers. Scrollback is never scanned — it ends at
+/// content by construction — and a fully blank screen keeps the bottom
+/// anchor so a cleared pane still reads as empty rather than resurfacing
+/// old scrollback.
+fn ghostty_last_content_row(
+    terminal: &crate::ghostty::Terminal,
+    total_rows: usize,
+    cols: u16,
+) -> Result<usize, crate::ghostty::Error> {
+    let last = total_rows.saturating_sub(1);
+    let screen_rows = usize::from(terminal.rows()?).max(1);
+    let first_screen_row = total_rows.saturating_sub(screen_rows);
+    let mut y = last;
+    loop {
+        let row_text =
+            terminal.read_text_screen((0, y as u32), (cols.saturating_sub(1), y as u32), false)?;
+        if !row_text.trim().is_empty() {
+            return Ok(y);
+        }
+        if y == first_screen_row {
+            break;
+        }
+        y -= 1;
+    }
+    Ok(last)
 }
 
 fn ghostty_set_scroll_offset_from_bottom(
@@ -5216,6 +5247,21 @@ mod tests {
         assert!(pane.recent_unwrapped_text_snapshot(2).truncated);
         assert!(pane.recent_unwrapped_ansi_snapshot(2).truncated);
         assert!(!pane.recent_text_snapshot(100).truncated);
+    }
+
+    #[test]
+    fn recent_reads_anchor_at_content_not_the_blank_screen_tail() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(20, 30, 100).unwrap();
+        terminal.write(b"hello from socket\r\n> ");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        // The content sits on the top rows of a 30-row screen. A window
+        // smaller than the screen must anchor at the last content row and
+        // reach it, not return the blank tail below the cursor.
+        assert!(pane.recent_unwrapped_text(10).contains("hello from socket"));
+        assert!(pane.recent_text(10).contains("hello from socket"));
+        assert!(pane.recent_ansi(10).contains("hello from socket"));
     }
 
     #[test]
