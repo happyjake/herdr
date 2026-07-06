@@ -1575,6 +1575,9 @@ pub struct AppState {
     pub shell_mode: crate::config::ShellModeConfig,
     pub new_terminal_cwd: NewTerminalCwdConfig,
     pub pane_scrollback_limit_bytes: usize,
+    /// `[advanced] headless_min_cols/rows`: floor for the shared runtime
+    /// size while no client is attached (cols, rows).
+    pub headless_min_size: (u16, u16),
     #[allow(dead_code)] // kept for backward compat; palette.accent is the source of truth
     pub accent: Color,
     pub sound: SoundConfig,
@@ -1958,6 +1961,10 @@ impl AppState {
             shell_mode: crate::config::ShellModeConfig::Auto,
             new_terminal_cwd: NewTerminalCwdConfig::Follow,
             pane_scrollback_limit_bytes: crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES,
+            headless_min_size: (
+                crate::config::DEFAULT_HEADLESS_MIN_COLS,
+                crate::config::DEFAULT_HEADLESS_MIN_ROWS,
+            ),
             accent: Color::Cyan,
             sound: SoundConfig {
                 enabled: false,

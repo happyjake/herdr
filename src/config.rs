@@ -55,6 +55,8 @@ pub const DEFAULT_MOUSE_SCROLL_LINES: usize = 3;
 pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
 pub const DEFAULT_HEADLESS_COLS: u16 = 120;
 pub const DEFAULT_HEADLESS_ROWS: u16 = 40;
+pub const DEFAULT_HEADLESS_MIN_COLS: u16 = 180;
+pub const DEFAULT_HEADLESS_MIN_ROWS: u16 = 60;
 
 #[cfg(test)]
 pub(crate) fn app_dir_name() -> &'static str {

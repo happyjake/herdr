@@ -694,6 +694,10 @@ impl App {
             shell_mode: config.terminal.shell_mode,
             new_terminal_cwd: config.terminal.new_cwd.clone(),
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
+            headless_min_size: (
+                config.advanced.headless_min_cols,
+                config.advanced.headless_min_rows,
+            ),
             accent: crate::config::parse_color(&config.ui.accent),
             sound: config.ui.sound.clone(),
             local_sound_playback: true,
@@ -1598,6 +1602,10 @@ impl App {
 
         if !invalid_section("advanced") {
             self.state.pane_scrollback_limit_bytes = config.advanced.scrollback_limit_bytes;
+            self.state.headless_min_size = (
+                config.advanced.headless_min_cols,
+                config.advanced.headless_min_rows,
+            );
         }
 
         if !invalid_section("update") {

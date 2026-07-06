@@ -5,8 +5,9 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 
 use super::{
     ActionKeybinds, BindingConfig, CommandKeybindConfig, IndexedKeybind, Keybinds, SidebarConfig,
-    SoundConfig, TabBarRightEntryConfig, ThemeConfig, DEFAULT_MOBILE_WIDTH_THRESHOLD,
-    DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
+    SoundConfig, TabBarRightEntryConfig, ThemeConfig, DEFAULT_HEADLESS_MIN_COLS,
+    DEFAULT_HEADLESS_MIN_ROWS, DEFAULT_MOBILE_WIDTH_THRESHOLD, DEFAULT_MOUSE_SCROLL_LINES,
+    DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
@@ -959,6 +960,17 @@ pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
     #[serde(alias = "scrollback_lines")]
     pub scrollback_limit_bytes: usize,
+    /// Minimum shared runtime width (columns) while no client is attached.
+    /// Headless panes lay out at least this wide so API readers see agent
+    /// transcripts at real-terminal proportions instead of an 80-column
+    /// minimum. A foreground client's real size always wins while attached.
+    /// Values below 80 are raised to 80. Default: 180.
+    pub headless_min_cols: u16,
+    /// Minimum shared runtime height (rows) while no client is attached.
+    /// Height bounds how much transcript a repainting agent shows at once,
+    /// which is all an API reader can fetch. Values below 24 are raised
+    /// to 24. Default: 60.
+    pub headless_min_rows: u16,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1256,6 +1268,8 @@ impl Default for AdvancedConfig {
     fn default() -> Self {
         Self {
             scrollback_limit_bytes: DEFAULT_SCROLLBACK_LIMIT_BYTES,
+            headless_min_cols: DEFAULT_HEADLESS_MIN_COLS,
+            headless_min_rows: DEFAULT_HEADLESS_MIN_ROWS,
         }
     }
 }

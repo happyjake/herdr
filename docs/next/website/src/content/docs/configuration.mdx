@@ -505,6 +505,16 @@ claude = "on"
 
 Search the [Config reference](/docs/config-reference/) for scrollback limits, nested launches, and other advanced or experimental settings. See [Session state and restore](/docs/session-state/) before enabling pane screen history; that guide explains the security trade-off of saving pane contents.
 
+## Headless pane size
+
+While no client is attached, the server lays panes out at least this large (default 180×60), so API readers such as the mobile client see agent output at real-terminal proportions. An attached client's real terminal size always wins while it is connected, and a larger last-attached size is kept after detach. Values below the 80×24 minimum are raised to it:
+
+```toml
+[advanced]
+headless_min_cols = 180
+headless_min_rows = 60
+```
+
 ## Kitty graphics
 
 Kitty graphics rendering for attached local clients is experimental and disabled by default:

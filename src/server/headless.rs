@@ -252,6 +252,22 @@ fn dirty_patch_intersects_hyperlinks(
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Hard minimum shared runtime size (columns, rows). The configured
+/// headless floor clamps up to this, and it remains the initial size for
+/// test servers built without config.
+const MIN_COLS: u16 = 80;
+const MIN_ROWS: u16 = 24;
+
+/// The configured floor for the shared runtime size while no client is
+/// attached: `[advanced] headless_min_cols/rows`, each dimension raised to
+/// the hard minimum. While a foreground client is attached its real
+/// terminal size always wins; headless, panes never lay out smaller than
+/// this floor.
+fn headless_size_floor(state: &crate::app::AppState) -> (u16, u16) {
+    let (cols, rows) = state.headless_min_size;
+    (cols.max(MIN_COLS), rows.max(MIN_ROWS))
+}
+
 /// Timeout for in-flight API requests during shutdown.
 #[allow(dead_code)]
 const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
@@ -329,11 +345,13 @@ pub struct HeadlessServer {
     /// Configured virtual terminal size used when no clients are connected.
     headless_size: (u16, u16),
     /// Shared pane runtime size derived from the foreground client. With no
-    /// clients connected it retains the last foreground client's size (or the
-    /// configured headless size if none ever attached), so detaching does not
-    /// collapse panes to the configured minimum — repainting agents redraw
-    /// only their current screen, and API readers (the mobile client) would
-    /// otherwise see their transcripts shrink to that window.
+    /// clients connected it is the component-wise max of the configured
+    /// headless floor (`[advanced] headless_min_cols/rows`) and the last
+    /// foreground client's size (or the configured `[server]
+    /// headless_cols/rows` base if none ever attached), so detaching never
+    /// collapses panes below the floor — repainting agents redraw only
+    /// their current screen, and API readers (the mobile client) can only
+    /// ever fetch what fits it.
     effective_size: (u16, u16),
     /// Terminal size of the most recent foreground client, kept across
     /// detach as the headless `effective_size`.
@@ -509,6 +527,7 @@ impl HeadlessServer {
         #[cfg(windows)]
         spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
 
+        let headless_floor = headless_size_floor(&app.state);
         let server_keybindings = app_keybindings(&app);
         let headless_size = app.state.headless_size;
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
@@ -540,7 +559,10 @@ impl HeadlessServer {
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
             headless_size,
-            effective_size: headless_size,
+            effective_size: (
+                headless_size.0.max(headless_floor.0),
+                headless_size.1.max(headless_floor.1),
+            ),
             last_foreground_terminal_size: None,
             shutting_down: false,
             handoff_in_progress: false,
@@ -1190,9 +1212,11 @@ impl HeadlessServer {
         if !self.app.direct_graphics_available {
             self.retire_all_direct_graphics();
         }
-        let headless_size = self
+        let floor = headless_size_floor(&self.app.state);
+        let retained = self
             .last_foreground_terminal_size
             .unwrap_or(self.headless_size);
+        let headless_size = (retained.0.max(floor.0), retained.1.max(floor.1));
         let Some(client_id) = self.foreground_client_id else {
             self.effective_size = headless_size;
             self.app.state.outer_terminal_focus = None;
@@ -5480,6 +5504,7 @@ mod tests {
         let server_keybindings = app_keybindings(&app);
         let headless_size = app.state.headless_size;
 
+        let headless_floor = headless_size_floor(&app.state);
         HeadlessServer {
             app,
             #[cfg(unix)]
@@ -5505,7 +5530,10 @@ mod tests {
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
             headless_size,
-            effective_size: headless_size,
+            effective_size: (
+                headless_size.0.max(headless_floor.0),
+                headless_size.1.max(headless_floor.1),
+            ),
             last_foreground_terminal_size: None,
             shutting_down: false,
             handoff_in_progress: false,
@@ -8237,40 +8265,83 @@ next_tab = ""
         );
     }
 
-    #[test]
-    fn headless_size_retains_last_foreground_client_after_detach() {
-        let mut server = test_headless_server();
-        assert_eq!(
-            server.effective_size,
-            (
-                crate::config::DEFAULT_HEADLESS_COLS,
-                crate::config::DEFAULT_HEADLESS_ROWS
-            )
-        );
-
+    fn insert_test_client(server: &mut HeadlessServer, client_id: u64, size: (u16, u16)) {
         server.clients.insert(
-            1,
+            client_id,
             ClientConnection::new(
-                (183, 53),
+                size,
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
                 None,
-                1,
+                client_id,
                 RenderEncoding::SemanticFrame,
                 None,
             ),
         );
+    }
+
+    #[test]
+    fn headless_size_floor_clamps_each_dimension_to_the_minimum() {
+        let mut state = AppState::test_new();
+        state.headless_min_size = (10, 100);
+        assert_eq!(headless_size_floor(&state), (MIN_COLS, 100));
+        state.headless_min_size = (200, 10);
+        assert_eq!(headless_size_floor(&state), (200, MIN_ROWS));
+    }
+
+    #[test]
+    fn headless_boot_uses_configured_size_floor() {
+        let server = test_headless_server();
+        assert_eq!(
+            server.effective_size,
+            (
+                crate::config::DEFAULT_HEADLESS_MIN_COLS,
+                crate::config::DEFAULT_HEADLESS_MIN_ROWS,
+            ),
+            "construction itself must lay out at the configured floor, not \
+             the 80x24 hard minimum — a fresh headless server has to be \
+             phone-ready before any client ever attaches"
+        );
+    }
+
+    #[test]
+    fn headless_size_retains_last_foreground_client_above_the_floor() {
+        let mut server = test_headless_server();
+        server.app.state.headless_min_size = (180, 60);
+
+        insert_test_client(&mut server, 1, (220, 70));
         assert!(server.promote_client_to_foreground(1));
-        assert_eq!(server.effective_size, (183, 53));
+        assert_eq!(server.effective_size, (220, 70));
 
         server.remove_client(1);
         assert_eq!(server.foreground_client_id, None);
         assert_eq!(
             server.effective_size,
-            (183, 53),
-            "detaching the last client must not collapse the shared runtime \
-             size to the minimum; repainting agents redraw only their current \
-             screen, so API readers would lose their transcripts"
+            (220, 70),
+            "a retained client size above the floor must survive detach"
+        );
+    }
+
+    #[test]
+    fn headless_size_floor_wins_component_wise_over_a_smaller_retained_client() {
+        let mut server = test_headless_server();
+        server.app.state.headless_min_size = (180, 60);
+
+        insert_test_client(&mut server, 1, (200, 30));
+        assert!(server.promote_client_to_foreground(1));
+        assert_eq!(
+            server.effective_size,
+            (200, 30),
+            "an attached client's real size always wins, even below the floor"
+        );
+
+        server.remove_client(1);
+        assert_eq!(server.foreground_client_id, None);
+        assert_eq!(
+            server.effective_size,
+            (200, 60),
+            "each dimension is independently the max of the retained client \
+             size and the configured floor"
         );
     }
 
