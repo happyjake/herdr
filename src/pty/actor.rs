@@ -96,6 +96,18 @@ mod windows {
             }
         }
 
+        pub(crate) fn is_accepting_user_input(&self) -> bool {
+            *self
+                .accepting
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        pub(crate) fn user_input_capacity(&self) -> usize {
+            self.data_tx.capacity()
+        }
+
+
         pub(crate) fn resize(
             &self,
             rows: u16,

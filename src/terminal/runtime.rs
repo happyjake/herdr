@@ -466,8 +466,8 @@ impl TerminalRuntime {
         &self,
         delay: std::time::Duration,
         writes: impl IntoIterator<Item = Bytes>,
-    ) {
-        self.0.schedule_delayed_user_input(delay, writes);
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.schedule_delayed_user_input(delay, writes)
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {

@@ -56,6 +56,10 @@ pub use self::{
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
 const PANE_TERM: &str = "xterm-256color";
 const PANE_COLORTERM: &str = "truecolor";
+// Match the production PTY actor user-input command channel capacity so pacing
+// preserves bounded backpressure instead of introducing a second unbounded queue.
+const PACED_USER_INPUT_QUEUE_MAX_ITEMS: usize = 1024;
+const PACED_USER_INPUT_FULL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
 #[cfg(test)]
 thread_local! {
@@ -1089,6 +1093,7 @@ enum PacedUserInputItem {
 struct PacedUserInputState {
     active: bool,
     queue: VecDeque<PacedUserInputItem>,
+    queued_writes: usize,
 }
 
 #[derive(Default)]
@@ -1219,30 +1224,57 @@ impl PaneUserInputWriter {
             PaneUserInputWriter::TestChannel(sender) => sender.send(bytes).await,
         }
     }
+
+    fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        match self {
+            PaneUserInputWriter::Actor(actor) => actor.try_write_user_input(bytes),
+            #[cfg(test)]
+            PaneUserInputWriter::TestChannel(sender) => sender.try_send(bytes),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            PaneUserInputWriter::Actor(actor) => !actor.is_accepting_user_input(),
+            #[cfg(test)]
+            PaneUserInputWriter::TestChannel(sender) => sender.is_closed(),
+        }
+    }
+
+    fn remaining_capacity(&self) -> usize {
+        match self {
+            PaneUserInputWriter::Actor(actor) => actor.user_input_capacity(),
+            #[cfg(test)]
+            PaneUserInputWriter::TestChannel(sender) => sender.capacity(),
+        }
+    }
 }
 
 impl PacedUserInput {
+    fn queue_capacity_for(writer: &PaneUserInputWriter) -> usize {
+        writer
+            .remaining_capacity()
+            .min(PACED_USER_INPUT_QUEUE_MAX_ITEMS)
+    }
+
     async fn send_or_queue(
         self: &Arc<Self>,
         writer: PaneUserInputWriter,
         bytes: Bytes,
     ) -> Result<(), mpsc::error::SendError<Bytes>> {
-        let should_queue = {
+        {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.active {
-                state
-                    .queue
-                    .push_back(PacedUserInputItem::Write(bytes.clone()));
-                true
-            } else {
-                false
+                if writer.is_closed() || state.queued_writes >= Self::queue_capacity_for(&writer) {
+                    return Err(mpsc::error::SendError(bytes));
+                }
+                state.queue.push_back(PacedUserInputItem::Write(bytes));
+                state.queued_writes += 1;
+                return Ok(());
             }
-        };
-        if should_queue {
-            return Ok(());
         }
 
         writer.send_bytes(bytes).await
@@ -1253,29 +1285,25 @@ impl PacedUserInput {
         writer: PaneUserInputWriter,
         bytes: Bytes,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        let should_queue = {
+        {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if state.active {
-                state
-                    .queue
-                    .push_back(PacedUserInputItem::Write(bytes.clone()));
-                true
-            } else {
-                false
+                if writer.is_closed() {
+                    return Err(mpsc::error::TrySendError::Closed(bytes));
+                }
+                if state.queued_writes >= Self::queue_capacity_for(&writer) {
+                    return Err(mpsc::error::TrySendError::Full(bytes));
+                }
+                state.queue.push_back(PacedUserInputItem::Write(bytes));
+                state.queued_writes += 1;
+                return Ok(());
             }
-        };
-        if should_queue {
-            return Ok(());
         }
 
-        match writer {
-            PaneUserInputWriter::Actor(actor) => actor.try_write_user_input(bytes),
-            #[cfg(test)]
-            PaneUserInputWriter::TestChannel(sender) => sender.try_send(bytes),
-        }
+        writer.try_send_bytes(bytes)
     }
 
     fn schedule_delayed_writes(
@@ -1283,13 +1311,26 @@ impl PacedUserInput {
         writer: PaneUserInputWriter,
         delay: std::time::Duration,
         writes: impl IntoIterator<Item = Bytes>,
-    ) {
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        let writes = writes.into_iter().collect::<Vec<_>>();
+        if writes.is_empty() {
+            return Ok(());
+        }
+        if writer.is_closed() {
+            return Err(mpsc::error::TrySendError::Closed(Bytes::new()));
+        }
+
         let should_start = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.queued_writes.saturating_add(writes.len()) > Self::queue_capacity_for(&writer)
+            {
+                return Err(mpsc::error::TrySendError::Full(Bytes::new()));
+            }
             state.queue.push_back(PacedUserInputItem::Delay(delay));
+            state.queued_writes += writes.len();
             state
                 .queue
                 .extend(writes.into_iter().map(PacedUserInputItem::Write));
@@ -1307,6 +1348,7 @@ impl PacedUserInput {
                 paced.drain(writer).await;
             });
         }
+        Ok(())
     }
 
     fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {
@@ -1354,6 +1396,7 @@ impl PacedUserInput {
                     Some(item) => item,
                     None => {
                         state.active = false;
+                        state.queued_writes = 0;
                         return;
                     }
                 }
@@ -1361,18 +1404,40 @@ impl PacedUserInput {
 
             match item {
                 PacedUserInputItem::Delay(delay) => tokio::time::sleep(delay).await,
-                PacedUserInputItem::Write(bytes) => {
-                    if let Err(err) = writer.send_bytes(bytes).await {
+                PacedUserInputItem::Write(bytes) => match writer.try_send_bytes(bytes) {
+                    Ok(()) => self.decrement_queued_writes(),
+                    Err(mpsc::error::TrySendError::Full(bytes)) => {
+                        self.requeue_front_write(bytes);
+                        tokio::time::sleep(PACED_USER_INPUT_FULL_RETRY_DELAY).await;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(err)) => {
                         tracing::warn!(
-                            err = %err,
+                            err = %mpsc::error::SendError(err),
                             "failed to flush queued pane input bytes after pacing"
                         );
                         self.clear();
                         return;
                     }
-                }
+                },
             }
         }
+    }
+
+    fn decrement_queued_writes(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.queued_writes = state.queued_writes.saturating_sub(1);
+    }
+
+    fn requeue_front_write(&self, bytes: Bytes) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.queue.push_front(PacedUserInputItem::Write(bytes));
+        state.active = true;
     }
 
     fn clear(&self) {
@@ -1381,7 +1446,55 @@ impl PacedUserInput {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.queue.clear();
+        state.queued_writes = 0;
         state.active = false;
+    }
+
+    #[cfg(unix)]
+    fn flush_immediately(&self, writer: PaneUserInputWriter) -> std::io::Result<()> {
+        loop {
+            let item = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match state.queue.pop_front() {
+                    Some(item) => item,
+                    None => {
+                        state.active = false;
+                        state.queued_writes = 0;
+                        return Ok(());
+                    }
+                }
+            };
+
+            match item {
+                PacedUserInputItem::Delay(_) => {}
+                PacedUserInputItem::Write(bytes) => {
+                    if let Err(err) = writer.try_send_bytes(bytes) {
+                        let kind = match &err {
+                            mpsc::error::TrySendError::Full(_) => std::io::ErrorKind::WouldBlock,
+                            mpsc::error::TrySendError::Closed(_) => std::io::ErrorKind::BrokenPipe,
+                        };
+                        let bytes = match err {
+                            mpsc::error::TrySendError::Full(bytes)
+                            | mpsc::error::TrySendError::Closed(bytes) => bytes,
+                        };
+                        let mut state = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.queue.push_front(PacedUserInputItem::Write(bytes));
+                        state.active = true;
+                        return Err(std::io::Error::new(
+                            kind,
+                            "failed to flush paced pane input before handoff",
+                        ));
+                    }
+                    self.decrement_queued_writes();
+                }
+            }
+        }
     }
 }
 
@@ -1801,6 +1914,19 @@ impl PaneRuntime {
 
     #[cfg(unix)]
     pub fn set_handoff_reader_paused(&self, paused: bool) {
+        if paused {
+            if let Err(err) = self
+                .paced_user_input
+                .flush_immediately(self.io.user_input_writer())
+            {
+                warn!(
+                    pane = self.pane_id.raw(),
+                    err = %err,
+                    "failed to flush paced pane input before pausing handoff reader"
+                );
+                return;
+            }
+        }
         if let Err(err) = self.io.set_handoff_paused(paused) {
             warn!(
                 pane = self.pane_id.raw(),
@@ -1813,6 +1939,8 @@ impl PaneRuntime {
 
     #[cfg(unix)]
     pub fn pause_handoff_reader(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+        self.paced_user_input
+            .flush_immediately(self.io.user_input_writer())?;
         self.io.begin_handoff(timeout)
     }
 
@@ -3025,9 +3153,9 @@ impl PaneRuntime {
         &self,
         delay: std::time::Duration,
         writes: impl IntoIterator<Item = Bytes>,
-    ) {
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.paced_user_input
-            .schedule_delayed_writes(self.io.user_input_writer(), delay, writes);
+            .schedule_delayed_writes(self.io.user_input_writer(), delay, writes)
     }
 
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
@@ -3788,6 +3916,60 @@ mod tests {
                 color_scheme_reporting: true,
             })
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_user_input_returns_full_when_active_queue_reaches_writer_capacity() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_capacity(80, 24, 2);
+
+        runtime
+            .try_send_bytes(Bytes::from_static(b"text"))
+            .expect("initial text write accepted");
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"text"));
+        runtime
+            .schedule_delayed_user_input(
+                std::time::Duration::from_secs(1),
+                [Bytes::from_static(b"\r")],
+            )
+            .expect("delayed enter scheduled");
+
+        runtime
+            .try_send_bytes(Bytes::from_static(b"x"))
+            .expect("queued write fits under writer capacity");
+
+        let overflow = Bytes::from_static(b"overflow");
+        match runtime.try_send_bytes(overflow.clone()) {
+            Err(mpsc::error::TrySendError::Full(bytes)) => assert_eq!(bytes, overflow),
+            other => panic!("expected paced queue overflow, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn pause_handoff_reader_flushes_paced_user_input_queue() {
+        let (runtime, mut rx) = PaneRuntime::test_with_channel_capacity(80, 24, 4);
+
+        runtime
+            .try_send_bytes(Bytes::from_static(b"text"))
+            .expect("initial text write accepted");
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"text"));
+        runtime
+            .schedule_delayed_user_input(
+                std::time::Duration::from_secs(30),
+                [Bytes::from_static(b"\r"), Bytes::from_static(b"after")],
+            )
+            .expect("delayed writes scheduled");
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(1))
+            .expect("handoff pause flushes paced input");
+
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"after"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[cfg(unix)]

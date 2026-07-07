@@ -1545,10 +1545,12 @@ impl App {
         }
 
         if has_text && has_keys {
-            runtime.schedule_delayed_user_input(
+            if let Err(err) = runtime.schedule_delayed_user_input(
                 SEND_INPUT_TEXT_KEY_PACING,
                 encoded_keys.into_iter().map(Bytes::from),
-            );
+            ) {
+                return encode_error(id, "pane_send_failed", err.to_string());
+            }
         } else {
             for bytes in encoded_keys {
                 if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
