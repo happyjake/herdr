@@ -388,8 +388,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
             finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         Method::PaneWaitForOutput(params) => {
-            let response =
-                wait_for_output(request_id.clone(), params, transport, api_tx, running)?;
+            let response = wait_for_output(request_id.clone(), params, transport, api_tx, running)?;
             finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         method_body => {

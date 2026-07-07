@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::sync::{
@@ -1047,6 +1048,7 @@ pub struct PaneRuntime {
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
+    paced_user_input: Arc<PacedUserInput>,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
@@ -1069,6 +1071,29 @@ enum PaneRuntimeIo {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
     },
+}
+
+#[derive(Clone)]
+enum PaneUserInputWriter {
+    Actor(PtyIoActorHandle),
+    #[cfg(test)]
+    TestChannel(mpsc::Sender<Bytes>),
+}
+
+enum PacedUserInputItem {
+    Write(Bytes),
+    Delay(std::time::Duration),
+}
+
+#[derive(Default)]
+struct PacedUserInputState {
+    active: bool,
+    queue: VecDeque<PacedUserInputItem>,
+}
+
+#[derive(Default)]
+struct PacedUserInput {
+    state: Mutex<PacedUserInputState>,
 }
 
 impl PaneRuntimeIo {
@@ -1175,19 +1200,112 @@ impl PaneRuntimeIo {
         }
     }
 
+    fn user_input_writer(&self) -> PaneUserInputWriter {
+        match self {
+            PaneRuntimeIo::Actor(actor) => PaneUserInputWriter::Actor(actor.clone()),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => {
+                PaneUserInputWriter::TestChannel(sender.clone())
+            }
+        }
+    }
+}
+
+impl PaneUserInputWriter {
     async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
         match self {
-            PaneRuntimeIo::Actor(actor) => actor.write_user_input(bytes).await,
+            PaneUserInputWriter::Actor(actor) => actor.write_user_input(bytes).await,
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.send(bytes).await,
+            PaneUserInputWriter::TestChannel(sender) => sender.send(bytes).await,
+        }
+    }
+}
+
+impl PacedUserInput {
+    async fn send_or_queue(
+        self: &Arc<Self>,
+        writer: PaneUserInputWriter,
+        bytes: Bytes,
+    ) -> Result<(), mpsc::error::SendError<Bytes>> {
+        let should_queue = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.active {
+                state
+                    .queue
+                    .push_back(PacedUserInputItem::Write(bytes.clone()));
+                true
+            } else {
+                false
+            }
+        };
+        if should_queue {
+            return Ok(());
+        }
+
+        writer.send_bytes(bytes).await
+    }
+
+    fn try_send_or_queue(
+        self: &Arc<Self>,
+        writer: PaneUserInputWriter,
+        bytes: Bytes,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        let should_queue = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.active {
+                state
+                    .queue
+                    .push_back(PacedUserInputItem::Write(bytes.clone()));
+                true
+            } else {
+                false
+            }
+        };
+        if should_queue {
+            return Ok(());
+        }
+
+        match writer {
+            PaneUserInputWriter::Actor(actor) => actor.try_write_user_input(bytes),
+            #[cfg(test)]
+            PaneUserInputWriter::TestChannel(sender) => sender.try_send(bytes),
         }
     }
 
-    fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        match self {
-            PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
-            #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
+    fn schedule_delayed_writes(
+        self: &Arc<Self>,
+        writer: PaneUserInputWriter,
+        delay: std::time::Duration,
+        writes: impl IntoIterator<Item = Bytes>,
+    ) {
+        let should_start = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.queue.push_back(PacedUserInputItem::Delay(delay));
+            state
+                .queue
+                .extend(writes.into_iter().map(PacedUserInputItem::Write));
+            if state.active {
+                false
+            } else {
+                state.active = true;
+                true
+            }
+        };
+
+        if should_start {
+            let paced = Arc::clone(self);
+            tokio::spawn(async move {
+                paced.drain(writer).await;
+            });
         }
     }
 
@@ -1223,6 +1341,47 @@ impl PaneRuntimeIo {
                 });
             }
         }
+    }
+
+    async fn drain(self: Arc<Self>, writer: PaneUserInputWriter) {
+        loop {
+            let item = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match state.queue.pop_front() {
+                    Some(item) => item,
+                    None => {
+                        state.active = false;
+                        return;
+                    }
+                }
+            };
+
+            match item {
+                PacedUserInputItem::Delay(delay) => tokio::time::sleep(delay).await,
+                PacedUserInputItem::Write(bytes) => {
+                    if let Err(err) = writer.send_bytes(bytes).await {
+                        tracing::warn!(
+                            err = %err,
+                            "failed to flush queued pane input bytes after pacing"
+                        );
+                        self.clear();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.queue.clear();
+        state.active = false;
     }
 }
 
@@ -2008,6 +2167,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            paced_user_input: Arc::new(PacedUserInput::default()),
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
@@ -2564,6 +2724,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            paced_user_input: Arc::new(PacedUserInput::default()),
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
@@ -2850,11 +3011,23 @@ impl PaneRuntime {
     }
 
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
-        self.io.send_bytes(bytes).await
+        self.paced_user_input
+            .send_or_queue(self.io.user_input_writer(), bytes)
+            .await
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.io.try_send_bytes(bytes)
+        self.paced_user_input
+            .try_send_or_queue(self.io.user_input_writer(), bytes)
+    }
+
+    pub fn schedule_delayed_user_input(
+        &self,
+        delay: std::time::Duration,
+        writes: impl IntoIterator<Item = Bytes>,
+    ) {
+        self.paced_user_input
+            .schedule_delayed_writes(self.io.user_input_writer(), delay, writes);
     }
 
     pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
@@ -3085,6 +3258,7 @@ impl PaneRuntime {
                     sender: tx,
                     resize_tx,
                 },
+                paced_user_input: Arc::new(PacedUserInput::default()),
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
@@ -3654,6 +3828,7 @@ mod tests {
                 sender: tx,
                 resize_tx,
             },
+            paced_user_input: Arc::new(PacedUserInput::default()),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
@@ -3686,6 +3861,7 @@ mod tests {
                 sender: tx,
                 resize_tx,
             },
+            paced_user_input: Arc::new(PacedUserInput::default()),
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),

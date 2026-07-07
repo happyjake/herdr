@@ -21,12 +21,16 @@ use crate::app::Mode;
 use crate::layout::{find_in_direction, NavDirection, PaneId};
 
 use super::super::api_helpers::{
-    detect_state_from_api, encode_api_keys, normalize_metadata_source, normalize_metadata_tokens,
-    normalize_metadata_ttl, normalize_reported_agent_label, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
+    detect_state_from_api, encode_api_keys, encode_api_text, normalize_metadata_source,
+    normalize_metadata_tokens, normalize_metadata_ttl, normalize_reported_agent_label,
+    MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
+
+pub(crate) const SEND_INPUT_TEXT_KEY_PACING: std::time::Duration =
+    std::time::Duration::from_millis(30);
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -1527,16 +1531,30 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let bytes = match super::super::api_helpers::encode_api_input(
-            runtime,
-            &params.text,
-            &params.keys,
-        ) {
-            Ok(bytes) => bytes,
+        let encoded_keys = match super::super::api_helpers::encode_api_keys(runtime, &params.keys) {
+            Ok(keys) => keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-            return encode_error(id, "pane_send_failed", err.to_string());
+        let has_text = !params.text.is_empty();
+        let has_keys = !encoded_keys.is_empty();
+        if has_text {
+            let text_bytes = encode_api_text(runtime, &params.text);
+            if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
+                return encode_error(id, "pane_send_failed", err.to_string());
+            }
+        }
+
+        if has_text && has_keys {
+            runtime.schedule_delayed_user_input(
+                SEND_INPUT_TEXT_KEY_PACING,
+                encoded_keys.into_iter().map(Bytes::from),
+            );
+        } else {
+            for bytes in encoded_keys {
+                if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+                    return encode_error(id, "pane_send_failed", err.to_string());
+                }
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -2004,6 +2022,12 @@ mod tests {
         response.error.code
     }
 
+    fn assert_ok_response(response: &str, id: &str) {
+        let success: SuccessResponse = serde_json::from_str(response).unwrap();
+        assert_eq!(success.id, id);
+        assert_eq!(success.result, ResponseResult::Ok {});
+    }
+
     #[tokio::test]
     async fn api_pane_send_keys_accepts_control_navigation_chords() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
@@ -2234,6 +2258,118 @@ mod tests {
         assert_eq!(success.id, "req");
         assert_eq!(success.result, ResponseResult::Ok {});
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![0x0a]));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_text_only_is_undelayed() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: "hello".into(),
+                keys: Vec::new(),
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"hello"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_pane_send_input_paces_keys_after_text() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: "hello".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"hello"));
+        assert!(rx.try_recv().is_err());
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(SEND_INPUT_TEXT_KEY_PACING - std::time::Duration::from_millis(1))
+            .await;
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_pane_send_input_follow_up_same_pane_write_waits_for_paced_keys() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(3);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "first".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: pane_id.clone(),
+                text: "first".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+        assert_ok_response(&response, "first");
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"first"));
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "second".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: "second".into(),
+                keys: Vec::new(),
+            }),
+        });
+        assert_ok_response(&response, "second");
+        assert!(rx.try_recv().is_err());
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(SEND_INPUT_TEXT_KEY_PACING).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"second"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_failed_text_write_errors_before_scheduling_keys() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+
+        let prefill = app.handle_api_request(crate::api::schema::Request {
+            id: "prefill".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: pane_id.clone(),
+                text: "prefill".into(),
+                keys: Vec::new(),
+            }),
+        });
+        assert_ok_response(&prefill, "prefill");
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: "hello".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_send_failed");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"prefill")
+        );
         assert!(rx.try_recv().is_err());
     }
 
