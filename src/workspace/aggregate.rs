@@ -216,6 +216,25 @@ mod tests {
     }
 
     #[test]
+    fn pane_details_lists_codebuddy_detected_agent_label() {
+        let mut ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        ws.tabs[0].panes.get_mut(&root_pane).unwrap().seen = false;
+        let mut terminals = HashMap::new();
+        let mut terminal = terminal_for_pane(&ws, root_pane);
+        terminal.set_detected_state(Some(Agent::Codebuddy), AgentState::Idle);
+        terminals.insert(terminal.id.clone(), terminal);
+
+        let details = ws.pane_details(&terminals);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].label, "codebuddy");
+        assert_eq!(details[0].agent_label, "codebuddy");
+        assert_eq!(details[0].agent, Some(Agent::Codebuddy));
+        assert_eq!(details[0].state, AgentState::Idle);
+        assert!(!details[0].seen);
+    }
+
+    #[test]
     fn pane_details_includes_tab_context_for_multi_tab_workspace() {
         let mut ws = Workspace::test_new("test");
         ws.tabs[0].custom_name = Some("main".into());

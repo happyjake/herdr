@@ -43,6 +43,7 @@ pub struct AgentDetection {
 pub enum Agent {
     Pi,
     Claude,
+    Codebuddy,
     Codex,
     Gemini,
     Cursor,
@@ -65,9 +66,10 @@ pub enum Agent {
 }
 
 impl Agent {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::Pi,
         Self::Claude,
+        Self::Codebuddy,
         Self::Codex,
         Self::Gemini,
         Self::Cursor,
@@ -89,9 +91,10 @@ impl Agent {
         Self::Maki,
     ];
 
-    pub const SCREEN_MANIFEST_AGENTS: [Self; 19] = [
+    pub const SCREEN_MANIFEST_AGENTS: [Self; 20] = [
         Self::Pi,
         Self::Claude,
+        Self::Codebuddy,
         Self::Codex,
         Self::Gemini,
         Self::Cursor,
@@ -116,6 +119,7 @@ pub fn agent_label(agent: Agent) -> &'static str {
     match agent {
         Agent::Pi => "pi",
         Agent::Claude => "claude",
+        Agent::Codebuddy => "codebuddy",
         Agent::Codex => "codex",
         Agent::Gemini => "gemini",
         Agent::Cursor => "cursor",
@@ -142,6 +146,7 @@ pub fn interactive_agent_executable(agent: Agent) -> &'static str {
     match agent {
         Agent::Pi => "pi",
         Agent::Claude => "claude",
+        Agent::Codebuddy => "cbc",
         Agent::Codex => "codex",
         Agent::Gemini => "gemini",
         Agent::Cursor => "cursor-agent",
@@ -178,6 +183,7 @@ fn lookup_agent(name: &str) -> Option<Agent> {
     match name {
         "pi" => Some(Agent::Pi),
         "claude" | "claude-code" => Some(Agent::Claude),
+        "codebuddy" | "cbc" => Some(Agent::Codebuddy),
         "codex" => Some(Agent::Codex),
         "gemini" => Some(Agent::Gemini),
         "cursor" | "cursor-agent" => Some(Agent::Cursor),
@@ -658,6 +664,8 @@ mod tests {
         assert_eq!(identify_agent("pi"), Some(Agent::Pi));
         assert_eq!(identify_agent("claude"), Some(Agent::Claude));
         assert_eq!(identify_agent("claude-code"), Some(Agent::Claude));
+        assert_eq!(identify_agent("codebuddy"), Some(Agent::Codebuddy));
+        assert_eq!(identify_agent("cbc"), Some(Agent::Codebuddy));
         assert_eq!(identify_agent("codex"), Some(Agent::Codex));
         assert_eq!(identify_agent("gemini"), Some(Agent::Gemini));
         assert_eq!(identify_agent("cursor"), Some(Agent::Cursor));
@@ -691,6 +699,8 @@ mod tests {
     fn parse_known_agent_labels() {
         assert_eq!(parse_agent_label("pi"), Some(Agent::Pi));
         assert_eq!(parse_agent_label("claude"), Some(Agent::Claude));
+        assert_eq!(parse_agent_label("codebuddy"), Some(Agent::Codebuddy));
+        assert_eq!(parse_agent_label("cbc"), Some(Agent::Codebuddy));
         assert_eq!(parse_agent_label("cursor-agent"), Some(Agent::Cursor));
         assert_eq!(parse_agent_label("devin-cli"), Some(Agent::Devin));
         assert_eq!(parse_agent_label("agy"), Some(Agent::Antigravity));
@@ -727,6 +737,7 @@ mod tests {
         let expected = [
             (Agent::Pi, "pi"),
             (Agent::Claude, "claude"),
+            (Agent::Codebuddy, "cbc"),
             (Agent::Codex, "codex"),
             (Agent::Gemini, "gemini"),
             (Agent::Cursor, "cursor-agent"),
@@ -789,6 +800,7 @@ mod tests {
     fn identify_case_insensitive() {
         assert_eq!(identify_agent("Pi"), Some(Agent::Pi));
         assert_eq!(identify_agent("CLAUDE"), Some(Agent::Claude));
+        assert_eq!(identify_agent("CodeBuddy"), Some(Agent::Codebuddy));
         assert_eq!(identify_agent("Codex"), Some(Agent::Codex));
         assert_eq!(identify_agent("Devin"), Some(Agent::Devin));
     }
@@ -807,6 +819,22 @@ mod tests {
             identify_agent_in_job(&job),
             Some((Agent::Codex, "codex".to_string()))
         );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_node_wrapped_codebuddy_binaries() {
+        for binary in ["codebuddy", "cbc"] {
+            let path = format!("/opt/homebrew/bin/{binary}");
+            let job = crate::platform::ForegroundJob {
+                process_group_id: 123,
+                processes: vec![foreground_process(123, "node", &["node", &path])],
+            };
+
+            assert_eq!(
+                identify_agent_in_job(&job),
+                Some((Agent::Codebuddy, "codebuddy".to_string()))
+            );
+        }
     }
 
     #[test]

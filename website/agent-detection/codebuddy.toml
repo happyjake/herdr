@@ -1,0 +1,32 @@
+id = "codebuddy"
+version = "2026.07.09.1"
+min_engine_version = 2
+updated_at = "2026-07-09T00:00:00Z"
+aliases = ["cbc"]
+
+# Evidence: CodeBuddy Code v2.117.2 captured in a 100x30 tmux PTY with
+# CODEBUDDY_API_KEY and CODEBUDDY_BASE_URL pointed at a local mock endpoint.
+# The idle footer renders a prompt box with an ASCII input marker:
+#
+#   ───────────────────────────────────────────────────────────────────────
+#   >
+#   ───────────────────────────────────────────────────────────────────────
+#   ? for shortcuts
+#
+# Inside the prompt_box_body region the invariant live idle control is the
+# prompt marker, ">", not Claude's "❯". The stock "? for shortcuts" banner is
+# outside this region and can share its line with optional status chips.
+
+[[rules]]
+id = "live_prompt_box"
+state = "idle"
+priority = 950
+region = "prompt_box_body"
+visible_idle = true
+line_regex = ['^\s*>']
+not = [
+  { contains = ["enter to confirm"] },
+  { contains = ["esc to exit"] },
+  { contains = ["enter to select"] },
+  { contains = ["esc to cancel"] },
+]
