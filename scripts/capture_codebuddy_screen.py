@@ -2,10 +2,11 @@
 """Capture account-free CodeBuddy screen fixtures in a tmux PTY.
 
 The harness starts a local mock model server, points CodeBuddy at it with
-CODEBUDDY_API_KEY and CODEBUDDY_BASE_URL, runs CodeBuddy in tmux with an
-isolated HOME under .local, captures the workspace trust prompt, accepts it,
-captures the idle prompt-box screen, then returns a mock Bash tool-call and
-captures the resulting permission prompt as text and ANSI fixtures.
+CODEBUDDY_API_KEY and CODEBUDDY_BASE_URL, runs CodeBuddy in tmux with isolated
+HOME and CODEBUDDY_CONFIG_DIR directories under .local, captures the workspace
+trust prompt, accepts it, captures the idle prompt-box screen, captures menu
+skip screens, then delays a mock Bash tool-call long enough to capture working
+and permission fixtures as text and ANSI.
 
 Example:
     python3 scripts/capture_codebuddy_screen.py --fixture-dir tests/fixtures/agent-screen/codebuddy
@@ -32,19 +33,33 @@ from typing import Any, Callable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = PROJECT_ROOT / ".local/codebuddy-screen-captures"
 IDLE_PROMPT_RE = re.compile(r"(?m)^─{3,}.*\n>\s*\n─{3,}")
+OSC_WORKING_TITLE_RE = re.compile(r"^[\u2800-\u28ff] ")
 TRUST_PROMPT = "Do you trust the files in this folder?"
 PERMISSION_PROMPT = "Do you want to proceed?"
 PERMISSION_USER_PROMPT = "Please run echo herdr-permission"
 PERMISSION_COMMAND = "echo herdr-permission"
 PERMISSION_COMMAND_DESCRIPTION = "Print permission fixture marker"
 TITLE_RESPONSE = '{"isNewTopic": true, "title": "Run permission command"}'
+WORKING_INDICATOR = "esc to interrupt"
+MODEL_PICKER_PROMPT = "/model"
+MODEL_PICKER_MARKER = "Select Model"
+TRANSCRIPT_MARKER = "Showing detailed transcript"
 FIXTURE_FILES = (
     "trust.txt",
     "trust.ansi",
     "idle.txt",
     "idle.ansi",
+    "model-picker.txt",
+    "model-picker.ansi",
+    "model-picker-session.txt",
+    "model-picker-session.ansi",
+    "working.txt",
+    "working.ansi",
+    "working-osc-title.txt",
     "permission.txt",
     "permission.ansi",
+    "transcript-viewer.txt",
+    "transcript-viewer.ansi",
 )
 
 
@@ -82,6 +97,9 @@ class MockModelHandler(BaseHTTPRequestHandler):
         if self.path.endswith("/chat/completions"):
             if body_json.get("stream"):
                 if body_json.get("tools"):
+                    delay = self.server.consume_tool_stream_delay()
+                    if delay > 0.0:
+                        time.sleep(delay)
                     self.write_openai_bash_tool_call_stream()
                 else:
                     self.write_openai_text_stream(TITLE_RESPONSE)
@@ -206,6 +224,7 @@ class MockModelServer(ThreadingHTTPServer):
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), MockModelHandler)
         self.requests: list[dict[str, Any]] = []
+        self._tool_stream_delay_seconds = 0.0
         self._lock = threading.Lock()
 
     @property
@@ -228,6 +247,16 @@ class MockModelServer(ThreadingHTTPServer):
                 }
             )
 
+    def delay_next_tool_stream(self, seconds: float) -> None:
+        with self._lock:
+            self._tool_stream_delay_seconds = seconds
+
+    def consume_tool_stream_delay(self) -> float:
+        with self._lock:
+            seconds = self._tool_stream_delay_seconds
+            self._tool_stream_delay_seconds = 0.0
+            return seconds
+
 
 def main() -> int:
     args = parse_args()
@@ -240,9 +269,10 @@ def main() -> int:
     run_dir = args.out / datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=False)
     home = run_dir / "home"
+    codebuddy_config = run_dir / "codebuddy-config"
     xdg_config = run_dir / "xdg-config"
     xdg_state = run_dir / "xdg-state"
-    for path in (home, xdg_config, xdg_state):
+    for path in (home, codebuddy_config, xdg_config, xdg_state):
         path.mkdir(parents=True, exist_ok=True)
 
     server = MockModelServer()
@@ -257,6 +287,7 @@ def main() -> int:
             command=command,
             session_name=session_name,
             home=home,
+            codebuddy_config=codebuddy_config,
             xdg_config=xdg_config,
             xdg_state=xdg_state,
             base_url=server.base_url,
@@ -273,10 +304,38 @@ def main() -> int:
         (run_dir / "idle.txt").write_text(idle_screen, encoding="utf-8")
         capture_pane(pane_id, run_dir / "idle.ansi", ansi=True)
 
+        submit_prompt(pane_id, MODEL_PICKER_PROMPT)
+        model_picker_screen = wait_for_model_picker(pane_id, args.timeout)
+        (run_dir / "model-picker.txt").write_text(model_picker_screen, encoding="utf-8")
+        capture_pane(pane_id, run_dir / "model-picker.ansi", ansi=True)
+        run(["tmux", "send-keys", "-t", pane_id, "Tab"])
+        model_picker_session_screen = wait_for_model_picker_session(pane_id, args.timeout)
+        (run_dir / "model-picker-session.txt").write_text(
+            model_picker_session_screen,
+            encoding="utf-8",
+        )
+        capture_pane(pane_id, run_dir / "model-picker-session.ansi", ansi=True)
+        run(["tmux", "send-keys", "-t", pane_id, "Escape"])
+        wait_for_idle(pane_id, args.timeout)
+
+        server.delay_next_tool_stream(args.working_delay)
         submit_prompt(pane_id, PERMISSION_USER_PROMPT)
+        working_screen = wait_for_working(pane_id, args.timeout)
+        (run_dir / "working.txt").write_text(working_screen, encoding="utf-8")
+        capture_pane(pane_id, run_dir / "working.ansi", ansi=True)
+        (run_dir / "working-osc-title.txt").write_text(
+            wait_for_working_osc_title(pane_id, min(args.working_delay, args.timeout)),
+            encoding="utf-8",
+        )
         permission_screen = wait_for_permission(pane_id, args.timeout)
         (run_dir / "permission.txt").write_text(permission_screen, encoding="utf-8")
         capture_pane(pane_id, run_dir / "permission.ansi", ansi=True)
+        dismiss_permission_prompt(pane_id, args.timeout)
+
+        run(["tmux", "send-keys", "-t", pane_id, "C-o"])
+        transcript_screen = wait_for_transcript_viewer(pane_id, args.timeout)
+        (run_dir / "transcript-viewer.txt").write_text(transcript_screen, encoding="utf-8")
+        capture_pane(pane_id, run_dir / "transcript-viewer.ansi", ansi=True)
         write_metadata(
             run_dir,
             args=args,
@@ -313,6 +372,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rows", type=int, default=30, help="tmux PTY rows")
     parser.add_argument("--startup-delay", type=float, default=4.0, help="seconds before trust capture")
     parser.add_argument("--timeout", type=float, default=30.0, help="seconds to wait for idle")
+    parser.add_argument(
+        "--working-delay",
+        type=float,
+        default=8.0,
+        help="seconds to delay the mock tool-call stream for the working capture",
+    )
     parser.add_argument("--keep-session", action="store_true", help="leave tmux session running")
     return parser.parse_args()
 
@@ -328,6 +393,7 @@ def start_tmux_codebuddy(
     command: str,
     session_name: str,
     home: Path,
+    codebuddy_config: Path,
     xdg_config: Path,
     xdg_state: Path,
     base_url: str,
@@ -339,6 +405,7 @@ def start_tmux_codebuddy(
             "&&",
             "env",
             f"HOME={shlex.quote(str(home.resolve()))}",
+            f"CODEBUDDY_CONFIG_DIR={shlex.quote(str(codebuddy_config.resolve()))}",
             f"XDG_CONFIG_HOME={shlex.quote(str(xdg_config.resolve()))}",
             f"XDG_STATE_HOME={shlex.quote(str(xdg_state.resolve()))}",
             "CODEBUDDY_API_KEY=herdr-capture",
@@ -392,7 +459,8 @@ def wait_for_idle(pane_id: str, timeout: float) -> str:
 
 def submit_prompt(pane_id: str, prompt: str) -> None:
     run(["tmux", "send-keys", "-l", "-t", pane_id, prompt])
-    run(["tmux", "send-keys", "-t", pane_id, "C-m"])
+    time.sleep(0.2)
+    run(["tmux", "send-keys", "-t", pane_id, "Enter"])
 
 
 def wait_for_permission(pane_id: str, timeout: float) -> str:
@@ -401,6 +469,68 @@ def wait_for_permission(pane_id: str, timeout: float) -> str:
         timeout,
         label="permission prompt",
         predicate=lambda screen: PERMISSION_PROMPT in screen and "Bash command" in screen,
+    )
+
+
+def dismiss_permission_prompt(pane_id: str, timeout: float) -> str:
+    run(["tmux", "send-keys", "-t", pane_id, "Escape"])
+    try:
+        return wait_for_idle(pane_id, min(timeout, 5.0))
+    except RuntimeError:
+        run(["tmux", "send-keys", "-t", pane_id, "Down"])
+        run(["tmux", "send-keys", "-t", pane_id, "Down"])
+        run(["tmux", "send-keys", "-t", pane_id, "Enter"])
+        return wait_for_idle(pane_id, timeout)
+
+
+def wait_for_working(pane_id: str, timeout: float) -> str:
+    return wait_for_screen(
+        pane_id,
+        timeout,
+        label="working indicator",
+        predicate=lambda screen: WORKING_INDICATOR in screen.lower(),
+    )
+
+
+def wait_for_working_osc_title(pane_id: str, timeout: float) -> str:
+    deadline = time.monotonic() + timeout
+    last_title = ""
+    while time.monotonic() < deadline:
+        last_title = capture_pane_title(pane_id)
+        if OSC_WORKING_TITLE_RE.search(last_title):
+            return last_title
+        time.sleep(0.2)
+    return last_title
+
+
+def wait_for_model_picker(pane_id: str, timeout: float) -> str:
+    return wait_for_screen(
+        pane_id,
+        timeout,
+        label="model picker",
+        predicate=lambda screen: MODEL_PICKER_MARKER in screen
+        and "Enter to confirm" in screen
+        and "Esc to exit" in screen,
+    )
+
+
+def wait_for_model_picker_session(pane_id: str, timeout: float) -> str:
+    return wait_for_screen(
+        pane_id,
+        timeout,
+        label="session model picker",
+        predicate=lambda screen: MODEL_PICKER_MARKER in screen
+        and "Session" in screen
+        and "Switch model for this session only" in screen,
+    )
+
+
+def wait_for_transcript_viewer(pane_id: str, timeout: float) -> str:
+    return wait_for_screen(
+        pane_id,
+        timeout,
+        label="transcript viewer",
+        predicate=lambda screen: TRANSCRIPT_MARKER in screen,
     )
 
 
@@ -434,6 +564,10 @@ def capture_pane_text(pane_id: str) -> str:
     return run(["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-200"]).stdout
 
 
+def capture_pane_title(pane_id: str) -> str:
+    return run(["tmux", "display-message", "-p", "-t", pane_id, "#{pane_title}"]).stdout
+
+
 def write_metadata(
     run_dir: Path,
     *,
@@ -458,6 +592,7 @@ def write_metadata(
         "env": {
             "CODEBUDDY_API_KEY": "herdr-capture",
             "CODEBUDDY_BASE_URL": base_url,
+            "CODEBUDDY_CONFIG_DIR": str((run_dir / "codebuddy-config").resolve()),
         },
     }
     (run_dir / "metadata.json").write_text(

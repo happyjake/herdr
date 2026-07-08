@@ -1,0 +1,33 @@
+╭─── CodeBuddy Code v2.117.2 ──────────────────────────────────────────────────────────────────────╮
+│                                [2m│[0m Tips for getting started                                        │
+│                                [2m│[0m Run /init to create a CODEBUDDY.md or AGENTS.md file with instr…│
+│                                [2m│[0m Press / to use commands, @ to mention files.                    │
+│        ████        ████        [2m│[0m Open Web UI in browser for a richer interactive experience.     │
+│        ████████████████        [2m│[0m [2m───────────────────────────────────────────────────────────────[0m │
+│      ████            ████      [2m│[0m Recent activity                                                 │
+│      ████  ██    ██  ████      [2m│[0m No recent activity                                              │
+│      ████  ██    ██  ████      [2m│[0m [2m───────────────────────────────────────────────────────────────[0m │
+│      ████            ████      [2m│[0m [1m]8;;http://127.0.0.1:58934\http://127.0.0.1:58934[0m]8;;\                                          │
+│        ████████████████        [2m│[0m No login or model information available.                        │
+│                                [2m│[0m /Users/anon/code/herdr-worktrees/case-074-codebuddy-working     │
+│                                [2m│[0m                                                                 │
+│                                [2m│[0m                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+> /model
+  ⎿ (No content)
+
+> Please run echo herdr-permission
+
+● [1mBash[0m(echo herdr-permission)
+  ⎿ No (tell CodeBuddy what to do differently)
+
+> /model
+  ⎿ (No content)
+
+> Please run echo herdr-permission
+
+● [1mBash[0m(command: "echo herdr-permission", description: "Print permission fixture marker")
+  ⎿ No (tell CodeBuddy what to do differently)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Showing detailed transcript · ctrl+o to toggle

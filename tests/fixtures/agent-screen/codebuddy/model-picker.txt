@@ -1,0 +1,37 @@
+╭─── CodeBuddy Code v2.117.2 ──────────────────────────────────────────────────────────────────────╮
+│                                │ Tips for getting started                                        │
+│                                │ Run /init to create a CODEBUDDY.md or AGENTS.md file with instr…│
+│                                │ Press / to use commands, @ to mention files.                    │
+│        ████        ████        │ Open Web UI in browser for a richer interactive experience.     │
+│        ████████████████        │ ─────────────────────────────────────────────────────────────── │
+│      ████            ████      │ Recent activity                                                 │
+│      ████  ██    ██  ████      │ No recent activity                                              │
+│      ████  ██    ██  ████      │ ─────────────────────────────────────────────────────────────── │
+│      ████            ████      │ http://127.0.0.1:58934                                          │
+│        ████████████████        │ No login or model information available.                        │
+│                                │ /Users/anon/code/herdr-worktrees/case-074-codebuddy-working     │
+│                                │                                                                 │
+│                                │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+> /model
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Select Model   Global   Session  (tab to switch)
+ Select a model for all future sessions.
+
+ ❯ Default                  【default-model】                (x2.00 credits) ✔
+   Gemini-3.1-Pro           【gemini-3.1-pro】               (x1.32 credits)
+   Gemini-3.0-Flash         【gemini-3.0-flash】             (x0.33 credits)
+   Gemini-3.5-Flash         【gemini-3.5-flash】             (x0.99 credits)
+   Gemini-2.5-Pro           【gemini-2.5-pro】               (x0.90 credits)
+   Gemini-2.5-Flash         【gemini-2.5-flash】             (x0.22 credits)
+   Gemini-3.1-flash-lite    【gemini-3.1-flash-lite】        (x0.17 credits)
+   GPT-5.5                  【gpt-5.5】                      (x3.31 credits)
+   GPT-5.4                  【gpt-5.4】                      (x1.65 credits)
+   GPT-5.3-Codex            【gpt-5.3-codex】                (x1.25 credits)
+   GPT-5.1-Codex            【gpt-5.1-codex】                (x0.90 credits)
+   GPT-5.1-Codex-Mini       【gpt-5.1-codex-mini】           (x0.18 credits)
+   DeepSeek-V3.2            【deepseek-v3-2-volc】           (x0.29 credits)
+   GLM-5.0                  【glm-5.0】                      (x0.80 credits)
+   Kimi-K2.5                【kimi-k2.5】                    (x0.45 credits)
+ Enter to confirm · Tab to switch scope · Esc to exit

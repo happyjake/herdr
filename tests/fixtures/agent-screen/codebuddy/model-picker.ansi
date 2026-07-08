@@ -1,0 +1,37 @@
+╭─── CodeBuddy Code v2.117.2 ──────────────────────────────────────────────────────────────────────╮
+│                                [2m│[0m Tips for getting started                                        │
+│                                [2m│[0m Run /init to create a CODEBUDDY.md or AGENTS.md file with instr…│
+│                                [2m│[0m Press / to use commands, @ to mention files.                    │
+│        ████        ████        [2m│[0m Open Web UI in browser for a richer interactive experience.     │
+│        ████████████████        [2m│[0m [2m───────────────────────────────────────────────────────────────[0m │
+│      ████            ████      [2m│[0m Recent activity                                                 │
+│      ████  ██    ██  ████      [2m│[0m No recent activity                                              │
+│      ████  ██    ██  ████      [2m│[0m [2m───────────────────────────────────────────────────────────────[0m │
+│      ████            ████      [2m│[0m [1m]8;;http://127.0.0.1:58934\http://127.0.0.1:58934[0m]8;;\                                          │
+│        ████████████████        [2m│[0m No login or model information available.                        │
+│                                [2m│[0m /Users/anon/code/herdr-worktrees/case-074-codebuddy-working     │
+│                                [2m│[0m                                                                 │
+│                                [2m│[0m                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+> /model
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Select Model   Global   Session  (tab to switch)
+ Select a model for all future sessions.
+
+ ❯ Default                  [2m【default-model】[0m                (x2.00 credits) ✔
+   Gemini-3.1-Pro           [2m【gemini-3.1-pro】[0m               (x1.32 credits)
+   Gemini-3.0-Flash         [2m【gemini-3.0-flash】[0m             (x0.33 credits)
+   Gemini-3.5-Flash         [2m【gemini-3.5-flash】[0m             (x0.99 credits)
+   Gemini-2.5-Pro           [2m【gemini-2.5-pro】[0m               (x0.90 credits)
+   Gemini-2.5-Flash         [2m【gemini-2.5-flash】[0m             (x0.22 credits)
+   Gemini-3.1-flash-lite    [2m【gemini-3.1-flash-lite】[0m        (x0.17 credits)
+   GPT-5.5                  [2m【gpt-5.5】[0m                      (x3.31 credits)
+   GPT-5.4                  [2m【gpt-5.4】[0m                      (x1.65 credits)
+   GPT-5.3-Codex            [2m【gpt-5.3-codex】[0m                (x1.25 credits)
+   GPT-5.1-Codex            [2m【gpt-5.1-codex】[0m                (x0.90 credits)
+   GPT-5.1-Codex-Mini       [2m【gpt-5.1-codex-mini】[0m           (x0.18 credits)
+   DeepSeek-V3.2            [2m【deepseek-v3-2-volc】[0m           (x0.29 credits)
+   GLM-5.0                  [2m【glm-5.0】[0m                      (x0.80 credits)
+   Kimi-K2.5                [2m【kimi-k2.5】[0m                    (x0.45 credits)
+ Enter to confirm · Tab to switch scope · Esc to exit
