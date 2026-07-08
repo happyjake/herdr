@@ -1,0 +1,38 @@
+╭─── CodeBuddy Code v2.117.2 ──────────────────────────────────────────────────────────────────────╮
+│                                [2m│[0m Tips for getting started                                        │
+│                                [2m│[0m Run /init to create a CODEBUDDY.md or AGENTS.md file with instr…│
+│                                [2m│[0m Press Esc twice to reset the input box.                         │
+│        ████        ████        [2m│[0m Shift + Enter to add a new line (run /terminal-setup if not wor…│
+│        ████████████████        [2m│[0m [2m───────────────────────────────────────────────────────────────[0m │
+│      ████            ████      [2m│[0m Recent activity                                                 │
+│      ████  ██    ██  ████      [2m│[0m No recent activity                                              │
+│      ████  ██    ██  ████      [2m│[0m [2m───────────────────────────────────────────────────────────────[0m │
+│      ████            ████      [2m│[0m [1m]8;;http://127.0.0.1:49709\http://127.0.0.1:49709[0m]8;;\                                          │
+│        ████████████████        [2m│[0m No login or model information available.                        │
+│                                [2m│[0m /Users/anon/code/herdr-worktrees/case-073-codebuddy-blocked     │
+│                                [2m│[0m                                                                 │
+│                                [2m│[0m                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+> Please run echo herdr-permission
+
+● [1mBash[0m(echo herdr-permission)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ [1mBash command[0m
+
+   echo herdr-permission
+   Print permission fixture marker
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Do you want to proceed?
+
+ > 1. Yes
+   2. Yes, and don't ask again for session (shift + tab)
+   3. No, and tell CodeBuddy what to do differently (escape)
+
+
+
+
+
+
