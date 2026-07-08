@@ -43,6 +43,7 @@ pub struct AgentDetection {
 pub enum Agent {
     Pi,
     Claude,
+    Codebuddy,
     Codex,
     Gemini,
     Cursor,
@@ -68,9 +69,10 @@ pub enum Agent {
 }
 
 impl Agent {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::Pi,
         Self::Claude,
+        Self::Codebuddy,
         Self::Codex,
         Self::Gemini,
         Self::Cursor,
@@ -95,9 +97,10 @@ impl Agent {
         Self::Muse,
     ];
 
-    pub const SCREEN_MANIFEST_AGENTS: [Self; 22] = [
+    pub const SCREEN_MANIFEST_AGENTS: [Self; 23] = [
         Self::Pi,
         Self::Claude,
+        Self::Codebuddy,
         Self::Codex,
         Self::Gemini,
         Self::Cursor,
@@ -125,6 +128,7 @@ pub fn agent_label(agent: Agent) -> &'static str {
     match agent {
         Agent::Pi => "pi",
         Agent::Claude => "claude",
+        Agent::Codebuddy => "codebuddy",
         Agent::Codex => "codex",
         Agent::Gemini => "gemini",
         Agent::Cursor => "cursor",
@@ -154,6 +158,7 @@ pub fn interactive_agent_executable(agent: Agent) -> &'static str {
     match agent {
         Agent::Pi => "pi",
         Agent::Claude => "claude",
+        Agent::Codebuddy => "cbc",
         Agent::Codex => "codex",
         Agent::Gemini => "gemini",
         Agent::Cursor => {
@@ -200,6 +205,7 @@ fn lookup_agent(name: &str) -> Option<Agent> {
     match name {
         "pi" => Some(Agent::Pi),
         "claude" | "claude-code" => Some(Agent::Claude),
+        "codebuddy" | "cbc" => Some(Agent::Codebuddy),
         "codex" => Some(Agent::Codex),
         "gemini" => Some(Agent::Gemini),
         "cursor" | "cursor-agent" => Some(Agent::Cursor),
@@ -402,6 +408,17 @@ fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> Stri
         .or_else(|| cmdline_argv0_agent_name(process.cmdline.as_deref().unwrap_or_default()))
     {
         return wrapped_agent;
+    }
+
+    // Some agents rewrite their argv after launch to set a process title,
+    // which can truncate or replace argv0 (e.g. kimi's title degrades to
+    // "kimi-co" when the original argv space is short, with env vars leaking
+    // into argv). The OS-reported process name still carries the real
+    // executable name, so try it when argv0 identified nothing.
+    if process.argv0.as_deref() != Some(process.name.as_str())
+        && identify_agent(&process.name).is_some()
+    {
+        return process.name.clone();
     }
 
     effective.to_string()
@@ -905,6 +922,8 @@ mod tests {
         assert_eq!(identify_agent("pi"), Some(Agent::Pi));
         assert_eq!(identify_agent("claude"), Some(Agent::Claude));
         assert_eq!(identify_agent("claude-code"), Some(Agent::Claude));
+        assert_eq!(identify_agent("codebuddy"), Some(Agent::Codebuddy));
+        assert_eq!(identify_agent("cbc"), Some(Agent::Codebuddy));
         assert_eq!(identify_agent("codex"), Some(Agent::Codex));
         assert_eq!(identify_agent("gemini"), Some(Agent::Gemini));
         assert_eq!(identify_agent("cursor"), Some(Agent::Cursor));
@@ -957,6 +976,8 @@ mod tests {
     fn parse_known_agent_labels() {
         assert_eq!(parse_agent_label("pi"), Some(Agent::Pi));
         assert_eq!(parse_agent_label("claude"), Some(Agent::Claude));
+        assert_eq!(parse_agent_label("codebuddy"), Some(Agent::Codebuddy));
+        assert_eq!(parse_agent_label("cbc"), Some(Agent::Codebuddy));
         assert_eq!(parse_agent_label("cursor-agent"), Some(Agent::Cursor));
         assert_eq!(parse_agent_label("devin-cli"), Some(Agent::Devin));
         assert_eq!(parse_agent_label("agy"), Some(Agent::Antigravity));
@@ -995,6 +1016,7 @@ mod tests {
         let expected = [
             (Agent::Pi, "pi"),
             (Agent::Claude, "claude"),
+            (Agent::Codebuddy, "cbc"),
             (Agent::Codex, "codex"),
             (Agent::Gemini, "gemini"),
             (
@@ -1081,6 +1103,7 @@ mod tests {
     fn identify_case_insensitive() {
         assert_eq!(identify_agent("Pi"), Some(Agent::Pi));
         assert_eq!(identify_agent("CLAUDE"), Some(Agent::Claude));
+        assert_eq!(identify_agent("CodeBuddy"), Some(Agent::Codebuddy));
         assert_eq!(identify_agent("Codex"), Some(Agent::Codex));
         assert_eq!(identify_agent("Devin"), Some(Agent::Devin));
     }
@@ -1332,6 +1355,22 @@ mod tests {
     }
 
     #[test]
+    fn identify_agent_in_job_detects_node_wrapped_codebuddy_binaries() {
+        for binary in ["codebuddy", "cbc"] {
+            let path = format!("/opt/homebrew/bin/{binary}");
+            let job = crate::platform::ForegroundJob {
+                process_group_id: 123,
+                processes: vec![foreground_process(123, "node", &["node", &path])],
+            };
+
+            assert_eq!(
+                identify_agent_in_job(&job),
+                Some((Agent::Codebuddy, "codebuddy".to_string()))
+            );
+        }
+    }
+
+    #[test]
     fn identify_agent_in_job_prefers_recognized_process_group_leader() {
         let job = crate::platform::ForegroundJob {
             process_group_id: 42,
@@ -1382,6 +1421,25 @@ mod tests {
         assert_eq!(
             identify_agent_in_job(&job),
             Some((Agent::Hermes, "hermes".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_kimi_from_name_when_argv0_is_rewritten() {
+        // kimi rewrites its argv after launch to set a process title; when the
+        // original argv space is short (e.g. `kimi -y`), the title truncates
+        // to "kimi-co" and env vars leak into argv. The OS process name stays
+        // "kimi".
+        let mut kimi = foreground_process(42, "kimi", &["kimi-co", "COLORTERM=truecolor"]);
+        kimi.argv0 = Some("kimi-co".to_string());
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![kimi],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Kimi, "kimi".to_string()))
         );
     }
 

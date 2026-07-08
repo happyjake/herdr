@@ -157,6 +157,23 @@ mod tests {
     }
 
     #[test]
+    fn pane_details_lists_codebuddy_detected_agent_label() {
+        let mut ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        ws.tabs[0].panes.get_mut(&root_pane).unwrap().seen = false;
+        let mut terminals = HashMap::new();
+        let mut terminal = terminal_for_pane(&ws, root_pane);
+        terminal.set_detected_state(Some(Agent::Codebuddy), AgentState::Idle);
+        terminals.insert(terminal.id.clone(), terminal);
+
+        let details = ws.pane_details(&terminals);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].agent_kind_label.as_deref(), Some("codebuddy"));
+        assert_eq!(details[0].state, AgentState::Idle);
+        assert!(!details[0].seen);
+    }
+
+    #[test]
     fn pane_details_use_tab_vector_index_not_stable_public_tab_number() {
         let mut ws = Workspace::test_new("test");
         let removed_tab = ws.test_add_tab(Some("removed"));
