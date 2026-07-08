@@ -406,7 +406,18 @@ fn muse_manifest_requires_complete_live_controls() {
 }
 
 #[test]
-fn codebuddy_manifest_detects_captured_idle_prompt_box() {
+fn codebuddy_manifest_detects_captured_idle_and_blocked_states() {
+    fn assert_codebuddy_blocked_by(screen: &str, expected_rule_id: &str) {
+        let detected = explain(Agent::Codebuddy, screen);
+
+        assert_eq!(detected.state, AgentState::Blocked);
+        assert_eq!(
+            detected.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some(expected_rule_id)
+        );
+        assert!(detected.visible_blocker);
+    }
+
     let idle = explain(
         Agent::Codebuddy,
         include_str!("../../../tests/fixtures/agent-screen/codebuddy/idle.txt"),
@@ -418,6 +429,35 @@ fn codebuddy_manifest_detects_captured_idle_prompt_box() {
         Some("live_prompt_box")
     );
     assert!(idle.visible_idle);
+
+    assert_codebuddy_blocked_by(
+        include_str!("../../../tests/fixtures/agent-screen/codebuddy/trust.txt"),
+        "workspace_trust_prompt",
+    );
+
+    assert_codebuddy_blocked_by(
+        include_str!("../../../tests/fixtures/agent-screen/codebuddy/permission.txt"),
+        "bash_permission_prompt",
+    );
+
+    assert_codebuddy_blocked_by(
+        include_str!(
+            "../../../tests/fixtures/agent-screen/codebuddy/permission-selection-option-2.txt"
+        ),
+        "bash_permission_prompt",
+    );
+
+    assert_codebuddy_blocked_by(
+        include_str!(
+            "../../../tests/fixtures/agent-screen/codebuddy/permission-selection-option-3.txt"
+        ),
+        "bash_permission_prompt",
+    );
+
+    assert_codebuddy_blocked_by(
+        include_str!("../../../tests/fixtures/agent-screen/codebuddy/trust-narrow-wrapped.txt"),
+        "workspace_trust_prompt",
+    );
 }
 
 #[test]

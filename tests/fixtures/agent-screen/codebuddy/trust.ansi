@@ -1,0 +1,29 @@
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ [1mDo you trust the files in this folder?[0m                                                           │
+│                                                                                                  │
+│ [1m/Users/anon/code/herdr-worktrees/case-073-codebuddy-blocked[0m                                      │
+│                                                                                                  │
+│ CodeBuddy Code may read, write, or execute files contained in this directory. This can pose      │
+│ security risks, so only use files and bash commands from trusted sources.                        │
+│                                                                                                  │
+│ Learn more ( https://www.codebuddy.ai/docs/cli )                                                 │
+│                                                                                                  │
+│   > 1. Trust folder only (case-073-codebuddy-blocked)                                            │
+│     2. Trust parent folder (herdr-worktrees/**)                                                  │
+│     3. Trust folder and all subdirectories (case-073-codebuddy-blocked/**)                       │
+│     4. No, exit (escape)                                                                         │
+│                                                                                                  │
+│ Enter to confirm • Esc to exit                                                                   │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+

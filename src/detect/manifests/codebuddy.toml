@@ -1,5 +1,5 @@
 id = "codebuddy"
-version = "2026.07.09.1"
+version = "2026.07.09.2"
 min_engine_version = 2
 updated_at = "2026-07-09T00:00:00Z"
 aliases = ["cbc"]
@@ -16,6 +16,50 @@ aliases = ["cbc"]
 # Inside the prompt_box_body region the invariant live idle control is the
 # prompt marker, ">", not Claude's "❯". The stock "? for shortcuts" banner is
 # outside this region and can share its line with optional status chips.
+#
+# Blocked evidence from captured trust.txt and permission.txt fixtures:
+#
+#   Do you trust the files in this folder?
+#     1. Trust folder only (case-073-codebuddy-blocked)
+#     4. No, exit (escape)
+#   Enter to confirm • Esc to exit
+#
+#   Bash command
+#   Do you want to proceed?
+#     1. Yes
+#     2. Yes, and don't ask again for session (shift + tab)
+#     3. No, and tell CodeBuddy what to do differently (escape)
+
+[[rules]]
+id = "workspace_trust_prompt"
+state = "blocked"
+priority = 980
+region = "whole_recent"
+visible_blocker = true
+contains = [
+  "do you trust the files in this folder?",
+  "enter to confirm • esc to exit",
+]
+any = [
+  { line_regex = ['(?i)^\s*│?\s*>?\s*1\.\s*Trust folder only\b'] },
+  { line_regex = ['(?i)^\s*│?\s*>?\s*4\.\s*No, exit\b'] },
+]
+
+[[rules]]
+id = "bash_permission_prompt"
+state = "blocked"
+priority = 970
+region = "whole_recent"
+visible_blocker = true
+contains = [
+  "bash command",
+  "do you want to proceed?",
+]
+any = [
+  { line_regex = ['(?i)^\s*│?\s*>?\s*1\.\s*Yes\b'] },
+  { line_regex = ['(?i)^\s*│?\s*>?\s*2\.\s*Yes\b'] },
+  { line_regex = ['(?i)^\s*│?\s*>?\s*3\.\s*No\b'] },
+]
 
 [[rules]]
 id = "live_prompt_box"

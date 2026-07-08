@@ -1,0 +1,32 @@
+╭─── CodeBuddy Code v2.117.2 ──────────────────────────────────────────────────────────────────────╮
+│                                │ Tips for getting started                                        │
+│                                │ Run /init to create a CODEBUDDY.md or AGENTS.md file with instr…│
+│                                │ Press Esc twice to reset the input box.                         │
+│        ████        ████        │ Shift + Enter to add a new line (run /terminal-setup if not wor…│
+│        ████████████████        │ ─────────────────────────────────────────────────────────────── │
+│      ████            ████      │ Recent activity                                                 │
+│      ████  ██    ██  ████      │ No recent activity                                              │
+│      ████  ██    ██  ████      │ ─────────────────────────────────────────────────────────────── │
+│      ████            ████      │ http://127.0.0.1:49709                                          │
+│        ████████████████        │ No login or model information available.                        │
+│                                │ /Users/anon/code/herdr-worktrees/case-073-codebuddy-blocked     │
+│                                │                                                                 │
+│                                │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+> Please run echo herdr-permission
+
+● Bash(echo herdr-permission)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   echo herdr-permission
+   Print permission fixture marker
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Do you want to proceed?
+
+   1. Yes
+   2. Yes, and don't ask again for session (shift + tab)
+ > 3. No, and tell CodeBuddy what to do differently (escape)
