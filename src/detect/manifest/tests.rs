@@ -406,6 +406,21 @@ fn muse_manifest_requires_complete_live_controls() {
 }
 
 #[test]
+fn codebuddy_manifest_detects_captured_idle_prompt_box() {
+    let idle = explain(
+        Agent::Codebuddy,
+        include_str!("../../../tests/fixtures/agent-screen/codebuddy/idle.txt"),
+    );
+
+    assert_eq!(idle.state, AgentState::Idle);
+    assert_eq!(
+        idle.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("live_prompt_box")
+    );
+    assert!(idle.visible_idle);
+}
+
+#[test]
 fn manifest_validation_rejects_unknown_fields_empty_rules_invalid_regions_and_regexes() {
     assert!(parse_manifest(
         r#"
