@@ -1,5 +1,5 @@
 id = "codebuddy"
-version = "2026.07.09.2"
+version = "2026.07.09.4"
 min_engine_version = 2
 updated_at = "2026-07-09T00:00:00Z"
 aliases = ["cbc"]
@@ -29,6 +29,49 @@ aliases = ["cbc"]
 #     1. Yes
 #     2. Yes, and don't ask again for session (shift + tab)
 #     3. No, and tell CodeBuddy what to do differently (escape)
+#
+# Working and skip evidence from captured working.txt, working-osc-title.txt,
+# model-picker.txt, model-picker-session.txt, and transcript-viewer.txt fixtures:
+#
+#   ⠙ Run permission command
+#   ✶ Waking… (0s · preparing · ↑ 0 tokens · esc to interrupt)
+#
+#   Select Model   Global   Session  (tab to switch)
+#   Select a model for all future sessions.
+#   Enter to confirm · Tab to switch scope · Esc to exit
+#
+#   Select Model  Global   Session   (tab to switch)
+#   Switch model for this session only (won't persist).
+#   Enter to confirm · Tab to switch scope · Esc to exit
+#
+#   Showing detailed transcript · ctrl+o to toggle
+#
+# CodeBuddy can keep a braille OSC title while a permission prompt is visible,
+# so explicit blockers rank above working even though the OSC rule is still the
+# preferred working signal when no live blocker is on screen.
+
+[[rules]]
+id = "transcript_viewer"
+state = "unknown"
+priority = 1000
+region = "bottom_non_empty_lines(3)"
+skip_state_update = true
+contains = ["showing detailed transcript", "ctrl+o to toggle"]
+
+[[rules]]
+id = "model_picker_menu"
+state = "unknown"
+priority = 990
+region = "whole_recent"
+skip_state_update = true
+contains = [
+  "select model",
+]
+any = [
+  { contains = ["tab to switch"] },
+  { contains = ["enter to confirm"] },
+  { contains = ["esc to exit"] },
+]
 
 [[rules]]
 id = "workspace_trust_prompt"
@@ -62,6 +105,26 @@ any = [
 ]
 
 [[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 960
+region = "osc_title"
+visible_working = true
+regex = ['^[\x{2800}-\x{28FF}] ']
+
+[[rules]]
+id = "visible_working"
+state = "working"
+priority = 960
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+contains = ["esc to interrupt"]
+any = [
+  { contains = ["thinking..."] },
+  { contains = ["waking"] },
+]
+
+[[rules]]
 id = "live_prompt_box"
 state = "idle"
 priority = 950
@@ -73,4 +136,5 @@ not = [
   { contains = ["esc to exit"] },
   { contains = ["enter to select"] },
   { contains = ["esc to cancel"] },
+  { contains = ["esc to interrupt"] },
 ]
