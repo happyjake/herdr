@@ -1064,6 +1064,8 @@ pub struct PaneRuntime {
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
+    #[cfg(unix)]
+    pending_handoff_repaint_nudge: bool,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
 }
@@ -1910,6 +1912,10 @@ impl PaneRuntime {
     #[cfg(unix)]
     pub fn assume_handoff_ownership(&mut self) {
         self.preserve_processes_on_drop = false;
+        if self.pending_handoff_repaint_nudge {
+            self.pending_handoff_repaint_nudge = false;
+            self.nudge_child_redraw_after_handoff();
+        }
     }
 
     #[cfg(unix)]
@@ -2177,6 +2183,9 @@ impl PaneRuntime {
             terminal_title,
             initial_history_ansi,
         } = state;
+        let pending_handoff_repaint_nudge = input_state
+            .as_ref()
+            .is_some_and(|input_state| input_state.alternate_screen);
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
 
@@ -2291,7 +2300,7 @@ impl PaneRuntime {
             events,
         );
 
-        Ok(Self {
+        let runtime = Self {
             pane_id,
             terminal,
             io,
@@ -2307,8 +2316,10 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
+            pending_handoff_repaint_nudge,
             detect_handle: Some(detect_handle),
-        })
+        };
+        Ok(runtime)
     }
 
     // Runtime construction needs to thread PTY size, environment, theme, render hooks, and detection policy together.
@@ -2864,6 +2875,8 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
+            #[cfg(unix)]
+            pending_handoff_repaint_nudge: false,
             detect_handle,
         })
     }
@@ -3398,6 +3411,8 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
+                #[cfg(unix)]
+                pending_handoff_repaint_nudge: false,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
             rx,
@@ -3887,6 +3902,171 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn handoff_input_state(alternate_screen: bool) -> InputState {
+        InputState {
+            alternate_screen,
+            application_cursor: false,
+            bracketed_paste: false,
+            focus_reporting: false,
+            mouse_protocol_mode: crate::input::MouseProtocolMode::None,
+            mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
+            mouse_alternate_scroll: false,
+            modify_other_keys: false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_handoff_sleep_child(
+        rows: u16,
+        cols: u16,
+    ) -> (
+        std::os::fd::OwnedFd,
+        Box<dyn portable_pty::Child + Send + Sync>,
+        u32,
+    ) {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg("while :; do sleep 60; done");
+        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
+            .expect("handoff sleep child should spawn");
+        let crate::pty::backend::SpawnedPty { master_fd, child } = spawned;
+        let child_pid = child.process_id().unwrap_or(0);
+        (master_fd, child, child_pid)
+    }
+
+    #[cfg(unix)]
+    fn observe_pty_winsize_change(
+        fd: std::os::fd::OwnedFd,
+        original: (u16, u16),
+        timeout: std::time::Duration,
+    ) -> std::thread::JoinHandle<bool> {
+        use std::os::fd::AsRawFd;
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let deadline = std::time::Instant::now() + timeout;
+            while std::time::Instant::now() < deadline {
+                if crate::pty::fd::pty_winsize_for_test(fd.as_raw_fd())
+                    .is_ok_and(|size| size != original)
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            false
+        });
+        ready_rx.recv().expect("winsize monitor starts");
+        handle
+    }
+
+    #[cfg(unix)]
+    fn imported_handoff_runtime(
+        master_fd: std::os::fd::RawFd,
+        child_pid: u32,
+        rows: u16,
+        cols: u16,
+        input_state: InputState,
+    ) -> crate::handoff_runtime::ImportedHandoffRuntime {
+        crate::handoff_runtime::ImportedHandoffRuntime {
+            master_fd,
+            state: crate::handoff_runtime::HandoffRuntimeState {
+                pane_id: 0,
+                child_pid,
+                rows,
+                cols,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                keyboard_protocol_flags: 0,
+                keyboard_protocol_ansi: None,
+                input_state: Some(input_state),
+                initial_history_ansi: None,
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn runtime_from_handoff_for_test(
+        import: crate::handoff_runtime::ImportedHandoffRuntime,
+    ) -> PaneRuntime {
+        let (events, _events_rx) = mpsc::channel(4);
+        PaneRuntime::from_handoff_fd(
+            import,
+            4096,
+            crate::terminal_theme::TerminalTheme::default(),
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("imported runtime should restore")
+    }
+
+    #[cfg(unix)]
+    async fn assert_handoff_adopt_winsize_nudge(
+        alternate_screen: bool,
+        expect_nudge: bool,
+        timeout: std::time::Duration,
+    ) {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        let rows = 6;
+        let cols = 40;
+        let (master_fd, mut child, child_pid) = spawn_handoff_sleep_child(rows, cols);
+        let monitor_fd = crate::pty::fd::duplicate_owned_fd_for_test(master_fd.as_raw_fd())
+            .expect("duplicate monitor fd");
+        let original_size = crate::pty::fd::pty_winsize_for_test(monitor_fd.as_raw_fd())
+            .expect("initial pty winsize");
+        let pre_commit_monitor = observe_pty_winsize_change(
+            crate::pty::fd::duplicate_owned_fd_for_test(monitor_fd.as_raw_fd())
+                .expect("duplicate pre-commit monitor fd"),
+            original_size,
+            std::time::Duration::from_millis(150),
+        );
+        let mut runtime = runtime_from_handoff_for_test(imported_handoff_runtime(
+            master_fd.into_raw_fd(),
+            child_pid,
+            rows,
+            cols,
+            handoff_input_state(alternate_screen),
+        ));
+        assert!(
+            !pre_commit_monitor
+                .join()
+                .expect("pre-commit winsize monitor thread joins"),
+            "handoff import nudged before ownership was committed"
+        );
+
+        let post_commit_monitor = observe_pty_winsize_change(monitor_fd, original_size, timeout);
+        runtime.assume_handoff_ownership();
+        runtime.set_handoff_reader_paused(false);
+
+        let observed_nudge = post_commit_monitor
+            .join()
+            .expect("post-commit winsize monitor thread joins");
+        assert_eq!(
+            observed_nudge, expect_nudge,
+            "handoff import winsize nudge mismatch for alternate_screen={alternate_screen}"
+        );
+
+        runtime.shutdown();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handoff_adopt_nudges_alternate_screen_winsize() {
+        assert_handoff_adopt_winsize_nudge(true, true, std::time::Duration::from_secs(1)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handoff_adopt_leaves_primary_screen_winsize_stable() {
+        assert_handoff_adopt_winsize_nudge(false, false, std::time::Duration::from_millis(200))
+            .await;
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn handoff_runtime_state_captures_terminal_input_and_title_state() {
         let runtime = PaneRuntime::test_with_screen_bytes(
@@ -4022,6 +4202,8 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            #[cfg(unix)]
+            pending_handoff_repaint_nudge: false,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 
@@ -4055,6 +4237,8 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            #[cfg(unix)]
+            pending_handoff_repaint_nudge: false,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
 

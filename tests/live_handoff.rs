@@ -944,6 +944,97 @@ fn live_handoff_preserves_pane_process_io() {
 }
 
 #[test]
+fn live_handoff_repaints_nonfocused_alternate_screen_pane() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let ready_marker = base.join("alt-ready");
+    let script = base.join("alt-redraw.py");
+    let redraw_marker = "HANDOFF-ALT-REDRAW";
+
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &script,
+        format!(
+            r#"import os
+import pathlib
+import signal
+import time
+
+redraw = b"\x1b[H" + {redraw_marker:?}.encode() + b"\r\n"
+
+def handle_winch(signum, frame):
+    os.write(1, redraw)
+
+signal.signal(signal.SIGWINCH, handle_winch)
+os.write(1, b"\x1b[?1049h\x1b[2J\x1b[H")
+pathlib.Path({ready:?}).write_text("ready")
+while True:
+    time.sleep(60)
+"#,
+            redraw_marker = redraw_marker,
+            ready = ready_marker.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:split-focus-other",
+            "method": "pane.split",
+            "params": {
+                "target_pane_id": pane_id,
+                "direction": "right",
+                "focus": true
+            }
+        }),
+    ));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-alt",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&ready_marker, Duration::from_secs(5));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    wait_for_output(&api_socket, &pane_id, redraw_marker);
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_preserves_keyboard_protocol_for_client_input() {
     let _lock = test_lock();
     let base = unique_test_dir();

@@ -258,11 +258,6 @@ impl TerminalRuntime {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
 
-    #[cfg(unix)]
-    pub fn nudge_child_redraw_after_handoff(&self) {
-        self.0.nudge_child_redraw_after_handoff();
-    }
-
     pub fn scroll_up(&self, lines: usize) {
         self.0.scroll_up(lines);
     }
