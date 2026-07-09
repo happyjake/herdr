@@ -239,3 +239,23 @@ pub(crate) fn resize_pty_fd(
     }
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+pub(crate) fn duplicate_owned_fd_for_test(fd: RawFd) -> std::io::Result<OwnedFd> {
+    let duplicated = duplicate_fd(fd)?;
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn pty_winsize_for_test(fd: RawFd) -> std::io::Result<(u16, u16)> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((size.ws_row, size.ws_col))
+}
