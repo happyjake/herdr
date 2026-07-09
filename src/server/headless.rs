@@ -250,9 +250,6 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
-    /// Imported panes get one app-safe resize nudge after the first client attaches.
-    #[cfg(unix)]
-    pending_handoff_repaint_nudge: bool,
     /// Flag set by a stop signal or `server stop`; shares `server_stop`'s flag.
     should_quit: Arc<AtomicBool>,
     server_stop: ServerStop,
@@ -398,8 +395,6 @@ impl HeadlessServer {
             #[cfg(test)]
             host_shutdown_probe: crate::platform::host_shutdown_in_progress,
             handoff_in_progress: false,
-            #[cfg(unix)]
-            pending_handoff_repaint_nudge: false,
             should_quit,
             server_stop,
             server_event_rx,
@@ -2043,7 +2038,6 @@ impl HeadlessServer {
                 }
                 self.sync_foreground_client_state();
                 self.claim_unowned_shell_tab_geometry(client_id, true);
-                self.nudge_handoff_panes_on_first_client_attach();
                 true
             }
             ServerEvent::GraphicsTransmissionResult {

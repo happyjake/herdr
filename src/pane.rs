@@ -53,7 +53,9 @@ pub(crate) use self::terminal::{
 };
 pub use self::{
     state::PaneState,
-    terminal::{ScrollMetrics, TerminalCursorState},
+    terminal::{
+        RecentReadRequest, RecentReadWindow, ScrollMetrics, TerminalCursorState,
+    },
 };
 
 pub(crate) struct TerminalDirtyPatchSnapshot {
@@ -1617,22 +1619,6 @@ impl PaneRuntimeIo {
         }
     }
 
-    #[cfg(unix)]
-    fn nudge_child_redraw_after_handoff(
-        &self,
-        rows: u16,
-        cols: u16,
-        cell_width_px: u32,
-        cell_height_px: u32,
-    ) {
-        match self {
-            PaneRuntimeIo::Actor(actor) => {
-                actor.nudge_child_redraw_after_handoff(rows, cols, cell_width_px, cell_height_px);
-            }
-            #[cfg(test)]
-            PaneRuntimeIo::TestChannel { .. } => {}
-        }
-    }
 
     fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         match self {
@@ -2314,14 +2300,37 @@ impl PaneRuntime {
         }
     }
 
+    /// The ANSI stream that reconstructs this pane's content in the next
+    /// server process. The stream is self-describing about the screen mode:
+    /// a pane whose app really sits on the alternate screen re-enters it via
+    /// its own `?1049h` here — even when the frame is blank, so the mode is
+    /// never lost — and the import never has to guess the mode from agent
+    /// identity or input-mode heuristics. Guessing is what silently
+    /// destroyed history for claude-style agents — primary-screen TUIs whose
+    /// transcript lives in scrollback: classified "alternate", they lost
+    /// their scrollback at export and their emulator was stuck on the alt
+    /// screen after import, never accumulating history again.
+    ///
+    /// `replay_budget` bounds this pane's stream; the caller divides the
+    /// handoff-wide MAX_REPLAY_BYTES_TOTAL across panes so the one-line
+    /// manifest stays under the importer's frame limit.
     #[cfg(unix)]
-    pub fn handoff_history_ansi(&self) -> Option<String> {
-        if self.terminal.alternate_screen_active() {
-            return None;
+    pub fn handoff_history_ansi(&self, replay_budget: usize) -> Option<String> {
+        let alternate_screen = self
+            .input_state()
+            .is_some_and(|input_state| input_state.alternate_screen);
+        if alternate_screen {
+            // The primary screen's history cannot be read from behind an
+            // active alternate screen, so only the visible frame carries
+            // over — matching what the app itself would restore.
+            let frame = truncate_handoff_history(self.visible_ansi(), replay_budget);
+            if frame.trim().is_empty() {
+                return Some("\x1b[?1049h".to_string());
+            }
+            return Some(format!("\x1b[?1049h\x1b[H{frame}"));
         }
-        self.snapshot_history().map(|history| {
-            truncate_handoff_history(history, crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
-        })
+        self.snapshot_history()
+            .map(|history| truncate_handoff_history(history, replay_budget))
     }
 
     pub fn apply_host_terminal_theme(&self, theme: crate::terminal_theme::TerminalTheme) {
@@ -2658,7 +2667,7 @@ impl PaneRuntime {
             events,
         );
 
-        Ok(Self {
+        let runtime = Self {
             pane_id,
             terminal,
             io,
@@ -2679,7 +2688,8 @@ impl PaneRuntime {
             preserve_processes_on_drop: true,
             compression,
             detect_handle: Some(detect_handle),
-        })
+        };
+        Ok(runtime)
     }
 
     // Runtime construction needs to thread PTY size, environment, theme, render hooks, and detection policy together.
@@ -3367,13 +3377,6 @@ impl PaneRuntime {
         );
     }
 
-    #[cfg(unix)]
-    pub fn nudge_child_redraw_after_handoff(&self) {
-        let (rows, cols, cell_width_px, cell_height_px) = self.current_size.get();
-        self.io
-            .nudge_child_redraw_after_handoff(rows, cols, cell_width_px, cell_height_px);
-    }
-
     /// Scroll up by N lines (into scrollback history).
     pub fn scroll_up(&self, lines: usize) {
         self.terminal.scroll_up(lines);
@@ -3570,6 +3573,10 @@ impl PaneRuntime {
         let result = self.terminal.recent_unwrapped_ansi_snapshot(lines);
         self.compression.wake();
         result
+    }
+
+    pub fn recent_read_at_offset(&self, request: RecentReadRequest) -> RecentReadWindow {
+        self.terminal.recent_read_at_offset(request)
     }
 
     pub fn snapshot_history(&self) -> Option<String> {
@@ -5218,26 +5225,61 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn handoff_history_ansi_captures_primary_screen() {
-        let runtime =
-            PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"handoff-primary-history\r\n");
+    async fn handoff_history_ansi_captures_primary_screen_scrollback() {
+        let mut bytes = Vec::new();
+        for line in 1..=12 {
+            bytes.extend_from_slice(format!("handoff-primary-history-{line:02}\r\n").as_bytes());
+        }
+        let runtime = PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, &bytes);
 
-        let history = runtime.handoff_history_ansi().unwrap();
+        let history = runtime
+            .handoff_history_ansi(crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
+            .unwrap();
 
-        assert!(history.contains("handoff-primary-history"));
+        assert!(history.contains("handoff-primary-history-01"));
+        assert!(history.contains("handoff-primary-history-12"));
+        // A primary-screen pane's stream must never re-enter the alternate
+        // screen: that is how agent transcripts were once marooned there.
+        assert!(!history.contains("\x1b[?1049h"));
     }
 
+    /// The stream is self-describing: only an app really sitting on the
+    /// alternate screen (its own ?1049h processed by this emulator) makes
+    /// the export re-enter it, and the frame rides behind that switch.
     #[cfg(unix)]
     #[tokio::test]
-    async fn handoff_history_ansi_skips_alternate_screen() {
+    async fn handoff_history_ansi_captures_alternate_screen() {
         let runtime = PaneRuntime::test_with_scrollback_bytes(
             40,
             5,
             4096,
-            b"primary\r\n\x1b[?1049halt-screen",
+            b"primary\r\n\x1b[?1049h\x1b[2J\x1b[Halt-screen",
         );
 
-        assert!(runtime.handoff_history_ansi().is_none());
+        let history = runtime
+            .handoff_history_ansi(crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
+            .unwrap();
+
+        assert!(history.starts_with("\x1b[?1049h\x1b[H"));
+        assert!(history.contains("alt-screen"));
+        assert!(!history.contains("primary"));
+    }
+
+    /// A blank alternate screen still exports the mode switch: the importer
+    /// deliberately ignores the carried alternate flag, so dropping the
+    /// stream entirely would restore the pane on the primary screen while
+    /// the app keeps drawing for the alternate one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handoff_history_ansi_keeps_mode_marker_for_blank_alternate_screen() {
+        let runtime =
+            PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"primary\r\n\x1b[?1049h\x1b[2J");
+
+        let history = runtime
+            .handoff_history_ansi(crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
+            .unwrap();
+
+        assert_eq!(history, "\x1b[?1049h");
     }
 
     #[cfg(unix)]

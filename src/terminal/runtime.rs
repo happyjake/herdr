@@ -55,8 +55,8 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
-    pub fn handoff_history_ansi(&self) -> Option<String> {
-        self.0.handoff_history_ansi()
+    pub fn handoff_history_ansi(&self, replay_budget: usize) -> Option<String> {
+        self.0.handoff_history_ansi(replay_budget)
     }
 
     #[cfg(unix)]
@@ -257,11 +257,6 @@ impl TerminalRuntime {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }
 
-    #[cfg(unix)]
-    pub fn nudge_child_redraw_after_handoff(&self) {
-        self.0.nudge_child_redraw_after_handoff();
-    }
-
     pub fn scroll_up(&self, lines: usize) {
         self.0.scroll_up(lines);
     }
@@ -409,6 +404,13 @@ impl TerminalRuntime {
         lines: usize,
     ) -> crate::pane::TerminalReadSnapshot {
         self.0.recent_unwrapped_ansi_snapshot(lines)
+    }
+
+    pub fn recent_read_at_offset(
+        &self,
+        request: crate::pane::RecentReadRequest,
+    ) -> crate::pane::RecentReadWindow {
+        self.0.recent_read_at_offset(request)
     }
 
     pub fn snapshot_history(&self) -> Option<String> {

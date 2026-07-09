@@ -2003,6 +2003,8 @@ mod tests {
                                     text: String::new(),
                                     revision: 0,
                                     truncated: false,
+                                    effective_offset: None,
+                                    has_more: None,
                                 },
                             },
                         })

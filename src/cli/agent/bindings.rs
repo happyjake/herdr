@@ -90,6 +90,13 @@ pub(crate) fn lines() -> Input<Option<u32>> {
     })
 }
 
+pub(crate) fn offset() -> Input<Option<u64>> {
+    Input::value("offset", "N", |slot, value| {
+        *slot = Some(super::super::parse_u64_flag("--offset", value)?);
+        Ok(())
+    })
+}
+
 pub(crate) fn keys() -> Input<Vec<String>> {
     Input::<Vec<String>>::positional("key", 1, |slot, value| {
         slot.push(value.to_owned());

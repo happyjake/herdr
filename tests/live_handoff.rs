@@ -396,6 +396,46 @@ fn wait_for_output(socket_path: &Path, pane_id: &str, needle: &str) {
     );
 }
 
+fn wait_for_read_source_contains(
+    socket_path: &Path,
+    pane_id: &str,
+    source: &str,
+    lines: usize,
+    needle: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_text = String::new();
+    let mut last_response = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        let response = request(
+            socket_path,
+            serde_json::json!({
+                "id": "test:pane:read",
+                "method": "pane.read",
+                "params": {
+                    "pane_id": pane_id,
+                    "source": source,
+                    "lines": lines,
+                    "format": "text",
+                    "strip_ansi": true
+                }
+            }),
+        );
+        last_response = response.clone();
+        let text = response["result"]["read"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        last_text = text.to_string();
+        if text.contains(needle) {
+            return last_text;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "pane {source} read did not contain {needle:?}; last text was {last_text:?}; last response was {last_response}"
+    );
+}
+
 fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     let mut last_text = String::new();
@@ -1172,6 +1212,388 @@ fn live_handoff_preserves_pane_process_io() {
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
     let _ = client_socket;
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_repaints_realistic_alt_screen_tui() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let ready_marker = base.join("alt-ready");
+    let script = base.join("alt-tui.py");
+    let redraw_marker = "HANDOFF-ALT-CONTENT-RESTORED";
+
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &script,
+        format!(
+            r#"import os, signal, time, pathlib
+signal.signal(signal.SIGWINCH, signal.SIG_IGN)
+os.write(1, b"\x1b[?1049h\x1b[2J\x1b[H" + {redraw_marker:?}.encode() + b"\r\n")
+pathlib.Path({ready:?}).write_text("ready")
+while True:
+    time.sleep(60)
+"#,
+            redraw_marker = redraw_marker,
+            ready = ready_marker.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:split-focus-other",
+            "method": "pane.split",
+            "params": {
+                "target_pane_id": pane_id,
+                "direction": "right",
+                "focus": true
+            }
+        }),
+    ));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-alt",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&ready_marker, Duration::from_secs(5));
+    wait_for_output(&api_socket, &pane_id, redraw_marker);
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    wait_for_output(&api_socket, &pane_id, redraw_marker);
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+/// Regression (phone report 2026-07-13): agent TUIs like claude live on the
+/// PRIMARY screen — their transcript is the pane's scrollback. A handoff
+/// must carry that scrollback and leave the pane accumulating more, not
+/// classify the pane "alternate screen" by agent identity, which destroyed
+/// the history at export and marooned the emulator on the alt screen where
+/// scrollback never grows again.
+#[test]
+fn live_handoff_preserves_agent_pane_scrollback_and_accumulation() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let ready_marker = base.join("agent-history-ready");
+    let more_trigger = base.join("agent-history-more");
+    let done_marker = base.join("agent-history-done");
+    let script = base.join("agent-history.py");
+    let first_marker = "AGENT-HANDOFF-HISTORY-001";
+    let last_marker = "AGENT-HANDOFF-HISTORY-080";
+    let post_marker = "AGENT-POST-HANDOFF-020";
+
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &script,
+        format!(
+            r#"import pathlib
+import time
+
+for i in range(1, 81):
+    print(f"AGENT-HANDOFF-HISTORY-{{i:03d}}", flush=True)
+pathlib.Path({ready:?}).write_text("ready")
+while not pathlib.Path({more:?}).exists():
+    time.sleep(0.05)
+for i in range(1, 21):
+    print(f"AGENT-POST-HANDOFF-{{i:03d}}", flush=True)
+pathlib.Path({done:?}).write_text("done")
+while True:
+    time.sleep(60)
+"#,
+            ready = ready_marker.display().to_string(),
+            more = more_trigger.display().to_string(),
+            done = done_marker.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-agent-history",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&ready_marker, Duration::from_secs(5));
+    wait_for_output(&api_socket, &pane_id, last_marker);
+    // A lifecycle-hook report (non-reserved source, so it establishes hook
+    // authority and a known agent) is what used to trip the agent-identity
+    // alternate-screen heuristic at export.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:report-agent",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": pane_id,
+                "source": "claude-hooks",
+                "agent": "claude",
+                "state": "working"
+            }
+        }),
+    ));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let history = wait_for_read_source_contains(
+        &api_socket,
+        &pane_id,
+        "recent_unwrapped",
+        1000,
+        first_marker,
+    );
+    assert!(
+        history.contains(last_marker),
+        "handoff preserved deep agent history but lost bottom history: {history:?}"
+    );
+
+    // The pane must keep accumulating scrollback after the import: new app
+    // output may not overwrite-in-place (the marooned-on-alt failure mode).
+    fs::write(&more_trigger, "more").unwrap();
+    support::wait_for_file(&done_marker, Duration::from_secs(5));
+    let after =
+        wait_for_read_source_contains(&api_socket, &pane_id, "recent_unwrapped", 1000, post_marker);
+    assert!(
+        after.contains(first_marker),
+        "post-handoff output displaced the imported history instead of scrolling above it: {after:?}"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_repaints_nonfocused_alternate_screen_pane() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let ready_marker = base.join("alt-ready");
+    let script = base.join("alt-redraw.py");
+    let redraw_marker = "HANDOFF-ALT-REDRAW";
+
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &script,
+        format!(
+            r#"import os
+import pathlib
+import signal
+import time
+
+redraw = b"\x1b[H" + {redraw_marker:?}.encode() + b"\r\n"
+
+def handle_winch(signum, frame):
+    os.write(1, redraw)
+
+signal.signal(signal.SIGWINCH, handle_winch)
+os.write(1, b"\x1b[?1049h\x1b[2J" + redraw)
+pathlib.Path({ready:?}).write_text("ready")
+while True:
+    time.sleep(60)
+"#,
+            redraw_marker = redraw_marker,
+            ready = ready_marker.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:split-focus-other",
+            "method": "pane.split",
+            "params": {
+                "target_pane_id": pane_id,
+                "direction": "right",
+                "focus": true
+            }
+        }),
+    ));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-alt",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&ready_marker, Duration::from_secs(5));
+    wait_for_output(&api_socket, &pane_id, redraw_marker);
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    wait_for_output(&api_socket, &pane_id, redraw_marker);
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_preserves_primary_screen_scrollback_history() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let ready_marker = base.join("primary-history-ready");
+    let script = base.join("primary-history.py");
+    let first_marker = "PRIMARY-HANDOFF-HISTORY-001";
+    let last_marker = "PRIMARY-HANDOFF-HISTORY-080";
+
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &script,
+        format!(
+            r#"import pathlib
+import time
+
+for i in range(1, 81):
+    print(f"PRIMARY-HANDOFF-HISTORY-{{i:03d}}", flush=True)
+pathlib.Path({ready:?}).write_text("ready")
+while True:
+    time.sleep(60)
+"#,
+            ready = ready_marker.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-primary-history",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&ready_marker, Duration::from_secs(5));
+    wait_for_output(&api_socket, &pane_id, last_marker);
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let history = wait_for_read_source_contains(
+        &api_socket,
+        &pane_id,
+        "recent_unwrapped",
+        1000,
+        first_marker,
+    );
+    assert!(
+        history.contains(last_marker),
+        "handoff preserved off-screen history but lost bottom history: {history:?}"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
     cleanup_test_base(&base);
 }
 

@@ -77,6 +77,10 @@ impl HeadlessServer {
             self.app.state.selected,
         );
 
+        // Divide the aggregate replay budget fairly so the one-line manifest
+        // stays under the importer's frame limit even at max pane count.
+        let replay_budget = crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE
+            .min(crate::server::handoff::MAX_REPLAY_BYTES_TOTAL / pane_by_terminal.len().max(1));
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
             let Some(pane_id) = pane_by_terminal.get(terminal_id).copied() else {
@@ -89,15 +93,7 @@ impl HeadlessServer {
                 .terminals
                 .get(terminal_id)
                 .and_then(|terminal| terminal.handoff_agent_state());
-            let has_agent_session = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .is_some_and(|terminal| terminal.persisted_agent_session.is_some());
-            if !has_agent_session {
-                handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
-            }
+            handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi(replay_budget);
             handoff_entries.push((terminal_id.clone(), handoff_runtime));
         }
 
@@ -328,19 +324,6 @@ impl HeadlessServer {
         let _ = std::fs::remove_file(socket_path);
     }
 
-    #[cfg(unix)]
-    pub(super) fn nudge_handoff_panes_on_first_client_attach(&mut self) {
-        if !self.pending_handoff_repaint_nudge {
-            return;
-        }
-        self.pending_handoff_repaint_nudge = false;
-        self.app
-            .terminal_runtimes
-            .nudge_child_redraw_after_handoff();
-    }
-
-    #[cfg(not(unix))]
-    pub(super) fn nudge_handoff_panes_on_first_client_attach(&mut self) {}
     /// Initiates graceful shutdown.
     pub(super) fn initiate_shutdown(&mut self) {
         if self.shutting_down {

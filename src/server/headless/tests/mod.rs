@@ -136,7 +136,6 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         host_shutdown_probe: crate::platform::host_shutdown_in_progress,
         handoff_in_progress: false,
         #[cfg(unix)]
-        pending_handoff_repaint_nudge: false,
         should_quit,
         server_stop,
         server_event_rx,
@@ -4230,6 +4229,7 @@ fn explicit_agent_history_read_requires_idle_on_alternate_screen() {
                     lines: Some(200),
                     format: api::schema::ReadFormat::Text,
                     strip_ansi: true,
+                    offset_from_bottom: None,
                 }),
             };
 
@@ -4557,6 +4557,8 @@ fn terminal_control_rejects_attach_during_alt_screen_read() {
                     text: String::new(),
                     revision: 0,
                     truncated: false,
+                    effective_offset: None,
+                    has_more: None,
                 },
                 120,
                 false,

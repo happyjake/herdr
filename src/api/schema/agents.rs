@@ -18,6 +18,10 @@ cli_params! {
             .input(bindings::format()).input(bindings::ansi()),
         #[serde(default = "super::common::default_true")]
         pub strip_ansi: bool => Field::new(true),
+        /// Shift the recent-source window up from the bottom anchor: physical
+        /// rows for `recent`, logical lines for `recent_unwrapped`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub offset_from_bottom: Option<u64> => Field::new(None).input(bindings::offset()),
     }
 }
 

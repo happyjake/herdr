@@ -22,6 +22,107 @@ fn normalize_api_key_alias(key: &str) -> &str {
     }
 }
 
+const IMAGE_PATH_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
+
+/// A whitespace-delimited token that is one absolute path to an image file —
+/// the shape attachments take inside ordinary pane input (ADR-0004 mints
+/// space-free server-side names precisely so a path never needs quoting).
+fn is_image_path_token(token: &str) -> bool {
+    if !token.starts_with('/') {
+        return false;
+    }
+    let Some((_, ext)) = token.rsplit_once('.') else {
+        return false;
+    };
+    IMAGE_PATH_EXTENSIONS
+        .iter()
+        .any(|known| ext.eq_ignore_ascii_case(known))
+}
+
+/// One send_input text segment: either prose, or a run of image-path tokens
+/// (plus the whitespace between them) that must travel as its own paste.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SendTextChunk<'a> {
+    pub text: &'a str,
+    pub is_image_paths: bool,
+}
+
+/// Split `text` into alternating prose and image-path chunks so each path
+/// run can travel as its own bracketed paste. Claude Code hoists the
+/// `[Image #N]` tokens for paths found in a mixed paste to the front of that
+/// paste — mangling the prose and disarming a leading slash command — but
+/// anchors the tokens at the cursor when the paths arrive as their own
+/// paste, wherever in the draft the phone put them (inline after prose, or
+/// followed by more prose; both shapes ship from the composer, which inserts
+/// a pill's path at the cursor).
+///
+/// A path run is a maximal sequence of image-path tokens separated only by
+/// whitespace; whitespace-only text before the first run and after the last
+/// run folds into those runs so no chunk is ever pure whitespace.
+/// Invariant: concatenating the chunks yields `text` byte-for-byte.
+pub(super) fn split_image_path_chunks(text: &str) -> Vec<SendTextChunk<'_>> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut previous_token_was_path = false;
+    let mut token_start: Option<usize> = None;
+    for (index, character) in text.char_indices().chain([(text.len(), ' ')]) {
+        if !character.is_whitespace() {
+            token_start.get_or_insert(index);
+            continue;
+        }
+        let Some(start) = token_start.take() else {
+            continue;
+        };
+        if is_image_path_token(&text[start..index]) {
+            match runs.last_mut() {
+                Some(run) if previous_token_was_path => run.1 = index,
+                _ => runs.push((start, index)),
+            }
+            previous_token_was_path = true;
+        } else {
+            previous_token_was_path = false;
+        }
+    }
+    if runs.is_empty() {
+        return vec![SendTextChunk {
+            text,
+            is_image_paths: false,
+        }];
+    }
+    if let Some(first) = runs.first_mut() {
+        if text[..first.0].trim().is_empty() {
+            first.0 = 0;
+        }
+    }
+    if let Some(last) = runs.last_mut() {
+        if text[last.1..].trim().is_empty() {
+            last.1 = text.len();
+        }
+    }
+
+    let mut chunks = Vec::with_capacity(runs.len() * 2 + 1);
+    let mut cursor = 0;
+    for (start, end) in runs {
+        if cursor < start {
+            chunks.push(SendTextChunk {
+                text: &text[cursor..start],
+                is_image_paths: false,
+            });
+        }
+        chunks.push(SendTextChunk {
+            text: &text[start..end],
+            is_image_paths: true,
+        });
+        cursor = end;
+    }
+    if cursor < text.len() {
+        chunks.push(SendTextChunk {
+            text: &text[cursor..],
+            is_image_paths: false,
+        });
+    }
+    chunks
+}
+
 pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: &str) -> Vec<u8> {
     let bracketed = runtime.bracketed_paste_enabled();
     if bracketed {

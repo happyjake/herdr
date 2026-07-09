@@ -67,6 +67,30 @@ fn agent_projection_defaults_and_ordered_read_policy() {
 }
 
 #[test]
+fn agent_read_projection_preserves_offsets_and_rejects_invalid_values() {
+    assert_eq!(
+        params(&["read", "opaque", "--offset=12"]),
+        serde_json::json!({
+            "target": "opaque",
+            "source": "recent",
+            "format": "text",
+            "strip_ansi": true,
+            "offset_from_bottom": 12
+        })
+    );
+    assert_eq!(
+        params(&["read", "--offset", "0", "opaque"])["offset_from_bottom"],
+        0
+    );
+    for value in ["bad", "18446744073709551616"] {
+        let Err(error) = parse(&["read", "opaque", "--offset", value]) else {
+            panic!("invalid offset was accepted");
+        };
+        assert!(format!("{error:?}").contains("--offset"));
+    }
+}
+
+#[test]
 fn agent_projection_nested_wait_omission_and_repeated_statuses() {
     for text in ["--wait", "--until", "--timeout", "--help", ""] {
         assert_eq!(
