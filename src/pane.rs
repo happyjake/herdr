@@ -1953,15 +1953,20 @@ impl PaneRuntime {
     }
 
     #[cfg(unix)]
-    pub fn handoff_history_ansi(&self) -> Option<String> {
-        let visible_ansi = self.visible_ansi();
-        if !visible_ansi.trim().is_empty() {
-            let history = format!("\x1b[H{visible_ansi}");
-            let history = truncate_handoff_history(
-                history,
-                crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE,
-            );
-            return (!history.trim().is_empty()).then_some(history);
+    pub fn handoff_history_ansi(
+        &self,
+        screen_restore: crate::handoff_runtime::HandoffScreenRestore,
+    ) -> Option<String> {
+        if screen_restore.is_alternate() {
+            let visible_ansi = self.visible_ansi();
+            if !visible_ansi.trim().is_empty() {
+                let history = format!("\x1b[H{visible_ansi}");
+                let history = truncate_handoff_history(
+                    history,
+                    crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE,
+                );
+                return (!history.trim().is_empty()).then_some(history);
+            }
         }
         self.snapshot_history().map(|history| {
             truncate_handoff_history(history, crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
@@ -3848,12 +3853,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn handoff_history_ansi_captures_primary_screen() {
-        let runtime =
-            PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"handoff-primary-history\r\n");
+        let mut bytes = Vec::new();
+        for line in 1..=12 {
+            bytes.extend_from_slice(format!("handoff-primary-history-{line:02}\r\n").as_bytes());
+        }
+        let runtime = PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, &bytes);
 
-        let history = runtime.handoff_history_ansi().unwrap();
+        let history = runtime
+            .handoff_history_ansi(crate::handoff_runtime::HandoffScreenRestore::Primary)
+            .unwrap();
 
-        assert!(history.contains("handoff-primary-history"));
+        assert!(history.contains("handoff-primary-history-01"));
+        assert!(history.contains("handoff-primary-history-12"));
     }
 
     #[cfg(unix)]
@@ -3866,7 +3877,9 @@ mod tests {
             b"primary\r\n\x1b[?1049h\x1b[2J\x1b[Halt-screen",
         );
 
-        let history = runtime.handoff_history_ansi().unwrap();
+        let history = runtime
+            .handoff_history_ansi(crate::handoff_runtime::HandoffScreenRestore::Alternate)
+            .unwrap();
 
         assert!(history.starts_with("\x1b[H"));
         assert!(history.contains("alt-screen"));

@@ -388,6 +388,46 @@ fn wait_for_output(socket_path: &Path, pane_id: &str, needle: &str) {
     );
 }
 
+fn wait_for_read_source_contains(
+    socket_path: &Path,
+    pane_id: &str,
+    source: &str,
+    lines: usize,
+    needle: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_text = String::new();
+    let mut last_response = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        let response = request(
+            socket_path,
+            serde_json::json!({
+                "id": "test:pane:read",
+                "method": "pane.read",
+                "params": {
+                    "pane_id": pane_id,
+                    "source": source,
+                    "lines": lines,
+                    "format": "text",
+                    "strip_ansi": true
+                }
+            }),
+        );
+        last_response = response.clone();
+        let text = response["result"]["read"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        last_text = text.to_string();
+        if text.contains(needle) {
+            return last_text;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "pane {source} read did not contain {needle:?}; last text was {last_text:?}; last response was {last_response}"
+    );
+}
+
 fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     let mut last_text = String::new();
@@ -1296,6 +1336,88 @@ while True:
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_output(&api_socket, &pane_id, redraw_marker);
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_preserves_primary_screen_scrollback_history() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let ready_marker = base.join("primary-history-ready");
+    let script = base.join("primary-history.py");
+    let first_marker = "PRIMARY-HANDOFF-HISTORY-001";
+    let last_marker = "PRIMARY-HANDOFF-HISTORY-080";
+
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &script,
+        format!(
+            r#"import pathlib
+import time
+
+for i in range(1, 81):
+    print(f"PRIMARY-HANDOFF-HISTORY-{{i:03d}}", flush=True)
+pathlib.Path({ready:?}).write_text("ready")
+while True:
+    time.sleep(60)
+"#,
+            ready = ready_marker.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-primary-history",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&ready_marker, Duration::from_secs(5));
+    wait_for_output(&api_socket, &pane_id, last_marker);
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let history = wait_for_read_source_contains(
+        &api_socket,
+        &pane_id,
+        "recent_unwrapped",
+        1000,
+        first_marker,
+    );
+    assert!(
+        history.contains(last_marker),
+        "handoff preserved off-screen history but lost bottom history: {history:?}"
+    );
 
     let _ = request(
         &api_socket,
