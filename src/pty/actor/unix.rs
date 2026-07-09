@@ -59,7 +59,6 @@ struct PtyResizeRequest {
 #[derive(Default)]
 struct SharedPtyControls {
     resize: Option<PtyResizeRequest>,
-    nudge: Option<PtyResize>,
     terminal_responses: Vec<Bytes>,
 }
 
@@ -215,28 +214,6 @@ impl PtyIoActorHandle {
                     cell_height_px,
                 },
                 terminal_responses,
-            });
-        }
-        self.wake_actor();
-    }
-
-    pub(crate) fn nudge_child_redraw_after_handoff(
-        &self,
-        rows: u16,
-        cols: u16,
-        cell_width_px: u32,
-        cell_height_px: u32,
-    ) {
-        {
-            let mut controls = self
-                .controls
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            controls.nudge = Some(PtyResize {
-                rows,
-                cols,
-                cell_width_px,
-                cell_height_px,
             });
         }
         self.wake_actor();
@@ -789,14 +766,13 @@ impl PtyIoActorRunner {
     }
 
     fn apply_pending_controls(&mut self) {
-        let (resize, nudge, terminal_responses) = {
+        let (resize, terminal_responses) = {
             let mut controls = self
                 .controls
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             (
                 controls.resize.take(),
-                controls.nudge.take(),
                 std::mem::take(&mut controls.terminal_responses),
             )
         };
@@ -806,9 +782,6 @@ impl PtyIoActorRunner {
         if let Some(request) = resize {
             self.resize(request.resize);
             self.enqueue_terminal_responses(request.terminal_responses);
-        }
-        if let Some(nudge) = nudge {
-            self.nudge(nudge);
         }
         self.enqueue_terminal_responses(terminal_responses);
     }
@@ -964,52 +937,6 @@ impl PtyIoActorRunner {
     }
 
     fn resize(&self, resize: PtyResize) {
-        self.log_resize_result(fd::resize_pty_fd(
-            self.file.as_raw_fd(),
-            resize.rows,
-            resize.cols,
-            resize.cell_width_px,
-            resize.cell_height_px,
-        ));
-    }
-
-    fn nudge(&mut self, resize: PtyResize) {
-        if self.state == ActorState::Released {
-            return;
-        }
-        let nudge = if resize.rows > 2 {
-            (
-                resize.rows - 1,
-                resize.cols,
-                resize.cell_width_px,
-                resize.cell_height_px,
-            )
-        } else {
-            (
-                resize.rows,
-                resize.cols.saturating_sub(1).max(4),
-                resize.cell_width_px,
-                resize.cell_height_px,
-            )
-        };
-        if nudge
-            == (
-                resize.rows,
-                resize.cols,
-                resize.cell_width_px,
-                resize.cell_height_px,
-            )
-        {
-            return;
-        }
-        self.log_resize_result(fd::resize_pty_fd(
-            self.file.as_raw_fd(),
-            nudge.0,
-            nudge.1,
-            nudge.2,
-            nudge.3,
-        ));
-        std::thread::sleep(Duration::from_millis(30));
         self.log_resize_result(fd::resize_pty_fd(
             self.file.as_raw_fd(),
             resize.rows,
@@ -1601,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_and_nudge_keep_latest_request_when_command_queue_is_full() {
+    fn resize_keeps_latest_request_when_command_queue_is_full() {
         let (data_tx, _data_rx) = mpsc::channel(1);
         let (control_tx, _control_rx) = std_mpsc::channel();
         data_tx
@@ -1622,7 +1549,6 @@ mod tests {
 
         handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"old")]);
         handle.resize(40, 120, 9, 18, vec![Bytes::from_static(b"new")]);
-        handle.nudge_child_redraw_after_handoff(41, 121, 10, 20);
         handle.write_terminal_response(|| Some(Bytes::from_static(b"response")));
 
         let controls = controls.lock().expect("controls lock");
@@ -1636,15 +1562,6 @@ mod tests {
                     cell_height_px: 18,
                 },
                 terminal_responses: vec![Bytes::from_static(b"new")],
-            })
-        );
-        assert_eq!(
-            controls.nudge,
-            Some(PtyResize {
-                rows: 41,
-                cols: 121,
-                cell_width_px: 10,
-                cell_height_px: 20,
             })
         );
         assert_eq!(

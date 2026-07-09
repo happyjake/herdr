@@ -127,7 +127,6 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         host_shutdown_requested: Arc::new(AtomicBool::new(false)),
         handoff_in_progress: false,
         #[cfg(unix)]
-        pending_handoff_repaint_nudge: false,
         should_quit,
         server_event_rx,
         server_event_tx,

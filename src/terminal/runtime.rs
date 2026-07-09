@@ -55,8 +55,11 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
-    pub fn handoff_history_ansi(&self) -> Option<String> {
-        self.0.handoff_history_ansi()
+    pub fn handoff_history_ansi(
+        &self,
+        screen_restore: crate::handoff_runtime::HandoffScreenRestore,
+    ) -> Option<String> {
+        self.0.handoff_history_ansi(screen_restore)
     }
 
     #[cfg(unix)]
@@ -251,11 +254,6 @@ impl TerminalRuntime {
 
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
-    }
-
-    #[cfg(unix)]
-    pub fn nudge_child_redraw_after_handoff(&self) {
-        self.0.nudge_child_redraw_after_handoff();
     }
 
     pub fn scroll_up(&self, lines: usize) {

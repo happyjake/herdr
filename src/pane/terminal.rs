@@ -146,6 +146,18 @@ pub struct InputState {
     pub color_scheme_reporting: bool,
 }
 
+#[cfg(unix)]
+impl InputState {
+    /// Modes a full-screen application turns on, used by live handoff to
+    /// restore such a pane to the screen it draws on.
+    pub fn indicates_fullscreen_application(self) -> bool {
+        self.alternate_screen
+            || self.application_cursor
+            || self.focus_reporting
+            || self.mouse_protocol_mode != crate::input::MouseProtocolMode::None
+    }
+}
+
 #[cfg(test)]
 impl InputState {
     pub fn mouse_reporting_enabled(self) -> bool {
@@ -1689,22 +1701,20 @@ impl GhosttyPaneTerminal {
                         .saturating_sub(scrollbar.offset + scrollbar.len)
                 })
                 .unwrap_or(0);
-            let bottom_before_resize = ghostty_detection_text(&mut core)
+            let visible_before_resize = ghostty_visible_text(&mut core)
                 .map(|text| !text.trim().is_empty())
                 .unwrap_or(false);
-            let resize_recovery_probe_lines = usize::from(rows)
-                .saturating_mul(8)
-                .max(DEFAULT_DETECTION_ROWS);
-            let replay_ansi = if core.terminal.active_screen().ok()
-                == Some(crate::ghostty::ActiveScreen::Primary)
-                && bottom_before_resize
-            {
-                ghostty_recent_ansi(&mut core, resize_recovery_probe_lines, true)
+            let replay_ansi = if visible_before_resize {
+                ghostty_visible_ansi(&core)
                     .ok()
                     .filter(|ansi| !ansi.trim().is_empty())
+                    .map(|ansi| format!("\x1b[H{ansi}"))
             } else {
                 None
             };
+            let resize_recovery_probe_lines = usize::from(rows)
+                .saturating_mul(8)
+                .max(DEFAULT_DETECTION_ROWS);
 
             #[cfg(windows)]
             if core.recent_fallback.usable {
@@ -1724,10 +1734,10 @@ impl GhosttyPaneTerminal {
             }
             let terminal_responses = self.drain_pending_pty_responses();
 
-            let bottom_is_blank = ghostty_detection_text(&mut core)
+            let visible_is_blank = ghostty_visible_text(&mut core)
                 .map(|text| text.trim().is_empty())
                 .unwrap_or(false);
-            if bottom_is_blank {
+            if visible_is_blank {
                 if let Some(ansi) = replay_ansi.as_deref() {
                     core.terminal.scroll_viewport_bottom();
                     core.terminal.write(ansi.as_bytes());
@@ -2896,14 +2906,6 @@ fn ghostty_recent_text_unwrapped_snapshot(
 ) -> Result<TerminalReadSnapshot, crate::ghostty::Error> {
     let text = ghostty_recent_text_unwrapped_for_terminal(&core.terminal, lines)?;
     Ok(finish_recent_snapshot(core, text, lines, true))
-}
-
-fn ghostty_recent_ansi(
-    core: &mut GhosttyPaneCore,
-    lines: usize,
-    unwrap: bool,
-) -> Result<String, crate::ghostty::Error> {
-    ghostty_recent_ansi_snapshot(core, lines, unwrap).map(|snapshot| snapshot.text)
 }
 
 fn ghostty_recent_ansi_snapshot(
@@ -5119,6 +5121,38 @@ mod tests {
             pane.encode_terminal_key(malformed_release, protocol),
             expected
         );
+    }
+
+    #[test]
+    fn input_state_marks_fullscreen_application_modes() {
+        let plain = InputState {
+            alternate_screen: false,
+            application_cursor: false,
+            bracketed_paste: true,
+            focus_reporting: false,
+            mouse_protocol_mode: crate::input::MouseProtocolMode::None,
+            mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
+            mouse_alternate_scroll: true,
+            modify_other_keys: false,
+            color_scheme_reporting: false,
+        };
+        assert!(!plain.indicates_fullscreen_application());
+
+        let mut alternate = plain;
+        alternate.alternate_screen = true;
+        assert!(alternate.indicates_fullscreen_application());
+
+        let mut cursor = plain;
+        cursor.application_cursor = true;
+        assert!(cursor.indicates_fullscreen_application());
+
+        let mut focus = plain;
+        focus.focus_reporting = true;
+        assert!(focus.indicates_fullscreen_application());
+
+        let mut mouse = plain;
+        mouse.mouse_protocol_mode = crate::input::MouseProtocolMode::ButtonMotion;
+        assert!(mouse.indicates_fullscreen_application());
     }
 
     #[test]

@@ -1432,22 +1432,6 @@ impl PaneRuntimeIo {
         }
     }
 
-    #[cfg(unix)]
-    fn nudge_child_redraw_after_handoff(
-        &self,
-        rows: u16,
-        cols: u16,
-        cell_width_px: u32,
-        cell_height_px: u32,
-    ) {
-        match self {
-            PaneRuntimeIo::Actor(actor) => {
-                actor.nudge_child_redraw_after_handoff(rows, cols, cell_width_px, cell_height_px);
-            }
-            #[cfg(test)]
-            PaneRuntimeIo::TestChannel { .. } => {}
-        }
-    }
 
     fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         match self {
@@ -2130,9 +2114,20 @@ impl PaneRuntime {
     }
 
     #[cfg(unix)]
-    pub fn handoff_history_ansi(&self) -> Option<String> {
-        if self.terminal.alternate_screen_active() {
-            return None;
+    pub fn handoff_history_ansi(
+        &self,
+        screen_restore: crate::handoff_runtime::HandoffScreenRestore,
+    ) -> Option<String> {
+        if screen_restore.is_alternate() {
+            let visible_ansi = self.visible_ansi();
+            if !visible_ansi.trim().is_empty() {
+                let history = format!("\x1b[H{visible_ansi}");
+                let history = truncate_handoff_history(
+                    history,
+                    crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE,
+                );
+                return (!history.trim().is_empty()).then_some(history);
+            }
         }
         self.snapshot_history().map(|history| {
             truncate_handoff_history(history, crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
@@ -2470,7 +2465,7 @@ impl PaneRuntime {
             events,
         );
 
-        Ok(Self {
+        let runtime = Self {
             pane_id,
             terminal,
             io,
@@ -2490,7 +2485,8 @@ impl PaneRuntime {
             preserve_processes_on_drop: true,
             compression,
             detect_handle: Some(detect_handle),
-        })
+        };
+        Ok(runtime)
     }
 
     // Runtime construction needs to thread PTY size, environment, theme, render hooks, and detection policy together.
@@ -3148,13 +3144,6 @@ impl PaneRuntime {
             cell_height_px,
             terminal_responses,
         );
-    }
-
-    #[cfg(unix)]
-    pub fn nudge_child_redraw_after_handoff(&self) {
-        let (rows, cols, cell_width_px, cell_height_px) = self.current_size.get();
-        self.io
-            .nudge_child_redraw_after_handoff(rows, cols, cell_width_px, cell_height_px);
     }
 
     /// Scroll up by N lines (into scrollback history).
@@ -4745,25 +4734,37 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn handoff_history_ansi_captures_primary_screen() {
-        let runtime =
-            PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"handoff-primary-history\r\n");
+        let mut bytes = Vec::new();
+        for line in 1..=12 {
+            bytes.extend_from_slice(format!("handoff-primary-history-{line:02}\r\n").as_bytes());
+        }
+        let runtime = PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, &bytes);
 
-        let history = runtime.handoff_history_ansi().unwrap();
+        let history = runtime
+            .handoff_history_ansi(crate::handoff_runtime::HandoffScreenRestore::Primary)
+            .unwrap();
 
-        assert!(history.contains("handoff-primary-history"));
+        assert!(history.contains("handoff-primary-history-01"));
+        assert!(history.contains("handoff-primary-history-12"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn handoff_history_ansi_skips_alternate_screen() {
+    async fn handoff_history_ansi_captures_alternate_screen() {
         let runtime = PaneRuntime::test_with_scrollback_bytes(
             40,
             5,
             4096,
-            b"primary\r\n\x1b[?1049halt-screen",
+            b"primary\r\n\x1b[?1049h\x1b[2J\x1b[Halt-screen",
         );
 
-        assert!(runtime.handoff_history_ansi().is_none());
+        let history = runtime
+            .handoff_history_ansi(crate::handoff_runtime::HandoffScreenRestore::Alternate)
+            .unwrap();
+
+        assert!(history.starts_with("\x1b[H"));
+        assert!(history.contains("alt-screen"));
+        assert!(!history.contains("primary"));
     }
 
     #[cfg(unix)]
