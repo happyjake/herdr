@@ -734,6 +734,62 @@ fn pane_list_and_pane_read_are_identical_over_unix_socket_and_websocket() {
 }
 
 #[test]
+fn offset_reads_are_identical_over_unix_socket_and_websocket() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+
+    let created = unix_request(
+        &server.socket_path,
+        &format!(
+            r#"{{"id":"req_off_ws1","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            server.base.display()
+        ),
+    );
+    assert_eq!(created["result"]["type"], "workspace_created");
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Print known history so an offset window lands above the tail.
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let sent = ws.request(&format!(
+        r#"{{"id":"off_send","method":"pane.send_text","params":{{"pane_id":"{pane_id}","text":"for i in $(seq 1 80); do echo \"wsoff-$i\"; done"}}}}"#
+    ));
+    assert_eq!(sent["result"]["type"], "ok");
+    let entered = ws.request(&format!(
+        r#"{{"id":"off_enter","method":"pane.send_keys","params":{{"pane_id":"{pane_id}","keys":["Enter"]}}}}"#
+    ));
+    assert_eq!(entered["result"]["type"], "ok");
+    ws.send(&format!(
+        r#"{{"id":"off_wait","method":"pane.wait_for_output","params":{{"pane_id":"{pane_id}","source":"recent","lines":40,"match":{{"type":"substring","value":"wsoff-80"}},"timeout_ms":10000}}}}"#
+    ));
+    let waited = ws.read_json(Duration::from_secs(11));
+    assert_eq!(waited["result"]["type"], "output_matched");
+
+    let offset_request = format!(
+        r#"{{"id":"req_off_read","method":"pane.read","params":{{"pane_id":"{pane_id}","source":"recent","lines":10,"offset_from_bottom":30}}}}"#
+    );
+    assert_eventually_identical(
+        "pane.read with offset_from_bottom",
+        || unix_request(&server.socket_path, &offset_request),
+        || ws.request(&offset_request),
+    );
+
+    let response = unix_request(&server.socket_path, &offset_request);
+    let read = &response["result"]["read"];
+    assert_eq!(read["effective_offset"], 30);
+    assert_eq!(read["has_more"], true);
+    let text = read["text"].as_str().unwrap();
+    assert!(
+        text.contains("wsoff-") && !text.contains("wsoff-80"),
+        "a 30-row offset window must sit above the tail: {text:?}"
+    );
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
 fn send_text_and_wait_for_output_work_over_one_websocket_connection() {
     let _lock = test_lock();
     let server = start_ws_test_server();

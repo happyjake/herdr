@@ -340,6 +340,7 @@ fn agent_command() -> Command {
                 .arg(required("target", "TARGET"))
                 .arg(read_source_option(true))
                 .arg(option("lines", "N"))
+                .arg(option("offset", "N"))
                 .arg(text_ansi_format_option())
                 .arg(flag("ansi")),
         )

@@ -508,6 +508,7 @@ fn pane_read(
                 format: crate::api::schema::ReadFormat::Text,
                 strip_ansi,
                 intent: crate::api::schema::ReadIntent::Passive,
+                offset_from_bottom: None,
             }),
         },
         api_tx,

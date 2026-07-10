@@ -284,6 +284,10 @@ pub struct PaneReadParams {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) intent: super::common::ReadIntent,
+    /// Shift the recent-source window up from the bottom anchor: physical
+    /// rows for `recent`, logical lines for `recent_unwrapped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_from_bottom: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -681,4 +685,12 @@ pub struct PaneReadResult {
     pub text: String,
     pub revision: u64,
     pub truncated: bool,
+    /// Echoed on offset reads: the requested offset_from_bottom clamped at
+    /// the top of scrollback. Absent when the request carried no offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_offset: Option<u64>,
+    /// Echoed on offset reads: whether content remains above the returned
+    /// window. Absent when the request carried no offset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
 }

@@ -1280,6 +1280,15 @@
                 "null"
               ]
             },
+            "offset_from_bottom": {
+              "description": "Shift the recent-source window up from the bottom anchor: physical\nrows for `recent`, logical lines for `recent_unwrapped`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "source": {
               "$ref": "#/schemas/request/$defs/ReadSource"
             },
@@ -2735,6 +2744,15 @@
             },
             "lines": {
               "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "offset_from_bottom": {
+              "description": "Shift the recent-source window up from the bottom anchor: physical\nrows for `recent`, logical lines for `recent_unwrapped`.",
+              "format": "uint64",
               "minimum": 0,
               "type": [
                 "integer",
@@ -6000,8 +6018,24 @@
         },
         "PaneReadResult": {
           "properties": {
+            "effective_offset": {
+              "description": "Echoed on offset reads: the requested offset_from_bottom clamped at\nthe top of scrollback. Absent when the request carried no offset.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "format": {
               "$ref": "#/schemas/subscription_event/$defs/ReadFormat"
+            },
+            "has_more": {
+              "description": "Echoed on offset reads: whether content remains above the returned\nwindow. Absent when the request carried no offset.",
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "pane_id": {
               "type": "string"
@@ -7864,8 +7898,24 @@
         },
         "PaneReadResult": {
           "properties": {
+            "effective_offset": {
+              "description": "Echoed on offset reads: the requested offset_from_bottom clamped at\nthe top of scrollback. Absent when the request carried no offset.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "format": {
               "$ref": "#/schemas/success_response/$defs/ReadFormat"
+            },
+            "has_more": {
+              "description": "Echoed on offset reads: whether content remains above the returned\nwindow. Absent when the request carried no offset.",
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "pane_id": {
               "type": "string"

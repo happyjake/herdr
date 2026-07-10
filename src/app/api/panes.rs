@@ -12,7 +12,7 @@ use crate::api::schema::{
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
     PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneZoomResult, ReadFormat, ReadSource, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -1208,12 +1208,44 @@ impl App {
         else {
             return pane_not_found(id, &params.pane_id);
         };
-        let snapshot = crate::app::api_helpers::read_terminal_snapshot(
-            pane,
-            params.source,
-            params.format,
-            params.lines,
-        );
+        let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
+        if params.offset_from_bottom.is_some()
+            && !matches!(
+                params.source,
+                ReadSource::Recent | ReadSource::RecentUnwrapped
+            )
+        {
+            return encode_error(
+                id,
+                "invalid_request",
+                "offset_from_bottom requires source recent or recent_unwrapped",
+            );
+        }
+        let (text, truncated, effective_offset, has_more) = match params.offset_from_bottom {
+            Some(offset) => {
+                let window = pane.recent_read_at_offset(crate::pane::RecentReadRequest {
+                    lines: requested_lines,
+                    offset_from_bottom: usize::try_from(offset).unwrap_or(usize::MAX),
+                    unwrapped: matches!(params.source, ReadSource::RecentUnwrapped),
+                    ansi: matches!(params.format, ReadFormat::Ansi),
+                });
+                (
+                    window.text,
+                    window.has_more,
+                    Some(window.effective_offset as u64),
+                    Some(window.has_more),
+                )
+            }
+            None => {
+                let snapshot = crate::app::api_helpers::read_terminal_snapshot(
+                    pane,
+                    params.source,
+                    params.format,
+                    params.lines,
+                );
+                (snapshot.text, snapshot.truncated, None, None)
+            }
+        };
 
         encode_success(
             id,
@@ -1224,9 +1256,11 @@ impl App {
                     tab_id: self.public_tab_id(ws_idx, tab_idx).unwrap(),
                     source: params.source,
                     format: params.format,
-                    text: snapshot.text,
+                    text,
                     revision: 0,
-                    truncated: snapshot.truncated,
+                    truncated,
+                    effective_offset,
+                    has_more,
                 },
             },
         )
@@ -2001,6 +2035,46 @@ mod tests {
         (app, public_pane_id, pane_id)
     }
 
+    /// 30 numbered scrollback lines and a prompt row on a 20x5 screen, so
+    /// offset windows land on known rows (0..=29 numbered, row 30 prompt).
+    fn app_with_offset_read_runtime() -> (App, String, PaneId) {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let mut bytes = Vec::new();
+        for line in 0..30 {
+            bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"> ");
+        let runtime =
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(20, 5, 100_000, &bytes);
+        app.state.insert_test_runtime(pane_id, runtime);
+        (app, public_pane_id, pane_id)
+    }
+
+    fn offset_read_params(
+        pane_id: String,
+        source: ReadSource,
+        lines: u32,
+        offset_from_bottom: Option<u64>,
+    ) -> PaneReadParams {
+        PaneReadParams {
+            pane_id,
+            source,
+            lines: Some(lines),
+            format: ReadFormat::Text,
+            strip_ansi: true,
+            offset_from_bottom,
+        }
+    }
+
+    fn pane_read_result(response: &str) -> PaneReadResult {
+        let success: SuccessResponse = serde_json::from_str(response).unwrap();
+        let ResponseResult::PaneRead { read } = success.result else {
+            panic!("expected pane read response");
+        };
+        read
+    }
+
     fn metadata_params(pane_id: String) -> PaneReportMetadataParams {
         PaneReportMetadataParams {
             pane_id,
@@ -2073,6 +2147,148 @@ mod tests {
         assert_eq!(success.result, ResponseResult::Ok {});
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\x1b[Z"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_offset_pages_walk_scrollback() {
+        let (mut app, public_pane_id, _pane) = app_with_offset_read_runtime();
+
+        let page = pane_read_result(&app.handle_pane_read(
+            "req".into(),
+            offset_read_params(public_pane_id.clone(), ReadSource::Recent, 10, Some(10)),
+        ));
+        assert_eq!(page.effective_offset, Some(10));
+        assert_eq!(page.has_more, Some(true));
+        assert!(page.text.contains("line 11") && page.text.contains("line 20"));
+        assert!(!page.text.contains("line 10") && !page.text.contains("line 21"));
+
+        // 31 content rows and a 10-row window put the top page at offset
+        // 21; overshooting clamps there and has_more flips off.
+        let top = pane_read_result(&app.handle_pane_read(
+            "req".into(),
+            offset_read_params(public_pane_id.clone(), ReadSource::Recent, 10, Some(500)),
+        ));
+        assert_eq!(top.effective_offset, Some(21));
+        assert_eq!(top.has_more, Some(false));
+        assert!(top.text.contains("line 00") && top.text.contains("line 09"));
+        assert!(!top.text.contains("line 10"));
+
+        let below_top = pane_read_result(&app.handle_pane_read(
+            "req".into(),
+            offset_read_params(public_pane_id, ReadSource::Recent, 10, Some(20)),
+        ));
+        assert_eq!(below_top.has_more, Some(true));
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_offset_zero_and_omitted_match_legacy_reads() {
+        let (mut app, public_pane_id, _pane) = app_with_offset_read_runtime();
+
+        // A request without the field parses as no offset, so pre-change
+        // clients keep today's wire shape end to end.
+        let parsed: PaneReadParams = serde_json::from_value(serde_json::json!({
+            "pane_id": public_pane_id.clone(),
+            "source": "recent",
+            "lines": 10,
+        }))
+        .unwrap();
+        assert_eq!(parsed.offset_from_bottom, None);
+        let omitted_raw = app.handle_pane_read("req".into(), parsed);
+        assert!(
+            !omitted_raw.contains("effective_offset") && !omitted_raw.contains("has_more"),
+            "offset-free responses must keep the pre-change shape: {omitted_raw}"
+        );
+
+        for source in [ReadSource::Recent, ReadSource::RecentUnwrapped] {
+            let omitted = pane_read_result(&app.handle_pane_read(
+                "req".into(),
+                offset_read_params(public_pane_id.clone(), source, 10, None),
+            ));
+            let zero = pane_read_result(&app.handle_pane_read(
+                "req".into(),
+                offset_read_params(public_pane_id.clone(), source, 10, Some(0)),
+            ));
+            assert_eq!(zero.text, omitted.text);
+            assert_eq!(zero.effective_offset, Some(0));
+            assert_eq!(zero.has_more, Some(true));
+            assert_eq!(omitted.effective_offset, None);
+            assert_eq!(omitted.has_more, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_offset_counts_logical_lines_for_unwrapped() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        // Physical rows: 0..=2 wrapped alpha, 3 beta, 4..=5 wrapped gamma,
+        // 6 delta.
+        let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            10,
+            4,
+            100_000,
+            b"alpha-0123456789-alpha\r\nbeta\r\ngamma-0123456789\r\ndelta",
+        );
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        // Two logical lines up skips delta and the whole soft-wrapped
+        // gamma line; the wrapped source counts the same offset in
+        // physical rows and lands lower.
+        let logical = pane_read_result(&app.handle_pane_read(
+            "req".into(),
+            offset_read_params(
+                public_pane_id.clone(),
+                ReadSource::RecentUnwrapped,
+                2,
+                Some(2),
+            ),
+        ));
+        assert_eq!(logical.text, "ha\nbeta");
+        assert_eq!(logical.effective_offset, Some(2));
+        let physical = pane_read_result(&app.handle_pane_read(
+            "req".into(),
+            offset_read_params(public_pane_id, ReadSource::Recent, 2, Some(2)),
+        ));
+        assert_eq!(physical.text, "beta\ngamma-0123\n");
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_offset_windows_drift_while_content_appends() {
+        let (mut app, public_pane_id, pane_id) = app_with_offset_read_runtime();
+
+        let before = pane_read_result(&app.handle_pane_read(
+            "req".into(),
+            offset_read_params(public_pane_id.clone(), ReadSource::Recent, 5, Some(5)),
+        ));
+        assert!(before.text.contains("line 21") && before.text.contains("line 25"));
+
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(b"\r\nline 30\r\nline 31\r\nline 32\r\n> ");
+
+        // The window stays bottom-anchored, so the same offset lands four
+        // rows lower after the append; paging clients must anchor-merge
+        // overlapping pages instead of assuming stable windows.
+        let after = pane_read_result(&app.handle_pane_read(
+            "req".into(),
+            offset_read_params(public_pane_id, ReadSource::Recent, 5, Some(5)),
+        ));
+        assert!(after.text.contains("line 25") && after.text.contains("line 29"));
+        assert!(!after.text.contains("line 21"));
+        assert_ne!(before.text, after.text);
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_offset_rejects_non_recent_sources() {
+        let (mut app, public_pane_id, _pane) = app_with_offset_read_runtime();
+        for source in [ReadSource::Visible, ReadSource::Detection] {
+            let response = app.handle_pane_read(
+                "req".into(),
+                offset_read_params(public_pane_id.clone(), source, 10, Some(1)),
+            );
+            assert_eq!(metadata_error_code(&response), "invalid_request");
+        }
     }
 
     #[tokio::test]

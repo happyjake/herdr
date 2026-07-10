@@ -406,6 +406,13 @@ impl TerminalRuntime {
         self.0.recent_unwrapped_ansi_snapshot(lines)
     }
 
+    pub fn recent_read_at_offset(
+        &self,
+        request: crate::pane::RecentReadRequest,
+    ) -> crate::pane::RecentReadWindow {
+        self.0.recent_read_at_offset(request)
+    }
+
     pub fn snapshot_history(&self) -> Option<String> {
         self.0.snapshot_history()
     }

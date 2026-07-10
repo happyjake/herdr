@@ -53,6 +53,28 @@ pub struct ScrollMetrics {
     pub viewport_rows: usize,
 }
 
+/// A recent-source read window shifted up from the bottom anchor.
+/// `offset_from_bottom` counts physical rows for the wrapped source and
+/// logical lines for the unwrapped source, matching how each source
+/// reports its lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecentReadRequest {
+    pub lines: usize,
+    pub offset_from_bottom: usize,
+    pub unwrapped: bool,
+    pub ansi: bool,
+}
+
+/// Where an offset read actually landed: `effective_offset` is the
+/// requested offset clamped at the top of scrollback, `has_more` reports
+/// whether content remains above the returned window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecentReadWindow {
+    pub text: String,
+    pub effective_offset: usize,
+    pub has_more: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TerminalTextPoint {
     pub row: u32,
@@ -482,6 +504,10 @@ impl PaneTerminal {
 
     pub(crate) fn recent_unwrapped_ansi_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         self.ghostty.recent_unwrapped_ansi_snapshot(lines)
+    }
+
+    pub fn recent_read_at_offset(&self, request: RecentReadRequest) -> RecentReadWindow {
+        self.ghostty.recent_read_at_offset(request)
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -2065,6 +2091,14 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
+    pub fn recent_read_at_offset(&self, request: RecentReadRequest) -> RecentReadWindow {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| ghostty_recent_read_at_offset(&core, request).ok())
+            .unwrap_or_default()
+    }
+
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.core
             .lock()
@@ -2783,6 +2817,134 @@ fn ghostty_last_content_row(
         y -= 1;
     }
     Ok(last)
+}
+
+fn ghostty_recent_read_at_offset(
+    core: &GhosttyPaneCore,
+    request: RecentReadRequest,
+) -> Result<RecentReadWindow, crate::ghostty::Error> {
+    let window = ghostty_recent_read_at_offset_for_terminal(&core.terminal, request)?;
+    #[cfg(windows)]
+    {
+        // Zero offset keeps the legacy console-buffer fallback; offset pages
+        // skip it because the fallback holds no row-addressable history.
+        if request.offset_from_bottom == 0 && window.text.trim().is_empty() {
+            let fallback =
+                windows_recent_fallback::recent_text(core, request.lines, request.unwrapped);
+            if !fallback.trim().is_empty() {
+                return Ok(RecentReadWindow {
+                    text: fallback,
+                    ..window
+                });
+            }
+        }
+    }
+    Ok(window)
+}
+
+fn ghostty_recent_read_at_offset_for_terminal(
+    terminal: &crate::ghostty::Terminal,
+    request: RecentReadRequest,
+) -> Result<RecentReadWindow, crate::ghostty::Error> {
+    let RecentReadRequest {
+        lines,
+        offset_from_bottom,
+        unwrapped,
+        ansi,
+    } = request;
+    if offset_from_bottom == 0 {
+        // The zero-offset window is byte-identical to today's reads, floor
+        // guard included; only the echo fields are new.
+        let text = match (unwrapped, ansi) {
+            (false, false) => ghostty_recent_text_for_terminal(terminal, lines)?,
+            (true, false) => ghostty_recent_text_unwrapped_for_terminal(terminal, lines)?,
+            (_, true) => ghostty_recent_ansi_for_terminal(terminal, lines, unwrapped)?,
+        };
+        let has_more =
+            ghostty_recent_read_range(terminal, lines)?.is_some_and(|(start, _, _)| start > 0);
+        return Ok(RecentReadWindow {
+            text,
+            effective_offset: 0,
+            has_more,
+        });
+    }
+    let Some((_, end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
+        return Ok(RecentReadWindow::default());
+    };
+    // A nonzero offset is an explicit history read, so the window may land
+    // on any scrollback row; the zero-offset floor guard that keeps small
+    // reads on the visible screen does not apply. The window also keeps
+    // blank rows verbatim instead of trimming them: mid-history blank rows
+    // are content, and pages must stitch without silently dropped lines.
+    let (start, page_end, effective_offset) = if unwrapped {
+        ghostty_offset_window_logical(terminal, end, lines, offset_from_bottom)?
+    } else {
+        let max_offset = end.saturating_add(1).saturating_sub(lines);
+        let effective = offset_from_bottom.min(max_offset);
+        let page_end = end - effective;
+        let start = page_end.saturating_add(1).saturating_sub(lines);
+        (start, page_end, effective)
+    };
+    let text = if ansi {
+        terminal.read_ansi_screen(
+            (0, start as u32),
+            (cols.saturating_sub(1), page_end as u32),
+            false,
+            unwrapped,
+        )?
+    } else if unwrapped {
+        terminal.read_text_screen(
+            (0, start as u32),
+            (cols.saturating_sub(1), page_end as u32),
+            false,
+        )?
+    } else {
+        let mut rows = Vec::with_capacity(page_end.saturating_sub(start).saturating_add(1));
+        for y in start..=page_end {
+            rows.push(ghostty_screen_row(terminal, cols, y as u32)?);
+        }
+        lines_to_text(rows)
+    };
+    Ok(RecentReadWindow {
+        text,
+        effective_offset,
+        has_more: start > 0,
+    })
+}
+
+/// Shift the bottom anchor of an unwrapped read up by `offset` logical
+/// lines. Each step skips one whole logical line (a hard-broken row plus
+/// its soft-wrap continuations), so the offset counts the same units the
+/// unwrapped source reports. Stepping stops early once the window reaches
+/// the top of scrollback, or when the bottommost remaining logical line
+/// starts at row zero (a logical line taller than the window cannot be
+/// paged past; `has_more` stays true and `effective_offset` stops growing
+/// so callers can detect the stall). Returns `(start, end,
+/// effective_offset)` for the shifted window.
+fn ghostty_offset_window_logical(
+    terminal: &crate::ghostty::Terminal,
+    end: usize,
+    lines: usize,
+    offset: usize,
+) -> Result<(usize, usize, usize), crate::ghostty::Error> {
+    let mut anchor = end;
+    let mut effective = 0usize;
+    while effective < offset && anchor >= lines {
+        let mut line_start = anchor;
+        while line_start > 0 && terminal.row_wrap_continuation(line_start as u32)? {
+            line_start -= 1;
+        }
+        if line_start == 0 {
+            break;
+        }
+        anchor = line_start - 1;
+        effective += 1;
+    }
+    Ok((
+        anchor.saturating_sub(lines.saturating_sub(1)),
+        anchor,
+        effective,
+    ))
 }
 
 fn ghostty_set_scroll_offset_from_bottom(
@@ -5358,6 +5520,222 @@ mod tests {
             text.contains("line 10"),
             "a read taller than the screen must still include scrollback: {text:?}"
         );
+    }
+
+    fn offset_window(
+        terminal: &crate::ghostty::Terminal,
+        lines: usize,
+        offset: usize,
+        unwrapped: bool,
+        ansi: bool,
+    ) -> RecentReadWindow {
+        ghostty_recent_read_at_offset_for_terminal(
+            terminal,
+            RecentReadRequest {
+                lines,
+                offset_from_bottom: offset,
+                unwrapped,
+                ansi,
+            },
+        )
+        .expect("offset read")
+    }
+
+    /// 30 numbered scrollback lines and a prompt row on a 20x5 screen.
+    fn terminal_with_numbered_scrollback() -> crate::ghostty::Terminal {
+        let mut terminal = crate::ghostty::Terminal::new(20, 5, 100_000).unwrap();
+        write_numbered_lines(&mut terminal, 30);
+        terminal.write(b"> ");
+        terminal
+    }
+
+    #[test]
+    fn offset_read_zero_matches_legacy_recent_reads() {
+        let terminal = terminal_with_numbered_scrollback();
+
+        let legacy_text = ghostty_recent_text_for_terminal(&terminal, 10).unwrap();
+        let legacy_unwrapped = ghostty_recent_text_unwrapped_for_terminal(&terminal, 10).unwrap();
+        let legacy_ansi = ghostty_recent_ansi_for_terminal(&terminal, 10, false).unwrap();
+        let legacy_unwrapped_ansi = ghostty_recent_ansi_for_terminal(&terminal, 10, true).unwrap();
+
+        assert_eq!(
+            offset_window(&terminal, 10, 0, false, false).text,
+            legacy_text
+        );
+        assert_eq!(
+            offset_window(&terminal, 10, 0, true, false).text,
+            legacy_unwrapped
+        );
+        assert_eq!(
+            offset_window(&terminal, 10, 0, false, true).text,
+            legacy_ansi
+        );
+        assert_eq!(
+            offset_window(&terminal, 10, 0, true, true).text,
+            legacy_unwrapped_ansi
+        );
+
+        let window = offset_window(&terminal, 10, 0, false, false);
+        assert_eq!(window.effective_offset, 0);
+        assert!(
+            window.has_more,
+            "scrollback above the window must report more"
+        );
+    }
+
+    #[test]
+    fn offset_read_zero_keeps_the_post_clear_guard_but_offsets_reach_history() {
+        let mut terminal = crate::ghostty::Terminal::new(20, 10, 100_000).unwrap();
+        for i in 1..=30 {
+            terminal.write(format!("old line {i}\r\n").as_bytes());
+        }
+        terminal.write(b"\x1b[2J\x1b[H> ");
+
+        // Zero offset is today's guarded read: the cleared screen only.
+        let zero = offset_window(&terminal, 8, 0, false, false);
+        assert_eq!(
+            zero.text,
+            ghostty_recent_text_for_terminal(&terminal, 8).unwrap()
+        );
+        assert!(!zero.text.contains("old line"));
+        assert!(
+            zero.has_more,
+            "pre-clear scrollback above the guarded window must report more"
+        );
+
+        // An explicit offset is a history read and may reach pre-clear rows.
+        let page = offset_window(&terminal, 8, 1, false, false);
+        assert!(
+            page.text.contains("old line"),
+            "offset pages must reach pre-clear scrollback: {:?}",
+            page.text
+        );
+        assert_eq!(page.effective_offset, 1);
+    }
+
+    #[test]
+    fn offset_read_pages_walk_scrollback_rows() {
+        let terminal = terminal_with_numbered_scrollback();
+        // Rows 0..=29 hold 000000..000029, row 30 holds the prompt; a
+        // 10-row window at offset 10 covers rows 11..=20.
+        let page = offset_window(&terminal, 10, 10, false, false);
+        assert!(page.text.contains("000011") && page.text.contains("000020"));
+        assert!(!page.text.contains("000010") && !page.text.contains("000021"));
+        assert_eq!(page.effective_offset, 10);
+        assert!(page.has_more);
+
+        // The topmost full window sits at offset 21 (31 content rows).
+        let top = offset_window(&terminal, 10, 21, false, false);
+        assert!(top.text.contains("000000") && top.text.contains("000009"));
+        assert!(!top.text.contains("000010"));
+        assert_eq!(top.effective_offset, 21);
+        assert!(!top.has_more, "the top window must flip has_more off");
+        assert!(
+            offset_window(&terminal, 10, 20, false, false).has_more,
+            "one step below the top must still report more"
+        );
+
+        // Overshooting clamps to the same top window.
+        let clamped = offset_window(&terminal, 10, 500, false, false);
+        assert_eq!(clamped.effective_offset, 21);
+        assert_eq!(clamped.text, top.text);
+        assert!(!clamped.has_more);
+    }
+
+    #[test]
+    fn offset_read_stepping_covers_entire_scrollback() {
+        let terminal = terminal_with_numbered_scrollback();
+        let mut stitched = String::new();
+        let mut offset = 0;
+        loop {
+            let page = offset_window(&terminal, 10, offset, false, false);
+            stitched = format!("{}{}", page.text, stitched);
+            if !page.has_more {
+                break;
+            }
+            offset = page.effective_offset + page.text.lines().count();
+            assert!(offset <= 60, "stepping must terminate");
+        }
+        for i in 0..30 {
+            assert!(
+                stitched.contains(&format!("{i:06}")),
+                "stepping the offset must cover line {i:06}"
+            );
+        }
+        assert!(stitched.contains('>'));
+    }
+
+    #[test]
+    fn offset_read_counts_logical_lines_for_unwrapped() {
+        let mut terminal = crate::ghostty::Terminal::new(10, 4, 100_000).unwrap();
+        // Physical rows: 0 "alpha-0123", 1 "456789-alp", 2 "ha",
+        // 3 "beta", 4 "gamma-0123", 5 "456789", 6 "delta".
+        terminal.write(b"alpha-0123456789-alpha\r\nbeta\r\ngamma-0123456789\r\ndelta");
+
+        // One logical line up skips "delta" and lands on the whole
+        // soft-wrapped "gamma-0123456789".
+        let one_up = offset_window(&terminal, 2, 1, true, false);
+        assert_eq!(one_up.text, "gamma-0123456789");
+        assert_eq!(one_up.effective_offset, 1);
+        assert!(one_up.has_more);
+
+        // Two logical lines up is "ha\nbeta"; the same offset in the
+        // wrapped source counts physical rows and lands lower.
+        let logical = offset_window(&terminal, 2, 2, true, false);
+        assert_eq!(logical.text, "ha\nbeta");
+        let physical = offset_window(&terminal, 2, 2, false, false);
+        assert!(physical.text.contains("beta") && physical.text.contains("gamma-0123"));
+        assert!(!physical.text.contains("ha"));
+
+        // Clamping at the top reports the effective offset and drops
+        // has_more once the window includes the first row.
+        let top = offset_window(&terminal, 4, 99, true, false);
+        assert_eq!(top.effective_offset, 2);
+        assert!(!top.has_more);
+        assert_eq!(top.text, "alpha-0123456789-alpha\nbeta");
+
+        // A window too short for the wrapped top line stalls: the offset
+        // stops growing while has_more stays honest about the hidden head.
+        let stalled = offset_window(&terminal, 2, 99, true, false);
+        assert_eq!(stalled.effective_offset, 3);
+        assert!(stalled.has_more);
+        assert_eq!(stalled.text, "456789-alpha");
+    }
+
+    #[test]
+    fn offset_read_drifts_with_appended_content() {
+        let mut terminal = crate::ghostty::Terminal::new(20, 5, 100_000).unwrap();
+        write_numbered_lines(&mut terminal, 20);
+        terminal.write(b"> ");
+
+        // Rows 0..=19 numbered, row 20 prompt: offset 5 covers rows 11..=15.
+        let before = offset_window(&terminal, 5, 5, false, false);
+        assert!(before.text.contains("000011") && before.text.contains("000015"));
+
+        terminal.write(b"\r\n");
+        for i in 20..23 {
+            terminal.write(format!("{i:06}\r\n").as_bytes());
+        }
+        terminal.write(b"> ");
+
+        // The window is bottom-anchored, so the same offset now lands four
+        // rows lower; paging clients must anchor-merge overlapping pages.
+        let after = offset_window(&terminal, 5, 5, false, false);
+        assert!(after.text.contains("000015") && after.text.contains("000019"));
+        assert!(!after.text.contains("000011"));
+        assert_ne!(before.text, after.text);
+    }
+
+    #[test]
+    fn offset_read_ansi_pages_keep_styling_and_window_placement() {
+        let terminal = terminal_with_numbered_scrollback();
+        let page = offset_window(&terminal, 10, 10, false, true);
+        assert!(page.text.contains("000011") && page.text.contains("000020"));
+        assert!(!page.text.contains("000021"));
+        assert_eq!(page.effective_offset, 10);
+
+        let unwrapped = offset_window(&terminal, 10, 10, true, true);
+        assert_eq!(unwrapped.effective_offset, 10);
     }
 
     #[test]

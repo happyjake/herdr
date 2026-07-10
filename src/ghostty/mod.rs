@@ -1107,6 +1107,14 @@ impl Terminal {
         Ok((wide, graphemes))
     }
 
+    /// Whether screen row `y` is a soft-wrap continuation of the row above,
+    /// i.e. part of the same logical line rather than the start of a new one.
+    pub(crate) fn row_wrap_continuation(&self, y: u32) -> Result<bool, Error> {
+        let grid_ref = self.grid_ref(ghostty_screen_point(0, y))?;
+        let (_soft_wrapped, wrap_continuation) = grid_ref_wrap_state(&grid_ref)?;
+        Ok(wrap_continuation)
+    }
+
     pub(crate) fn screen_text_rows(&self) -> Result<Vec<ScreenTextRow>, Error> {
         self.screen_text_rows_range(0, usize::MAX)
     }

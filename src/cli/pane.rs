@@ -536,6 +536,7 @@ fn parse_pane_read_args(args: &[String]) -> Result<PaneReadParams, String> {
         lines,
         format,
         strip_ansi,
+        offset_from_bottom: None,
         intent: crate::api::schema::ReadIntent::Interactive,
     })
 }

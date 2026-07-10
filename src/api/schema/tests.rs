@@ -687,6 +687,8 @@ fn subscription_event_envelope_round_trips() {
                 text: "auth: received\n".into(),
                 revision: 0,
                 truncated: false,
+                effective_offset: None,
+                has_more: None,
             },
         }),
     };

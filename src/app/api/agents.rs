@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    PaneReadResult, ReadFormat, ReadSource, ResponseResult,
 };
 use crate::app::App;
 
@@ -143,12 +143,44 @@ impl App {
         else {
             return agent_not_found(id, &params.target);
         };
-        let snapshot = crate::app::api_helpers::read_terminal_snapshot(
-            pane,
-            params.source,
-            params.format,
-            params.lines,
-        );
+        let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
+        if params.offset_from_bottom.is_some()
+            && !matches!(
+                params.source,
+                ReadSource::Recent | ReadSource::RecentUnwrapped
+            )
+        {
+            return encode_error(
+                id,
+                "invalid_request",
+                "offset_from_bottom requires source recent or recent_unwrapped",
+            );
+        }
+        let (text, truncated, effective_offset, has_more) = match params.offset_from_bottom {
+            Some(offset) => {
+                let window = pane.recent_read_at_offset(crate::pane::RecentReadRequest {
+                    lines: requested_lines,
+                    offset_from_bottom: usize::try_from(offset).unwrap_or(usize::MAX),
+                    unwrapped: matches!(params.source, ReadSource::RecentUnwrapped),
+                    ansi: matches!(params.format, ReadFormat::Ansi),
+                });
+                (
+                    window.text,
+                    window.has_more,
+                    Some(window.effective_offset as u64),
+                    Some(window.has_more),
+                )
+            }
+            None => {
+                let snapshot = crate::app::api_helpers::read_terminal_snapshot(
+                    pane,
+                    params.source,
+                    params.format,
+                    params.lines,
+                );
+                (snapshot.text, snapshot.truncated, None, None)
+            }
+        };
 
         encode_success(
             id,
@@ -163,9 +195,11 @@ impl App {
                         .unwrap(),
                     source: params.source,
                     format: params.format,
-                    text: snapshot.text,
+                    text,
                     revision: 0,
-                    truncated: snapshot.truncated,
+                    truncated,
+                    effective_offset,
+                    has_more,
                 },
             },
         )
@@ -563,6 +597,50 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "agent_not_ready");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_read_supports_offset_from_bottom() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let mut bytes = Vec::new();
+        for line in 0..30 {
+            bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"> ");
+        let runtime =
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(20, 5, 100_000, &bytes);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        let read_params = |offset_from_bottom, source| crate::api::schema::AgentReadParams {
+            target: target.clone(),
+            source,
+            lines: Some(10),
+            format: crate::api::schema::ReadFormat::Text,
+            strip_ansi: true,
+            offset_from_bottom,
+        };
+
+        let response = app.handle_agent_read(
+            "req".into(),
+            read_params(Some(10), crate::api::schema::ReadSource::Recent),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneRead { read } = success.result else {
+            panic!("expected pane read response");
+        };
+        assert_eq!(read.effective_offset, Some(10));
+        assert_eq!(read.has_more, Some(true));
+        assert!(read.text.contains("line 11") && read.text.contains("line 20"));
+        assert!(!read.text.contains("line 21"));
+
+        let rejected = app.handle_agent_read(
+            "req".into(),
+            read_params(Some(1), crate::api::schema::ReadSource::Visible),
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "invalid_request");
     }
 
     #[test]
