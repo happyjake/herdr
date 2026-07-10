@@ -63,6 +63,7 @@ pub(super) fn wait_for_output<T: ApiTransport>(
                 lines: params.lines,
                 format: crate::api::schema::ReadFormat::Text,
                 strip_ansi: params.strip_ansi,
+                offset_from_bottom: None,
             }),
         };
         let response =

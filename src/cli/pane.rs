@@ -503,6 +503,7 @@ fn pane_read(args: &[String]) -> std::io::Result<i32> {
             lines,
             format,
             strip_ansi,
+            offset_from_bottom: None,
         }),
     })?;
 

@@ -558,6 +558,7 @@ fn pane_read(
                 lines,
                 format: crate::api::schema::ReadFormat::Text,
                 strip_ansi,
+                offset_from_bottom: None,
             }),
         },
         api_tx,

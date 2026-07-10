@@ -48,7 +48,9 @@ pub(crate) use self::terminal::{
 };
 pub use self::{
     state::PaneState,
-    terminal::{InputState, ScrollMetrics, TerminalCursorState},
+    terminal::{
+        InputState, RecentReadRequest, RecentReadWindow, ScrollMetrics, TerminalCursorState,
+    },
 };
 
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
@@ -2867,6 +2869,10 @@ impl PaneRuntime {
 
     pub(crate) fn recent_unwrapped_ansi_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         self.terminal.recent_unwrapped_ansi_snapshot(lines)
+    }
+
+    pub fn recent_read_at_offset(&self, request: RecentReadRequest) -> RecentReadWindow {
+        self.terminal.recent_read_at_offset(request)
     }
 
     pub fn snapshot_history(&self) -> Option<String> {
