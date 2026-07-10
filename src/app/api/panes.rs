@@ -12,8 +12,10 @@ use crate::api::schema::{
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
     PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ReadFormat, ReadSource, ResponseResult,
+    PaneZoomResult, ResponseResult,
 };
+#[cfg(test)]
+use crate::api::schema::{ReadFormat, ReadSource};
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
 #[cfg(test)]
@@ -1208,43 +1210,15 @@ impl App {
         else {
             return pane_not_found(id, &params.pane_id);
         };
-        let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
-        if params.offset_from_bottom.is_some()
-            && !matches!(
-                params.source,
-                ReadSource::Recent | ReadSource::RecentUnwrapped
-            )
-        {
-            return encode_error(
-                id,
-                "invalid_request",
-                "offset_from_bottom requires source recent or recent_unwrapped",
-            );
-        }
-        let (text, truncated, effective_offset, has_more) = match params.offset_from_bottom {
-            Some(offset) => {
-                let window = pane.recent_read_at_offset(crate::pane::RecentReadRequest {
-                    lines: requested_lines,
-                    offset_from_bottom: usize::try_from(offset).unwrap_or(usize::MAX),
-                    unwrapped: matches!(params.source, ReadSource::RecentUnwrapped),
-                    ansi: matches!(params.format, ReadFormat::Ansi),
-                });
-                (
-                    window.text,
-                    window.has_more,
-                    Some(window.effective_offset as u64),
-                    Some(window.has_more),
-                )
-            }
-            None => {
-                let snapshot = crate::app::api_helpers::read_terminal_snapshot(
-                    pane,
-                    params.source,
-                    params.format,
-                    params.lines,
-                );
-                (snapshot.text, snapshot.truncated, None, None)
-            }
+        let (text, truncated, effective_offset, has_more) = match super::pane_read_window(
+            pane,
+            params.source,
+            params.format,
+            params.lines,
+            params.offset_from_bottom,
+        ) {
+            Ok(window) => window,
+            Err(message) => return encode_error(id, "invalid_request", message),
         };
 
         encode_success(

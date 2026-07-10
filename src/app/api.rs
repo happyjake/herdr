@@ -27,6 +27,52 @@ enum RuntimeExitAction {
     ClosePane,
 }
 
+/// Read window shared by the pane.read and agent.read handlers so their
+/// source dispatch and offset semantics cannot drift. Returns the text plus
+/// the offset echo fields (`Some` only when the request carried an offset),
+/// or the invalid_request message when the offset targets a source without
+/// bottom-anchored history.
+fn pane_read_window(
+    pane: &crate::terminal::TerminalRuntime,
+    source: crate::api::schema::ReadSource,
+    format: crate::api::schema::ReadFormat,
+    lines: Option<u32>,
+    offset_from_bottom: Option<u64>,
+) -> Result<(String, bool, Option<u64>, Option<bool>), &'static str> {
+    use crate::api::schema::{ReadFormat, ReadSource};
+
+    if offset_from_bottom.is_some()
+        && !matches!(source, ReadSource::Recent | ReadSource::RecentUnwrapped)
+    {
+        return Err("offset_from_bottom requires source recent or recent_unwrapped");
+    }
+    Ok(match offset_from_bottom {
+        Some(offset) => {
+            let requested_lines = lines.unwrap_or(80).min(1000) as usize;
+            let window = pane.recent_read_at_offset(crate::pane::RecentReadRequest {
+                lines: requested_lines,
+                offset_from_bottom: usize::try_from(offset).unwrap_or(usize::MAX),
+                unwrapped: matches!(source, ReadSource::RecentUnwrapped),
+                ansi: matches!(format, ReadFormat::Ansi),
+            });
+            if window.offset_unsupported {
+                return Err("offset paging is unsupported on this pane");
+            }
+            (
+                window.text,
+                window.has_more,
+                Some(window.effective_offset as u64),
+                Some(window.has_more),
+            )
+        }
+        None => {
+            let snapshot =
+                crate::app::api_helpers::read_terminal_snapshot(pane, source, format, lines);
+            (snapshot.text, snapshot.truncated, None, None)
+        }
+    })
+}
+
 impl App {
     pub(crate) fn dispatch_api_request(
         &mut self,

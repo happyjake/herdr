@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ReadFormat, ReadSource, ResponseResult,
+    PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -143,43 +143,15 @@ impl App {
         else {
             return agent_not_found(id, &params.target);
         };
-        let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
-        if params.offset_from_bottom.is_some()
-            && !matches!(
-                params.source,
-                ReadSource::Recent | ReadSource::RecentUnwrapped
-            )
-        {
-            return encode_error(
-                id,
-                "invalid_request",
-                "offset_from_bottom requires source recent or recent_unwrapped",
-            );
-        }
-        let (text, truncated, effective_offset, has_more) = match params.offset_from_bottom {
-            Some(offset) => {
-                let window = pane.recent_read_at_offset(crate::pane::RecentReadRequest {
-                    lines: requested_lines,
-                    offset_from_bottom: usize::try_from(offset).unwrap_or(usize::MAX),
-                    unwrapped: matches!(params.source, ReadSource::RecentUnwrapped),
-                    ansi: matches!(params.format, ReadFormat::Ansi),
-                });
-                (
-                    window.text,
-                    window.has_more,
-                    Some(window.effective_offset as u64),
-                    Some(window.has_more),
-                )
-            }
-            None => {
-                let snapshot = crate::app::api_helpers::read_terminal_snapshot(
-                    pane,
-                    params.source,
-                    params.format,
-                    params.lines,
-                );
-                (snapshot.text, snapshot.truncated, None, None)
-            }
+        let (text, truncated, effective_offset, has_more) = match super::pane_read_window(
+            pane,
+            params.source,
+            params.format,
+            params.lines,
+            params.offset_from_bottom,
+        ) {
+            Ok(window) => window,
+            Err(message) => return encode_error(id, "invalid_request", message),
         };
 
         encode_success(
@@ -603,6 +575,13 @@ mod tests {
     async fn agent_read_supports_offset_from_bottom() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        // Agent targets only resolve pane ids that currently host an agent.
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
         let mut bytes = Vec::new();
         for line in 0..30 {
             bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
