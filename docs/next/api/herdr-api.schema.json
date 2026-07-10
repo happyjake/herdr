@@ -1286,6 +1286,15 @@
                 "null"
               ]
             },
+            "offset_from_bottom": {
+              "description": "Shift the recent-source window up from the bottom anchor: physical\nrows for `recent`, logical lines for `recent_unwrapped`.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "source": {
               "$ref": "#/schemas/request/$defs/ReadSource"
             },
@@ -1692,6 +1701,18 @@
           },
           "required": [
             "target"
+          ],
+          "type": "object"
+        },
+        "AttachmentCreateParams": {
+          "properties": {
+            "bytes_b64": {
+              "description": "Image bytes encoded as standard base64 (RFC 4648, padding accepted).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "bytes_b64"
           ],
           "type": "object"
         },
@@ -2819,6 +2840,15 @@
             },
             "lines": {
               "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "offset_from_bottom": {
+              "description": "Shift the recent-source window up from the bottom anchor: physical\nrows for `recent`, logical lines for `recent_unwrapped`. Inside a\nlogical line taller than the window, one step degrades to one\nwindow of physical rows so every prefix row stays reachable; page\nby the echoed `effective_offset` rather than assuming fixed units.\nPanes whose only history lives in the Windows console fallback echo\n`has_more: false` at offset zero and reject nonzero offsets.",
+              "format": "uint64",
               "minimum": 0,
               "type": [
                 "integer",
@@ -4779,6 +4809,22 @@
         {
           "properties": {
             "method": {
+              "const": "attachment.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttachmentCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "notification.show",
               "type": "string"
             },
@@ -6384,8 +6430,24 @@
         },
         "PaneReadResult": {
           "properties": {
+            "effective_offset": {
+              "description": "Echoed on offset reads: the requested offset_from_bottom clamped at\nthe top of scrollback. Absent when the request carried no offset.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "format": {
               "$ref": "#/schemas/subscription_event/$defs/ReadFormat"
+            },
+            "has_more": {
+              "description": "Echoed on offset reads: whether content remains above the returned\nwindow. Absent when the request carried no offset.",
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "pane_id": {
               "type": "string"
@@ -8327,8 +8389,24 @@
         },
         "PaneReadResult": {
           "properties": {
+            "effective_offset": {
+              "description": "Echoed on offset reads: the requested offset_from_bottom clamped at\nthe top of scrollback. Absent when the request carried no offset.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "format": {
               "$ref": "#/schemas/success_response/$defs/ReadFormat"
+            },
+            "has_more": {
+              "description": "Echoed on offset reads: whether content remains above the returned\nwindow. Absent when the request carried no offset.",
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "pane_id": {
               "type": "string"
@@ -9203,6 +9281,30 @@
               "required": [
                 "type",
                 "snapshot"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "expires_at": {
+                  "description": "Unix seconds after which the TTL sweep may remove the file.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Absolute, space-free path of the fully written attachment file.\nThe success response is encoded only after the file is renamed\ninto place, so this path always names a complete, readable file.",
+                  "type": "string"
+                },
+                "type": {
+                  "const": "attachment_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "path",
+                "expires_at"
               ],
               "type": "object"
             },

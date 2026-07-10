@@ -228,12 +228,16 @@ impl App {
         else {
             return agent_not_found(id, &params.target);
         };
-        let snapshot = crate::app::api_helpers::read_terminal_snapshot(
+        let (text, truncated, effective_offset, has_more) = match super::pane_read_window(
             pane,
             params.source,
             params.format,
             params.lines,
-        );
+            params.offset_from_bottom,
+        ) {
+            Ok(window) => window,
+            Err(message) => return encode_error(id, "invalid_request", message),
+        };
 
         encode_success(
             id,
@@ -248,9 +252,11 @@ impl App {
                         .unwrap(),
                     source: params.source,
                     format: params.format,
-                    text: snapshot.text,
+                    text,
                     revision: 0,
-                    truncated: snapshot.truncated,
+                    truncated,
+                    effective_offset,
+                    has_more,
                 },
             },
         )
@@ -755,6 +761,57 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "agent_not_ready");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_read_supports_offset_from_bottom() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        // Agent targets only resolve pane ids that currently host an agent.
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        let mut bytes = Vec::new();
+        for line in 0..30 {
+            bytes.extend_from_slice(format!("line {line:02}\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"> ");
+        let runtime =
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(20, 5, 100_000, &bytes);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        let read_params = |offset_from_bottom, source| crate::api::schema::AgentReadParams {
+            target: target.clone(),
+            source,
+            lines: Some(10),
+            format: crate::api::schema::ReadFormat::Text,
+            strip_ansi: true,
+            offset_from_bottom,
+        };
+
+        let response = app.handle_agent_read(
+            "req".into(),
+            read_params(Some(10), crate::api::schema::ReadSource::Recent),
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneRead { read } = success.result else {
+            panic!("expected pane read response");
+        };
+        assert_eq!(read.effective_offset, Some(10));
+        assert_eq!(read.has_more, Some(true));
+        assert!(read.text.contains("line 11") && read.text.contains("line 20"));
+        assert!(!read.text.contains("line 21"));
+
+        let rejected = app.handle_agent_read(
+            "req".into(),
+            read_params(Some(1), crate::api::schema::ReadSource::Visible),
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "invalid_request");
     }
 
     #[test]

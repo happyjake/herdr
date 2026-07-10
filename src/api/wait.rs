@@ -64,6 +64,7 @@ pub(super) fn wait_for_output<T: ApiTransport>(
                 format: crate::api::schema::ReadFormat::Text,
                 strip_ansi: params.strip_ansi,
                 intent: crate::api::schema::ReadIntent::Passive,
+                offset_from_bottom: None,
             }),
         };
         let response =

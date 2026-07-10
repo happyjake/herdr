@@ -867,12 +867,13 @@ fn agent_send_keys(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
-        eprintln!("usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!("usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--offset N] [--format text|ansi] [--ansi]");
         return Ok(2);
     };
 
     let mut source = ReadSource::Recent;
     let mut lines = None;
+    let mut offset_from_bottom = None;
     let mut format = ReadFormat::Text;
     let mut strip_ansi = true;
 
@@ -893,6 +894,14 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
                     return Ok(2);
                 };
                 lines = Some(super::parse_u32_flag("--lines", value)?);
+                index += 2;
+            }
+            "--offset" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --offset");
+                    return Ok(2);
+                };
+                offset_from_bottom = Some(super::parse_u64_flag("--offset", value)?);
                 index += 2;
             }
             "--format" => {
@@ -924,6 +933,7 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
             lines,
             format,
             strip_ansi,
+            offset_from_bottom,
         }),
     })?;
     super::print_read_response(&response)
@@ -933,7 +943,7 @@ fn print_agent_help() {
     eprintln!("herdr agent commands:");
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
-    eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--offset N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");

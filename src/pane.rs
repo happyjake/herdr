@@ -49,7 +49,9 @@ pub(crate) use self::terminal::{
 };
 pub use self::{
     state::PaneState,
-    terminal::{ScrollMetrics, TerminalCursorState},
+    terminal::{
+        RecentReadRequest, RecentReadWindow, ScrollMetrics, TerminalCursorState,
+    },
 };
 
 pub(crate) struct TerminalDirtyPatchSnapshot {
@@ -3342,6 +3344,10 @@ impl PaneRuntime {
         let result = self.terminal.recent_unwrapped_ansi_snapshot(lines);
         self.compression.wake();
         result
+    }
+
+    pub fn recent_read_at_offset(&self, request: RecentReadRequest) -> RecentReadWindow {
+        self.terminal.recent_read_at_offset(request)
     }
 
     pub fn snapshot_history(&self) -> Option<String> {
