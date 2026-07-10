@@ -2781,7 +2781,18 @@ fn ghostty_recent_read_range(
     }
     let screen_rows = usize::from(terminal.rows()?).max(1);
     let first_screen_row = total_rows.saturating_sub(screen_rows);
-    let end = ghostty_last_content_row(terminal, total_rows, first_screen_row, cols)?;
+    // A fully blank screen with no scrollback has no content to anchor on:
+    // report nothing to read so fresh and cleared panes echo an empty
+    // window with `has_more: false` instead of advertising bogus history.
+    // A blank screen sitting on top of scrollback keeps the bottom anchor
+    // so a cleared pane still reads as empty rather than resurfacing old
+    // scrollback, while explicit offset pages can still walk up into the
+    // pre-clear history above the screen.
+    let end = match ghostty_last_content_row(terminal, total_rows, first_screen_row, cols)? {
+        Some(end) => end,
+        None if first_screen_row == 0 => return Ok(None),
+        None => total_rows.saturating_sub(1),
+    };
     // Anchoring `end` at the last content row may only trim the blank
     // screen tail below it, never lift the window into scrollback a
     // bottom-anchored window of the same size could not reach: rows above
@@ -2799,29 +2810,29 @@ fn ghostty_recent_read_range(
 /// screen tail below the cursor. On tall panes that tail can swallow a
 /// window smaller than the screen, hiding output near the top from small
 /// reads and output matchers. Scrollback is never scanned — it ends at
-/// content by construction — and a fully blank screen keeps the bottom
-/// anchor so a cleared pane still reads as empty rather than resurfacing
-/// old scrollback.
+/// content by construction. Returns `None` when the scanned screen span
+/// holds no content; the caller decides what a fully blank screen anchors
+/// to.
 fn ghostty_last_content_row(
     terminal: &crate::ghostty::Terminal,
     total_rows: usize,
     first_screen_row: usize,
     cols: u16,
-) -> Result<usize, crate::ghostty::Error> {
+) -> Result<Option<usize>, crate::ghostty::Error> {
     let last = total_rows.saturating_sub(1);
     let mut y = last;
     loop {
         let row_text =
             terminal.read_text_screen((0, y as u32), (cols.saturating_sub(1), y as u32), false)?;
         if !row_text.trim().is_empty() {
-            return Ok(y);
+            return Ok(Some(y));
         }
         if y == first_screen_row {
             break;
         }
         y -= 1;
     }
-    Ok(last)
+    Ok(None)
 }
 
 fn ghostty_recent_read_at_offset(
@@ -5573,6 +5584,25 @@ mod tests {
         write_numbered_lines(&mut terminal, 30);
         terminal.write(b"> ");
         terminal
+    }
+
+    #[test]
+    fn offset_read_on_blank_pane_dries_immediately() {
+        // A fresh pane with no output and no scrollback must not advertise
+        // history: offset zero echoes has_more false, and a positive
+        // offset returns an empty dry window instead of paging blank
+        // viewport rows.
+        let terminal = crate::ghostty::Terminal::new(20, 10, 100_000).unwrap();
+
+        let zero = offset_window(&terminal, 4, 0, true, false);
+        assert_eq!(zero.text, "");
+        assert!(!zero.has_more, "a blank pane must not advertise history");
+        assert_eq!(zero.effective_offset, 0);
+
+        let paged = offset_window(&terminal, 4, 5, false, false);
+        assert_eq!(paged.text, "");
+        assert!(!paged.has_more);
+        assert_eq!(paged.effective_offset, 0);
     }
 
     #[test]

@@ -2751,7 +2751,7 @@
               ]
             },
             "offset_from_bottom": {
-              "description": "Shift the recent-source window up from the bottom anchor: physical\nrows for `recent`, logical lines for `recent_unwrapped`.",
+              "description": "Shift the recent-source window up from the bottom anchor: physical\nrows for `recent`, logical lines for `recent_unwrapped`. Inside a\nlogical line taller than the window, one step degrades to one\nwindow of physical rows so every prefix row stays reachable; page\nby the echoed `effective_offset` rather than assuming fixed units.\nPanes whose only history lives in the Windows console fallback echo\n`has_more: false` at offset zero and reject nonzero offsets.",
               "format": "uint64",
               "minimum": 0,
               "type": [

@@ -285,7 +285,12 @@ pub struct PaneReadParams {
     #[schemars(skip)]
     pub(crate) intent: super::common::ReadIntent,
     /// Shift the recent-source window up from the bottom anchor: physical
-    /// rows for `recent`, logical lines for `recent_unwrapped`.
+    /// rows for `recent`, logical lines for `recent_unwrapped`. Inside a
+    /// logical line taller than the window, one step degrades to one
+    /// window of physical rows so every prefix row stays reachable; page
+    /// by the echoed `effective_offset` rather than assuming fixed units.
+    /// Panes whose only history lives in the Windows console fallback echo
+    /// `has_more: false` at offset zero and reject nonzero offsets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset_from_bottom: Option<u64>,
 }
