@@ -27,7 +27,7 @@ use crate::layout::{find_in_direction, NavDirection, PaneId};
 use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, encode_api_text, normalize_metadata_source,
     normalize_metadata_tokens, normalize_metadata_ttl, normalize_reported_agent_label,
-    MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
+    split_image_path_chunks, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
@@ -38,6 +38,90 @@ use super::responses::{encode_error, encode_success};
 /// a paste instead of a submit.
 pub(crate) const SEND_INPUT_TEXT_KEY_PACING: std::time::Duration =
     std::time::Duration::from_millis(30);
+/// Anything written after an image-path paste — trailing prose chunks and
+/// keys alike. Claude Code converts pasted image paths into attachments
+/// asynchronously and DROPS (not defers) input that lands inside that
+/// conversion window; 30ms sat inside it often enough to strand drafts
+/// (observed ~40% with six ~130KB images), and drops were still seen at
+/// 200ms. 1500ms cleared 6x1MiB images every run.
+pub(crate) const SEND_INPUT_ATTACHMENT_KEY_PACING: std::time::Duration =
+    std::time::Duration::from_millis(1500);
+
+/// One write of a `pane.send_input`, and how long after the write before it
+/// it must wait.
+#[derive(Debug, PartialEq, Eq)]
+struct SendInputSegment {
+    bytes: Bytes,
+    delay_before: std::time::Duration,
+}
+
+/// Lay a `pane.send_input` out as ordered writes. Image-path runs travel as
+/// their own pastes wherever they sit in the draft (see
+/// split_image_path_chunks for why), and anything written after a path run
+/// waits out Claude Code's async image conversion, which DROPS (not defers)
+/// input that lands inside it. Keys follow the text after
+/// SEND_INPUT_TEXT_KEY_PACING, or the attachment pacing when the text ended
+/// in a path run.
+fn send_input_segments(
+    chunks: impl IntoIterator<Item = (Vec<u8>, bool)>,
+    keys: Vec<Vec<u8>>,
+) -> Vec<SendInputSegment> {
+    let pacing_after = |image_paths: bool, otherwise| {
+        if image_paths {
+            SEND_INPUT_ATTACHMENT_KEY_PACING
+        } else {
+            otherwise
+        }
+    };
+    let mut segments = Vec::new();
+    let mut after_image_paths = false;
+    for (bytes, is_image_paths) in chunks {
+        segments.push(SendInputSegment {
+            bytes: Bytes::from(bytes),
+            delay_before: pacing_after(after_image_paths, std::time::Duration::ZERO),
+        });
+        after_image_paths = is_image_paths;
+    }
+    if !keys.is_empty() {
+        segments.push(SendInputSegment {
+            bytes: Bytes::from(keys.concat()),
+            delay_before: pacing_after(after_image_paths, SEND_INPUT_TEXT_KEY_PACING),
+        });
+    }
+    segments
+}
+
+/// Write send_input segments in order. A delayed segment rides the pane's
+/// ordered input submission with the write before it as its text, so its
+/// delay runs from that write's completion; later writes to the pane wait
+/// behind the submission. The caller's answer does not wait for delayed
+/// segments to land.
+fn write_send_input_segments(
+    runtime: &crate::terminal::TerminalRuntime,
+    segments: Vec<SendInputSegment>,
+) -> Result<(), String> {
+    let mut held: Option<Bytes> = None;
+    for segment in segments {
+        if segment.delay_before.is_zero() {
+            if let Some(bytes) = held.replace(segment.bytes) {
+                runtime.try_send_bytes(bytes).map_err(|err| err.to_string())?;
+            }
+        } else {
+            runtime
+                .queue_user_input_submission(
+                    held.take().unwrap_or_default(),
+                    segment.bytes,
+                    segment.delay_before,
+                    None,
+                )
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    if let Some(bytes) = held {
+        runtime.try_send_bytes(bytes).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -1868,24 +1952,13 @@ impl App {
                     return encode_error(id, "pane_send_failed", err.to_string());
                 }
             }
-        } else if encoded_keys.is_empty() {
-            let text = encode_api_text(runtime, &params.text);
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
         } else {
-            // One ordered submission on the pane's input queue: the keys
-            // follow the text after the pacing delay, and later writes to
-            // this pane wait behind both. The answer does not wait for the
-            // keys to land.
-            let text = encode_api_text(runtime, &params.text);
-            if let Err(err) = runtime.queue_user_input_submission(
-                Bytes::from(text),
-                Bytes::from(encoded_keys.concat()),
-                SEND_INPUT_TEXT_KEY_PACING,
-                None,
-            ) {
-                return encode_error(id, "pane_send_failed", err.to_string());
+            let chunks = split_image_path_chunks(&params.text)
+                .into_iter()
+                .map(|chunk| (encode_api_text(runtime, chunk.text), chunk.is_image_paths));
+            let segments = send_input_segments(chunks, encoded_keys);
+            if let Err(err) = write_send_input_segments(runtime, segments) {
+                return encode_error(id, "pane_send_failed", err);
             }
         }
 
@@ -3180,6 +3253,193 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\x1b"));
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn split_image_path_chunks_cases() {
+        use crate::app::api_helpers::split_image_path_chunks;
+
+        fn shapes(text: &str) -> Vec<(&str, bool)> {
+            let chunks = split_image_path_chunks(text);
+            // Invariant: chunks reassemble the original text exactly.
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.text).collect::<String>(),
+                text,
+            );
+            chunks
+                .into_iter()
+                .map(|chunk| (chunk.text, chunk.is_image_paths))
+                .collect()
+        }
+
+        // Trailing block: prose then paths, trailing whitespace folds into
+        // the path chunk (the pre-token-split behavior, preserved).
+        assert_eq!(
+            shapes("prose line\n\n/a/b.jpg\n\n/c/d.PNG\n"),
+            vec![
+                ("prose line\n\n", false),
+                ("/a/b.jpg\n\n/c/d.PNG\n", true),
+            ],
+        );
+        // Paths-only stays one chunk, absorbing surrounding whitespace.
+        assert_eq!(
+            shapes("/a/b.jpg\n\n/c/d.jpg"),
+            vec![("/a/b.jpg\n\n/c/d.jpg", true)],
+        );
+        // Wild shape A (phone 2026-07-13): pill path space-joined inline
+        // after prose on the same line.
+        assert_eq!(
+            shapes("don't lose anything. /att/rot.jpg"),
+            vec![("don't lose anything. ", false), ("/att/rot.jpg", true)],
+        );
+        // Wild shape B (phone 2026-07-13): slash command, path on its own
+        // line, then a quoted section AFTER the path.
+        assert_eq!(
+            shapes("/diagnose why\n\n/att/shot.jpg\n\nsample-notes\nclaude"),
+            vec![
+                ("/diagnose why\n\n", false),
+                ("/att/shot.jpg", true),
+                ("\n\nsample-notes\nclaude", false),
+            ],
+        );
+        // Path first, prose after: order preserved, no hoisting possible.
+        assert_eq!(
+            shapes("/a/b.jpg\nthen prose"),
+            vec![("/a/b.jpg", true), ("\nthen prose", false)],
+        );
+        // Interior run merges across whitespace; separate runs stay separate.
+        assert_eq!(
+            shapes("see /inline/x.jpg\n/mid/y.jpg\nprose\n/end/z.jpg"),
+            vec![
+                ("see ", false),
+                ("/inline/x.jpg\n/mid/y.jpg", true),
+                ("\nprose\n", false),
+                ("/end/z.jpg", true),
+            ],
+        );
+        // A slash command is not an image path (no image extension), and
+        // extension/path-shape are both required.
+        assert_eq!(shapes("/kickoff go"), vec![("/kickoff go", false)]);
+        assert_eq!(shapes("prose\n/a/b.txt"), vec![("prose\n/a/b.txt", false)]);
+        assert_eq!(
+            shapes("prose not/a-path.jpg"),
+            vec![("prose not/a-path.jpg", false)],
+        );
+        assert_eq!(shapes("prose only"), vec![("prose only", false)]);
+    }
+
+    fn planned_segments(text: &str, keys: &[&[u8]]) -> Vec<(String, std::time::Duration)> {
+        let chunks = crate::app::api_helpers::split_image_path_chunks(text)
+            .into_iter()
+            .map(|chunk| (chunk.text.as_bytes().to_vec(), chunk.is_image_paths));
+        let keys = keys.iter().map(|key| key.to_vec()).collect();
+        send_input_segments(chunks, keys)
+            .into_iter()
+            .map(|segment| {
+                (
+                    String::from_utf8(segment.bytes.to_vec()).unwrap(),
+                    segment.delay_before,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn send_input_segments_pace_everything_after_an_image_path_run() {
+        let none = std::time::Duration::ZERO;
+        let text = SEND_INPUT_TEXT_KEY_PACING;
+        let attachment = SEND_INPUT_ATTACHMENT_KEY_PACING;
+
+        // Plain text: the keys only need the text pacing.
+        assert_eq!(
+            planned_segments("hello", &[b"\r"]),
+            vec![("hello".into(), none), ("\r".into(), text)],
+        );
+        assert_eq!(planned_segments("hello", &[]), vec![("hello".into(), none)]);
+        // Trailing paths: prose and paths are two pastes, and the Enter waits
+        // out the image conversion.
+        assert_eq!(
+            planned_segments(
+                "/kickoff redesign the header\n\n/tmp/att/a-1.jpg\n\n/tmp/att/b-2.jpg\n",
+                &[b"\r"],
+            ),
+            vec![
+                ("/kickoff redesign the header\n\n".into(), none),
+                ("/tmp/att/a-1.jpg\n\n/tmp/att/b-2.jpg\n".into(), none),
+                ("\r".into(), attachment),
+            ],
+        );
+        // Paths only: one paste, still the attachment pacing for its keys.
+        assert_eq!(
+            planned_segments("/tmp/att/a-1.jpg\n\n/tmp/att/b-2.jpg", &[b"\r"]),
+            vec![
+                ("/tmp/att/a-1.jpg\n\n/tmp/att/b-2.jpg".into(), none),
+                ("\r".into(), attachment),
+            ],
+        );
+        // A pill path tapped inline after prose still splits off.
+        assert_eq!(
+            planned_segments("rotation just rebuilds everything. /tmp/att/rot-1.jpg", &[b"\r"]),
+            vec![
+                ("rotation just rebuilds everything. ".into(), none),
+                ("/tmp/att/rot-1.jpg".into(), none),
+                ("\r".into(), attachment),
+            ],
+        );
+        // Prose after an interior path waits out the conversion itself; the
+        // Enter after that prose needs only the text pacing.
+        assert_eq!(
+            planned_segments(
+                "/diagnose why\n\n/tmp/att/shot-1.jpg\n\nsample-notes\nclaude",
+                &[b"\r"],
+            ),
+            vec![
+                ("/diagnose why\n\n".into(), none),
+                ("/tmp/att/shot-1.jpg".into(), none),
+                ("\n\nsample-notes\nclaude".into(), attachment),
+                ("\r".into(), text),
+            ],
+        );
+    }
+
+    /// Regression: a draft mixing prose with trailing attachment paths must
+    /// arrive as TWO pastes (prose, then paths) so Claude Code anchors the
+    /// [Image #N] tokens after the prose instead of hoisting them to the
+    /// front of a mixed paste, and the Enter must use the attachment pacing
+    /// so it cannot land inside CC's image-conversion window and be dropped.
+    #[tokio::test]
+    async fn api_pane_send_input_splits_trailing_image_paths_and_paces_enter() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(3);
+        let text = "/kickoff redesign the header\n\n/tmp/att/a-1.jpg\n\n/tmp/att/b-2.jpg\n";
+
+        let sent = std::time::Instant::now();
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: text.into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+        assert_ok_response(&response, "req");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut writes = Vec::new();
+        while writes.len() < 3 && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(bytes) => writes.push(bytes),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(
+            writes,
+            vec![
+                bytes::Bytes::from_static(b"/kickoff redesign the header\n\n"),
+                bytes::Bytes::from_static(b"/tmp/att/a-1.jpg\n\n/tmp/att/b-2.jpg\n"),
+                bytes::Bytes::from_static(b"\r"),
+            ]
+        );
+        assert!(sent.elapsed() >= SEND_INPUT_ATTACHMENT_KEY_PACING);
     }
 
     #[tokio::test]
