@@ -93,7 +93,8 @@ impl App {
     fn execute_prefix_key_action(&mut self, action: NavigateAction) {
         if action == NavigateAction::EditScrollback {
             let previous_mode = self.state.mode;
-            self.cancel_copy_mode_if_active();
+            // No cancel_copy_mode_if_active here: the launcher captures the
+            // copy-mode cursor as the editor anchor line before canceling.
             self.launch_focused_scrollback_editor();
             finish_action_context(&mut self.state, ActionContext::Prefix, previous_mode);
         } else if action == NavigateAction::CopyMode {
@@ -964,10 +965,12 @@ impl App {
             .ok_or_else(|| std::io::Error::other("focused pane has no scrollback runtime"))?
             .recent_unwrapped_text_snapshot(usize::MAX)
             .text;
+        let anchor_line = self.scrollback_editor_anchor_line(ws_idx, pane_id, &scrollback);
+        self.cancel_copy_mode_if_active();
 
         let path = write_scrollback_temp_file(&scrollback)?;
 
-        let argv = match crate::platform::scrollback_editor_argv(&path) {
+        let argv = match crate::platform::scrollback_editor_argv(&path, anchor_line) {
             Ok(argv) => argv,
             Err(err) => {
                 let _ = fs::remove_file(&path);
@@ -999,6 +1002,46 @@ impl App {
             });
         }
         Ok(())
+    }
+
+    /// 1-based line in the scrollback dump where the editor should open: the
+    /// line the user is looking at — the copy-mode cursor when copy mode is
+    /// active on this pane, else the bottom of a scrolled-to view, else the
+    /// live terminal cursor.
+    pub(super) fn scrollback_editor_anchor_line(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        dump: &str,
+    ) -> usize {
+        let dump_lines = dump.lines().count().max(1);
+        let Some(metrics) = self
+            .state
+            .pane_scroll_metrics(&self.terminal_runtimes, pane_id)
+        else {
+            return dump_lines;
+        };
+        let copy_cursor_row = self
+            .state
+            .copy_mode
+            .as_ref()
+            .filter(|copy| copy.pane_id == pane_id)
+            .map(|copy| usize::from(copy.cursor_row));
+        let row_in_viewport = copy_cursor_row.or_else(|| {
+            if metrics.offset_from_bottom > 0 {
+                // Scrolled without copy mode: anchor on the bottom of the view.
+                None
+            } else {
+                self.state.pane_info_by_id(pane_id).and_then(|info| {
+                    self.state
+                        .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                        .and_then(|rt| rt.cursor_state(info.inner_rect, true))
+                        .filter(|cursor| cursor.visible)
+                        .map(|cursor| usize::from(cursor.y.saturating_sub(info.inner_rect.y)))
+                })
+            }
+        });
+        scrollback_editor_anchor_from_geometry(&metrics, row_in_viewport, dump_lines)
     }
 
     fn spawn_pane_command(
@@ -1988,6 +2031,22 @@ fn leave_command_mode(state: &mut AppState) {
     };
 }
 
+fn scrollback_editor_anchor_from_geometry(
+    metrics: &crate::pane::ScrollMetrics,
+    row_in_viewport: Option<usize>,
+    dump_lines: usize,
+) -> usize {
+    let bottom_row = metrics.viewport_rows.saturating_sub(1);
+    let row = row_in_viewport.unwrap_or(bottom_row).min(bottom_row);
+    let viewport_top = metrics
+        .max_offset_from_bottom
+        .saturating_sub(metrics.offset_from_bottom);
+    viewport_top
+        .saturating_add(row)
+        .saturating_add(1)
+        .clamp(1, dump_lines.max(1))
+}
+
 fn write_scrollback_temp_file(content: &str) -> io::Result<std::path::PathBuf> {
     let mut last_collision = None;
     for attempt in 0..16 {
@@ -2051,6 +2110,54 @@ mod tests {
         terminal::TerminalState,
         workspace::Workspace,
     };
+
+    fn anchor_metrics(
+        max_offset_from_bottom: usize,
+        offset_from_bottom: usize,
+        viewport_rows: usize,
+    ) -> crate::pane::ScrollMetrics {
+        crate::pane::ScrollMetrics {
+            offset_from_bottom,
+            max_offset_from_bottom,
+            viewport_rows,
+        }
+    }
+
+    #[test]
+    fn scrollback_editor_anchor_uses_live_cursor_row() {
+        let metrics = anchor_metrics(100, 0, 20);
+        assert_eq!(
+            scrollback_editor_anchor_from_geometry(&metrics, Some(5), 1000),
+            106
+        );
+    }
+
+    #[test]
+    fn scrollback_editor_anchor_follows_scrolled_view_bottom() {
+        let metrics = anchor_metrics(100, 40, 20);
+        assert_eq!(
+            scrollback_editor_anchor_from_geometry(&metrics, None, 1000),
+            80
+        );
+    }
+
+    #[test]
+    fn scrollback_editor_anchor_clamps_to_dump_lines() {
+        let metrics = anchor_metrics(100, 0, 20);
+        assert_eq!(
+            scrollback_editor_anchor_from_geometry(&metrics, Some(19), 90),
+            90
+        );
+    }
+
+    #[test]
+    fn scrollback_editor_anchor_clamps_row_to_viewport_bottom() {
+        let metrics = anchor_metrics(0, 0, 10);
+        assert_eq!(
+            scrollback_editor_anchor_from_geometry(&metrics, Some(500), 1000),
+            10
+        );
+    }
 
     fn mark_worktree_space_member(state: &mut AppState, ws_idx: usize, key: &str) {
         state.workspaces[ws_idx].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
@@ -3782,7 +3889,8 @@ navigate_pane_down = "ctrl+j"
         let previous_editor = std::env::var_os("EDITOR");
         std::env::set_var(
             "EDITOR",
-            format!("sh -c 'cp \"$1\" {}' sh", output_path.display()),
+            // The editor receives `+<anchor-line>` first and the dump path second.
+            format!("sh -c 'cp \"$2\" {}' sh", output_path.display()),
         );
         app.state.keybinds.edit_scrollback = crate::config::ActionKeybinds::prefix("g");
 

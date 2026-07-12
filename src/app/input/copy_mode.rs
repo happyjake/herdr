@@ -1176,6 +1176,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scrollback_editor_anchor_follows_copy_mode_cursor() {
+        let bytes = numbered_lines_bytes(64);
+        let (mut app, pane_id) = app_with_copy_scrollback(&bytes);
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+        for _ in 0..3 {
+            app.handle_copy_mode_key(TerminalKey::new(KeyCode::Char('k'), KeyModifiers::empty()));
+        }
+        let dump = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .recent_text(usize::MAX);
+
+        let copy_anchor = app.scrollback_editor_anchor_line(0, pane_id, &dump);
+        let copy = app.state.copy_mode.as_ref().expect("copy mode");
+        let expected_copy_anchor =
+            copy_mode_viewport_top_row(&app, pane_id) + usize::from(copy.cursor_row) + 1;
+
+        app.state.cancel_copy_mode(&app.terminal_runtimes);
+        let live_anchor = app.scrollback_editor_anchor_line(0, pane_id, &dump);
+
+        assert_eq!(copy_anchor, expected_copy_anchor);
+        // The live cursor sits on the blank row past the trimmed dump, so the
+        // live anchor clamps to the dump's last line.
+        assert_eq!(live_anchor, dump.lines().count());
+        assert!(copy_anchor < live_anchor);
+    }
+
+    #[tokio::test]
     async fn copy_mode_ctrl_b_uses_page_up() {
         let bytes = numbered_lines_bytes(64);
         let (mut app, pane_id) = app_with_copy_scrollback(&bytes);

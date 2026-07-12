@@ -149,7 +149,10 @@ pub(crate) fn interactive_shell_command(_argv: &[String], _shell_name: &str) -> 
 }
 
 /// Unsupported platform stub.
-pub(crate) fn scrollback_editor_argv(_path: &std::path::Path) -> std::io::Result<Vec<String>> {
+pub(crate) fn scrollback_editor_argv(
+    _path: &std::path::Path,
+    _anchor_line: usize,
+) -> std::io::Result<Vec<String>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "opening scrollback in an editor is not supported on this platform",

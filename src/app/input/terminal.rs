@@ -1482,7 +1482,8 @@ mod tests {
         let previous_editor = std::env::var_os("EDITOR");
         std::env::set_var(
             "EDITOR",
-            format!("sh -c 'cp \"$1\" {}' sh", output_path.display()),
+            // The editor receives `+<anchor-line>` first and the dump path second.
+            format!("sh -c 'cp \"$2\" {}' sh", output_path.display()),
         );
         app.state.keybinds.edit_scrollback = crate::config::ActionKeybinds::direct("ctrl+alt+e");
 
