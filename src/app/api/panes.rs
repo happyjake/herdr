@@ -25,7 +25,7 @@ use crate::layout::{find_in_direction, NavDirection, PaneId};
 use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, encode_api_text, normalize_metadata_source,
     normalize_metadata_tokens, normalize_metadata_ttl, normalize_reported_agent_label,
-    MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
+    split_trailing_image_paths, text_has_image_path_line, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
@@ -33,6 +33,13 @@ use super::responses::{encode_error, encode_success};
 
 pub(crate) const SEND_INPUT_TEXT_KEY_PACING: std::time::Duration =
     std::time::Duration::from_millis(30);
+/// Keys after text that carries image-path lines. Claude Code converts pasted
+/// image paths into attachments asynchronously and DROPS (not defers) key
+/// input that lands inside that conversion window; 30ms sat inside it often
+/// enough to strand drafts (observed ~40% with six ~130KB images), and drops
+/// were still seen at 200ms. 1500ms cleared 6x1MiB images every run.
+pub(crate) const SEND_INPUT_ATTACHMENT_KEY_PACING: std::time::Duration =
+    std::time::Duration::from_millis(1500);
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -1546,17 +1553,29 @@ impl App {
         let has_text = !params.text.is_empty();
         let has_keys = !encoded_keys.is_empty();
         if has_text {
-            let text_bytes = encode_api_text(runtime, &params.text);
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
+            // Prose and a trailing image-path block travel as separate pastes
+            // (see split_trailing_image_paths for why).
+            let chunks = match split_trailing_image_paths(&params.text) {
+                Some((head, tail)) => vec![head, tail],
+                None => vec![params.text.as_str()],
+            };
+            for chunk in chunks {
+                let text_bytes = encode_api_text(runtime, chunk);
+                if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
+                    return encode_error(id, "pane_send_failed", err.to_string());
+                }
             }
         }
 
         if has_text && has_keys {
-            if let Err(err) = runtime.schedule_delayed_user_input(
-                SEND_INPUT_TEXT_KEY_PACING,
-                encoded_keys.into_iter().map(Bytes::from),
-            ) {
+            let pacing = if text_has_image_path_line(&params.text) {
+                SEND_INPUT_ATTACHMENT_KEY_PACING
+            } else {
+                SEND_INPUT_TEXT_KEY_PACING
+            };
+            if let Err(err) = runtime
+                .schedule_delayed_user_input(pacing, encoded_keys.into_iter().map(Bytes::from))
+            {
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
         } else {
@@ -2531,6 +2550,110 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"second"));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Regression: a draft mixing prose with trailing attachment paths must
+    /// arrive as TWO pastes (prose, then paths) so Claude Code anchors the
+    /// [Image #N] tokens after the prose instead of hoisting them to the
+    /// front of a mixed paste, and the Enter must use the attachment pacing
+    /// so it cannot land inside CC's image-conversion window and be dropped.
+    #[tokio::test(start_paused = true)]
+    async fn api_pane_send_input_splits_trailing_image_paths_and_paces_enter() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(3);
+        let text = "/kickoff redesign the header\n\n/tmp/att/a-1.jpg\n\n/tmp/att/b-2.jpg\n";
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: text.into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"/kickoff redesign the header\n\n"),
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"/tmp/att/a-1.jpg\n\n/tmp/att/b-2.jpg\n"),
+        );
+        assert!(rx.try_recv().is_err());
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(
+            SEND_INPUT_ATTACHMENT_KEY_PACING - std::time::Duration::from_millis(1),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A paths-only draft has no prose to split off, but still needs the
+    /// attachment pacing for its keys.
+    #[tokio::test(start_paused = true)]
+    async fn api_pane_send_input_paths_only_text_keeps_single_paste_with_attachment_pacing() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
+        let text = "/tmp/att/a-1.jpg\n\n/tmp/att/b-2.jpg";
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: text.into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(text));
+        assert!(rx.try_recv().is_err());
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(
+            SEND_INPUT_ATTACHMENT_KEY_PACING - std::time::Duration::from_millis(1),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn split_trailing_image_paths_cases() {
+        use crate::app::api_helpers::split_trailing_image_paths;
+
+        // Head + tail must reassemble the original text exactly.
+        let text = "prose line\n\n/a/b.jpg\n\n/c/d.PNG\n";
+        let (head, tail) = split_trailing_image_paths(text).unwrap();
+        assert_eq!(head, "prose line\n\n");
+        assert_eq!(tail, "/a/b.jpg\n\n/c/d.PNG\n");
+        assert_eq!(format!("{head}{tail}"), text);
+
+        // No prose before the block: nothing to split.
+        assert_eq!(split_trailing_image_paths("/a/b.jpg\n\n/c/d.jpg"), None);
+        // No trailing block: prose after the last path line.
+        assert_eq!(split_trailing_image_paths("/a/b.jpg\nthen prose"), None);
+        // Interior path with a trailing block: split only at the block.
+        let text = "see /inline/x.jpg\n/mid/y.jpg\nprose\n/end/z.jpg";
+        let (head, tail) = split_trailing_image_paths(text).unwrap();
+        assert_eq!(head, "see /inline/x.jpg\n/mid/y.jpg\nprose\n");
+        assert_eq!(tail, "/end/z.jpg");
+        // Not image paths: extension and path-shape both required.
+        assert_eq!(split_trailing_image_paths("prose\n/a/b.txt"), None);
+        assert_eq!(split_trailing_image_paths("prose\nnot/a path.jpg"), None);
+        assert_eq!(split_trailing_image_paths("prose only"), None);
     }
 
     #[tokio::test]

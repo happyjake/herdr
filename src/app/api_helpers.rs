@@ -22,6 +22,53 @@ fn normalize_api_key_alias(key: &str) -> &str {
     }
 }
 
+const IMAGE_PATH_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
+
+/// A line whose entire content is one absolute path to an image file — the
+/// shape attachments take inside ordinary pane input (ADR-0004).
+pub(super) fn is_image_path_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('/') || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let Some((_, ext)) = trimmed.rsplit_once('.') else {
+        return false;
+    };
+    IMAGE_PATH_EXTENSIONS
+        .iter()
+        .any(|known| ext.eq_ignore_ascii_case(known))
+}
+
+pub(super) fn text_has_image_path_line(text: &str) -> bool {
+    text.lines().any(is_image_path_line)
+}
+
+/// Split `text` before its trailing block of image-path lines, so prose and
+/// paths can travel as separate pastes. Claude Code hoists the `[Image #N]`
+/// tokens for paths found in a mixed paste to the front of that paste,
+/// mangling the prose and disarming any leading slash command; pasting the
+/// paths separately anchors the tokens at the cursor, after the prose.
+/// Returns None when there is no trailing path block or no prose before it.
+/// Invariant: `head` + `tail` == `text`.
+pub(super) fn split_trailing_image_paths(text: &str) -> Option<(&str, &str)> {
+    let mut offset = text.len();
+    let mut split_at: Option<usize> = None;
+    for line in text.split_inclusive('\n').rev() {
+        offset -= line.len();
+        if is_image_path_line(line) {
+            split_at = Some(offset);
+        } else if !line.trim().is_empty() {
+            break;
+        }
+    }
+    let split_at = split_at?;
+    let (head, tail) = text.split_at(split_at);
+    if head.trim().is_empty() {
+        return None;
+    }
+    Some((head, tail))
+}
+
 pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: &str) -> Vec<u8> {
     let bracketed = runtime.bracketed_paste_enabled();
     if bracketed {
