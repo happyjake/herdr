@@ -1456,6 +1456,125 @@ pathlib.Path({received:?}).write_text(data.hex())
     cleanup_test_base(&base);
 }
 
+/// Regression (fleet verification 2026-07-13): handoff-imported panes kept
+/// mouse mode bits but lost the encoder's derived event/format state.
+#[test]
+fn live_handoff_restores_mouse_encoder_state_for_api_input() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let script = base.join("read-mouse.py");
+    let ready_marker = base.join("mouse-ready");
+    let received_marker = base.join("mouse-received");
+    let ready_text = "MOUSE-HANDOFF-READY";
+
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &script,
+        format!(
+            r#"import os
+import pathlib
+import select
+import sys
+import tty
+
+sys.stdout.buffer.write(b"\x1b[?1049h\x1b[2J\x1b[H\x1b[?1003h\x1b[?1006h" + {ready_text:?}.encode() + b"\r\n")
+sys.stdout.flush()
+pathlib.Path({ready:?}).write_text("ready")
+tty.setraw(sys.stdin.fileno())
+ready_fds, _, _ = select.select([sys.stdin.fileno()], [], [], 15)
+data = os.read(sys.stdin.fileno(), 64) if ready_fds else b""
+pathlib.Path({received:?}).write_text(data.hex())
+"#,
+            ready_text = ready_text,
+            ready = ready_marker.display().to_string(),
+            received = received_marker.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:run",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&ready_marker, Duration::from_secs(5));
+    wait_for_output(&api_socket, &pane_id, ready_text);
+
+    let before = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:get-before-handoff",
+            "method": "pane.get",
+            "params": {"pane_id": pane_id}
+        }),
+    );
+    assert_eq!(before["result"]["pane"]["mouse_tracking"], true);
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let imported = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:get-after-handoff",
+            "method": "pane.get",
+            "params": {"pane_id": pane_id}
+        }),
+    );
+    assert_eq!(imported["result"]["pane"]["mouse_tracking"], true);
+
+    let click = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:send-mouse-after-handoff",
+            "method": "pane.send_mouse",
+            "params": {"pane_id": pane_id, "action": "click", "row": 2, "col": 1}
+        }),
+    );
+    assert_eq!(
+        click["result"]["delivered"], true,
+        "handoff-imported mouse-tracking pane refused API mouse input: {click}"
+    );
+    assert_eq!(click["result"]["routing"], "mouse_report");
+    wait_for_file_contains(
+        &received_marker,
+        "1b5b3c303b323b334d1b5b3c303b323b336d",
+        Duration::from_secs(5),
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
 #[test]
 fn live_handoff_preserves_modify_other_keys_for_client_input() {
     let _lock = test_lock();

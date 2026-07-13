@@ -1360,42 +1360,26 @@ impl GhosttyPaneTerminal {
             input_state.mouse_alternate_scroll,
         );
 
-        for mode in [
-            MODE_MOUSE_X10,
-            MODE_MOUSE_PRESS_RELEASE,
-            MODE_MOUSE_BUTTON_MOTION,
-            MODE_MOUSE_ANY_MOTION,
-        ] {
-            let _ = core.terminal.mode_set(mode, false);
-        }
-        let mouse_mode = match input_state.mouse_protocol_mode {
-            crate::input::MouseProtocolMode::None => None,
-            crate::input::MouseProtocolMode::Press => Some(MODE_MOUSE_X10),
-            crate::input::MouseProtocolMode::PressRelease => Some(MODE_MOUSE_PRESS_RELEASE),
-            crate::input::MouseProtocolMode::ButtonMotion => Some(MODE_MOUSE_BUTTON_MOTION),
-            crate::input::MouseProtocolMode::AnyMotion => Some(MODE_MOUSE_ANY_MOTION),
-        };
-        if let Some(mode) = mouse_mode {
-            let _ = core.terminal.mode_set(mode, true);
-        }
-
-        let _ = core
-            .terminal
-            .mode_set(crate::ghostty::MODE_MOUSE_UTF8, false);
-        let _ = core
-            .terminal
-            .mode_set(crate::ghostty::MODE_MOUSE_SGR, false);
-        match input_state.mouse_protocol_encoding {
-            crate::input::MouseProtocolEncoding::Default => {}
-            crate::input::MouseProtocolEncoding::Utf8 => {
-                let _ = core
-                    .terminal
-                    .mode_set(crate::ghostty::MODE_MOUSE_UTF8, true);
-            }
-            crate::input::MouseProtocolEncoding::Sgr => {
-                let _ = core.terminal.mode_set(crate::ghostty::MODE_MOUSE_SGR, true);
-            }
-        }
+        // Restore mouse state through the VT parser, not mode_set. libghostty-vt's
+        // mode API updates the mode bits read by pane.get and wheel routing, but
+        // MouseEncoder::set_from_terminal reads derived mouse event/format flags
+        // that the parser maintains. Setting only the bits made imported panes
+        // report mouse tracking while every encoded event came back empty.
+        core.terminal
+            .write(b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
+        core.terminal.write(match input_state.mouse_protocol_mode {
+            crate::input::MouseProtocolMode::None => b"",
+            crate::input::MouseProtocolMode::Press => b"\x1b[?9h",
+            crate::input::MouseProtocolMode::PressRelease => b"\x1b[?1000h",
+            crate::input::MouseProtocolMode::ButtonMotion => b"\x1b[?1002h",
+            crate::input::MouseProtocolMode::AnyMotion => b"\x1b[?1003h",
+        });
+        core.terminal
+            .write(match input_state.mouse_protocol_encoding {
+                crate::input::MouseProtocolEncoding::Default => b"",
+                crate::input::MouseProtocolEncoding::Utf8 => b"\x1b[?1005h",
+                crate::input::MouseProtocolEncoding::Sgr => b"\x1b[?1006h",
+            });
 
         if input_state.modify_other_keys {
             core.terminal.write(b"\x1b[>4;2m");
@@ -4125,6 +4109,10 @@ mod tests {
                 mouse_alternate_scroll: true,
                 modify_other_keys: true,
             })
+        );
+        assert_eq!(
+            pane.encode_mouse_click(1, 2),
+            Some(b"\x1b[<0;2;3M\x1b[<0;2;3m".to_vec())
         );
 
         let encoded = pane.encode_terminal_key(
