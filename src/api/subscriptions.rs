@@ -673,6 +673,7 @@ mod tests {
             tokens: HashMap::new(),
             agent_session: None,
             scroll,
+            mouse_tracking: false,
             revision: 0,
         }
     }

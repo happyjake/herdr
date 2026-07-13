@@ -453,6 +453,10 @@ impl TerminalRuntime {
         self.0.encode_mouse_button(kind, column, row, modifiers)
     }
 
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        self.0.encode_mouse_click(column, row)
+    }
+
     pub fn encode_mouse_motion(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -471,6 +475,16 @@ impl TerminalRuntime {
         modifiers: crossterm::event::KeyModifiers,
     ) -> Option<Vec<u8>> {
         self.0.encode_mouse_wheel(kind, column, row, modifiers)
+    }
+
+    pub fn route_mouse_wheel(
+        &self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> (crate::pane::WheelRouting, Option<Vec<u8>>) {
+        self.0.route_mouse_wheel(kind, column, row, modifiers)
     }
 
     pub fn encode_alternate_scroll(

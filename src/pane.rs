@@ -1023,6 +1023,28 @@ struct PacedUserInput {
 }
 
 impl PaneRuntimeIo {
+    fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
+        match self {
+            PaneRuntimeIo::Actor(actor) => {
+                let actor = actor.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Err(err) = actor.write_user_input(bytes).await {
+                        warn!(error = %err, "failed to send delayed PTY input");
+                    }
+                });
+            }
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => {
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = sender.send(bytes).await;
+                });
+            }
+        }
+    }
+
     fn shutdown(&self) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.shutdown(),
@@ -1253,28 +1275,6 @@ impl PacedUserInput {
             });
         }
         Ok(())
-    }
-
-    fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
-        match self {
-            PaneRuntimeIo::Actor(actor) => {
-                let actor = actor.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    if let Err(err) = actor.write_user_input(bytes).await {
-                        warn!(error = %err, "failed to send delayed PTY input");
-                    }
-                });
-            }
-            #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => {
-                let sender = sender.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = sender.send(bytes).await;
-                });
-            }
-        }
     }
 
     async fn drain(self: Arc<Self>, writer: PaneUserInputWriter) {
@@ -3016,6 +3016,13 @@ impl PaneRuntime {
             .encode_mouse_button(kind, column, row, modifiers)
     }
 
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        if !self.input_state()?.mouse_protocol_mode.reporting_enabled() {
+            return None;
+        }
+        self.terminal.encode_mouse_click(column, row)
+    }
+
     pub fn encode_mouse_motion(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -3039,6 +3046,33 @@ impl PaneRuntime {
         }
         self.terminal
             .encode_mouse_wheel(kind, column, row, modifiers)
+    }
+
+    /// Route a wheel action from the terminal's live input state.
+    ///
+    /// Host scrolling is reported without mutating the viewport; callers decide
+    /// how to handle that route. Terminal-owned routes reset the host viewport
+    /// and return the bytes to write to the PTY.
+    pub fn route_mouse_wheel(
+        &self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> (WheelRouting, Option<Vec<u8>>) {
+        let routing = self.wheel_routing().unwrap_or(WheelRouting::HostScroll);
+        let bytes = match routing {
+            WheelRouting::HostScroll => None,
+            WheelRouting::MouseReport => {
+                self.scroll_reset();
+                self.encode_mouse_wheel(kind, column, row, modifiers)
+            }
+            WheelRouting::AlternateScroll => {
+                self.scroll_reset();
+                self.encode_alternate_scroll(kind)
+            }
+        };
+        (routing, bytes)
     }
 
     pub fn encode_alternate_scroll(
