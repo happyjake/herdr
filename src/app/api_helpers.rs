@@ -24,14 +24,14 @@ fn normalize_api_key_alias(key: &str) -> &str {
 
 const IMAGE_PATH_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
 
-/// A line whose entire content is one absolute path to an image file — the
-/// shape attachments take inside ordinary pane input (ADR-0004).
-pub(super) fn is_image_path_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('/') || trimmed.chars().any(char::is_whitespace) {
+/// A whitespace-delimited token that is one absolute path to an image file —
+/// the shape attachments take inside ordinary pane input (ADR-0004 mints
+/// space-free server-side names precisely so a path never needs quoting).
+fn is_image_path_token(token: &str) -> bool {
+    if !token.starts_with('/') {
         return false;
     }
-    let Some((_, ext)) = trimmed.rsplit_once('.') else {
+    let Some((_, ext)) = token.rsplit_once('.') else {
         return false;
     };
     IMAGE_PATH_EXTENSIONS
@@ -39,34 +39,88 @@ pub(super) fn is_image_path_line(line: &str) -> bool {
         .any(|known| ext.eq_ignore_ascii_case(known))
 }
 
-pub(super) fn text_has_image_path_line(text: &str) -> bool {
-    text.lines().any(is_image_path_line)
+/// One send_input text segment: either prose, or a run of image-path tokens
+/// (plus the whitespace between them) that must travel as its own paste.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SendTextChunk<'a> {
+    pub text: &'a str,
+    pub is_image_paths: bool,
 }
 
-/// Split `text` before its trailing block of image-path lines, so prose and
-/// paths can travel as separate pastes. Claude Code hoists the `[Image #N]`
-/// tokens for paths found in a mixed paste to the front of that paste,
-/// mangling the prose and disarming any leading slash command; pasting the
-/// paths separately anchors the tokens at the cursor, after the prose.
-/// Returns None when there is no trailing path block or no prose before it.
-/// Invariant: `head` + `tail` == `text`.
-pub(super) fn split_trailing_image_paths(text: &str) -> Option<(&str, &str)> {
-    let mut offset = text.len();
-    let mut split_at: Option<usize> = None;
-    for line in text.split_inclusive('\n').rev() {
-        offset -= line.len();
-        if is_image_path_line(line) {
-            split_at = Some(offset);
-        } else if !line.trim().is_empty() {
-            break;
+/// Split `text` into alternating prose and image-path chunks so each path
+/// run can travel as its own bracketed paste. Claude Code hoists the
+/// `[Image #N]` tokens for paths found in a mixed paste to the front of that
+/// paste — mangling the prose and disarming a leading slash command — but
+/// anchors the tokens at the cursor when the paths arrive as their own
+/// paste, wherever in the draft the phone put them (inline after prose, or
+/// followed by more prose; both shapes ship from the composer, which inserts
+/// a pill's path at the cursor).
+///
+/// A path run is a maximal sequence of image-path tokens separated only by
+/// whitespace; whitespace-only text before the first run and after the last
+/// run folds into those runs so no chunk is ever pure whitespace.
+/// Invariant: concatenating the chunks yields `text` byte-for-byte.
+pub(super) fn split_image_path_chunks(text: &str) -> Vec<SendTextChunk<'_>> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut previous_token_was_path = false;
+    let mut token_start: Option<usize> = None;
+    for (index, character) in text.char_indices().chain([(text.len(), ' ')]) {
+        if !character.is_whitespace() {
+            token_start.get_or_insert(index);
+            continue;
+        }
+        let Some(start) = token_start.take() else {
+            continue;
+        };
+        if is_image_path_token(&text[start..index]) {
+            match runs.last_mut() {
+                Some(run) if previous_token_was_path => run.1 = index,
+                _ => runs.push((start, index)),
+            }
+            previous_token_was_path = true;
+        } else {
+            previous_token_was_path = false;
         }
     }
-    let split_at = split_at?;
-    let (head, tail) = text.split_at(split_at);
-    if head.trim().is_empty() {
-        return None;
+    if runs.is_empty() {
+        return vec![SendTextChunk {
+            text,
+            is_image_paths: false,
+        }];
     }
-    Some((head, tail))
+    if let Some(first) = runs.first_mut() {
+        if text[..first.0].trim().is_empty() {
+            first.0 = 0;
+        }
+    }
+    if let Some(last) = runs.last_mut() {
+        if text[last.1..].trim().is_empty() {
+            last.1 = text.len();
+        }
+    }
+
+    let mut chunks = Vec::with_capacity(runs.len() * 2 + 1);
+    let mut cursor = 0;
+    for (start, end) in runs {
+        if cursor < start {
+            chunks.push(SendTextChunk {
+                text: &text[cursor..start],
+                is_image_paths: false,
+            });
+        }
+        chunks.push(SendTextChunk {
+            text: &text[start..end],
+            is_image_paths: true,
+        });
+        cursor = end;
+    }
+    if cursor < text.len() {
+        chunks.push(SendTextChunk {
+            text: &text[cursor..],
+            is_image_paths: false,
+        });
+    }
+    chunks
 }
 
 pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: &str) -> Vec<u8> {

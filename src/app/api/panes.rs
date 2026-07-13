@@ -25,7 +25,7 @@ use crate::layout::{find_in_direction, NavDirection, PaneId};
 use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, encode_api_text, normalize_metadata_source,
     normalize_metadata_tokens, normalize_metadata_ttl, normalize_reported_agent_label,
-    split_trailing_image_paths, text_has_image_path_line, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
+    split_image_path_chunks, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
@@ -33,11 +33,12 @@ use super::responses::{encode_error, encode_success};
 
 pub(crate) const SEND_INPUT_TEXT_KEY_PACING: std::time::Duration =
     std::time::Duration::from_millis(30);
-/// Keys after text that carries image-path lines. Claude Code converts pasted
-/// image paths into attachments asynchronously and DROPS (not defers) key
-/// input that lands inside that conversion window; 30ms sat inside it often
-/// enough to strand drafts (observed ~40% with six ~130KB images), and drops
-/// were still seen at 200ms. 1500ms cleared 6x1MiB images every run.
+/// Anything written after an image-path paste — trailing prose chunks and
+/// keys alike. Claude Code converts pasted image paths into attachments
+/// asynchronously and DROPS (not defers) input that lands inside that
+/// conversion window; 30ms sat inside it often enough to strand drafts
+/// (observed ~40% with six ~130KB images), and drops were still seen at
+/// 200ms. 1500ms cleared 6x1MiB images every run.
 pub(crate) const SEND_INPUT_ATTACHMENT_KEY_PACING: std::time::Duration =
     std::time::Duration::from_millis(1500);
 
@@ -1552,27 +1553,31 @@ impl App {
         };
         let has_text = !params.text.is_empty();
         let has_keys = !encoded_keys.is_empty();
+        // Image-path runs travel as their own pastes wherever they sit in the
+        // draft (see split_image_path_chunks for why), and everything written
+        // after a path run waits out Claude Code's async image conversion,
+        // which DROPS (not defers) input that lands inside it.
+        let mut pending_delay: Option<std::time::Duration> = None;
         if has_text {
-            // Prose and a trailing image-path block travel as separate pastes
-            // (see split_trailing_image_paths for why).
-            let chunks = match split_trailing_image_paths(&params.text) {
-                Some((head, tail)) => vec![head, tail],
-                None => vec![params.text.as_str()],
-            };
-            for chunk in chunks {
-                let text_bytes = encode_api_text(runtime, chunk);
-                if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
+            for chunk in split_image_path_chunks(&params.text) {
+                let text_bytes = Bytes::from(encode_api_text(runtime, chunk.text));
+                let written = match pending_delay.take() {
+                    Some(delay) => {
+                        runtime.schedule_delayed_user_input(delay, std::iter::once(text_bytes))
+                    }
+                    None => runtime.try_send_bytes(text_bytes),
+                };
+                if let Err(err) = written {
                     return encode_error(id, "pane_send_failed", err.to_string());
+                }
+                if chunk.is_image_paths {
+                    pending_delay = Some(SEND_INPUT_ATTACHMENT_KEY_PACING);
                 }
             }
         }
 
         if has_text && has_keys {
-            let pacing = if text_has_image_path_line(&params.text) {
-                SEND_INPUT_ATTACHMENT_KEY_PACING
-            } else {
-                SEND_INPUT_TEXT_KEY_PACING
-            };
+            let pacing = pending_delay.unwrap_or(SEND_INPUT_TEXT_KEY_PACING);
             if let Err(err) = runtime
                 .schedule_delayed_user_input(pacing, encoded_keys.into_iter().map(Bytes::from))
             {
@@ -2631,29 +2636,177 @@ mod tests {
     }
 
     #[test]
-    fn split_trailing_image_paths_cases() {
-        use crate::app::api_helpers::split_trailing_image_paths;
+    fn split_image_path_chunks_cases() {
+        use crate::app::api_helpers::split_image_path_chunks;
 
-        // Head + tail must reassemble the original text exactly.
-        let text = "prose line\n\n/a/b.jpg\n\n/c/d.PNG\n";
-        let (head, tail) = split_trailing_image_paths(text).unwrap();
-        assert_eq!(head, "prose line\n\n");
-        assert_eq!(tail, "/a/b.jpg\n\n/c/d.PNG\n");
-        assert_eq!(format!("{head}{tail}"), text);
+        fn shapes(text: &str) -> Vec<(&str, bool)> {
+            let chunks = split_image_path_chunks(text);
+            // Invariant: chunks reassemble the original text exactly.
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.text).collect::<String>(),
+                text,
+            );
+            chunks
+                .into_iter()
+                .map(|chunk| (chunk.text, chunk.is_image_paths))
+                .collect()
+        }
 
-        // No prose before the block: nothing to split.
-        assert_eq!(split_trailing_image_paths("/a/b.jpg\n\n/c/d.jpg"), None);
-        // No trailing block: prose after the last path line.
-        assert_eq!(split_trailing_image_paths("/a/b.jpg\nthen prose"), None);
-        // Interior path with a trailing block: split only at the block.
-        let text = "see /inline/x.jpg\n/mid/y.jpg\nprose\n/end/z.jpg";
-        let (head, tail) = split_trailing_image_paths(text).unwrap();
-        assert_eq!(head, "see /inline/x.jpg\n/mid/y.jpg\nprose\n");
-        assert_eq!(tail, "/end/z.jpg");
-        // Not image paths: extension and path-shape both required.
-        assert_eq!(split_trailing_image_paths("prose\n/a/b.txt"), None);
-        assert_eq!(split_trailing_image_paths("prose\nnot/a path.jpg"), None);
-        assert_eq!(split_trailing_image_paths("prose only"), None);
+        // Trailing block: prose then paths, trailing whitespace folds into
+        // the path chunk (the pre-token-split behavior, preserved).
+        assert_eq!(
+            shapes("prose line\n\n/a/b.jpg\n\n/c/d.PNG\n"),
+            vec![
+                ("prose line\n\n", false),
+                ("/a/b.jpg\n\n/c/d.PNG\n", true),
+            ],
+        );
+        // Paths-only stays one chunk, absorbing surrounding whitespace.
+        assert_eq!(
+            shapes("/a/b.jpg\n\n/c/d.jpg"),
+            vec![("/a/b.jpg\n\n/c/d.jpg", true)],
+        );
+        // Wild shape A (phone 2026-07-13): pill path space-joined inline
+        // after prose on the same line.
+        assert_eq!(
+            shapes("don't lose anything. /att/rot.jpg"),
+            vec![("don't lose anything. ", false), ("/att/rot.jpg", true)],
+        );
+        // Wild shape B (phone 2026-07-13): slash command, path on its own
+        // line, then a quoted section AFTER the path.
+        assert_eq!(
+            shapes("/diagnose why\n\n/att/shot.jpg\n\nsample-notes\nclaude"),
+            vec![
+                ("/diagnose why\n\n", false),
+                ("/att/shot.jpg", true),
+                ("\n\nsample-notes\nclaude", false),
+            ],
+        );
+        // Path first, prose after: order preserved, no hoisting possible.
+        assert_eq!(
+            shapes("/a/b.jpg\nthen prose"),
+            vec![("/a/b.jpg", true), ("\nthen prose", false)],
+        );
+        // Interior run merges across whitespace; separate runs stay separate.
+        assert_eq!(
+            shapes("see /inline/x.jpg\n/mid/y.jpg\nprose\n/end/z.jpg"),
+            vec![
+                ("see ", false),
+                ("/inline/x.jpg\n/mid/y.jpg", true),
+                ("\nprose\n", false),
+                ("/end/z.jpg", true),
+            ],
+        );
+        // A slash command is not an image path (no image extension), and
+        // extension/path-shape are both required.
+        assert_eq!(shapes("/kickoff go"), vec![("/kickoff go", false)]);
+        assert_eq!(shapes("prose\n/a/b.txt"), vec![("prose\n/a/b.txt", false)]);
+        assert_eq!(
+            shapes("prose not/a-path.jpg"),
+            vec![("prose not/a-path.jpg", false)],
+        );
+        assert_eq!(shapes("prose only"), vec![("prose only", false)]);
+    }
+
+    /// Regression (phone report 2026-07-13): a pill path tapped inline after
+    /// prose — same line, space-joined — must still split into its own paste
+    /// so Claude Code cannot hoist the [Image #N] token over the prose.
+    #[tokio::test(start_paused = true)]
+    async fn api_pane_send_input_splits_inline_image_path_and_paces_enter() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(3);
+        let text = "rotation just rebuilds everything. /tmp/att/rot-1.jpg";
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: text.into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"rotation just rebuilds everything. "),
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"/tmp/att/rot-1.jpg"),
+        );
+        assert!(rx.try_recv().is_err());
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(
+            SEND_INPUT_ATTACHMENT_KEY_PACING - std::time::Duration::from_millis(1),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Regression (phone report 2026-07-13): prose FOLLOWING an image path —
+    /// the composer's quoted-section-after-attachment shape — must arrive as
+    /// its own paste, delayed past Claude Code's image-conversion window
+    /// (which drops input, not just keys), with the Enter paced after it.
+    #[tokio::test(start_paused = true)]
+    async fn api_pane_send_input_paces_prose_after_interior_image_path() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
+        let text = "/diagnose why\n\n/tmp/att/shot-1.jpg\n\nsample-notes\nclaude";
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: text.into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"/diagnose why\n\n"),
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"/tmp/att/shot-1.jpg"),
+        );
+        // The trailing prose waits out the image-conversion window.
+        assert!(rx.try_recv().is_err());
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(
+            SEND_INPUT_ATTACHMENT_KEY_PACING - std::time::Duration::from_millis(1),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\n\nsample-notes\nclaude"),
+        );
+        assert!(rx.try_recv().is_err());
+
+        // Enter needs only the text pacing after a prose chunk: the
+        // conversion window already elapsed before that chunk was written.
+        tokio::time::advance(SEND_INPUT_TEXT_KEY_PACING - std::time::Duration::from_millis(1))
+            .await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
