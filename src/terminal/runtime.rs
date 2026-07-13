@@ -55,11 +55,8 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
-    pub fn handoff_history_ansi(
-        &self,
-        screen_restore: crate::handoff_runtime::HandoffScreenRestore,
-    ) -> Option<String> {
-        self.0.handoff_history_ansi(screen_restore)
+    pub fn handoff_history_ansi(&self) -> Option<String> {
+        self.0.handoff_history_ansi()
     }
 
     #[cfg(unix)]
