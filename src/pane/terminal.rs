@@ -4748,6 +4748,10 @@ mod tests {
                 color_scheme_reporting: true,
             })
         );
+        assert_eq!(
+            pane.encode_mouse_click(1, 2),
+            Some(b"\x1b[<0;2;3M\x1b[<0;2;3m".to_vec())
+        );
 
         let encoded = pane.encode_terminal_key(
             crate::input::TerminalKey::new(
