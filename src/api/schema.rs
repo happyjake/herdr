@@ -146,6 +146,7 @@ operations::define_operations! {
     PluginPaneFocus(PluginPaneFocusParams) => "plugin.pane.focus", true, false;
     PluginPaneClose(PluginPaneCloseParams) => "plugin.pane.close", true, false;
     AttachmentCreate(AttachmentCreateParams) => "attachment.create", false, false;
+    PaneSendMouse(PaneSendMouseParams) => "pane.send_mouse", true, false;
 }
 
 #[cfg(test)]

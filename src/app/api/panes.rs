@@ -6,19 +6,20 @@ use crate::api::schema::{
     PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
     PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
     PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
-    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    PaneListParams, PaneMouseRouting, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
+    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
-    PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneSendMouseParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason,
+    PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams,
+    PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 #[cfg(test)]
 use crate::api::schema::{ReadFormat, ReadSource};
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
+use crate::app::terminal_targets::{TerminalTarget, TerminalTargetError};
 use crate::app::App;
 #[cfg(test)]
 use crate::app::Mode;
@@ -31,7 +32,7 @@ use super::super::api_helpers::{
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_success};
 
 /// How long `pane.send_input` holds its keys behind its text. An agent TUI
 /// that reads the text and an Enter in one chunk takes the Enter as part of
@@ -114,7 +115,9 @@ fn write_send_input_segments(
     for segment in segments {
         if segment.delay_before.is_zero() {
             if let Some(bytes) = held.replace(segment.bytes) {
-                runtime.try_send_bytes(bytes).map_err(|err| err.to_string())?;
+                runtime
+                    .try_send_bytes(bytes)
+                    .map_err(|err| err.to_string())?;
             }
         } else {
             runtime
@@ -128,7 +131,9 @@ fn write_send_input_segments(
         }
     }
     if let Some(bytes) = held {
-        runtime.try_send_bytes(bytes).map_err(|err| err.to_string())?;
+        runtime
+            .try_send_bytes(bytes)
+            .map_err(|err| err.to_string())?;
     }
     Ok(())
 }
@@ -1613,21 +1618,16 @@ impl App {
     }
 
     pub(super) fn handle_pane_read(&mut self, id: String, params: PaneReadParams) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let resolved = match self.resolve_pane_command_target(&id, &params.pane_id) {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
+        let ws_idx = resolved.ws_idx;
+        let pane_id = resolved.pane_id;
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some((pane, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
-        };
-        let Some(tab_idx) = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.find_tab_index_for_pane(pane_id))
-        else {
             return pane_not_found(id, &params.pane_id);
         };
         let (text, truncated, effective_offset, has_more) = match super::pane_read_window(
@@ -1647,7 +1647,7 @@ impl App {
                 read: PaneReadResult {
                     pane_id: public_pane_id,
                     workspace_id,
-                    tab_id: self.public_tab_id(ws_idx, tab_idx).unwrap(),
+                    tab_id: self.public_tab_id(ws_idx, resolved.tab_idx).unwrap(),
                     source: params.source,
                     format: params.format,
                     text,
@@ -2041,9 +2041,20 @@ impl App {
         id: String,
         params: PaneSendInputParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        if let Some(send_id) = params.send_id.as_deref() {
+            // A re-issued send the server already applied: acknowledge the
+            // affirmation without writing again — even if the pane has since
+            // closed, "applied" is the truthful answer.
+            if self.applied_send_ids.contains(send_id) {
+                return encode_success(id, ResponseResult::Ok {});
+            }
+        }
+        let resolved = match self.resolve_pane_command_target(&id, &params.pane_id) {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
+        let ws_idx = resolved.ws_idx;
+        let pane_id = resolved.pane_id;
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -2070,7 +2081,68 @@ impl App {
             }
         }
 
+        if let Some(send_id) = params.send_id {
+            self.applied_send_ids.record(send_id);
+        }
+
         encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_send_mouse(
+        &mut self,
+        id: String,
+        params: PaneSendMouseParams,
+    ) -> String {
+        use crate::api::schema::PaneMouseAction;
+
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let (rows, cols) = runtime.current_size();
+        let row = params.row.min(u32::from(rows.saturating_sub(1))) as u16;
+        let col = params.col.min(u32::from(cols.saturating_sub(1))) as u16;
+        let scroll_repeats = usize::from(params.lines.unwrap_or(1).max(1));
+        let route_scroll = |kind| {
+            let (routing, bytes) =
+                runtime.route_mouse_wheel(kind, col, row, crossterm::event::KeyModifiers::empty());
+            (pane_mouse_routing(routing), bytes, scroll_repeats)
+        };
+        let (routing, bytes, repeats) = match params.action {
+            PaneMouseAction::Click => {
+                let bytes = runtime.encode_mouse_click(col, row);
+                if bytes.is_some() {
+                    runtime.scroll_reset();
+                }
+                (PaneMouseRouting::MouseReport, bytes, 1)
+            }
+            PaneMouseAction::ScrollUp => route_scroll(crossterm::event::MouseEventKind::ScrollUp),
+            PaneMouseAction::ScrollDown => {
+                route_scroll(crossterm::event::MouseEventKind::ScrollDown)
+            }
+        };
+        let Some(bytes) = bytes else {
+            return encode_success(
+                id,
+                ResponseResult::PaneSendMouse {
+                    delivered: false,
+                    routing,
+                },
+            );
+        };
+
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes.repeat(repeats))) {
+            return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        encode_success(
+            id,
+            ResponseResult::PaneSendMouse {
+                delivered: true,
+                routing,
+            },
+        )
     }
 
     pub(super) fn handle_pane_close(&mut self, id: String, target: PaneTarget) -> String {
@@ -2207,7 +2279,32 @@ fn pane_not_found(id: String, pane_id: &str) -> String {
     encode_error(id, "pane_not_found", format!("pane {pane_id} not found"))
 }
 
+fn pane_mouse_routing(routing: crate::pane::WheelRouting) -> PaneMouseRouting {
+    match routing {
+        crate::pane::WheelRouting::HostScroll => PaneMouseRouting::HostScroll,
+        crate::pane::WheelRouting::MouseReport => PaneMouseRouting::MouseReport,
+        crate::pane::WheelRouting::AlternateScroll => PaneMouseRouting::AlternateScroll,
+    }
+}
+
 impl App {
+    fn resolve_pane_command_target(
+        &self,
+        request_id: &str,
+        target: &str,
+    ) -> Result<TerminalTarget, String> {
+        match self.resolve_terminal_target(target) {
+            Ok(resolved) => Ok(resolved),
+            Err(TerminalTargetError::NotFound { .. }) => {
+                Err(pane_not_found(request_id.to_string(), target))
+            }
+            Err(err @ TerminalTargetError::Ambiguous { .. }) => Err(encode_error_body(
+                request_id.to_string(),
+                self.agent_target_error_body(err),
+            )),
+        }
+    }
+
     fn resolve_optional_pane(&self, pane_id: Option<&str>) -> Option<(usize, PaneId)> {
         match pane_id {
             Some(pane_id) => self.parse_pane_id(pane_id),
@@ -2504,6 +2601,20 @@ mod tests {
         (app, public_pane_id, rx)
     }
 
+    fn app_with_mouse_runtime(
+        mode_ansi: &[u8],
+        capacity: usize,
+    ) -> (App, String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, mode_ansi, capacity,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        (app, public_pane_id, rx)
+    }
+
     fn app_with_scrollback_runtime() -> (App, String, PaneId) {
         let (mut app, public_pane_id) = app_with_test_workspace();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
@@ -2585,6 +2696,314 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_pane_send_mouse_click_is_one_atomic_press_release_write() {
+        let (mut app, pane_id, mut rx) = app_with_mouse_runtime(b"\x1b[?1000h\x1b[?1006h", 1);
+        let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+            "id": "req",
+            "method": "pane.send_mouse",
+            "params": {
+                "pane_id": pane_id,
+                "action": "click",
+                "row": 9,
+                "col": 11
+            }
+        }))
+        .unwrap();
+
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+        assert_eq!(response["id"], "req");
+        assert_eq!(response["result"]["type"], "pane_send_mouse");
+        assert_eq!(response["result"]["delivered"], true);
+        assert_eq!(response["result"]["routing"], "mouse_report");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[<0;12;10M\x1b[<0;12;10m")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_scroll_repeats_reports_in_one_write() {
+        let (mut app, pane_id, mut rx) = app_with_mouse_runtime(b"\x1b[?1000h\x1b[?1006h", 2);
+
+        for (id, action, lines, expected) in [
+            ("up", "scroll_up", 2, &b"\x1b[<64;12;10M\x1b[<64;12;10M"[..]),
+            (
+                "down",
+                "scroll_down",
+                3,
+                &b"\x1b[<65;12;10M\x1b[<65;12;10M\x1b[<65;12;10M"[..],
+            ),
+        ] {
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": id,
+                "method": "pane.send_mouse",
+                "params": {
+                    "pane_id": pane_id,
+                    "action": action,
+                    "row": 9,
+                    "col": 11,
+                    "lines": lines
+                }
+            }))
+            .unwrap();
+
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"]["type"], "pane_send_mouse");
+            assert_eq!(response["result"]["delivered"], true);
+            assert_eq!(response["result"]["routing"], "mouse_report");
+            assert_eq!(rx.try_recv().unwrap().as_ref(), expected);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_scroll_routes_to_alternate_scroll_arrows() {
+        let (mut app, pane_id, mut rx) = app_with_mouse_runtime(b"\x1b[?1049h\x1b[?1007h", 2);
+
+        for (id, action, lines, expected) in [
+            ("up", "scroll_up", 2, &b"\x1b[A\x1b[A"[..]),
+            ("down", "scroll_down", 3, &b"\x1b[B\x1b[B\x1b[B"[..]),
+        ] {
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": id,
+                "method": "pane.send_mouse",
+                "params": {
+                    "pane_id": pane_id,
+                    "action": action,
+                    "row": 9,
+                    "col": 11,
+                    "lines": lines
+                }
+            }))
+            .unwrap();
+
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+            assert_eq!(response["result"]["delivered"], true);
+            assert_eq!(response["result"]["routing"], "alternate_scroll");
+            assert_eq!(rx.try_recv().unwrap().as_ref(), expected);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_covers_every_tracking_mode_and_action() {
+        type ModeCase = (
+            &'static str,
+            &'static [u8],
+            Option<&'static [u8]>,
+            Option<&'static [u8]>,
+            Option<&'static [u8]>,
+            &'static str,
+        );
+        let cases: [ModeCase; 5] = [
+            ("off", b"", None, None, None, "host_scroll"),
+            (
+                "x10",
+                b"\x1b[?9h\x1b[?1006h",
+                Some(b"\x1b[<0;2;3M"),
+                None,
+                None,
+                "mouse_report",
+            ),
+            (
+                "press_release",
+                b"\x1b[?1000h\x1b[?1006h",
+                Some(b"\x1b[<0;2;3M\x1b[<0;2;3m"),
+                Some(b"\x1b[<64;2;3M"),
+                Some(b"\x1b[<65;2;3M"),
+                "mouse_report",
+            ),
+            (
+                "button_motion",
+                b"\x1b[?1002h\x1b[?1006h",
+                Some(b"\x1b[<0;2;3M\x1b[<0;2;3m"),
+                Some(b"\x1b[<64;2;3M"),
+                Some(b"\x1b[<65;2;3M"),
+                "mouse_report",
+            ),
+            (
+                "any_motion",
+                b"\x1b[?1003h\x1b[?1006h",
+                Some(b"\x1b[<0;2;3M\x1b[<0;2;3m"),
+                Some(b"\x1b[<64;2;3M"),
+                Some(b"\x1b[<65;2;3M"),
+                "mouse_report",
+            ),
+        ];
+
+        for (mode, ansi, click, scroll_up, scroll_down, scroll_routing) in cases {
+            let (mut app, pane_id, mut rx) = app_with_mouse_runtime(ansi, 3);
+            for (action, expected, routing) in [
+                ("click", click, "mouse_report"),
+                ("scroll_up", scroll_up, scroll_routing),
+                ("scroll_down", scroll_down, scroll_routing),
+            ] {
+                let request: crate::api::schema::Request =
+                    serde_json::from_value(serde_json::json!({
+                        "id": format!("{mode}_{action}"),
+                        "method": "pane.send_mouse",
+                        "params": {
+                            "pane_id": pane_id,
+                            "action": action,
+                            "row": 2,
+                            "col": 1
+                        }
+                    }))
+                    .unwrap();
+
+                let response: serde_json::Value =
+                    serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+                assert_eq!(
+                    response["result"]["delivered"],
+                    expected.is_some(),
+                    "{mode} {action} delivery"
+                );
+                assert_eq!(
+                    response["result"]["routing"], routing,
+                    "{mode} {action} routing"
+                );
+                match expected {
+                    Some(expected) => assert_eq!(
+                        rx.try_recv().unwrap().as_ref(),
+                        expected,
+                        "{mode} {action} bytes"
+                    ),
+                    None => assert!(rx.try_recv().is_err(), "{mode} {action} must write dry"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_clamps_sgr_pixel_click_to_cell_bounds() {
+        let (mut app, pane_id, mut rx) =
+            app_with_mouse_runtime(b"\x1b[?1000h\x1b[?1006h\x1b[?1016h", 1);
+        let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+            "id": "req",
+            "method": "pane.send_mouse",
+            "params": {
+                "pane_id": pane_id,
+                "action": "click",
+                "row": u32::MAX,
+                "col": u32::MAX
+            }
+        }))
+        .unwrap();
+
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+        assert_eq!(response["result"]["delivered"], true);
+        assert_eq!(response["result"]["routing"], "mouse_report");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[<0;80;24M\x1b[<0;80;24m")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_click_uses_live_legacy_coordinate_encoding() {
+        for (ansi, expected) in [
+            (&b"\x1b[?1000h"[..], &b"\x1b[M \x85\x99\x1b[M#\x85\x99"[..]),
+            (
+                &b"\x1b[?1000h\x1b[?1005h"[..],
+                &b"\x1b[M \xc2\x85\xc2\x99\x1b[M#\xc2\x85\xc2\x99"[..],
+            ),
+        ] {
+            let (mut app, pane_id) = app_with_test_workspace();
+            let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    300, 300, 0, ansi, 1,
+                );
+            app.state.insert_test_runtime(internal_pane_id, runtime);
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": "req",
+                "method": "pane.send_mouse",
+                "params": {
+                    "pane_id": pane_id,
+                    "action": "click",
+                    "row": 120,
+                    "col": 100
+                }
+            }))
+            .unwrap();
+
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+            assert_eq!(response["result"]["delivered"], true);
+            assert_eq!(rx.try_recv().unwrap().as_ref(), expected);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_exposes_live_mouse_tracking_as_a_boolean() {
+        for (ansi, expected) in [(&b"\x1b[?1000h\x1b[?1006h"[..], true), (&b""[..], false)] {
+            let (mut app, pane_id, _rx) = app_with_mouse_runtime(ansi, 1);
+
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_pane_get("req".into(), PaneTarget { pane_id }))
+                    .unwrap();
+
+            assert_eq!(response["result"]["pane"]["mouse_tracking"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_exposes_live_alternate_screen_as_a_boolean() {
+        let (mut app, pane_id, _rx) = app_with_mouse_runtime(b"", 1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+
+        for (ansi, expected) in [(&b"\x1b[?1049h"[..], true), (&b"\x1b[?1049l"[..], false)] {
+            app.state
+                .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, internal_pane_id)
+                .expect("runtime")
+                .test_process_pty_bytes(ansi);
+
+            let response: serde_json::Value = serde_json::from_str(&app.handle_pane_get(
+                "req".into(),
+                PaneTarget {
+                    pane_id: pane_id.clone(),
+                },
+            ))
+            .unwrap();
+
+            assert_eq!(response["result"]["pane"]["alternate_screen"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_alternate_screen_is_present_in_pane_list_and_subscription_snapshot() {
+        let (mut app, pane_id, _rx) = app_with_mouse_runtime(b"", 1);
+
+        let list: serde_json::Value =
+            serde_json::from_str(&app.handle_pane_list("list".into(), PaneListParams::default()))
+                .unwrap();
+        assert_eq!(list["result"]["panes"][0]["alternate_screen"], false);
+
+        let (ws_idx, internal_pane_id) = app.parse_pane_id(&pane_id).expect("pane id");
+        let pane = app.pane_info(ws_idx, internal_pane_id).expect("pane info");
+        let snapshot = serde_json::to_value(EventEnvelope {
+            event: EventKind::PaneCreated,
+            data: EventData::PaneCreated { pane },
+        })
+        .unwrap();
+        assert_eq!(snapshot["data"]["pane"]["alternate_screen"], false);
+    }
+
+    #[tokio::test]
     async fn api_pane_send_keys_accepts_control_navigation_chords() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
 
@@ -2647,6 +3066,28 @@ mod tests {
             .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
             .unwrap();
         assert_eq!(runtime.scroll_metrics().unwrap().max_offset_from_bottom, 0);
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_read_accepts_terminal_id() {
+        let (mut app, public_pane_id, pane_id) = app_with_scrollback_runtime();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .to_string();
+
+        let read = pane_read_result(&app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                terminal_id,
+                ReadSource::Recent,
+                40,
+                None,
+            )),
+        }));
+
+        assert_eq!(read.pane_id, public_pane_id);
+        assert!(read.text.contains("line 00") && read.text.contains("line 19"));
     }
 
     #[tokio::test]
@@ -3283,6 +3724,7 @@ mod tests {
                 pane_id,
                 text: "A != B".into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
 
@@ -3315,6 +3757,7 @@ mod tests {
                 pane_id,
                 text: String::new(),
                 keys: vec!["ctrl+j".into()],
+                send_id: None,
             }),
         });
 
@@ -3341,12 +3784,291 @@ mod tests {
                 pane_id,
                 text: "hello".into(),
                 keys: Vec::new(),
+                send_id: None,
             }),
         });
 
         assert_ok_response(&response, "req");
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"hello"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_with_seen_send_id_acks_without_rewriting() {
+        // The re-affirmation contract: a client that lost the ack re-issues
+        // the same send with the same send_id after reconnecting. The second
+        // request must answer ok while writing nothing to the pane.
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
+
+        let request = |req_id: &str| crate::api::schema::Request {
+            id: req_id.into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: pane_id.clone(),
+                text: "kick off".into(),
+                keys: Vec::new(),
+                send_id: Some("send-1".into()),
+            }),
+        };
+
+        let first = app.handle_api_request(request("req_a"));
+        assert_ok_response(&first, "req_a");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"kick off")
+        );
+
+        let second = app.handle_api_request(request("req_b"));
+        assert_ok_response(&second, "req_b");
+        assert!(rx.try_recv().is_err(), "re-affirmation must not rewrite");
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_dedupes_by_send_id_not_by_content() {
+        // Distinct ids apply even with identical text; absent ids never
+        // dedupe — two id-less sends of the same text both write.
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
+
+        let request = |req_id: &str, send_id: Option<&str>| crate::api::schema::Request {
+            id: req_id.into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: pane_id.clone(),
+                text: "again".into(),
+                keys: Vec::new(),
+                send_id: send_id.map(str::to_string),
+            }),
+        };
+
+        assert_ok_response(
+            &app.handle_api_request(request("req_a", Some("id-1"))),
+            "req_a",
+        );
+        assert_ok_response(
+            &app.handle_api_request(request("req_b", Some("id-2"))),
+            "req_b",
+        );
+        assert_ok_response(&app.handle_api_request(request("req_c", None)), "req_c");
+        assert_ok_response(&app.handle_api_request(request("req_d", None)), "req_d");
+
+        for _ in 0..4 {
+            assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"again"));
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_send_input_accepts_terminal_id() {
+        let (mut app, _public_pane_id, mut rx) = app_with_send_key_runtime(2);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .to_string();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: terminal_id,
+                text: "echo safe".into(),
+                keys: vec!["Enter".into()],
+                send_id: None,
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut writes = Vec::new();
+        while writes.len() < 2 && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(bytes) => writes.push(bytes),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(
+            writes,
+            vec![
+                bytes::Bytes::from_static(b"echo safe"),
+                bytes::Bytes::from_static(b"\r"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_rejects_unknown_terminal_id() {
+        let (mut app, _public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let unknown_terminal_id = "term_00000000000000000000";
+
+        let read_response = app.handle_api_request(crate::api::schema::Request {
+            id: "read".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                unknown_terminal_id.into(),
+                ReadSource::Recent,
+                10,
+                None,
+            )),
+        });
+        let send_response = app.handle_api_request(crate::api::schema::Request {
+            id: "send".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: unknown_terminal_id.into(),
+                text: "do not send".into(),
+                keys: vec!["Enter".into()],
+                send_id: None,
+            }),
+        });
+
+        for response in [read_response, send_response] {
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "pane_not_found");
+            assert!(error.error.message.contains(unknown_terminal_id));
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_rejects_stale_terminal_id_that_matches_agent_name() {
+        let (mut app, _public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let stale_terminal_id = "term_deadbeef";
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let live_terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .clone();
+        assert_ne!(live_terminal_id.to_string(), stale_terminal_id);
+        app.state
+            .terminals
+            .get_mut(&live_terminal_id)
+            .expect("terminal state")
+            .set_agent_name(stale_terminal_id.into());
+
+        let read_response = app.handle_api_request(crate::api::schema::Request {
+            id: "read".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                stale_terminal_id.into(),
+                ReadSource::Recent,
+                10,
+                None,
+            )),
+        });
+        let send_response = app.handle_api_request(crate::api::schema::Request {
+            id: "send".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: stale_terminal_id.into(),
+                text: "do not send".into(),
+                keys: vec!["Enter".into()],
+                send_id: None,
+            }),
+        });
+
+        for response in [read_response, send_response] {
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "pane_not_found");
+            assert!(error.error.message.contains(stale_terminal_id));
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_surfaces_ambiguous_candidates() {
+        let (mut app, _public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let first_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let second_pane =
+            app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let terminal_ids = [first_pane, second_pane].map(|pane_id| {
+            app.state.workspaces[0]
+                .terminal_id(pane_id)
+                .expect("terminal id")
+                .clone()
+        });
+        for terminal_id in &terminal_ids {
+            app.state
+                .terminals
+                .get_mut(terminal_id)
+                .expect("terminal state")
+                .set_agent_name("worker".into());
+        }
+
+        let read_response = app.handle_api_request(crate::api::schema::Request {
+            id: "read".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                "worker".into(),
+                ReadSource::Recent,
+                10,
+                None,
+            )),
+        });
+        let send_response = app.handle_api_request(crate::api::schema::Request {
+            id: "send".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: "worker".into(),
+                text: "do not send".into(),
+                keys: vec!["Enter".into()],
+                send_id: None,
+            }),
+        });
+
+        for response in [read_response, send_response] {
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "agent_target_ambiguous");
+            for terminal_id in &terminal_ids {
+                assert!(error
+                    .error
+                    .message
+                    .contains(&format!("terminal_id={terminal_id}")));
+            }
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_rejects_closed_terminal_id() {
+        let (mut app, _public_pane_id) = app_with_test_workspace();
+        let closed_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let survivor_pane =
+            app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let closed_pane_id = app.public_pane_id(0, closed_pane).expect("pane id");
+        let closed_terminal_id = app.state.workspaces[0]
+            .terminal_id(closed_pane)
+            .expect("terminal id")
+            .to_string();
+        let (survivor_runtime, mut survivor_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state
+            .insert_test_runtime(survivor_pane, survivor_runtime);
+
+        let close_response = app.handle_pane_close(
+            "close".into(),
+            PaneTarget {
+                pane_id: closed_pane_id,
+            },
+        );
+        assert_ok_response(&close_response, "close");
+
+        let read_response = app.handle_api_request(crate::api::schema::Request {
+            id: "read".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                closed_terminal_id.clone(),
+                ReadSource::Recent,
+                10,
+                None,
+            )),
+        });
+        let send_response = app.handle_api_request(crate::api::schema::Request {
+            id: "send".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: closed_terminal_id,
+                text: "do not send".into(),
+                keys: vec!["Enter".into()],
+                send_id: None,
+            }),
+        });
+
+        for response in [read_response, send_response] {
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "pane_not_found");
+        }
+        assert!(survivor_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -3360,6 +4082,7 @@ mod tests {
                 pane_id,
                 text: "hello".into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
         assert_ok_response(&response, "req");
@@ -3370,7 +4093,10 @@ mod tests {
                 if let Ok(bytes) = rx.try_recv() {
                     return bytes;
                 }
-                assert!(std::time::Instant::now() < deadline, "pane write never arrived");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pane write never arrived"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
@@ -3389,6 +4115,7 @@ mod tests {
                 pane_id,
                 text: String::new(),
                 keys: vec!["Escape".into(), "Enter".into()],
+                send_id: None,
             }),
         });
 
@@ -3519,7 +4246,10 @@ mod tests {
         );
         // A pill path tapped inline after prose still splits off.
         assert_eq!(
-            planned_segments("rotation just rebuilds everything. /tmp/att/rot-1.jpg", &[b"\r"]),
+            planned_segments(
+                "rotation just rebuilds everything. /tmp/att/rot-1.jpg",
+                &[b"\r"]
+            ),
             vec![
                 ("rotation just rebuilds everything. ".into(), none),
                 ("/tmp/att/rot-1.jpg".into(), none),
@@ -3559,6 +4289,7 @@ mod tests {
                 pane_id,
                 text: text.into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
         assert_ok_response(&response, "req");
@@ -3611,6 +4342,7 @@ mod tests {
                 pane_id,
                 text: "hello".into(),
                 keys: vec!["ctrl+h".into(), raw_key.clone()],
+                send_id: None,
             }),
         });
 

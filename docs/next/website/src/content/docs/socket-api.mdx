@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -140,6 +140,26 @@ like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
 
 On macOS, `pane.send_input` (used by `pane run`) and `agent.start` check the terminal's current canonical input limit before accepting a command into the input queue. An oversized encoded line, including Enter, is rejected in full; wait for the shell prompt and retry. Multiple short lines and raw-mode input remain supported. Successful responses still acknowledge queue admission, not command execution. This check covers the current submission only: it cannot inspect an earlier incomplete line or guarantee the terminal mode will remain unchanged while input is queued.
 
+`pane.send_mouse` sends a click or wheel action to one pane. `row` and `col`
+are zero-based terminal cell coordinates and are clamped to the pane bounds.
+The actions are `click`, `scroll_up`, and `scroll_down`; scroll actions accept
+an optional `lines` count, with a missing or zero value treated as one. A click
+is encoded as one atomic press-and-release PTY write when the pane has mouse
+tracking enabled. Wheel actions follow the pane's live terminal state: mouse
+reporting first, alternate-screen arrow emulation when DECSET 1007 is active,
+and otherwise `host_scroll`. The API does not mutate the server's host viewport
+for that last route.
+
+```json
+{"id":"req_click","method":"pane.send_mouse","params":{"pane_id":"w1:p1","action":"click","row":4,"col":12}}
+{"id":"req_scroll","method":"pane.send_mouse","params":{"pane_id":"w1:p1","action":"scroll_up","row":4,"col":12,"lines":3}}
+```
+
+The response has type `pane_send_mouse`, a `delivered` boolean, and a `routing`
+value of `mouse_report`, `alternate_scroll`, or `host_scroll`. Disabled mouse
+tracking makes clicks dry (`delivered: false`); host-routed wheel actions are
+also dry so a remote client can perform its own viewport scroll.
+
 ```json
 {"id":"req_current","method":"pane.current","params":{"caller_pane_id":"w1:p1"}}
 {"id":"req_layout","method":"pane.layout","params":{"pane_id":"w1:p1"}}
@@ -175,6 +195,14 @@ pane.
 ```
 
 Clients can treat `offset_from_bottom == 0` as at-bottom state.
+
+`PaneInfo.mouse_tracking` reports whether the live terminal currently accepts
+mouse reports. Supporting servers always include this boolean. Clients reading
+responses from older servers can treat an absent field as `false`.
+
+`PaneInfo.alternate_screen` reports whether the live terminal currently uses
+its alternate screen. Supporting servers always include this boolean. Clients
+reading responses from older servers can treat an absent field as `false`.
 
 ### Pane graphics
 
@@ -627,7 +655,7 @@ For request lines that reach JSON decoding, error responses also echo the reques
 or has no unambiguous top-level string `id`, the error response uses an empty `id`.
 Transport errors, such as invalid UTF-8, can close the connection without a response.
 
-The `ping` response also carries the server's version, protocol, capabilities, and its declared display name (`websocket_api.name`, defaulting to the machine hostname) — identical over the Unix socket and the WebSocket transport. The `name` field is additive: clients talking to older servers must treat it as optional.
+The `ping` response also carries the server's version, protocol, capabilities, and its declared display name (`websocket_api.name`, defaulting to the machine hostname) — identical over the Unix socket and the WebSocket transport, except `ssh_agent_registration`, which only the Unix socket can offer. It may also carry `reach`, the operator-declared route to the server; `session`, the live non-default Herdr session name; and `exe`, the absolute path of the running executable. `reach` is omitted when unset or empty, and `session` is omitted for the default session. These fields are additive: clients talking to older servers must treat them as optional.
 
 Event subscriptions keep the connection open after the initial response.
 

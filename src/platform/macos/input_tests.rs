@@ -104,6 +104,7 @@ fn pane_request(pane_id: &str, text: &str) -> Request {
             pane_id: pane_id.into(),
             text: text.into(),
             keys: vec!["enter".into()],
+            send_id: None,
         }),
     }
 }

@@ -192,6 +192,7 @@ mod tests {
             "pane.focus",
             "pane.input.set",
             "pane.rename",
+            "pane.send_mouse",
             "pane.report_agent",
             "pane.report_agent_session",
             "pane.report_metadata",

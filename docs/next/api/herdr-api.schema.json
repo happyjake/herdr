@@ -778,6 +778,11 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "alternate_screen": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
+            },
             "cwd": {
               "type": [
                 "string",
@@ -804,6 +809,11 @@
                 "string",
                 "null"
               ]
+            },
+            "mouse_tracking": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently reports mouse input.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
             },
             "pane_id": {
               "type": "string"
@@ -2700,6 +2710,14 @@
           },
           "type": "object"
         },
+        "PaneMouseAction": {
+          "enum": [
+            "click",
+            "scroll_up",
+            "scroll_down"
+          ],
+          "type": "string"
+        },
         "PaneMoveDestination": {
           "oneOf": [
             {
@@ -3203,6 +3221,13 @@
             "pane_id": {
               "type": "string"
             },
+            "send_id": {
+              "description": "Client-generated identity of this logical send. When present, an id\nthe server already applied is acknowledged without writing again —\nthe re-affirmation contract behind the `send_affirm` capability.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "text": {
               "type": "string"
             }
@@ -3227,6 +3252,43 @@
           "required": [
             "pane_id",
             "keys"
+          ],
+          "type": "object"
+        },
+        "PaneSendMouseParams": {
+          "description": "Mouse input addressed in zero-based terminal cells. Coordinates outside\nthe live pane grid are clamped to its last row or column before encoding.",
+          "properties": {
+            "action": {
+              "$ref": "#/schemas/request/$defs/PaneMouseAction"
+            },
+            "col": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "lines": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "row": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "action",
+            "row",
+            "col"
           ],
           "type": "object"
         },
@@ -5965,6 +6027,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.send_mouse",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendMouseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.read",
               "type": "string"
             },
@@ -7951,6 +8029,11 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "alternate_screen": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
+            },
             "cwd": {
               "type": [
                 "string",
@@ -7977,6 +8060,11 @@
                 "string",
                 "null"
               ]
+            },
+            "mouse_tracking": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently reports mouse input.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
             },
             "pane_id": {
               "type": "string"
@@ -8204,6 +8292,14 @@
             "end_col"
           ],
           "type": "object"
+        },
+        "PaneMouseRouting": {
+          "enum": [
+            "mouse_report",
+            "alternate_scroll",
+            "host_scroll"
+          ],
+          "type": "string"
         },
         "PaneMoveReason": {
           "enum": [
@@ -9261,6 +9357,13 @@
                   ],
                   "default": null
                 },
+                "exe": {
+                  "description": "Absolute path of the running server executable. Reported live so\nclients do not depend on a remote shell's PATH or a stale config.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "name": {
                   "description": "Display name the server declares (`websocket_api.name`, falling\nback to the machine hostname). Additive: absent from pongs of\nolder servers, so the protocol version is unchanged. Display\nonly, never identity.",
                   "type": [
@@ -9272,6 +9375,20 @@
                   "format": "uint32",
                   "minimum": 0,
                   "type": "integer"
+                },
+                "reach": {
+                  "description": "Operator-declared route other machines use to open a shell on this\nserver. Additive and absent when `websocket_api.reach` is unset or\nempty; it is never inferred from the hostname or display name.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "session": {
+                  "description": "Live non-default herdr session name. The default session needs no\n`--session` argument and is represented by an absent field.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "pong",
@@ -10009,6 +10126,26 @@
             },
             {
               "properties": {
+                "delivered": {
+                  "type": "boolean"
+                },
+                "routing": {
+                  "$ref": "#/schemas/success_response/$defs/PaneMouseRouting"
+                },
+                "type": {
+                  "const": "pane_send_mouse",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delivered",
+                "routing"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "explain": true,
                 "type": {
                   "const": "agent_explain",
@@ -10551,6 +10688,11 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "send_affirm": {
+              "default": false,
+              "description": "Whether `pane.send_input` dedupes by `send_id`, so a client may\nsafely re-issue an unacked send after a reconnect. Additive: absent\n(false) in pongs of servers that predate it.",
               "type": "boolean"
             },
             "ssh_agent_registration": {

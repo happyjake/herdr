@@ -21,6 +21,7 @@ mod git_refresh;
 mod ids;
 mod popup;
 mod runtime;
+mod send_affirm;
 mod session;
 pub mod state;
 mod tab_bar_status;
@@ -133,6 +134,9 @@ pub struct App {
     pub(crate) pending_worktree_remove_runtime_exits: HashMap<crate::layout::PaneId, usize>,
     pub(crate) pending_worktree_remove_runtime_restores: HashMap<crate::layout::PaneId, u64>,
     pub(crate) next_api_worktree_operation_id: u64,
+    /// Recently applied `pane.send_input` send_ids, so a client re-issuing
+    /// an unacked send after a reconnect is answered without a second write.
+    pub(crate) applied_send_ids: send_affirm::AppliedSendIds,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -181,6 +185,9 @@ pub struct App {
     /// renames the server through this; every subsequent pong carries the
     /// new name on both transports without a restart.
     pub(crate) server_name: Option<crate::api::SharedServerName>,
+    /// Live operator-declared reach shared with both API listeners. Config
+    /// reload replaces or clears it for every subsequent pong.
+    pub(crate) server_reach: Option<crate::api::SharedServerReach>,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -650,6 +657,7 @@ impl App {
             pending_worktree_remove_runtime_exits: HashMap::new(),
             pending_worktree_remove_runtime_restores: HashMap::new(),
             next_api_worktree_operation_id: 1,
+            applied_send_ids: Default::default(),
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -689,6 +697,7 @@ impl App {
             endpoint_commands,
             websocket_api_token: None,
             server_name: None,
+            server_reach: None,
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
@@ -835,6 +844,12 @@ impl App {
     /// reloads rename the server for every subsequent pong.
     pub(crate) fn set_server_name(&mut self, server_name: Option<crate::api::SharedServerName>) {
         self.server_name = server_name;
+    }
+
+    /// Attach the declared-reach slot shared with the API listeners so config
+    /// reloads update the route for every subsequent pong.
+    pub(crate) fn set_server_reach(&mut self, server_reach: Option<crate::api::SharedServerReach>) {
+        self.server_reach = server_reach;
     }
 
     pub(crate) fn take_config_reloaded_from_disk(&mut self) -> bool {
@@ -1035,7 +1050,7 @@ impl App {
         }
 
         if !invalid_section("websocket_api") {
-            // Only the token and the name are live-reloadable; the bind
+            // Only the token and server declarations are live-reloadable; the bind
             // address stays fixed until the server restarts. A reload that
             // would leave the bound listener without a usable token keeps
             // the current one instead.
@@ -1048,6 +1063,9 @@ impl App {
             // the machine hostname.
             if let Some(server_name) = &self.server_name {
                 server_name.apply_reloaded_config(&config.websocket_api);
+            }
+            if let Some(server_reach) = &self.server_reach {
+                server_reach.apply_reloaded_config(&config.websocket_api);
             }
         }
 
@@ -2423,6 +2441,18 @@ mod tests {
                 },
             ),
         };
+        let pane_send_mouse = crate::api::schema::Request {
+            id: "req_10".into(),
+            method: crate::api::schema::Method::PaneSendMouse(
+                crate::api::schema::PaneSendMouseParams {
+                    pane_id: "w1:p1".into(),
+                    action: crate::api::schema::PaneMouseAction::Click,
+                    row: 0,
+                    col: 0,
+                    lines: None,
+                },
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -2436,6 +2466,7 @@ mod tests {
         assert!(crate::api::request_changes_ui(&command_invoke));
         assert!(crate::api::request_changes_ui(&announcement_dismiss));
         assert!(crate::api::request_changes_ui(&release_notes_dismiss));
+        assert!(crate::api::request_changes_ui(&pane_send_mouse));
     }
 
     #[test]

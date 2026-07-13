@@ -43,10 +43,20 @@ impl App {
             return Ok(resolved);
         }
 
-        if let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(target) {
+        // Pane commands route here, so accept every pane-id form their
+        // legacy handlers accepted (`w1:p1` and `w1-1`), not only ids that
+        // round-trip through the public form. Agent-name strictness lives in
+        // resolve_agent_target.
+        if let Some((ws_idx, pane_id)) = self.parse_pane_id(target) {
             if let Some(resolved) = self.terminal_target_for_pane(ws_idx, pane_id) {
                 return Ok(resolved);
             }
+        }
+
+        if target.starts_with("term_") {
+            return Err(TerminalTargetError::NotFound {
+                target: target.to_string(),
+            });
         }
 
         let agent_matches: Vec<_> = self

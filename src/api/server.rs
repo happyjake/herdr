@@ -102,6 +102,7 @@ pub(crate) fn start_server_with_stop_control(
     event_hub: EventHub,
     server_stop: ServerStop,
     server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
 ) -> std::io::Result<ServerHandle> {
     start_server_inner(
         api_tx,
@@ -109,6 +110,7 @@ pub(crate) fn start_server_with_stop_control(
         default_capabilities(),
         Some(server_stop),
         server_name,
+        server_reach,
     )
 }
 
@@ -122,6 +124,7 @@ pub(super) fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         ssh_agent_registration: false,
+        send_affirm: true,
     })
 }
 
@@ -131,6 +134,7 @@ fn start_server_inner(
     mut capabilities: Option<ServerCapabilities>,
     server_stop: Option<ServerStop>,
     server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -179,6 +183,7 @@ fn start_server_inner(
                 let capabilities = capabilities.clone();
                 let server_stop = server_stop.clone();
                 let server_name = server_name.clone();
+                let server_reach = server_reach.clone();
                 let connection_running = Arc::clone(&listener_running);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
@@ -193,6 +198,7 @@ fn start_server_inner(
                         #[cfg(unix)]
                         ssh_agents.as_ref(),
                         &server_name,
+                        &server_reach,
                     ) {
                         warn!(err = %err, "api connection failed");
                     }
@@ -374,6 +380,7 @@ fn handle_connection(
         #[cfg(unix)]
         None,
         &crate::api::SharedServerName::new("test".to_string()),
+        &crate::api::SharedServerReach::from_config(&crate::config::WebSocketApiConfig::default()),
     )
 }
 
@@ -387,6 +394,7 @@ fn handle_connection_with_stop(
     server_stop: Option<&ServerStop>,
     #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -420,6 +428,7 @@ fn handle_connection_with_stop(
             capabilities,
             server_stop,
             server_name,
+            server_reach,
         ),
     }
 }
@@ -527,6 +536,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&ServerStop>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -637,6 +647,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
                 stop_caller,
                 Some(response_write_rx),
                 server_name,
+                server_reach,
             );
             let result = write_message_allow_disconnect(transport, &response);
             let _ = response_write_tx.send(());
@@ -693,9 +704,10 @@ fn handle_request(
     stop_caller: Option<String>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> String {
-    // The name is read per request, not captured at listener start, so a
-    // reloaded name shows up in the next pong on every transport.
+    // Declarations and runtime facts are read per request, so config
+    // reloads and the running process are reflected on every transport.
     if matches!(&request.method, Method::Ping(_)) {
         return serde_json::to_string(&SuccessResponse {
             id: request.id,
@@ -704,6 +716,9 @@ fn handle_request(
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
                 name: Some(server_name.current()),
+                reach: server_reach.current(),
+                session: crate::session::active_name_for_api_socket(),
+                exe: crate::api::server_executable::path_for_pong(),
             },
         })
         .unwrap_or_else(|_| {
@@ -1226,6 +1241,10 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn undeclared_server_reach() -> crate::api::SharedServerReach {
+        crate::api::SharedServerReach::from_config(&crate::config::WebSocketApiConfig::default())
+    }
+
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1275,6 +1294,9 @@ mod tests {
                 None,
                 Some(&worker_registry),
                 &crate::api::SharedServerName::new("test".to_string()),
+                &crate::api::SharedServerReach::from_config(
+                    &crate::config::WebSocketApiConfig::default(),
+                ),
             )
             .unwrap();
         });
@@ -1325,6 +1347,8 @@ mod tests {
             tokens: HashMap::new(),
             agent_session: None,
             scroll: None,
+            mouse_tracking: false,
+            alternate_screen: false,
             revision: 0,
         }
     }
@@ -1421,6 +1445,7 @@ mod tests {
             None,
             None,
             crate::api::SharedServerName::new("test".into()),
+            undeclared_server_reach(),
         );
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
 
@@ -1615,11 +1640,13 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                send_affirm: true,
             }),
             None,
             None,
             None,
             &crate::api::SharedServerName::new("the-mini".to_string()),
+            &undeclared_server_reach(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1634,6 +1661,7 @@ mod tests {
     fn pong_reflects_a_renamed_server_without_restarting_anything() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let server_name = crate::api::SharedServerName::new("before".to_string());
+        let server_reach = undeclared_server_reach();
         let ping = |id: &str| {
             handle_request(
                 Request {
@@ -1646,6 +1674,7 @@ mod tests {
                 None,
                 None,
                 &server_name,
+                &server_reach,
             )
         };
 
@@ -1677,6 +1706,7 @@ mod tests {
             Some("pid 42 (herdr)".into()),
             None,
             &server_name,
+            &undeclared_server_reach(),
         );
 
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1701,6 +1731,7 @@ mod tests {
             None,
             None,
             &server_name,
+            &undeclared_server_reach(),
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
@@ -1717,6 +1748,7 @@ mod tests {
         // thread — identically for every transport and server mode.
         let (tx, _) = mpsc::unbounded_channel();
         let server_name = crate::api::SharedServerName::new("test".to_string());
+        let server_reach = undeclared_server_reach();
         let create = |id: &str, bytes_b64: String| {
             handle_request(
                 Request {
@@ -1731,6 +1763,7 @@ mod tests {
                 None,
                 None,
                 &server_name,
+                &server_reach,
             )
         };
         let error_code = |response: &str| {
@@ -1792,6 +1825,7 @@ mod tests {
                 None,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             )
         });
 
@@ -1865,14 +1899,7 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = EventHub::default();
-        handle_connection(
-            server,
-            &api_tx,
-            &event_hub,
-            &running,
-            None,
-        )
-        .unwrap();
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_1");
@@ -1899,14 +1926,7 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = EventHub::default();
-        handle_connection(
-            server,
-            &api_tx,
-            &event_hub,
-            &running,
-            None,
-        )
-        .unwrap();
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_2");
@@ -2185,13 +2205,8 @@ mod tests {
         let server_event_hub = event_hub.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(
-                server,
-                &api_tx,
-                &server_event_hub,
-                &server_running,
-                None,
-            );
+            let result =
+                handle_connection(server, &api_tx, &server_event_hub, &server_running, None);
             done_tx.send(result).unwrap();
         });
 
@@ -2240,13 +2255,8 @@ mod tests {
         let server_event_hub = event_hub.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(
-                server,
-                &api_tx,
-                &server_event_hub,
-                &server_running,
-                None,
-            );
+            let result =
+                handle_connection(server, &api_tx, &server_event_hub, &server_running, None);
             done_tx.send(result).unwrap();
         });
 

@@ -687,6 +687,10 @@ impl PaneTerminal {
         self.ghostty.encode_mouse_button(kind, position, modifiers)
     }
 
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        self.ghostty.encode_mouse_click(column, row)
+    }
+
     pub(crate) fn encode_mouse_motion(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -2131,6 +2135,24 @@ impl GhosttyPaneTerminal {
         )
     }
 
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        let position = crate::input::mouse::Position::Cell { column, row };
+        let mut bytes = self.encode_mouse_button(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            position,
+            crossterm::event::KeyModifiers::empty(),
+        )?;
+        // X10 tracking reports the press only; the release encodes to nothing.
+        if let Some(release) = self.encode_mouse_button(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            position,
+            crossterm::event::KeyModifiers::empty(),
+        ) {
+            bytes.extend(release);
+        }
+        (!bytes.is_empty()).then_some(bytes)
+    }
+
     pub(crate) fn encode_mouse_motion(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -3130,9 +3152,9 @@ fn ghostty_recent_read_at_offset(
         if request.offset_from_bottom == 0 && window.text.trim().is_empty() {
             let fallback =
                 windows_recent_fallback::recent_text(core, request.lines, request.unwrapped);
-            if !fallback.trim().is_empty() {
+            if !fallback.text.trim().is_empty() {
                 return Ok(RecentReadWindow {
-                    text: fallback,
+                    text: fallback.text,
                     ..window
                 });
             }
@@ -3144,7 +3166,7 @@ fn ghostty_recent_read_at_offset(
         if request.offset_from_bottom > 0 && window.text.trim().is_empty() {
             let fallback =
                 windows_recent_fallback::recent_text(core, request.lines, request.unwrapped);
-            if !fallback.trim().is_empty() {
+            if !fallback.text.trim().is_empty() {
                 return Ok(RecentReadWindow {
                     offset_unsupported: true,
                     ..RecentReadWindow::default()
@@ -5415,6 +5437,10 @@ mod tests {
             })
         );
         assert_eq!(pane.modify_other_keys_level(), 2);
+        assert_eq!(
+            pane.encode_mouse_click(1, 2),
+            Some(b"\x1b[<0;2;3M\x1b[<0;2;3m".to_vec())
+        );
 
         let encoded = pane.encode_terminal_key(crate::input::TerminalKey::new(
             crossterm::event::KeyCode::Up,
@@ -5434,7 +5460,7 @@ mod tests {
         assert_eq!(encoded.as_deref(), Some(&b"\x1b[<64;12;10M"[..]));
     }
 
-    /// Regression (phone report 2026-07-13): a pane imported from a server
+    /// Regression: a pane imported from a server
     /// whose export force-set `alternate_screen` for agent panes (the old
     /// heuristic) and carried a frame-only `\x1b[H…` history must come up on
     /// the PRIMARY screen with the frame visible — and keep accumulating
@@ -6559,7 +6585,7 @@ mod tests {
         // Step by lines-received minus one page overlap: a window whose top
         // cuts a logical line mid-wrap returns only its tail, and stepping
         // by the full count would skip that line's head. The overlapped
-        // walk is the client contract the PRD's anchored merge assumes.
+        // walk is the client contract for merging anchored pages.
         let mut stitched = String::new();
         let mut offset = 0;
         loop {

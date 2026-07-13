@@ -220,6 +220,53 @@ fn request_round_trips_for_server_stop() {
 }
 
 #[test]
+fn pane_send_mouse_request_parses_actions_and_optional_lines() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "req_mouse",
+        "method": "pane.send_mouse",
+        "params": {
+            "pane_id": "pane_1",
+            "action": "scroll_down",
+            "row": 0,
+            "col": 0,
+            "lines": 4
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(
+        request.method,
+        Method::PaneSendMouse(PaneSendMouseParams {
+            pane_id: "pane_1".into(),
+            action: PaneMouseAction::ScrollDown,
+            row: 0,
+            col: 0,
+            lines: Some(4),
+        })
+    );
+}
+
+#[test]
+fn pane_info_defaults_missing_mouse_tracking_and_alternate_screen_to_false_and_serializes_boole() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "pane_1",
+        "terminal_id": "terminal_1",
+        "workspace_id": "workspace_1",
+        "tab_id": "tab_1",
+        "focused": true,
+        "agent_status": "unknown",
+        "revision": 0
+    }))
+    .unwrap();
+
+    assert!(!pane.mouse_tracking);
+    assert!(!pane.alternate_screen);
+    let encoded = serde_json::to_value(pane).unwrap();
+    assert_eq!(encoded["mouse_tracking"], false);
+    assert_eq!(encoded["alternate_screen"], false);
+}
+
+#[test]
 fn request_round_trips_for_server_reload_config() {
     let request = Request {
         id: "req_reload".into(),
@@ -789,8 +836,12 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 ssh_agent_registration: false,
+                send_affirm: true,
             }),
             name: Some("the-mini".into()),
+            reach: Some("mini".into()),
+            session: Some("mobile".into()),
+            exe: Some("/opt/herdr".into()),
         },
     };
 
@@ -800,13 +851,24 @@ fn success_response_round_trips() {
 }
 
 #[test]
-fn pong_name_is_additive_for_older_peers() {
-    // A pong from a server that predates the name field must still parse —
-    // the field is additive and the protocol version did not bump.
+fn pong_declarations_are_additive_for_older_peers() {
+    // A pong from a server that predates the declaration fields must still
+    // parse — the fields are additive and the protocol version did not bump.
     let old_pong = r#"{"id":"req_old","result":{"type":"pong","version":"0.1.0","protocol":6}}"#;
     let restored: SuccessResponse = serde_json::from_str(old_pong).unwrap();
     match restored.result {
-        ResponseResult::Pong { name, .. } => assert_eq!(name, None),
+        ResponseResult::Pong {
+            name,
+            reach,
+            session,
+            exe,
+            ..
+        } => {
+            assert_eq!(name, None);
+            assert_eq!(reach, None);
+            assert_eq!(session, None);
+            assert_eq!(exe, None);
+        }
         other => panic!("expected pong, got {other:?}"),
     }
 }
@@ -913,6 +975,8 @@ fn worktree_request_and_response_round_trip() {
                 tokens: HashMap::new(),
                 agent_session: None,
                 scroll: None,
+                mouse_tracking: false,
+                alternate_screen: false,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1344,6 +1408,8 @@ fn create_response_round_trips_with_root_pane() {
                 tokens: HashMap::new(),
                 agent_session: None,
                 scroll: None,
+                mouse_tracking: false,
+                alternate_screen: false,
                 revision: 0,
             },
         },

@@ -380,7 +380,40 @@ crate::cli::projection::cli_params! {
         pub text: String => Field::new(String::new()).input(binding::joined("command", "COMMAND")),
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub keys: Vec<String> => Field::new(vec![String::from("Enter")]),
+        /// Client-generated identity of this logical send. When present, an id
+        /// the server already applied is acknowledged without writing again —
+        /// the re-affirmation contract behind the `send_affirm` capability.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub send_id: Option<String> => Field::new(None::<String>),
     }
+}
+
+/// Mouse input addressed in zero-based terminal cells. Coordinates outside
+/// the live pane grid are clamped to its last row or column before encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSendMouseParams {
+    pub pane_id: String,
+    pub action: PaneMouseAction,
+    pub row: u32,
+    pub col: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneMouseAction {
+    Click,
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneMouseRouting {
+    MouseReport,
+    AlternateScroll,
+    HostScroll,
 }
 
 crate::cli::projection::cli_params! {
@@ -539,6 +572,14 @@ pub struct PaneInfo {
     pub agent_session: Option<AgentSessionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
+    /// Whether the pane's live terminal state currently reports mouse input.
+    /// Additive: payloads from older servers omit this and deserialize false.
+    #[serde(default)]
+    pub mouse_tracking: bool,
+    /// Whether the pane's live terminal state currently uses the alternate screen.
+    /// Additive: payloads from older servers omit this and deserialize false.
+    #[serde(default)]
+    pub alternate_screen: bool,
     pub revision: u64,
 }
 

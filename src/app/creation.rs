@@ -310,9 +310,12 @@ impl App {
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::api::schema::PaneInfo> {
         let mut pane = self.pane_metadata(ws_idx, pane_id)?;
-        pane.scroll = self
-            .state
-            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        let runtime =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id);
+        pane.mouse_tracking = runtime.is_some_and(|runtime| runtime.mouse_reporting_enabled());
+        pane.alternate_screen = runtime.is_some_and(|runtime| runtime.alternate_screen_active());
+        pane.scroll = runtime
             .and_then(|runtime| runtime.scroll_metrics())
             .map(|metrics| crate::api::schema::PaneScrollInfo {
                 offset_from_bottom: metrics.offset_from_bottom as u64,
@@ -322,6 +325,9 @@ impl App {
         Some(pane)
     }
 
+    /// Internal projection only: runtime fields are placeholders here.
+    /// This value must not be serialized as a public response; pane_info
+    /// fills scroll, mouse tracking and active-screen state for API callers.
     pub(super) fn pane_metadata(
         &self,
         ws_idx: usize,
@@ -361,6 +367,8 @@ impl App {
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
             scroll: None,
+            mouse_tracking: false,
+            alternate_screen: false,
             revision: terminal.revision,
         })
     }

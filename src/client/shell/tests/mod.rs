@@ -199,6 +199,8 @@ fn pane_scroll_result(
                 max_offset_from_bottom,
                 viewport_rows,
             }),
+            mouse_tracking: false,
+            alternate_screen: false,
             revision: 0,
         },
     }

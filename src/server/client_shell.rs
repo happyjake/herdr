@@ -657,11 +657,16 @@ mod tests {
                 terminal.last_agent_state_change_seq = Some(5);
                 terminal.last_agent_completion_seq = Some(7);
             }
+            let output = if index == 0 {
+                format!("{history}\x1b[?1000h\x1b[?1049h")
+            } else {
+                history.clone()
+            };
             let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
                 20,
                 5,
                 1000,
-                history.as_bytes(),
+                output.as_bytes(),
             );
             runtime.scroll_up(3);
             app.terminal_runtimes.insert(terminal.id.clone(), runtime);
@@ -671,20 +676,39 @@ mod tests {
         assert_eq!(metadata.panes.len(), 3);
         assert_eq!(metadata.agents.len(), 2);
         assert!(metadata.panes.iter().all(|pane| pane.scroll.is_none()));
+        assert!(metadata
+            .panes
+            .iter()
+            .all(|pane| !pane.mouse_tracking && !pane.alternate_screen));
         assert!(app
             .terminal_runtimes
             .values()
             .all(|runtime| runtime.test_scroll_metrics_reads() == 0));
 
         let mut public = app.session_snapshot();
+        assert_eq!(
+            public
+                .panes
+                .iter()
+                .filter(|pane| pane.mouse_tracking && pane.alternate_screen)
+                .count(),
+            1
+        );
         for pane in &mut public.panes {
             let scroll = pane
                 .scroll
                 .take()
                 .expect("public session must expose scroll");
-            assert_eq!(scroll.offset_from_bottom, 3);
-            assert!(scroll.max_offset_from_bottom >= 3);
+            if pane.alternate_screen {
+                assert_eq!(scroll.offset_from_bottom, 0);
+                assert_eq!(scroll.max_offset_from_bottom, 0);
+            } else {
+                assert_eq!(scroll.offset_from_bottom, 3);
+                assert!(scroll.max_offset_from_bottom >= 3);
+            }
             assert_eq!(scroll.viewport_rows, 5);
+            pane.mouse_tracking = false;
+            pane.alternate_screen = false;
         }
         assert_eq!(metadata, public);
         assert!(app

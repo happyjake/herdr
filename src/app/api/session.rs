@@ -17,6 +17,8 @@ impl App {
         self.session_snapshot_with_pane_info(Self::pane_info)
     }
 
+    /// Internal client projection; runtime pane fields are placeholders.
+    /// Public API responses must use session_snapshot instead.
     pub(crate) fn session_metadata_snapshot(&self) -> SessionSnapshot {
         self.session_snapshot_with_pane_info(Self::pane_metadata)
     }
