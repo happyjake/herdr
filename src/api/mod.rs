@@ -75,6 +75,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneGraphicsStreamDirect(_)
             | Method::PaneGraphicsStreamOpen(_)
             | Method::PaneGraphicsStreamClose(_)
+            | Method::PaneSendMouse(_)
             | Method::PaneReportAgent(_)
             | Method::PaneReportAgentSession(_)
             | Method::PaneReportMetadata(_)
