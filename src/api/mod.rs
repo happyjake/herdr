@@ -73,6 +73,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneFocus(_)
             | Method::PaneInputSet(_)
             | Method::PaneRename(_)
+            | Method::PaneSendMouse(_)
             | Method::PaneReportAgent(_)
             | Method::PaneReportAgentSession(_)
             | Method::PaneReportMetadata(_)

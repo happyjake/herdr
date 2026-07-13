@@ -805,6 +805,11 @@
                 "null"
               ]
             },
+            "mouse_tracking": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently reports mouse input.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
+            },
             "pane_id": {
               "type": "string"
             },
@@ -2700,6 +2705,14 @@
           },
           "type": "object"
         },
+        "PaneMouseAction": {
+          "enum": [
+            "click",
+            "scroll_up",
+            "scroll_down"
+          ],
+          "type": "string"
+        },
         "PaneMoveDestination": {
           "oneOf": [
             {
@@ -3207,6 +3220,43 @@
           "required": [
             "pane_id",
             "keys"
+          ],
+          "type": "object"
+        },
+        "PaneSendMouseParams": {
+          "description": "Mouse input addressed in zero-based terminal cells. Coordinates outside\nthe live pane grid are clamped to its last row or column before encoding.",
+          "properties": {
+            "action": {
+              "$ref": "#/schemas/request/$defs/PaneMouseAction"
+            },
+            "col": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "lines": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "row": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "action",
+            "row",
+            "col"
           ],
           "type": "object"
         },
@@ -5945,6 +5995,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.send_mouse",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendMouseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.read",
               "type": "string"
             },
@@ -7958,6 +8024,11 @@
                 "null"
               ]
             },
+            "mouse_tracking": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently reports mouse input.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
+            },
             "pane_id": {
               "type": "string"
             },
@@ -8184,6 +8255,14 @@
             "end_col"
           ],
           "type": "object"
+        },
+        "PaneMouseRouting": {
+          "enum": [
+            "mouse_report",
+            "alternate_scroll",
+            "host_scroll"
+          ],
+          "type": "string"
         },
         "PaneMoveReason": {
           "enum": [
@@ -9984,6 +10063,26 @@
                 "content_revision",
                 "matches",
                 "total"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "delivered": {
+                  "type": "boolean"
+                },
+                "routing": {
+                  "$ref": "#/schemas/success_response/$defs/PaneMouseRouting"
+                },
+                "type": {
+                  "const": "pane_send_mouse",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delivered",
+                "routing"
               ],
               "type": "object"
             },

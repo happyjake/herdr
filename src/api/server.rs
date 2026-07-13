@@ -714,6 +714,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendInput(_) => "pane.send_input",
+        Method::PaneSendMouse(_) => "pane.send_mouse",
         Method::PaneRead(_) => "pane.read",
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
@@ -1305,6 +1306,7 @@ mod tests {
             tokens: HashMap::new(),
             agent_session: None,
             scroll: None,
+            mouse_tracking: false,
             revision: 0,
         }
     }

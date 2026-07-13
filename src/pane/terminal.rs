@@ -678,6 +678,10 @@ impl PaneTerminal {
         self.ghostty.encode_mouse_button(kind, position, modifiers)
     }
 
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        self.ghostty.encode_mouse_click(column, row)
+    }
+
     pub(crate) fn encode_mouse_motion(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -2138,6 +2142,24 @@ impl GhosttyPaneTerminal {
             position,
             false,
         )
+    }
+
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        let position = crate::input::mouse::Position::Cell { column, row };
+        let mut bytes = self.encode_mouse_button(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            position,
+            crossterm::event::KeyModifiers::empty(),
+        )?;
+        // X10 tracking reports the press only; the release encodes to nothing.
+        if let Some(release) = self.encode_mouse_button(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            position,
+            crossterm::event::KeyModifiers::empty(),
+        ) {
+            bytes.extend(release);
+        }
+        (!bytes.is_empty()).then_some(bytes)
     }
 
     pub(crate) fn encode_mouse_motion(
@@ -5224,6 +5246,10 @@ mod tests {
             })
         );
         assert_eq!(pane.modify_other_keys_level(), 2);
+        assert_eq!(
+            pane.encode_mouse_click(1, 2),
+            Some(b"\x1b[<0;2;3M\x1b[<0;2;3m".to_vec())
+        );
 
         let encoded = pane.encode_terminal_key(
             crate::input::TerminalKey::new(

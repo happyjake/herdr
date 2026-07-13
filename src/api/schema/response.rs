@@ -8,8 +8,8 @@ use super::integrations::{
 };
 use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
-    PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult, PaneResizeResult,
-    PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult,
+    PaneMouseRouting, PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult,
+    PaneResizeResult, PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult,
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
@@ -194,6 +194,10 @@ pub enum ResponseResult {
         current: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current_global: Option<u64>,
+    },
+    PaneSendMouse {
+        delivered: bool,
+        routing: PaneMouseRouting,
     },
     AgentExplain {
         explain: serde_json::Value,

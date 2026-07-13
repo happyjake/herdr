@@ -2360,6 +2360,18 @@ mod tests {
                 },
             ),
         };
+        let pane_send_mouse = crate::api::schema::Request {
+            id: "req_10".into(),
+            method: crate::api::schema::Method::PaneSendMouse(
+                crate::api::schema::PaneSendMouseParams {
+                    pane_id: "w1:p1".into(),
+                    action: crate::api::schema::PaneMouseAction::Click,
+                    row: 0,
+                    col: 0,
+                    lines: None,
+                },
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -2373,6 +2385,7 @@ mod tests {
         assert!(crate::api::request_changes_ui(&command_invoke));
         assert!(crate::api::request_changes_ui(&announcement_dismiss));
         assert!(crate::api::request_changes_ui(&release_notes_dismiss));
+        assert!(crate::api::request_changes_ui(&pane_send_mouse));
     }
 
     #[test]

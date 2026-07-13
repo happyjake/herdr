@@ -3529,6 +3529,13 @@ impl PaneRuntime {
         self.terminal.encode_mouse_button(kind, position, modifiers)
     }
 
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        if !self.mouse_reporting_enabled() {
+            return None;
+        }
+        self.terminal.encode_mouse_click(column, row)
+    }
+
     pub(crate) fn encode_mouse_motion(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -3555,6 +3562,37 @@ impl PaneRuntime {
         let width = u32::from(cols).checked_mul(cell_width_px)?;
         let height = u32::from(rows).checked_mul(cell_height_px)?;
         (width > 0 && height > 0).then_some((width, height))
+    }
+
+    /// Route a wheel action from the terminal's live input state.
+    ///
+    /// Host scrolling is reported without mutating the viewport; callers decide
+    /// how to handle that route. Terminal-owned routes reset the host viewport
+    /// and return the bytes to write to the PTY.
+    pub fn route_mouse_wheel(
+        &self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> (WheelRouting, Option<Vec<u8>>) {
+        let routing = self.wheel_routing().unwrap_or(WheelRouting::HostScroll);
+        let bytes = match routing {
+            WheelRouting::HostScroll => None,
+            WheelRouting::MouseReport => {
+                self.scroll_reset();
+                self.encode_mouse_wheel(
+                    kind,
+                    crate::input::mouse::Position::Cell { column, row },
+                    modifiers,
+                )
+            }
+            WheelRouting::AlternateScroll => {
+                self.scroll_reset();
+                self.encode_alternate_scroll(kind)
+            }
+        };
+        (routing, bytes)
     }
 
     pub fn encode_alternate_scroll(
