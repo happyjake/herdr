@@ -173,6 +173,8 @@ pub enum Method {
     PaneSendKeys(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
+    #[serde(rename = "pane.send_mouse")]
+    PaneSendMouse(PaneSendMouseParams),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
     #[serde(rename = "pane.graphics.set")]

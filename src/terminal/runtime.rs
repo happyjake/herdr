@@ -528,6 +528,10 @@ impl TerminalRuntime {
         self.0.encode_mouse_button(kind, position, modifiers)
     }
 
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        self.0.encode_mouse_click(column, row)
+    }
+
     pub(crate) fn encode_mouse_motion(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -548,6 +552,16 @@ impl TerminalRuntime {
 
     pub(crate) fn pixel_size(&self) -> Option<(u32, u32)> {
         self.0.pixel_size()
+    }
+
+    pub fn route_mouse_wheel(
+        &self,
+        kind: crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> (crate::pane::WheelRouting, Option<Vec<u8>>) {
+        self.0.route_mouse_wheel(kind, column, row, modifiers)
     }
 
     pub fn encode_alternate_scroll(

@@ -219,6 +219,51 @@ fn request_round_trips_for_server_stop() {
 }
 
 #[test]
+fn pane_send_mouse_request_parses_actions_and_optional_lines() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "req_mouse",
+        "method": "pane.send_mouse",
+        "params": {
+            "pane_id": "pane_1",
+            "action": "scroll_down",
+            "row": 0,
+            "col": 0,
+            "lines": 4
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(
+        request.method,
+        Method::PaneSendMouse(PaneSendMouseParams {
+            pane_id: "pane_1".into(),
+            action: PaneMouseAction::ScrollDown,
+            row: 0,
+            col: 0,
+            lines: Some(4),
+        })
+    );
+}
+
+#[test]
+fn pane_info_defaults_missing_mouse_tracking_to_false_and_serializes_a_boolean() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "pane_1",
+        "terminal_id": "terminal_1",
+        "workspace_id": "workspace_1",
+        "tab_id": "tab_1",
+        "focused": true,
+        "agent_status": "unknown",
+        "revision": 0
+    }))
+    .unwrap();
+
+    assert!(!pane.mouse_tracking);
+    let encoded = serde_json::to_value(pane).unwrap();
+    assert_eq!(encoded["mouse_tracking"], false);
+}
+
+#[test]
 fn request_round_trips_for_server_reload_config() {
     let request = Request {
         id: "req_reload".into(),
@@ -853,6 +898,7 @@ fn worktree_request_and_response_round_trip() {
                 tokens: HashMap::new(),
                 agent_session: None,
                 scroll: None,
+                mouse_tracking: false,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1283,6 +1329,7 @@ fn create_response_round_trips_with_root_pane() {
                 tokens: HashMap::new(),
                 agent_session: None,
                 scroll: None,
+                mouse_tracking: false,
                 revision: 0,
             },
         },

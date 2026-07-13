@@ -27,6 +27,10 @@ enum RuntimeExitAction {
     ClosePane,
 }
 
+/// Text plus the truncation flag and offset echo fields (`Some` only when
+/// the request carried an offset) produced by [`pane_read_window`].
+type PaneReadWindowParts = (String, bool, Option<u64>, Option<bool>);
+
 /// Read window shared by the pane.read and agent.read handlers so their
 /// source dispatch and offset semantics cannot drift. Returns the text plus
 /// the offset echo fields (`Some` only when the request carried an offset),
@@ -38,7 +42,7 @@ fn pane_read_window(
     format: crate::api::schema::ReadFormat,
     lines: Option<u32>,
     offset_from_bottom: Option<u64>,
-) -> Result<(String, bool, Option<u64>, Option<bool>), &'static str> {
+) -> Result<PaneReadWindowParts, &'static str> {
     use crate::api::schema::{ReadFormat, ReadSource};
 
     if offset_from_bottom.is_some()
@@ -1198,6 +1202,9 @@ impl App {
             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
             Method::PaneSendInput(params) => {
                 return self.handle_pane_send_input(request.id, params)
+            }
+            Method::PaneSendMouse(params) => {
+                return self.handle_pane_send_mouse(request.id, params)
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
             Method::PopupClose(_) => {

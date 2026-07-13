@@ -1734,6 +1734,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_pane_send_mouse_gets_normal_invalid_request_refusals() {
+        let server = start_test_server();
+        let mut websocket = connect_authorized(&server);
+
+        for request in [
+            r#"{"id":"bad_action","method":"pane.send_mouse","params":{"pane_id":"pane_1","action":"drag","row":0,"col":0}}"#,
+            r#"{"id":"missing_row","method":"pane.send_mouse","params":{"pane_id":"pane_1","action":"click","col":0}}"#,
+        ] {
+            websocket.send(Message::text(request)).unwrap();
+            let error = read_json(&mut websocket);
+            assert_eq!(error["id"], "");
+            assert_eq!(error["error"]["code"], "invalid_request");
+        }
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"req_after_mouse_error","method":"ping","params":{}}"#,
+            ))
+            .unwrap();
+        let response = read_json(&mut websocket);
+        assert_eq!(response["id"], "req_after_mouse_error");
+        assert_eq!(response["result"]["type"], "pong");
+    }
+
+    #[test]
     fn events_subscribe_streams_events_pushed_to_the_hub() {
         let server = start_test_server();
         let mut websocket = connect_authorized(&server);

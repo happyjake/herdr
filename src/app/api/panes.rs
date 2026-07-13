@@ -5,14 +5,14 @@ use crate::api::schema::{
     PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
     PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
     PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
-    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
-    PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
-    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
+    PaneListParams, PaneMouseRouting, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
+    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo,
+    PaneProcessInfoParams, PaneProcessInfoProcess, PaneReadParams, PaneReadResult,
+    PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
-    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
-    PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneSendInputParams, PaneSendKeysParams, PaneSendMouseParams, PaneSendTextParams,
+    PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode,
+    PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 #[cfg(test)]
 use crate::api::schema::{ReadFormat, ReadSource};
@@ -1594,6 +1594,63 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    pub(super) fn handle_pane_send_mouse(
+        &mut self,
+        id: String,
+        params: PaneSendMouseParams,
+    ) -> String {
+        use crate::api::schema::PaneMouseAction;
+
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let (rows, cols) = runtime.current_size();
+        let row = params.row.min(u32::from(rows.saturating_sub(1))) as u16;
+        let col = params.col.min(u32::from(cols.saturating_sub(1))) as u16;
+        let scroll_repeats = usize::from(params.lines.unwrap_or(1).max(1));
+        let route_scroll = |kind| {
+            let (routing, bytes) =
+                runtime.route_mouse_wheel(kind, col, row, crossterm::event::KeyModifiers::empty());
+            (pane_mouse_routing(routing), bytes, scroll_repeats)
+        };
+        let (routing, bytes, repeats) = match params.action {
+            PaneMouseAction::Click => {
+                let bytes = runtime.encode_mouse_click(col, row);
+                if bytes.is_some() {
+                    runtime.scroll_reset();
+                }
+                (PaneMouseRouting::MouseReport, bytes, 1)
+            }
+            PaneMouseAction::ScrollUp => route_scroll(crossterm::event::MouseEventKind::ScrollUp),
+            PaneMouseAction::ScrollDown => {
+                route_scroll(crossterm::event::MouseEventKind::ScrollDown)
+            }
+        };
+        let Some(bytes) = bytes else {
+            return encode_success(
+                id,
+                ResponseResult::PaneSendMouse {
+                    delivered: false,
+                    routing,
+                },
+            );
+        };
+
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes.repeat(repeats))) {
+            return encode_error(id, "pane_send_failed", err.to_string());
+        }
+        encode_success(
+            id,
+            ResponseResult::PaneSendMouse {
+                delivered: true,
+                routing,
+            },
+        )
+    }
+
     pub(super) fn handle_pane_close(&mut self, id: String, target: PaneTarget) -> String {
         match self.close_pane(id.clone(), &target) {
             Ok(()) => encode_success(id, ResponseResult::Ok {}),
@@ -1722,6 +1779,14 @@ fn normalize_state_labels(
 
 fn pane_not_found(id: String, pane_id: &str) -> String {
     encode_error(id, "pane_not_found", format!("pane {pane_id} not found"))
+}
+
+fn pane_mouse_routing(routing: crate::pane::WheelRouting) -> PaneMouseRouting {
+    match routing {
+        crate::pane::WheelRouting::HostScroll => PaneMouseRouting::HostScroll,
+        crate::pane::WheelRouting::MouseReport => PaneMouseRouting::MouseReport,
+        crate::pane::WheelRouting::AlternateScroll => PaneMouseRouting::AlternateScroll,
+    }
 }
 
 impl App {
@@ -2017,6 +2082,20 @@ mod tests {
         (app, public_pane_id, rx)
     }
 
+    fn app_with_mouse_runtime(
+        mode_ansi: &[u8],
+        capacity: usize,
+    ) -> (App, String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, mode_ansi, capacity,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        (app, public_pane_id, rx)
+    }
+
     fn app_with_scrollback_runtime() -> (App, String, PaneId) {
         let (mut app, public_pane_id) = app_with_test_workspace();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
@@ -2100,6 +2179,272 @@ mod tests {
         let success: SuccessResponse = serde_json::from_str(response).unwrap();
         assert_eq!(success.id, id);
         assert_eq!(success.result, ResponseResult::Ok {});
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_click_is_one_atomic_press_release_write() {
+        let (mut app, pane_id, mut rx) = app_with_mouse_runtime(b"\x1b[?1000h\x1b[?1006h", 1);
+        let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+            "id": "req",
+            "method": "pane.send_mouse",
+            "params": {
+                "pane_id": pane_id,
+                "action": "click",
+                "row": 9,
+                "col": 11
+            }
+        }))
+        .unwrap();
+
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+        assert_eq!(response["id"], "req");
+        assert_eq!(response["result"]["type"], "pane_send_mouse");
+        assert_eq!(response["result"]["delivered"], true);
+        assert_eq!(response["result"]["routing"], "mouse_report");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[<0;12;10M\x1b[<0;12;10m")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_scroll_repeats_reports_in_one_write() {
+        let (mut app, pane_id, mut rx) = app_with_mouse_runtime(b"\x1b[?1000h\x1b[?1006h", 2);
+
+        for (id, action, lines, expected) in [
+            ("up", "scroll_up", 2, &b"\x1b[<64;12;10M\x1b[<64;12;10M"[..]),
+            (
+                "down",
+                "scroll_down",
+                3,
+                &b"\x1b[<65;12;10M\x1b[<65;12;10M\x1b[<65;12;10M"[..],
+            ),
+        ] {
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": id,
+                "method": "pane.send_mouse",
+                "params": {
+                    "pane_id": pane_id,
+                    "action": action,
+                    "row": 9,
+                    "col": 11,
+                    "lines": lines
+                }
+            }))
+            .unwrap();
+
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+            assert_eq!(response["id"], id);
+            assert_eq!(response["result"]["type"], "pane_send_mouse");
+            assert_eq!(response["result"]["delivered"], true);
+            assert_eq!(response["result"]["routing"], "mouse_report");
+            assert_eq!(rx.try_recv().unwrap().as_ref(), expected);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_scroll_routes_to_alternate_scroll_arrows() {
+        let (mut app, pane_id, mut rx) = app_with_mouse_runtime(b"\x1b[?1049h\x1b[?1007h", 2);
+
+        for (id, action, lines, expected) in [
+            ("up", "scroll_up", 2, &b"\x1b[A\x1b[A"[..]),
+            ("down", "scroll_down", 3, &b"\x1b[B\x1b[B\x1b[B"[..]),
+        ] {
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": id,
+                "method": "pane.send_mouse",
+                "params": {
+                    "pane_id": pane_id,
+                    "action": action,
+                    "row": 9,
+                    "col": 11,
+                    "lines": lines
+                }
+            }))
+            .unwrap();
+
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+            assert_eq!(response["result"]["delivered"], true);
+            assert_eq!(response["result"]["routing"], "alternate_scroll");
+            assert_eq!(rx.try_recv().unwrap().as_ref(), expected);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_covers_every_tracking_mode_and_action() {
+        type ModeCase = (
+            &'static str,
+            &'static [u8],
+            Option<&'static [u8]>,
+            Option<&'static [u8]>,
+            Option<&'static [u8]>,
+            &'static str,
+        );
+        let cases: [ModeCase; 5] = [
+            ("off", b"", None, None, None, "host_scroll"),
+            (
+                "x10",
+                b"\x1b[?9h\x1b[?1006h",
+                Some(b"\x1b[<0;2;3M"),
+                None,
+                None,
+                "mouse_report",
+            ),
+            (
+                "press_release",
+                b"\x1b[?1000h\x1b[?1006h",
+                Some(b"\x1b[<0;2;3M\x1b[<0;2;3m"),
+                Some(b"\x1b[<64;2;3M"),
+                Some(b"\x1b[<65;2;3M"),
+                "mouse_report",
+            ),
+            (
+                "button_motion",
+                b"\x1b[?1002h\x1b[?1006h",
+                Some(b"\x1b[<0;2;3M\x1b[<0;2;3m"),
+                Some(b"\x1b[<64;2;3M"),
+                Some(b"\x1b[<65;2;3M"),
+                "mouse_report",
+            ),
+            (
+                "any_motion",
+                b"\x1b[?1003h\x1b[?1006h",
+                Some(b"\x1b[<0;2;3M\x1b[<0;2;3m"),
+                Some(b"\x1b[<64;2;3M"),
+                Some(b"\x1b[<65;2;3M"),
+                "mouse_report",
+            ),
+        ];
+
+        for (mode, ansi, click, scroll_up, scroll_down, scroll_routing) in cases {
+            let (mut app, pane_id, mut rx) = app_with_mouse_runtime(ansi, 3);
+            for (action, expected, routing) in [
+                ("click", click, "mouse_report"),
+                ("scroll_up", scroll_up, scroll_routing),
+                ("scroll_down", scroll_down, scroll_routing),
+            ] {
+                let request: crate::api::schema::Request =
+                    serde_json::from_value(serde_json::json!({
+                        "id": format!("{mode}_{action}"),
+                        "method": "pane.send_mouse",
+                        "params": {
+                            "pane_id": pane_id,
+                            "action": action,
+                            "row": 2,
+                            "col": 1
+                        }
+                    }))
+                    .unwrap();
+
+                let response: serde_json::Value =
+                    serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+                assert_eq!(
+                    response["result"]["delivered"],
+                    expected.is_some(),
+                    "{mode} {action} delivery"
+                );
+                assert_eq!(
+                    response["result"]["routing"], routing,
+                    "{mode} {action} routing"
+                );
+                match expected {
+                    Some(expected) => assert_eq!(
+                        rx.try_recv().unwrap().as_ref(),
+                        expected,
+                        "{mode} {action} bytes"
+                    ),
+                    None => assert!(rx.try_recv().is_err(), "{mode} {action} must write dry"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_clamps_sgr_pixel_click_to_cell_bounds() {
+        let (mut app, pane_id, mut rx) =
+            app_with_mouse_runtime(b"\x1b[?1000h\x1b[?1006h\x1b[?1016h", 1);
+        let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+            "id": "req",
+            "method": "pane.send_mouse",
+            "params": {
+                "pane_id": pane_id,
+                "action": "click",
+                "row": u32::MAX,
+                "col": u32::MAX
+            }
+        }))
+        .unwrap();
+
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+        assert_eq!(response["result"]["delivered"], true);
+        assert_eq!(response["result"]["routing"], "mouse_report");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"\x1b[<0;80;24M\x1b[<0;80;24m")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_mouse_click_uses_live_legacy_coordinate_encoding() {
+        for (ansi, expected) in [
+            (&b"\x1b[?1000h"[..], &b"\x1b[M \x85\x99\x1b[M#\x85\x99"[..]),
+            (
+                &b"\x1b[?1000h\x1b[?1005h"[..],
+                &b"\x1b[M \xc2\x85\xc2\x99\x1b[M#\xc2\x85\xc2\x99"[..],
+            ),
+        ] {
+            let (mut app, pane_id) = app_with_test_workspace();
+            let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    300, 300, 0, ansi, 1,
+                );
+            app.state.insert_test_runtime(internal_pane_id, runtime);
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": "req",
+                "method": "pane.send_mouse",
+                "params": {
+                    "pane_id": pane_id,
+                    "action": "click",
+                    "row": 120,
+                    "col": 100
+                }
+            }))
+            .unwrap();
+
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+
+            assert_eq!(response["result"]["delivered"], true);
+            assert_eq!(rx.try_recv().unwrap().as_ref(), expected);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_exposes_live_mouse_tracking_as_a_boolean() {
+        for (ansi, expected) in [(&b"\x1b[?1000h\x1b[?1006h"[..], true), (&b""[..], false)] {
+            let (mut app, pane_id, _rx) = app_with_mouse_runtime(ansi, 1);
+
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_pane_get("req".into(), PaneTarget { pane_id }))
+                    .unwrap();
+
+            assert_eq!(response["result"]["pane"]["mouse_tracking"], expected);
+        }
     }
 
     #[tokio::test]

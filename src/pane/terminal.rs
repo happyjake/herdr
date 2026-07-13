@@ -607,6 +607,10 @@ impl PaneTerminal {
         self.ghostty.encode_mouse_button(kind, position, modifiers)
     }
 
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        self.ghostty.encode_mouse_click(column, row)
+    }
+
     pub(crate) fn encode_mouse_motion(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -1953,6 +1957,28 @@ impl GhosttyPaneTerminal {
             position,
             false,
         )
+    }
+
+    pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
+        let Ok(core) = self.core.lock() else {
+            return None;
+        };
+        let mut encoder = ghostty_mouse_encoder_for_terminal(&core.terminal)?;
+        let press = ghostty_mouse_event_from_button_kind(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            crossterm::event::KeyModifiers::empty(),
+        )?;
+        let release = ghostty_mouse_event_from_button_kind(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            crossterm::event::KeyModifiers::empty(),
+        )?;
+        let mut bytes = encoder.encode(&press).ok()?;
+        bytes.extend(encoder.encode(&release).ok()?);
+        (!bytes.is_empty()).then_some(bytes)
     }
 
     pub(crate) fn encode_mouse_motion(

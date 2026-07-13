@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -138,6 +138,26 @@ plain printable keys, special keys like `enter` and `esc`, modifier chords
 like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
 `f1`, and named punctuation like `minus` and `plus`. They do not accept
 `prefix+` binding strings.
+
+`pane.send_mouse` sends a click or wheel action to one pane. `row` and `col`
+are zero-based terminal cell coordinates and are clamped to the pane bounds.
+The actions are `click`, `scroll_up`, and `scroll_down`; scroll actions accept
+an optional `lines` count, with a missing or zero value treated as one. A click
+is encoded as one atomic press-and-release PTY write when the pane has mouse
+tracking enabled. Wheel actions follow the pane's live terminal state: mouse
+reporting first, alternate-screen arrow emulation when DECSET 1007 is active,
+and otherwise `host_scroll`. The API does not mutate the server's host viewport
+for that last route.
+
+```json
+{"id":"req_click","method":"pane.send_mouse","params":{"pane_id":"w1:p1","action":"click","row":4,"col":12}}
+{"id":"req_scroll","method":"pane.send_mouse","params":{"pane_id":"w1:p1","action":"scroll_up","row":4,"col":12,"lines":3}}
+```
+
+The response has type `pane_send_mouse`, a `delivered` boolean, and a `routing`
+value of `mouse_report`, `alternate_scroll`, or `host_scroll`. Disabled mouse
+tracking makes clicks dry (`delivered: false`); host-routed wheel actions are
+also dry so a remote client can perform its own viewport scroll.
 
 ```json
 {"id":"req_current","method":"pane.current","params":{"caller_pane_id":"w1:p1"}}
@@ -174,6 +194,10 @@ pane.
 ```
 
 Clients can treat `offset_from_bottom == 0` as at-bottom state.
+
+`PaneInfo.mouse_tracking` reports whether the live terminal currently accepts
+mouse reports. Supporting servers always include this boolean. Clients reading
+responses from older servers can treat an absent field as `false`.
 
 ### Experimental pane graphics
 
