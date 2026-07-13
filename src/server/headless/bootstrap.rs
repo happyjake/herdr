@@ -151,6 +151,7 @@ fn take_startup_cwd() -> Option<PathBuf> {
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    crate::server::handoff::honor_legacy_alternate_screen_panes(&mut received.manifest);
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

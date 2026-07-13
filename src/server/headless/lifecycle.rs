@@ -77,6 +77,10 @@ impl HeadlessServer {
             self.app.state.selected,
         );
 
+        // Divide the aggregate replay budget fairly so the one-line manifest
+        // stays under the importer's frame limit even at max pane count.
+        let replay_budget = crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE
+            .min(crate::server::handoff::MAX_REPLAY_BYTES_TOTAL / pane_by_terminal.len().max(1));
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
             let Some(pane_id) = pane_by_terminal.get(terminal_id).copied() else {
@@ -89,16 +93,7 @@ impl HeadlessServer {
                 .terminals
                 .get(terminal_id)
                 .and_then(|terminal| terminal.handoff_agent_state());
-            let screen_restore = crate::handoff_runtime::handoff_screen_restore(
-                handoff_runtime.input_state.as_ref(),
-                self.app.state.terminals.get(terminal_id),
-            );
-            if screen_restore.is_alternate() {
-                if let Some(input_state) = handoff_runtime.input_state.as_mut() {
-                    input_state.alternate_screen = true;
-                }
-            }
-            handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi(screen_restore);
+            handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi(replay_budget);
             handoff_entries.push((terminal_id.clone(), handoff_runtime));
         }
 

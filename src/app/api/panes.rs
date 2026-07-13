@@ -3276,10 +3276,7 @@ mod tests {
         // the path chunk (the pre-token-split behavior, preserved).
         assert_eq!(
             shapes("prose line\n\n/a/b.jpg\n\n/c/d.PNG\n"),
-            vec![
-                ("prose line\n\n", false),
-                ("/a/b.jpg\n\n/c/d.PNG\n", true),
-            ],
+            vec![("prose line\n\n", false), ("/a/b.jpg\n\n/c/d.PNG\n", true),],
         );
         // Paths-only stays one chunk, absorbing surrounding whitespace.
         assert_eq!(

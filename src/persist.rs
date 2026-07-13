@@ -18,4 +18,8 @@ pub use self::snapshot::{
     capture, capture_history, DirectionSnapshot, LayoutSnapshot, SessionHistorySnapshot,
     SessionSnapshot, TabSnapshot, WorkspaceSnapshot,
 };
+// Production code reaches these through persist-internal paths; only the
+// unix live-handoff tests name them through the crate-level re-export.
+#[cfg(all(test, unix))]
+pub use self::snapshot::{PaneAgentSessionSnapshot, PaneSnapshot};
 pub(crate) use self::writer::SessionWriter;
