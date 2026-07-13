@@ -1065,32 +1065,48 @@ while True:
     cleanup_test_base(&base);
 }
 
+/// Regression (phone report 2026-07-13): agent TUIs like claude live on the
+/// PRIMARY screen — their transcript is the pane's scrollback. A handoff
+/// must carry that scrollback and leave the pane accumulating more, not
+/// classify the pane "alternate screen" by agent identity, which destroyed
+/// the history at export and marooned the emulator on the alt screen where
+/// scrollback never grows again.
 #[test]
-fn live_handoff_recovers_stale_false_agent_alt_screen_state() {
+fn live_handoff_preserves_agent_pane_scrollback_and_accumulation() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
-    let ready_marker = base.join("stale-alt-ready");
-    let script = base.join("stale-alt-agent.py");
-    let redraw_marker = "HANDOFF-STALE-FALSE-ALT-RESTORED";
+    let ready_marker = base.join("agent-history-ready");
+    let more_trigger = base.join("agent-history-more");
+    let done_marker = base.join("agent-history-done");
+    let script = base.join("agent-history.py");
+    let first_marker = "AGENT-HANDOFF-HISTORY-001";
+    let last_marker = "AGENT-HANDOFF-HISTORY-080";
+    let post_marker = "AGENT-POST-HANDOFF-020";
 
     fs::create_dir_all(&base).unwrap();
     fs::write(
         &script,
         format!(
-            r#"import os, signal, time, pathlib
-signal.signal(signal.SIGWINCH, signal.SIG_IGN)
-# Simulate an emulator already desynced by an older handoff: the app's
-# full-screen frame is visible, but this stream does not re-enter ?1049h.
-os.write(1, b"\x1b[2J\x1b[H" + {redraw_marker:?}.encode() + b"\r\n")
+            r#"import pathlib
+import time
+
+for i in range(1, 81):
+    print(f"AGENT-HANDOFF-HISTORY-{{i:03d}}", flush=True)
 pathlib.Path({ready:?}).write_text("ready")
+while not pathlib.Path({more:?}).exists():
+    time.sleep(0.05)
+for i in range(1, 21):
+    print(f"AGENT-POST-HANDOFF-{{i:03d}}", flush=True)
+pathlib.Path({done:?}).write_text("done")
 while True:
     time.sleep(60)
 "#,
-            redraw_marker = redraw_marker,
-            ready = ready_marker.display().to_string()
+            ready = ready_marker.display().to_string(),
+            more = more_trigger.display().to_string(),
+            done = done_marker.display().to_string()
         ),
     )
     .unwrap();
@@ -1114,13 +1130,16 @@ while True:
     assert_ok(request(
         &api_socket,
         serde_json::json!({
-            "id": "test:pane:start-stale-alt-agent",
+            "id": "test:pane:start-agent-history",
             "method": "pane.send_input",
             "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
         }),
     ));
     support::wait_for_file(&ready_marker, Duration::from_secs(5));
-    wait_for_output(&api_socket, &pane_id, redraw_marker);
+    wait_for_output(&api_socket, &pane_id, last_marker);
+    // A lifecycle-hook report (non-reserved source, so it establishes hook
+    // authority and a known agent) is what used to trip the agent-identity
+    // alternate-screen heuristic at export.
     assert_ok(request(
         &api_socket,
         serde_json::json!({
@@ -1128,8 +1147,8 @@ while True:
             "method": "pane.report_agent",
             "params": {
                 "pane_id": pane_id,
-                "source": "herdr:pi",
-                "agent": "pi",
+                "source": "claude-hooks",
+                "agent": "claude",
                 "state": "working"
             }
         }),
@@ -1141,108 +1160,33 @@ while True:
     ));
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
-    wait_for_output(&api_socket, &pane_id, redraw_marker);
 
-    let _ = request(
+    let history = wait_for_read_source_contains(
         &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+        &pane_id,
+        "recent_unwrapped",
+        1000,
+        first_marker,
     );
-    cleanup_test_base(&base);
-}
-
-#[test]
-fn live_handoff_recovers_stale_false_fullscreen_input_modes() {
-    let _lock = test_lock();
-    let base = unique_test_dir();
-    let config_home = base.join("config");
-    let runtime_dir = base.join("runtime");
-    let api_socket = runtime_dir.join("herdr.sock");
-    let ready_marker = base.join("fullscreen-ready");
-    let exit_marker = base.join("fullscreen-exit");
-    let script = base.join("fullscreen-stale-alt.py");
-    let redraw_marker = "HANDOFF-FULLSCREEN-MODE-ALT-RESTORED";
-
-    fs::create_dir_all(&base).unwrap();
-    fs::write(
-        &script,
-        format!(
-            r#"import os, pathlib, select, signal, time
-signal.signal(signal.SIGWINCH, signal.SIG_IGN)
-os.write(1, b"\x1b[?1h\x1b[2J\x1b[H" + {redraw_marker:?}.encode() + b"\r\n")
-pathlib.Path({ready:?}).write_text("ready")
-while True:
-    ready, _, _ = select.select([0], [], [], 60)
-    if ready:
-        data = os.read(0, 1024)
-        if b"exit-alt" in data:
-            os.write(1, b"\x1b[?1049l")
-            pathlib.Path({exit_marker:?}).write_text("exited")
-"#,
-            redraw_marker = redraw_marker,
-            ready = ready_marker.display().to_string(),
-            exit_marker = exit_marker.display().to_string()
-        ),
-    )
-    .unwrap();
-
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    register_runtime_dir(&runtime_dir);
-
-    let created = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:workspace:create",
-            "method": "workspace.create",
-            "params": {"cwd": "/tmp", "focus": true}
-        }),
-    );
-    let pane_id = created["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:pane:start-fullscreen-mode",
-            "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": format!("python3 {}", script.display()), "keys": ["Enter"]}
-        }),
-    ));
-    support::wait_for_file(&ready_marker, Duration::from_secs(5));
-    wait_for_output(&api_socket, &pane_id, redraw_marker);
-
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
-    ));
-    drop(spawned);
-    wait_for_api(&api_socket, Duration::from_secs(10));
-    wait_for_output(&api_socket, &pane_id, redraw_marker);
-
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:pane:exit-alt",
-            "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": "exit-alt", "keys": ["Enter"]}
-        }),
-    ));
-    support::wait_for_file(&exit_marker, Duration::from_secs(5));
-    let response = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:pane:read-after-exit-alt",
-            "method": "pane.read",
-            "params": {"pane_id": pane_id, "source": "visible", "format": "text"}
-        }),
-    );
-    let text = response["result"]["read"]["text"]
-        .as_str()
-        .unwrap_or_default();
     assert!(
-        !text.contains(redraw_marker),
-        "stale-false fullscreen frame was restored onto primary, not alternate: {response}"
+        history.contains(last_marker),
+        "handoff preserved deep agent history but lost bottom history: {history:?}"
+    );
+
+    // The pane must keep accumulating scrollback after the import: new app
+    // output may not overwrite-in-place (the marooned-on-alt failure mode).
+    fs::write(&more_trigger, "more").unwrap();
+    support::wait_for_file(&done_marker, Duration::from_secs(5));
+    let after = wait_for_read_source_contains(
+        &api_socket,
+        &pane_id,
+        "recent_unwrapped",
+        1000,
+        post_marker,
+    );
+    assert!(
+        after.contains(first_marker),
+        "post-handoff output displaced the imported history instead of scrolling above it: {after:?}"
     );
 
     let _ = request(

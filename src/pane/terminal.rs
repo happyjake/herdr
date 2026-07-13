@@ -163,15 +163,6 @@ impl InputState {
         self.mouse_protocol_mode.reporting_enabled()
     }
 
-    // Only called from unix-only live handoff; kept cross-platform for tests.
-    #[cfg_attr(windows, allow(dead_code))]
-    pub fn indicates_fullscreen_application(self) -> bool {
-        self.alternate_screen
-            || self.application_cursor
-            || self.focus_reporting
-            || self.mouse_reporting_enabled()
-    }
-
     pub fn plain_page_keys_use_host_scrollback(self) -> bool {
         !self.alternate_screen
             && !self.mouse_reporting_enabled()
@@ -1505,9 +1496,12 @@ impl GhosttyPaneTerminal {
             return;
         };
 
-        if input_state.alternate_screen {
-            core.terminal.write(b"\x1b[?1049h");
-        }
+        // The screen mode is deliberately NOT seeded from the carried flag:
+        // the history stream re-enters the alternate screen itself when the
+        // app really lives there (see handoff_history_ansi). Forcing ?1049h
+        // from carried state is how agent panes were once marooned on the
+        // alt screen — their primary-screen apps never emit ?1049l, so the
+        // pane stopped accumulating scrollback forever.
         let _ = core.terminal.mode_set(
             crate::ghostty::MODE_APPLICATION_CURSOR_KEYS,
             input_state.application_cursor,
@@ -4711,7 +4705,13 @@ mod tests {
         assert_eq!(
             pane.input_state(),
             Some(InputState {
-                alternate_screen: true,
+                // The carried alt flag must NOT move the emulator to the
+                // alternate screen: only the history stream's own ?1049h
+                // does that (see handoff_history_ansi). A poisoned exporter
+                // that force-set this flag for a primary-screen agent would
+                // otherwise maroon the pane on the alt screen, freezing its
+                // scrollback forever.
+                alternate_screen: false,
                 application_cursor: true,
                 bracketed_paste: true,
                 focus_reporting: true,
@@ -4742,6 +4742,55 @@ mod tests {
             crossterm::event::KeyModifiers::empty(),
         );
         assert_eq!(encoded.as_deref(), Some(&b"\x1b[<64;12;10M"[..]));
+    }
+
+    /// Regression (phone report 2026-07-13): a pane imported from a server
+    /// whose export force-set `alternate_screen` for agent panes (the old
+    /// heuristic) and carried a frame-only `\x1b[H…` history must come up on
+    /// the PRIMARY screen with the frame visible — and keep accumulating
+    /// scrollback from subsequent app output, instead of staying marooned on
+    /// the alt screen with history pinned at one page.
+    #[cfg(unix)]
+    #[test]
+    fn ghostty_poisoned_alt_import_heals_to_primary_and_accumulates() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(40, 5, 100_000).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+
+        pane.seed_handoff_input_state(InputState {
+            alternate_screen: true,
+            application_cursor: false,
+            bracketed_paste: true,
+            focus_reporting: false,
+            mouse_protocol_mode: crate::input::MouseProtocolMode::None,
+            mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
+            mouse_alternate_scroll: false,
+            modify_other_keys: false,
+        });
+        pane.seed_history_ansi("\x1b[Htranscript tail line\r\n");
+
+        assert!(pane
+            .input_state()
+            .is_some_and(|input_state| !input_state.alternate_screen));
+        assert!(pane.recent_text(5).contains("transcript tail line"));
+
+        let mut app_output = Vec::new();
+        for line in 1..=20 {
+            app_output.extend_from_slice(format!("new-transcript-{line:02}\r\n").as_bytes());
+        }
+        pane.process_pty_bytes(crate::layout::PaneId::from_raw(1), 0, &app_output, &tx);
+
+        // 20 new lines on a 5-row screen: history beyond the viewport must
+        // exist (accumulating scrollback) and still reach the seeded frame.
+        let window = pane.recent_read_at_offset(crate::pane::RecentReadRequest {
+            lines: 40,
+            offset_from_bottom: 5,
+            unwrapped: false,
+            ansi: false,
+        });
+        assert!(!window.offset_unsupported);
+        assert!(window.has_more || window.text.contains("transcript tail line"));
+        assert!(window.text.contains("new-transcript-01"));
     }
 
     #[test]
@@ -4804,37 +4853,6 @@ mod tests {
             pane.encode_terminal_key(malformed_release, protocol),
             expected
         );
-    }
-
-    #[test]
-    fn input_state_marks_fullscreen_application_modes() {
-        let plain = InputState {
-            alternate_screen: false,
-            application_cursor: false,
-            bracketed_paste: true,
-            focus_reporting: false,
-            mouse_protocol_mode: crate::input::MouseProtocolMode::None,
-            mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
-            mouse_alternate_scroll: true,
-            modify_other_keys: false,
-        };
-        assert!(!plain.indicates_fullscreen_application());
-
-        let mut alternate = plain;
-        alternate.alternate_screen = true;
-        assert!(alternate.indicates_fullscreen_application());
-
-        let mut cursor = plain;
-        cursor.application_cursor = true;
-        assert!(cursor.indicates_fullscreen_application());
-
-        let mut focus = plain;
-        focus.focus_reporting = true;
-        assert!(focus.indicates_fullscreen_application());
-
-        let mut mouse = plain;
-        mouse.mouse_protocol_mode = crate::input::MouseProtocolMode::ButtonMotion;
-        assert!(mouse.indicates_fullscreen_application());
     }
 
     #[test]

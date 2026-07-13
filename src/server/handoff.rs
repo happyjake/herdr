@@ -24,8 +24,12 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 pub(crate) const MAX_FDS_PER_HANDOFF: usize = 64;
+// Sized so a long-lived agent transcript survives a handoff with a few
+// thousand lines of scrollback intact (the phone pages through it), not
+// just a couple of screens; even MAX_FDS_PER_HANDOFF panes of it is only a
+// few MB over the local handoff socket.
 #[cfg(unix)]
-pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
+pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 256 * 1024;
 #[cfg(unix)]
 pub(crate) const COMMIT_TIMEOUT: Duration = READY_TIMEOUT;
 

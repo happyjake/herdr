@@ -2109,16 +2109,6 @@ impl TerminalState {
         }
     }
 
-    // Only called from unix-only live handoff; kept cross-platform for tests.
-    #[cfg_attr(windows, allow(dead_code))]
-    pub fn needs_handoff_alternate_screen_recovery(&self) -> bool {
-        self.effective_known_agent().is_some()
-            || self
-                .persisted_agent_session
-                .as_ref()
-                .is_some_and(|session| crate::detect::parse_agent_label(&session.agent).is_some())
-    }
-
     pub fn border_label(&self, show_agent_labels: bool) -> Option<String> {
         self.effective_title().or_else(|| {
             self.manual_label.clone().or_else(|| {
@@ -2282,27 +2272,6 @@ mod tests {
         assert!(timed_out.reconcile_managed_agent_at(now + Duration::from_millis(20), false));
         assert_eq!(timed_out.agent_name, None);
         assert_eq!(timed_out.managed_agent_kind(), None);
-    }
-
-    #[test]
-    fn handoff_alternate_screen_recovery_uses_known_agent_identity() {
-        let mut plain = test_terminal();
-        assert!(!plain.needs_handoff_alternate_screen_recovery());
-
-        plain.set_agent_name("reviewer".into());
-        assert!(!plain.needs_handoff_alternate_screen_recovery());
-
-        let mut detected = test_terminal();
-        detected.set_detected_state(Some(Agent::Pi), AgentState::Working);
-        assert!(detected.needs_handoff_alternate_screen_recovery());
-
-        let mut persisted = test_terminal();
-        persisted.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
-            source: "herdr:claude".into(),
-            agent: "claude".into(),
-            session_ref: crate::agent_resume::AgentSessionRef::id("session-1").unwrap(),
-        });
-        assert!(persisted.needs_handoff_alternate_screen_recovery());
     }
 
     #[test]

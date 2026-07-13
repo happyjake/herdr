@@ -1954,21 +1954,36 @@ impl PaneRuntime {
         }
     }
 
+    /// The ANSI stream that reconstructs this pane's content in the next
+    /// server process. The stream is self-describing about the screen mode:
+    /// a pane whose app really sits on the alternate screen re-enters it via
+    /// its own `?1049h` here, so the import never has to guess the mode from
+    /// agent identity or input-mode heuristics. Guessing is what silently
+    /// destroyed history for claude-style agents — primary-screen TUIs whose
+    /// transcript lives in scrollback: classified "alternate", they lost
+    /// their scrollback at export and their emulator was stuck on the alt
+    /// screen after import, never accumulating history again.
     #[cfg(unix)]
-    pub fn handoff_history_ansi(
-        &self,
-        screen_restore: crate::handoff_runtime::HandoffScreenRestore,
-    ) -> Option<String> {
-        if screen_restore.is_alternate() {
+    pub fn handoff_history_ansi(&self) -> Option<String> {
+        let alternate_screen = self
+            .input_state()
+            .is_some_and(|input_state| input_state.alternate_screen);
+        if alternate_screen {
+            // The primary screen's history cannot be read from behind an
+            // active alternate screen, so only the visible frame carries
+            // over — matching what the app itself would restore.
             let visible_ansi = self.visible_ansi();
-            if !visible_ansi.trim().is_empty() {
-                let history = format!("\x1b[H{visible_ansi}");
-                let history = truncate_handoff_history(
-                    history,
-                    crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE,
-                );
-                return (!history.trim().is_empty()).then_some(history);
+            if visible_ansi.trim().is_empty() {
+                return None;
             }
+            let frame = truncate_handoff_history(
+                visible_ansi,
+                crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE,
+            );
+            if frame.trim().is_empty() {
+                return None;
+            }
+            return Some(format!("\x1b[?1049h\x1b[H{frame}"));
         }
         self.snapshot_history().map(|history| {
             truncate_handoff_history(history, crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
@@ -3858,21 +3873,25 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn handoff_history_ansi_captures_primary_screen() {
+    async fn handoff_history_ansi_captures_primary_screen_scrollback() {
         let mut bytes = Vec::new();
         for line in 1..=12 {
             bytes.extend_from_slice(format!("handoff-primary-history-{line:02}\r\n").as_bytes());
         }
         let runtime = PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, &bytes);
 
-        let history = runtime
-            .handoff_history_ansi(crate::handoff_runtime::HandoffScreenRestore::Primary)
-            .unwrap();
+        let history = runtime.handoff_history_ansi().unwrap();
 
         assert!(history.contains("handoff-primary-history-01"));
         assert!(history.contains("handoff-primary-history-12"));
+        // A primary-screen pane's stream must never re-enter the alternate
+        // screen: that is how agent transcripts were once marooned there.
+        assert!(!history.contains("\x1b[?1049h"));
     }
 
+    /// The stream is self-describing: only an app really sitting on the
+    /// alternate screen (its own ?1049h processed by this emulator) makes
+    /// the export re-enter it, and the frame rides behind that switch.
     #[cfg(unix)]
     #[tokio::test]
     async fn handoff_history_ansi_captures_alternate_screen() {
@@ -3883,11 +3902,9 @@ mod tests {
             b"primary\r\n\x1b[?1049h\x1b[2J\x1b[Halt-screen",
         );
 
-        let history = runtime
-            .handoff_history_ansi(crate::handoff_runtime::HandoffScreenRestore::Alternate)
-            .unwrap();
+        let history = runtime.handoff_history_ansi().unwrap();
 
-        assert!(history.starts_with("\x1b[H"));
+        assert!(history.starts_with("\x1b[?1049h\x1b[H"));
         assert!(history.contains("alt-screen"));
         assert!(!history.contains("primary"));
     }

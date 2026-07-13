@@ -1345,16 +1345,7 @@ impl HeadlessServer {
                 continue;
             };
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
-            let screen_restore = crate::handoff_runtime::handoff_screen_restore(
-                handoff_runtime.input_state.as_ref(),
-                self.app.state.terminals.get(terminal_id),
-            );
-            if screen_restore.is_alternate() {
-                if let Some(input_state) = handoff_runtime.input_state.as_mut() {
-                    input_state.alternate_screen = true;
-                }
-            }
-            handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi(screen_restore);
+            handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
             handoff_entries.push((terminal_id.clone(), handoff_runtime));
         }
 
