@@ -3894,6 +3894,18 @@ mod tests {
                 crate::api::schema::AgentViewClearParams::default(),
             ),
         };
+        let pane_send_mouse = crate::api::schema::Request {
+            id: "req_10".into(),
+            method: crate::api::schema::Method::PaneSendMouse(
+                crate::api::schema::PaneSendMouseParams {
+                    pane_id: "w1:p1".into(),
+                    action: crate::api::schema::PaneMouseAction::Click,
+                    row: 0,
+                    col: 0,
+                    lines: None,
+                },
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -3904,6 +3916,7 @@ mod tests {
         assert!(crate::api::request_changes_ui(&pane_focus_direction));
         assert!(crate::api::request_changes_ui(&pane_resize));
         assert!(crate::api::request_changes_ui(&agent_view));
+        assert!(crate::api::request_changes_ui(&pane_send_mouse));
     }
 
     #[test]
