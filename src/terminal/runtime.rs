@@ -55,8 +55,8 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
-    pub fn handoff_history_ansi(&self) -> Option<String> {
-        self.0.handoff_history_ansi()
+    pub fn handoff_history_ansi(&self, replay_budget: usize) -> Option<String> {
+        self.0.handoff_history_ansi(replay_budget)
     }
 
     #[cfg(unix)]
