@@ -1339,13 +1339,17 @@ impl HeadlessServer {
             self.app.state.collapsed_space_keys.clone(),
         );
 
+        // Divide the aggregate replay budget fairly so the one-line manifest
+        // stays under the importer's frame limit even at max pane count.
+        let replay_budget = crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE
+            .min(crate::server::handoff::MAX_REPLAY_BYTES_TOTAL / pane_by_terminal.len().max(1));
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
             let Some(pane_id) = pane_by_terminal.get(terminal_id).copied() else {
                 continue;
             };
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
-            handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
+            handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi(replay_budget);
             handoff_entries.push((terminal_id.clone(), handoff_runtime));
         }
 
@@ -5257,6 +5261,7 @@ fn take_startup_cwd() -> Option<PathBuf> {
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    crate::server::handoff::honor_legacy_alternate_screen_panes(&mut received.manifest);
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

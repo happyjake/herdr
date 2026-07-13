@@ -26,10 +26,19 @@ const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const MAX_FDS_PER_HANDOFF: usize = 64;
 // Sized so a long-lived agent transcript survives a handoff with a few
 // thousand lines of scrollback intact (the phone pages through it), not
-// just a couple of screens; even MAX_FDS_PER_HANDOFF panes of it is only a
-// few MB over the local handoff socket.
+// just a couple of screens.
 #[cfg(unix)]
 pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 256 * 1024;
+// Aggregate replay ceiling across all panes of one handoff. The manifest
+// travels as ONE line and the importer rejects lines over
+// MAX_MANIFEST_LINE_BYTES, so the raw replay total must leave room for
+// JSON escaping of ANSI controls (~2x) plus the snapshot and pane
+// metadata. The export loop divides this fairly: each pane gets
+// min(MAX_REPLAY_BYTES_PER_PANE, MAX_REPLAY_BYTES_TOTAL / panes).
+#[cfg(unix)]
+pub(crate) const MAX_REPLAY_BYTES_TOTAL: usize = 6 * 1024 * 1024;
+#[cfg(unix)]
+pub(crate) const MAX_MANIFEST_LINE_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(unix)]
 pub(crate) const COMMIT_TIMEOUT: Duration = READY_TIMEOUT;
 
@@ -327,6 +336,48 @@ pub(crate) fn manifest_for(
     }
 }
 
+/// Repair manifests from pre-self-describing exporters (their history
+/// streams never carry `?1049h`; the screen mode lived only in
+/// `input_state.alternate_screen`). For a PLAIN pane that flag is the app's
+/// real state — a vim-style alternate-screen app must come back on the alt
+/// screen, so its stream gets the mode switch prepended. For an AGENT pane
+/// the flag is presumed forced by the old agent-identity heuristic (claude
+/// and pi are primary-screen TUIs); honoring it is what marooned agent
+/// transcripts on the alt screen, so those panes stay primary and heal.
+/// New-format streams re-enter the alt screen themselves and pass through
+/// untouched.
+#[cfg(unix)]
+pub(crate) fn honor_legacy_alternate_screen_panes(manifest: &mut HandoffManifest) {
+    use std::collections::HashSet;
+
+    let agent_panes: HashSet<u32> = manifest
+        .snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.tabs.iter())
+        .flat_map(|tab| tab.panes.iter())
+        .filter(|(_, pane)| {
+            pane.agent_session.is_some() || pane.agent_name.is_some() || pane.launch_argv.is_some()
+        })
+        .map(|(pane_id, _)| *pane_id)
+        .collect();
+
+    for pane in manifest.panes.iter_mut() {
+        let carried_alternate = pane
+            .input_state
+            .as_ref()
+            .is_some_and(|input_state| input_state.alternate_screen);
+        let stream_sets_mode = pane
+            .initial_history_ansi
+            .as_deref()
+            .is_some_and(|history| history.contains("\x1b[?1049h"));
+        if carried_alternate && !stream_sets_mode && !agent_panes.contains(&pane.pane_id) {
+            let history = pane.initial_history_ansi.take().unwrap_or_default();
+            pane.initial_history_ansi = Some(format!("\x1b[?1049h{history}"));
+        }
+    }
+}
+
 #[cfg(unix)]
 fn restrict_socket_permissions(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -375,7 +426,7 @@ fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
             return String::from_utf8(bytes)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
         }
-        if bytes.len() > 16 * 1024 * 1024 {
+        if bytes.len() > MAX_MANIFEST_LINE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "handoff line exceeded maximum size",
@@ -524,5 +575,154 @@ mod tests {
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+    }
+
+
+    fn manifest_pane(
+        pane_id: u32,
+        alternate_screen: bool,
+        initial_history_ansi: Option<&str>,
+    ) -> crate::handoff_runtime::HandoffRuntimeState {
+        crate::handoff_runtime::HandoffRuntimeState {
+            pane_id,
+            child_pid: 100 + pane_id,
+            rows: 24,
+            cols: 80,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            keyboard_protocol_flags: 0,
+            keyboard_protocol_ansi: None,
+            input_state: Some(crate::pane::InputState {
+                alternate_screen,
+                application_cursor: false,
+                bracketed_paste: false,
+                focus_reporting: false,
+                mouse_protocol_mode: crate::input::MouseProtocolMode::None,
+                mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
+                mouse_alternate_scroll: false,
+                modify_other_keys: false,
+            }),
+            initial_history_ansi: initial_history_ansi.map(str::to_string),
+        }
+    }
+
+    fn snapshot_with_agent_flags(panes: &[(u32, bool)]) -> crate::persist::SessionSnapshot {
+        let pane_snapshots = panes
+            .iter()
+            .map(|(pane_id, is_agent)| {
+                (
+                    *pane_id,
+                    crate::persist::PaneSnapshot {
+                        cwd: "/tmp".into(),
+                        label: None,
+                        agent_name: None,
+                        agent_session: is_agent.then(|| crate::persist::PaneAgentSessionSnapshot {
+                            source: "claude-hooks".into(),
+                            agent: "claude".into(),
+                            kind: crate::agent_resume::AgentSessionRefKind::Id,
+                            value: "session-1".into(),
+                        }),
+                        launch_argv: None,
+                    },
+                )
+            })
+            .collect();
+        crate::persist::SessionSnapshot {
+            version: 0,
+            workspaces: vec![crate::persist::WorkspaceSnapshot {
+                id: None,
+                custom_name: None,
+                identity_cwd: "/tmp".into(),
+                worktree_space: None,
+                public_pane_numbers: std::collections::HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![crate::persist::TabSnapshot {
+                    custom_name: None,
+                    layout: crate::persist::LayoutSnapshot::Pane(panes[0].0),
+                    panes: pane_snapshots,
+                    zoomed: false,
+                    focused: None,
+                    root_pane: Some(panes[0].0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Legacy manifests (pre-self-describing exporters) carry the screen
+    /// mode only in the input_state flag. A plain pane's flag is honored —
+    /// its stream gets the mode switch prepended — while an agent pane's
+    /// flag is presumed forced by the old agent-identity heuristic and the
+    /// pane heals to the primary screen. New-format streams pass untouched.
+    #[test]
+    fn legacy_alternate_flags_honored_for_plain_panes_only() {
+        let mut manifest = manifest_for(
+            snapshot_with_agent_flags(&[(1, true), (2, false), (3, false), (4, false)]),
+            vec![
+                manifest_pane(1, true, Some("\x1b[Hclaude frame")),
+                manifest_pane(2, true, Some("\x1b[Hvim frame")),
+                manifest_pane(3, true, Some("\x1b[?1049h\x1b[Hnew-format frame")),
+                manifest_pane(4, false, Some("primary history")),
+            ],
+            None,
+            None,
+        );
+
+        honor_legacy_alternate_screen_panes(&mut manifest);
+
+        // Poisoned agent pane heals: stream untouched, imports as primary.
+        assert_eq!(
+            manifest.panes[0].initial_history_ansi.as_deref(),
+            Some("\x1b[Hclaude frame"),
+        );
+        // Genuine legacy alt pane: the mode switch is prepended.
+        assert_eq!(
+            manifest.panes[1].initial_history_ansi.as_deref(),
+            Some("\x1b[?1049h\x1b[Hvim frame"),
+        );
+        // Self-describing stream passes through.
+        assert_eq!(
+            manifest.panes[2].initial_history_ansi.as_deref(),
+            Some("\x1b[?1049h\x1b[Hnew-format frame"),
+        );
+        // Primary pane untouched.
+        assert_eq!(
+            manifest.panes[3].initial_history_ansi.as_deref(),
+            Some("primary history"),
+        );
+    }
+
+    /// A legacy alt pane with NO carried history still needs the mode
+    /// switch so the app keeps drawing on the screen it believes it is on.
+    #[test]
+    fn legacy_alternate_flag_without_history_still_enters_alt() {
+        let mut manifest = manifest_for(
+            snapshot_with_agent_flags(&[(1, false)]),
+            vec![manifest_pane(1, true, None)],
+            None,
+            None,
+        );
+
+        honor_legacy_alternate_screen_panes(&mut manifest);
+
+        assert_eq!(
+            manifest.panes[0].initial_history_ansi.as_deref(),
+            Some("\x1b[?1049h"),
+        );
+    }
+
+    /// The aggregate replay budget must fit the one-line manifest frame
+    /// even after worst-case JSON escaping (~2x for ANSI-control-heavy
+    /// content) plus generous room for the snapshot and pane metadata.
+    #[test]
+    fn replay_budget_fits_manifest_frame_limit() {
+        assert!(MAX_REPLAY_BYTES_TOTAL * 2 + 2 * 1024 * 1024 <= MAX_MANIFEST_LINE_BYTES);
     }
 }

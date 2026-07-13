@@ -1177,13 +1177,8 @@ while True:
     // output may not overwrite-in-place (the marooned-on-alt failure mode).
     fs::write(&more_trigger, "more").unwrap();
     support::wait_for_file(&done_marker, Duration::from_secs(5));
-    let after = wait_for_read_source_contains(
-        &api_socket,
-        &pane_id,
-        "recent_unwrapped",
-        1000,
-        post_marker,
-    );
+    let after =
+        wait_for_read_source_contains(&api_socket, &pane_id, "recent_unwrapped", 1000, post_marker);
     assert!(
         after.contains(first_marker),
         "post-handoff output displaced the imported history instead of scrolling above it: {after:?}"

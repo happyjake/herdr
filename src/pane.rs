@@ -1957,14 +1957,19 @@ impl PaneRuntime {
     /// The ANSI stream that reconstructs this pane's content in the next
     /// server process. The stream is self-describing about the screen mode:
     /// a pane whose app really sits on the alternate screen re-enters it via
-    /// its own `?1049h` here, so the import never has to guess the mode from
-    /// agent identity or input-mode heuristics. Guessing is what silently
+    /// its own `?1049h` here — even when the frame is blank, so the mode is
+    /// never lost — and the import never has to guess the mode from agent
+    /// identity or input-mode heuristics. Guessing is what silently
     /// destroyed history for claude-style agents — primary-screen TUIs whose
     /// transcript lives in scrollback: classified "alternate", they lost
     /// their scrollback at export and their emulator was stuck on the alt
     /// screen after import, never accumulating history again.
+    ///
+    /// `replay_budget` bounds this pane's stream; the caller divides the
+    /// handoff-wide MAX_REPLAY_BYTES_TOTAL across panes so the one-line
+    /// manifest stays under the importer's frame limit.
     #[cfg(unix)]
-    pub fn handoff_history_ansi(&self) -> Option<String> {
+    pub fn handoff_history_ansi(&self, replay_budget: usize) -> Option<String> {
         let alternate_screen = self
             .input_state()
             .is_some_and(|input_state| input_state.alternate_screen);
@@ -1972,22 +1977,14 @@ impl PaneRuntime {
             // The primary screen's history cannot be read from behind an
             // active alternate screen, so only the visible frame carries
             // over — matching what the app itself would restore.
-            let visible_ansi = self.visible_ansi();
-            if visible_ansi.trim().is_empty() {
-                return None;
-            }
-            let frame = truncate_handoff_history(
-                visible_ansi,
-                crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE,
-            );
+            let frame = truncate_handoff_history(self.visible_ansi(), replay_budget);
             if frame.trim().is_empty() {
-                return None;
+                return Some("\x1b[?1049h".to_string());
             }
             return Some(format!("\x1b[?1049h\x1b[H{frame}"));
         }
-        self.snapshot_history().map(|history| {
-            truncate_handoff_history(history, crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
-        })
+        self.snapshot_history()
+            .map(|history| truncate_handoff_history(history, replay_budget))
     }
 
     pub fn apply_host_terminal_theme(&self, theme: crate::terminal_theme::TerminalTheme) {
@@ -3880,7 +3877,9 @@ mod tests {
         }
         let runtime = PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, &bytes);
 
-        let history = runtime.handoff_history_ansi().unwrap();
+        let history = runtime
+            .handoff_history_ansi(crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
+            .unwrap();
 
         assert!(history.contains("handoff-primary-history-01"));
         assert!(history.contains("handoff-primary-history-12"));
@@ -3902,11 +3901,30 @@ mod tests {
             b"primary\r\n\x1b[?1049h\x1b[2J\x1b[Halt-screen",
         );
 
-        let history = runtime.handoff_history_ansi().unwrap();
+        let history = runtime
+            .handoff_history_ansi(crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
+            .unwrap();
 
         assert!(history.starts_with("\x1b[?1049h\x1b[H"));
         assert!(history.contains("alt-screen"));
         assert!(!history.contains("primary"));
+    }
+
+    /// A blank alternate screen still exports the mode switch: the importer
+    /// deliberately ignores the carried alternate flag, so dropping the
+    /// stream entirely would restore the pane on the primary screen while
+    /// the app keeps drawing for the alternate one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handoff_history_ansi_keeps_mode_marker_for_blank_alternate_screen() {
+        let runtime =
+            PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"primary\r\n\x1b[?1049h\x1b[2J");
+
+        let history = runtime
+            .handoff_history_ansi(crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
+            .unwrap();
+
+        assert_eq!(history, "\x1b[?1049h");
     }
 
     #[cfg(unix)]
