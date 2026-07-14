@@ -324,6 +324,7 @@ impl App {
                 viewport_rows: metrics.viewport_rows as u64,
             });
         let mouse_tracking = runtime.is_some_and(|runtime| runtime.mouse_reporting_enabled());
+        let alternate_screen = runtime.is_some_and(|runtime| runtime.alternate_screen_active());
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
             && ws
@@ -355,6 +356,7 @@ impl App {
             agent_session: terminal_agent_session_info(terminal),
             scroll,
             mouse_tracking,
+            alternate_screen,
             revision: terminal.revision,
         })
     }

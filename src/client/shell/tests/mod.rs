@@ -200,6 +200,7 @@ fn pane_scroll_result(
                 viewport_rows,
             }),
             mouse_tracking: false,
+            alternate_screen: false,
             revision: 0,
         },
     }

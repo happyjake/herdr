@@ -715,6 +715,7 @@ mod tests {
             agent_session: None,
             scroll,
             mouse_tracking: false,
+            alternate_screen: false,
             revision: 0,
         }
     }
