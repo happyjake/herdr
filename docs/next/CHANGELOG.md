@@ -212,6 +212,7 @@
 - Added `ui.prompt_new_workspace_name` to ask for a workspace name before interactive TUI creation.
 - Added macOS support for the `HERDR_AGENT=<agent>` foreground-process hint, allowing agents hidden behind host-visible wrappers such as `nono` to use the named agent's screen manifest. (#679)
 - Added `pane.send_mouse` to the socket API with live mouse-report and alternate-scroll routing, plus `PaneInfo.mouse_tracking` for clients that need to choose input behavior.
+- Added `PaneInfo.alternate_screen` so API clients can distinguish live alternate-screen panes from primary-screen prompts.
 
 ### Changed
 - Agent commands now accept only a unique live agent name or the pane ID currently hosting that agent. Names are cleared when the occupant exits, is released, or is replaced. The old top-level `wait` commands were replaced by `agent wait` and `pane wait-output`, and `agent send` was replaced by `agent send-keys`.

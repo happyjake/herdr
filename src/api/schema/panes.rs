@@ -529,6 +529,10 @@ pub struct PaneInfo {
     /// Additive: payloads from older servers omit this and deserialize false.
     #[serde(default)]
     pub mouse_tracking: bool,
+    /// Whether the pane's live terminal state currently uses the alternate screen.
+    /// Additive: payloads from older servers omit this and deserialize false.
+    #[serde(default)]
+    pub alternate_screen: bool,
     pub revision: u64,
 }
 

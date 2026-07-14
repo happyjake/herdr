@@ -437,9 +437,10 @@ impl App {
                 max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
                 viewport_rows: metrics.viewport_rows as u64,
             });
-        let mouse_tracking = runtime
-            .and_then(crate::terminal::TerminalRuntime::input_state)
-            .is_some_and(crate::pane::InputState::mouse_reporting_enabled);
+        let input_state = runtime.and_then(crate::terminal::TerminalRuntime::input_state);
+        let mouse_tracking =
+            input_state.is_some_and(crate::pane::InputState::mouse_reporting_enabled);
+        let alternate_screen = input_state.is_some_and(|state| state.alternate_screen);
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
             && ws
@@ -470,6 +471,7 @@ impl App {
             agent_session: terminal_agent_session_info(terminal),
             scroll,
             mouse_tracking,
+            alternate_screen,
             revision: terminal.revision,
         })
     }

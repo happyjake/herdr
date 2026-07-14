@@ -199,6 +199,10 @@ Clients can treat `offset_from_bottom == 0` as at-bottom state.
 mouse reports. Supporting servers always include this boolean. Clients reading
 responses from older servers can treat an absent field as `false`.
 
+`PaneInfo.alternate_screen` reports whether the live terminal currently uses
+its alternate screen. Supporting servers always include this boolean. Clients
+reading responses from older servers can treat an absent field as `false`.
+
 ### Experimental pane graphics
 
 Pane graphics let a plugin place image data over a pane. They are available

@@ -246,7 +246,7 @@ fn pane_send_mouse_request_parses_actions_and_optional_lines() {
 }
 
 #[test]
-fn pane_info_defaults_missing_mouse_tracking_to_false_and_serializes_a_boolean() {
+fn pane_info_defaults_missing_mouse_tracking_and_alternate_screen_to_false_and_serializes_boole() {
     let pane: PaneInfo = serde_json::from_value(serde_json::json!({
         "pane_id": "pane_1",
         "terminal_id": "terminal_1",
@@ -259,8 +259,10 @@ fn pane_info_defaults_missing_mouse_tracking_to_false_and_serializes_a_boolean()
     .unwrap();
 
     assert!(!pane.mouse_tracking);
+    assert!(!pane.alternate_screen);
     let encoded = serde_json::to_value(pane).unwrap();
     assert_eq!(encoded["mouse_tracking"], false);
+    assert_eq!(encoded["alternate_screen"], false);
 }
 
 #[test]
@@ -899,6 +901,7 @@ fn worktree_request_and_response_round_trip() {
                 agent_session: None,
                 scroll: None,
                 mouse_tracking: false,
+                alternate_screen: false,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1330,6 +1333,7 @@ fn create_response_round_trips_with_root_pane() {
                 agent_session: None,
                 scroll: None,
                 mouse_tracking: false,
+                alternate_screen: false,
                 revision: 0,
             },
         },

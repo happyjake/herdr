@@ -2448,6 +2448,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_pane_info_exposes_live_alternate_screen_as_a_boolean() {
+        let (mut app, pane_id, _rx) = app_with_mouse_runtime(b"", 1);
+        let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+
+        for (ansi, expected) in [(&b"\x1b[?1049h"[..], true), (&b"\x1b[?1049l"[..], false)] {
+            app.state
+                .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, internal_pane_id)
+                .expect("runtime")
+                .test_process_pty_bytes(ansi);
+
+            let response: serde_json::Value = serde_json::from_str(&app.handle_pane_get(
+                "req".into(),
+                PaneTarget {
+                    pane_id: pane_id.clone(),
+                },
+            ))
+            .unwrap();
+
+            assert_eq!(response["result"]["pane"]["alternate_screen"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_alternate_screen_is_present_in_pane_list_and_subscription_snapshot() {
+        let (mut app, pane_id, _rx) = app_with_mouse_runtime(b"", 1);
+
+        let list: serde_json::Value =
+            serde_json::from_str(&app.handle_pane_list("list".into(), PaneListParams::default()))
+                .unwrap();
+        assert_eq!(list["result"]["panes"][0]["alternate_screen"], false);
+
+        let (ws_idx, internal_pane_id) = app.parse_pane_id(&pane_id).expect("pane id");
+        let pane = app.pane_info(ws_idx, internal_pane_id).expect("pane info");
+        let snapshot = serde_json::to_value(EventEnvelope {
+            event: EventKind::PaneCreated,
+            data: EventData::PaneCreated { pane },
+        })
+        .unwrap();
+        assert_eq!(snapshot["data"]["pane"]["alternate_screen"], false);
+    }
+
+    #[tokio::test]
     async fn api_pane_send_keys_accepts_control_navigation_chords() {
         let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
 
