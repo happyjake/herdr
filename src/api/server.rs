@@ -1012,6 +1012,7 @@ mod tests {
             agent_session: None,
             scroll: None,
             mouse_tracking: false,
+            alternate_screen: false,
             revision: 0,
         }
     }
