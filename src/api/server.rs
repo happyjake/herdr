@@ -89,6 +89,7 @@ pub fn start_server(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
 ) -> std::io::Result<ServerHandle> {
     start_server_with_capabilities(
         api_tx,
@@ -98,6 +99,7 @@ pub fn start_server(
             detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         }),
         server_name,
+        server_reach,
     )
 }
 
@@ -106,6 +108,7 @@ pub fn start_server_with_capabilities(
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
     server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -126,6 +129,7 @@ pub fn start_server_with_capabilities(
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let server_name = server_name.clone();
+                    let server_reach = server_reach.clone();
                     let connection_running = Arc::clone(&listener_running);
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection(
@@ -135,6 +139,7 @@ pub fn start_server_with_capabilities(
                             &connection_running,
                             capabilities,
                             &server_name,
+                            &server_reach,
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -177,6 +182,7 @@ fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -225,6 +231,7 @@ fn handle_connection(
             running,
             capabilities,
             server_name,
+            server_reach,
         ),
     }
 }
@@ -268,6 +275,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -371,6 +379,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
                 capabilities,
                 Some(response_write_rx),
                 server_name,
+                server_reach,
             );
             let result = write_message_allow_disconnect(transport, &response);
             let _ = response_write_tx.send(());
@@ -425,10 +434,11 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> String {
     match request.method {
-        // The name is read per request, not captured at listener start, so a
-        // reloaded name shows up in the next pong on every transport.
+        // Declarations and runtime facts are read per request, so config
+        // reloads and the running process are reflected on every transport.
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
             id: request.id,
             result: ResponseResult::Pong {
@@ -436,6 +446,12 @@ fn handle_request(
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
                 name: Some(server_name.current()),
+                reach: server_reach.current(),
+                session: crate::session::active_name_for_api_socket(),
+                exe: std::env::current_exe()
+                    .ok()
+                    .filter(|path| path.is_absolute() && path.is_file())
+                    .map(|path| path.display().to_string()),
             },
         })
         .unwrap_or_else(|_| {
@@ -961,6 +977,10 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn undeclared_server_reach() -> crate::api::SharedServerReach {
+        crate::api::SharedServerReach::from_config(&crate::config::WebSocketApiConfig::default())
+    }
+
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1188,6 +1208,7 @@ mod tests {
             }),
             None,
             &crate::api::SharedServerName::new("the-mini".to_string()),
+            &undeclared_server_reach(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1202,6 +1223,7 @@ mod tests {
     fn pong_reflects_a_renamed_server_without_restarting_anything() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let server_name = crate::api::SharedServerName::new("before".to_string());
+        let server_reach = undeclared_server_reach();
         let ping = |id: &str| {
             handle_request(
                 Request {
@@ -1212,6 +1234,7 @@ mod tests {
                 None,
                 None,
                 &server_name,
+                &server_reach,
             )
         };
 
@@ -1237,6 +1260,7 @@ mod tests {
         // thread — identically for every transport and server mode.
         let (tx, _) = mpsc::unbounded_channel();
         let server_name = crate::api::SharedServerName::new("test".to_string());
+        let server_reach = undeclared_server_reach();
         let create = |id: &str, bytes_b64: String| {
             handle_request(
                 Request {
@@ -1248,6 +1272,7 @@ mod tests {
                 &tx,
                 None,
                 &server_name,
+                &server_reach,
             )
         };
         let error_code = |response: &str| {
@@ -1307,6 +1332,7 @@ mod tests {
                 None,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             )
         });
 
@@ -1387,6 +1413,7 @@ mod tests {
             &running,
             None,
             &crate::api::SharedServerName::new("test".to_string()),
+            &undeclared_server_reach(),
         )
         .unwrap();
 
@@ -1422,6 +1449,7 @@ mod tests {
             &running,
             None,
             &crate::api::SharedServerName::new("test".to_string()),
+            &undeclared_server_reach(),
         )
         .unwrap();
 
@@ -1550,6 +1578,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1589,6 +1618,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1633,6 +1663,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1689,6 +1720,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1740,6 +1772,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });

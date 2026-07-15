@@ -53,6 +53,19 @@ pub enum ResponseResult {
         /// only, never identity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// Operator-declared route other machines use to open a shell on this
+        /// server. Additive and absent when `websocket_api.reach` is unset or
+        /// empty; it is never inferred from the hostname or display name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reach: Option<String>,
+        /// Live non-default herdr session name. The default session needs no
+        /// `--session` argument and is represented by an absent field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        /// Absolute path of the running server executable. Reported live so
+        /// clients do not depend on a remote shell's PATH or a stale config.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exe: Option<String>,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,

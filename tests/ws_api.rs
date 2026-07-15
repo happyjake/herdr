@@ -29,6 +29,8 @@ use tungstenite::{Message, WebSocket};
 
 const TEST_TOKEN: &str = "ws-api-test-token";
 const TEST_SERVER_NAME: &str = "ws-test-server";
+const TEST_REACH: &str = "ws-test-host";
+const TEST_SESSION_NAME: &str = "ws-test-session";
 const TEST_WS_IDLE_PING_AFTER_MS: &str = "250";
 const TEST_WS_IDLE_CLOSE_AFTER_MS: &str = "900";
 
@@ -120,6 +122,43 @@ fn spawn_herdr_with_config_and_env(
     websocket_section: &str,
     extra_env: &[(&str, &str)],
 ) -> SpawnedHerdr {
+    spawn_herdr_with_launch(
+        Path::new(env!("CARGO_BIN_EXE_herdr")),
+        config_home,
+        runtime_dir,
+        Some(socket_path),
+        None,
+        websocket_section,
+        extra_env,
+    )
+}
+
+fn spawn_named_session_herdr_with_config(
+    config_home: &Path,
+    runtime_dir: &Path,
+    session_name: &str,
+    websocket_section: &str,
+) -> SpawnedHerdr {
+    spawn_herdr_with_launch(
+        Path::new(env!("CARGO_BIN_EXE_herdr")),
+        config_home,
+        runtime_dir,
+        None,
+        Some(session_name),
+        websocket_section,
+        &[],
+    )
+}
+
+fn spawn_herdr_with_launch(
+    executable: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_override: Option<&Path>,
+    session_name: Option<&str>,
+    websocket_section: &str,
+    extra_env: &[(&str, &str)],
+) -> SpawnedHerdr {
     // Debug builds read the herdr-dev config dir; write the release dir too
     // so the fixture does not depend on the build profile.
     for dir in ["herdr", "herdr-dev"] {
@@ -142,11 +181,19 @@ fn spawn_herdr_with_config_and_env(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut cmd = CommandBuilder::new(executable);
+    if let Some(session_name) = session_name {
+        cmd.arg("--session");
+        cmd.arg(session_name);
+    }
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
-    cmd.env("HERDR_SOCKET_PATH", socket_path);
+    if let Some(socket_override) = socket_override {
+        cmd.env("HERDR_SOCKET_PATH", socket_override);
+    } else {
+        cmd.env_remove("HERDR_SOCKET_PATH");
+    }
     // An inherited config override (tests running inside a herdr pane) would
     // make the spawned server read the real config instead of the fixture.
     cmd.env_remove("HERDR_CONFIG_PATH");
@@ -172,7 +219,7 @@ fn spawn_herdr_with_config_and_env(
 
 fn websocket_section(port: u16) -> String {
     format!(
-        "[websocket_api]\nbind = \"127.0.0.1:{port}\"\ntoken = \"{TEST_TOKEN}\"\nname = \"{TEST_SERVER_NAME}\"\n"
+        "[websocket_api]\nbind = \"127.0.0.1:{port}\"\ntoken = \"{TEST_TOKEN}\"\nname = \"{TEST_SERVER_NAME}\"\nreach = \"{TEST_REACH}\"\n"
     )
 }
 
@@ -428,6 +475,13 @@ fn start_ws_test_server_with_short_liveness() -> WsTestServer {
 }
 
 fn start_ws_test_server_with_env(extra_env: &[(&str, &str)]) -> WsTestServer {
+    start_ws_test_server_with_executable_and_env(Path::new(env!("CARGO_BIN_EXE_herdr")), extra_env)
+}
+
+fn start_ws_test_server_with_executable_and_env(
+    executable: &Path,
+    extra_env: &[(&str, &str)],
+) -> WsTestServer {
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
@@ -435,12 +489,49 @@ fn start_ws_test_server_with_env(extra_env: &[(&str, &str)]) -> WsTestServer {
     let ws_port = pick_free_port();
     let ws_addr: SocketAddr = format!("127.0.0.1:{ws_port}").parse().unwrap();
 
-    let child = spawn_herdr_with_config_and_env(
+    let child = spawn_herdr_with_launch(
+        executable,
         &config_home,
         &runtime_dir,
-        &socket_path,
+        Some(&socket_path),
+        None,
         &websocket_section(ws_port),
         extra_env,
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    wait_for_ws_listener(ws_addr, Duration::from_secs(5));
+
+    WsTestServer {
+        base,
+        config_home,
+        socket_path,
+        ws_addr,
+        child,
+    }
+}
+
+fn start_named_session_ws_test_server(session_name: &str) -> WsTestServer {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    let socket_path = config_home
+        .join(app_dir)
+        .join("sessions")
+        .join(session_name)
+        .join("herdr.sock");
+    let ws_port = pick_free_port();
+    let ws_addr: SocketAddr = format!("127.0.0.1:{ws_port}").parse().unwrap();
+
+    let child = spawn_named_session_herdr_with_config(
+        &config_home,
+        &runtime_dir,
+        session_name,
+        &websocket_section(ws_port),
     );
     wait_for_socket(&socket_path, Duration::from_secs(5));
     wait_for_ws_listener(ws_addr, Duration::from_secs(5));
@@ -498,7 +589,7 @@ fn test_ws_idle_close_after() -> Duration {
 #[test]
 fn ping_response_is_identical_over_unix_socket_and_websocket() {
     let _lock = test_lock();
-    let server = start_ws_test_server();
+    let server = start_named_session_ws_test_server(TEST_SESSION_NAME);
 
     let request = r#"{"id":"req_eq_ping","method":"ping","params":{}}"#;
 
@@ -517,11 +608,71 @@ fn ping_response_is_identical_over_unix_socket_and_websocket() {
     let ws_response: serde_json::Value = serde_json::from_str(&ws_raw).unwrap();
     assert_eq!(ws_response["result"]["type"], "pong");
     assert_eq!(ws_response["result"]["version"], env!("CARGO_PKG_VERSION"));
-    // The declared server name rides the same pong on both transports (the
-    // raw equality above already proves they match).
+    // The server's declared and live facts ride the same pong on both
+    // transports (the raw equality above already proves they match).
     assert_eq!(ws_response["result"]["name"], TEST_SERVER_NAME);
+    assert_eq!(ws_response["result"]["reach"], TEST_REACH);
+    assert_eq!(ws_response["result"]["session"], TEST_SESSION_NAME);
+
+    let exe = ws_response["result"]["exe"]
+        .as_str()
+        .expect("pong must report the running executable");
+    assert!(Path::new(exe).is_absolute(), "reported exe: {exe}");
+    assert_eq!(
+        Path::new(exe),
+        fs::canonicalize(env!("CARGO_BIN_EXE_herdr")).unwrap()
+    );
 
     cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn pong_omits_session_that_cannot_address_overridden_socket() {
+    let _lock = test_lock();
+    let server = start_ws_test_server_with_env(&[("HERDR_SESSION", TEST_SESSION_NAME)]);
+    let request = r#"{"id":"req_override_session","method":"ping","params":{}}"#;
+
+    let unix_response = unix_request(&server.socket_path, request);
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let ws_response = ws.request(request);
+
+    assert_eq!(unix_response, ws_response);
+    assert!(
+        ws_response["result"].get("session").is_none(),
+        "an inherited session cannot address the overridden socket: {ws_response}"
+    );
+    assert_eq!(ws_response["result"]["reach"], TEST_REACH);
+    assert!(ws_response["result"]["exe"].is_string());
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn pong_omits_exe_after_running_binary_is_unlinked() {
+    let _lock = test_lock();
+    let executable_base = unique_test_dir();
+    fs::create_dir_all(&executable_base).unwrap();
+    let executable = executable_base.join("herdr-running-copy");
+    fs::copy(env!("CARGO_BIN_EXE_herdr"), &executable).unwrap();
+
+    let server = start_ws_test_server_with_executable_and_env(&executable, &[]);
+    fs::remove_file(&executable).unwrap();
+    assert!(!executable.exists());
+
+    let request = r#"{"id":"req_unlinked_exe","method":"ping","params":{}}"#;
+    let unix_response = unix_request(&server.socket_path, request);
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let ws_response = ws.request(request);
+
+    assert_eq!(unix_response, ws_response);
+    assert!(
+        ws_response["result"].get("exe").is_none(),
+        "an unlinked running executable cannot be invoked: {ws_response}"
+    );
+    assert_eq!(ws_response["result"]["reach"], TEST_REACH);
+
+    cleanup_spawned_herdr(server.child, server.base);
+    cleanup_test_base(&executable_base);
 }
 
 #[test]
@@ -617,7 +768,7 @@ fn rewrite_herdr_config(config_home: &Path, websocket_section: &str) {
 }
 
 #[test]
-fn pong_name_defaults_to_the_hostname_and_follows_config_reload() {
+fn pong_declarations_follow_config_reload_and_omit_unset_values() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -641,6 +792,14 @@ fn pong_name_defaults_to_the_hostname_and_follows_config_reload() {
         .expect("pong must declare a name even without one configured")
         .to_string();
     assert!(!default_name.is_empty());
+    assert!(
+        default_pong["result"].get("reach").is_none(),
+        "an undeclared reach must be omitted: {default_pong}"
+    );
+    assert!(
+        default_pong["result"].get("session").is_none(),
+        "the default session must be omitted: {default_pong}"
+    );
 
     let mut ws = WsClient::connect(ws_addr, TEST_TOKEN);
     assert_eq!(ws.request(ping)["result"]["name"], default_name.as_str());
@@ -650,7 +809,7 @@ fn pong_name_defaults_to_the_hostname_and_follows_config_reload() {
     // very next pong carries the new name on both transports.
     rewrite_herdr_config(
         &config_home,
-        &format!("{nameless_section}name = \"renamed-server\"\n"),
+        &format!("{nameless_section}name = \"renamed-server\"\nreach = \"reloaded-host\"\n"),
     );
     let reloaded = unix_request(
         &socket_path,
@@ -660,7 +819,26 @@ fn pong_name_defaults_to_the_hostname_and_follows_config_reload() {
 
     let renamed_pong = unix_request(&socket_path, ping);
     assert_eq!(renamed_pong["result"]["name"], "renamed-server");
-    assert_eq!(ws.request(ping)["result"]["name"], "renamed-server");
+    assert_eq!(renamed_pong["result"]["reach"], "reloaded-host");
+    let ws_reloaded = ws.request(ping);
+    assert_eq!(ws_reloaded["result"]["name"], "renamed-server");
+    assert_eq!(ws_reloaded["result"]["reach"], "reloaded-host");
+
+    // Empty has the same semantic meaning as absent: the operator has not
+    // declared a route, so the additive field disappears on the next pong.
+    rewrite_herdr_config(
+        &config_home,
+        &format!("{nameless_section}name = \"renamed-server\"\nreach = \"\"\n"),
+    );
+    let reloaded = unix_request(
+        &socket_path,
+        r#"{"id":"req_reach_unset","method":"server.reload_config","params":{}}"#,
+    );
+    assert_eq!(reloaded["result"]["type"], "config_reload");
+
+    let unset_pong = unix_request(&socket_path, ping);
+    assert!(unset_pong["result"].get("reach").is_none());
+    assert!(ws.request(ping)["result"].get("reach").is_none());
 
     cleanup_spawned_herdr(child, base);
 }
