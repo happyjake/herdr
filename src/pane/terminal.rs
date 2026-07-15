@@ -3107,9 +3107,9 @@ fn ghostty_recent_read_at_offset(
         if request.offset_from_bottom == 0 && window.text.trim().is_empty() {
             let fallback =
                 windows_recent_fallback::recent_text(core, request.lines, request.unwrapped);
-            if !fallback.trim().is_empty() {
+            if !fallback.text.trim().is_empty() {
                 return Ok(RecentReadWindow {
-                    text: fallback,
+                    text: fallback.text,
                     ..window
                 });
             }
@@ -3121,7 +3121,7 @@ fn ghostty_recent_read_at_offset(
         if request.offset_from_bottom > 0 && window.text.trim().is_empty() {
             let fallback =
                 windows_recent_fallback::recent_text(core, request.lines, request.unwrapped);
-            if !fallback.trim().is_empty() {
+            if !fallback.text.trim().is_empty() {
                 return Ok(RecentReadWindow {
                     offset_unsupported: true,
                     ..RecentReadWindow::default()

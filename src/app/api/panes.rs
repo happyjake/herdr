@@ -19,6 +19,7 @@ use crate::api::schema::{
 #[cfg(test)]
 use crate::api::schema::{ReadFormat, ReadSource};
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
+use crate::app::terminal_targets::{TerminalTarget, TerminalTargetError};
 use crate::app::App;
 #[cfg(test)]
 use crate::app::Mode;
@@ -31,7 +32,7 @@ use super::super::api_helpers::{
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_success};
 
 /// How long `pane.send_input` holds its keys behind its text. An agent TUI
 /// that reads the text and an Enter in one chunk takes the Enter as part of
@@ -1596,21 +1597,16 @@ impl App {
     }
 
     pub(super) fn handle_pane_read(&mut self, id: String, params: PaneReadParams) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let resolved = match self.resolve_pane_command_target(&id, &params.pane_id) {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
+        let ws_idx = resolved.ws_idx;
+        let pane_id = resolved.pane_id;
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some((pane, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
-        };
-        let Some(tab_idx) = self
-            .state
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.find_tab_index_for_pane(pane_id))
-        else {
             return pane_not_found(id, &params.pane_id);
         };
         let (text, truncated, effective_offset, has_more) = match super::pane_read_window(
@@ -1630,7 +1626,7 @@ impl App {
                 read: PaneReadResult {
                     pane_id: public_pane_id,
                     workspace_id,
-                    tab_id: self.public_tab_id(ws_idx, tab_idx).unwrap(),
+                    tab_id: self.public_tab_id(ws_idx, resolved.tab_idx).unwrap(),
                     source: params.source,
                     format: params.format,
                     text,
@@ -1936,9 +1932,12 @@ impl App {
         id: String,
         params: PaneSendInputParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let resolved = match self.resolve_pane_command_target(&id, &params.pane_id) {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
+        let ws_idx = resolved.ws_idx;
+        let pane_id = resolved.pane_id;
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -2161,6 +2160,23 @@ fn pane_mouse_routing(routing: crate::pane::WheelRouting) -> PaneMouseRouting {
 }
 
 impl App {
+    fn resolve_pane_command_target(
+        &self,
+        request_id: &str,
+        target: &str,
+    ) -> Result<TerminalTarget, String> {
+        match self.resolve_terminal_target(target) {
+            Ok(resolved) => Ok(resolved),
+            Err(TerminalTargetError::NotFound { .. }) => {
+                Err(pane_not_found(request_id.to_string(), target))
+            }
+            Err(err @ TerminalTargetError::Ambiguous { .. }) => Err(encode_error_body(
+                request_id.to_string(),
+                self.agent_target_error_body(err),
+            )),
+        }
+    }
+
     fn resolve_optional_pane(&self, pane_id: Option<&str>) -> Option<(usize, PaneId)> {
         match pane_id {
             Some(pane_id) => self.parse_pane_id(pane_id),
@@ -2921,6 +2937,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_pane_terminal_target_read_accepts_terminal_id() {
+        let (mut app, public_pane_id, pane_id) = app_with_scrollback_runtime();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .to_string();
+
+        let read = pane_read_result(&app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                terminal_id,
+                ReadSource::Recent,
+                40,
+                None,
+            )),
+        }));
+
+        assert_eq!(read.pane_id, public_pane_id);
+        assert!(read.text.contains("line 00") && read.text.contains("line 19"));
+    }
+
+    #[tokio::test]
     async fn api_pane_read_offset_pages_walk_scrollback() {
         let (mut app, public_pane_id, _pane) = app_with_offset_read_runtime();
 
@@ -3591,6 +3629,217 @@ mod tests {
         assert_ok_response(&response, "req");
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"hello"));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_send_input_accepts_terminal_id() {
+        let (mut app, _public_pane_id, mut rx) = app_with_send_key_runtime(2);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .to_string();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: terminal_id,
+                text: "echo safe".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut writes = Vec::new();
+        while writes.len() < 2 && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(bytes) => writes.push(bytes),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        assert_eq!(
+            writes,
+            vec![
+                bytes::Bytes::from_static(b"echo safe"),
+                bytes::Bytes::from_static(b"\r"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_rejects_unknown_terminal_id() {
+        let (mut app, _public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let unknown_terminal_id = "term_00000000000000000000";
+
+        let read_response = app.handle_api_request(crate::api::schema::Request {
+            id: "read".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                unknown_terminal_id.into(),
+                ReadSource::Recent,
+                10,
+                None,
+            )),
+        });
+        let send_response = app.handle_api_request(crate::api::schema::Request {
+            id: "send".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: unknown_terminal_id.into(),
+                text: "do not send".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        for response in [read_response, send_response] {
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "pane_not_found");
+            assert!(error.error.message.contains(unknown_terminal_id));
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_rejects_stale_terminal_id_that_matches_agent_name() {
+        let (mut app, _public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let stale_terminal_id = "term_deadbeef";
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let live_terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .clone();
+        assert_ne!(live_terminal_id.to_string(), stale_terminal_id);
+        app.state
+            .terminals
+            .get_mut(&live_terminal_id)
+            .expect("terminal state")
+            .set_agent_name(stale_terminal_id.into());
+
+        let read_response = app.handle_api_request(crate::api::schema::Request {
+            id: "read".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                stale_terminal_id.into(),
+                ReadSource::Recent,
+                10,
+                None,
+            )),
+        });
+        let send_response = app.handle_api_request(crate::api::schema::Request {
+            id: "send".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: stale_terminal_id.into(),
+                text: "do not send".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        for response in [read_response, send_response] {
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "pane_not_found");
+            assert!(error.error.message.contains(stale_terminal_id));
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_surfaces_ambiguous_candidates() {
+        let (mut app, _public_pane_id, mut rx) = app_with_send_key_runtime(1);
+        let first_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let second_pane =
+            app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let terminal_ids = [first_pane, second_pane].map(|pane_id| {
+            app.state.workspaces[0]
+                .terminal_id(pane_id)
+                .expect("terminal id")
+                .clone()
+        });
+        for terminal_id in &terminal_ids {
+            app.state
+                .terminals
+                .get_mut(terminal_id)
+                .expect("terminal state")
+                .set_agent_name("worker".into());
+        }
+
+        let read_response = app.handle_api_request(crate::api::schema::Request {
+            id: "read".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                "worker".into(),
+                ReadSource::Recent,
+                10,
+                None,
+            )),
+        });
+        let send_response = app.handle_api_request(crate::api::schema::Request {
+            id: "send".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: "worker".into(),
+                text: "do not send".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        for response in [read_response, send_response] {
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "agent_target_ambiguous");
+            for terminal_id in &terminal_ids {
+                assert!(error
+                    .error
+                    .message
+                    .contains(&format!("terminal_id={terminal_id}")));
+            }
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_terminal_target_rejects_closed_terminal_id() {
+        let (mut app, _public_pane_id) = app_with_test_workspace();
+        let closed_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let survivor_pane =
+            app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let closed_pane_id = app.public_pane_id(0, closed_pane).expect("pane id");
+        let closed_terminal_id = app.state.workspaces[0]
+            .terminal_id(closed_pane)
+            .expect("terminal id")
+            .to_string();
+        let (survivor_runtime, mut survivor_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state
+            .insert_test_runtime(survivor_pane, survivor_runtime);
+
+        let close_response = app.handle_pane_close(
+            "close".into(),
+            PaneTarget {
+                pane_id: closed_pane_id,
+            },
+        );
+        assert_ok_response(&close_response, "close");
+
+        let read_response = app.handle_api_request(crate::api::schema::Request {
+            id: "read".into(),
+            method: crate::api::schema::Method::PaneRead(offset_read_params(
+                closed_terminal_id.clone(),
+                ReadSource::Recent,
+                10,
+                None,
+            )),
+        });
+        let send_response = app.handle_api_request(crate::api::schema::Request {
+            id: "send".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: closed_terminal_id,
+                text: "do not send".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+
+        for response in [read_response, send_response] {
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "pane_not_found");
+        }
+        assert!(survivor_rx.try_recv().is_err());
     }
 
     #[tokio::test]
