@@ -241,6 +241,21 @@ fn copy_config_xattrs(source: RawFd, destination: RawFd) -> std::io::Result<()> 
     Ok(())
 }
 
+pub(super) fn executable_file_identity_platform(
+    path: &std::path::Path,
+) -> std::io::Result<super::ExecutableFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("executable path is not a file"));
+    }
+    Ok(super::ExecutableFileIdentity::new(
+        metadata.dev(),
+        metadata.ino(),
+    ))
+}
+
 pub fn raise_server_nofile_limit() {}
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {

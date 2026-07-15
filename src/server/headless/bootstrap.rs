@@ -31,9 +31,10 @@ pub fn run_server() -> io::Result<()> {
     let event_hub = api::EventHub::default();
     let should_quit = Arc::new(AtomicBool::new(false));
 
-    // The declared server name, shared by both API transports so their pongs
-    // match and by the app so config reloads rename the live server.
+    // The server declarations are shared by both API transports so their
+    // pongs match, and by the app so config reloads update the live server.
     let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+    let server_reach = api::SharedServerReach::from_config(&loaded_config.config.websocket_api);
 
     // Start the JSON API socket server.
     let _api_server = match api::start_server_with_stop_control(
@@ -41,6 +42,7 @@ pub fn run_server() -> io::Result<()> {
         event_hub.clone(),
         should_quit.clone(),
         server_name.clone(),
+        server_reach.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -58,6 +60,7 @@ pub fn run_server() -> io::Result<()> {
         api_tx.clone(),
         event_hub.clone(),
         server_name.clone(),
+        server_reach.clone(),
     ) {
         Ok(server) => server,
         Err(err) => {
@@ -81,6 +84,7 @@ pub fn run_server() -> io::Result<()> {
             event_hub,
         );
         app.set_server_name(Some(server_name));
+        app.set_server_reach(Some(server_reach));
         seed_startup_workspace_if_empty(&mut app);
 
         // Create the headless server.
@@ -193,12 +197,15 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
         let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+        let server_reach = api::SharedServerReach::from_config(&loaded_config.config.websocket_api);
         app.set_server_name(Some(server_name.clone()));
+        app.set_server_reach(Some(server_reach.clone()));
         let api_server = api::start_server_with_stop_control(
             api_tx.clone(),
             event_hub.clone(),
             should_quit.clone(),
             server_name.clone(),
+            server_reach.clone(),
         )?;
         // The old server released the websocket port with its socket files;
         // bind it here so a committed handoff keeps the listener alive.
@@ -208,6 +215,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             api_tx.clone(),
             event_hub.clone(),
             server_name,
+            server_reach,
         )?;
         let mut server = HeadlessServer::new(
             app,

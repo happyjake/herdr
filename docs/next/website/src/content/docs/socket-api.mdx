@@ -653,7 +653,7 @@ For request lines that reach JSON decoding, error responses also echo the reques
 or has no unambiguous top-level string `id`, the error response uses an empty `id`.
 Transport errors, such as invalid UTF-8, can close the connection without a response.
 
-The `ping` response also carries the server's version, protocol, capabilities, and its declared display name (`websocket_api.name`, defaulting to the machine hostname) — identical over the Unix socket and the WebSocket transport. The `name` field is additive: clients talking to older servers must treat it as optional.
+The `ping` response also carries the server's version, protocol, capabilities, and its declared display name (`websocket_api.name`, defaulting to the machine hostname) — identical over the Unix socket and the WebSocket transport, except `ssh_agent_registration`, which only the Unix socket can offer. It may also carry `reach`, the operator-declared route to the server; `session`, the live non-default Herdr session name; and `exe`, the absolute path of the running executable. `reach` is omitted when unset or empty, and `session` is omitted for the default session. These fields are additive: clients talking to older servers must treat them as optional.
 
 Event subscriptions keep the connection open after the initial response.
 

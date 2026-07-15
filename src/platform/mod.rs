@@ -193,6 +193,24 @@ pub(crate) fn prepare_server_process(_handoff_import: bool) -> std::io::Result<b
     Ok(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutableFileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+impl ExecutableFileIdentity {
+    const fn new(volume: u64, file: u64) -> Self {
+        Self { volume, file }
+    }
+}
+
+pub(crate) fn executable_file_identity(
+    path: &std::path::Path,
+) -> std::io::Result<ExecutableFileIdentity> {
+    executable_file_identity_platform(path)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detach_server_daemon_command(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;

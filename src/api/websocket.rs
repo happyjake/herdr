@@ -328,6 +328,7 @@ pub fn start_websocket_server(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
 ) -> io::Result<Option<WebSocketServerHandle>> {
     start_websocket_server_with_capabilities(
         config,
@@ -335,18 +336,21 @@ pub fn start_websocket_server(
         event_hub,
         default_capabilities(),
         server_name,
+        server_reach,
     )
 }
 
 /// Like [`start_websocket_server`], with explicit ping capabilities. Call
-/// sites must pass the same capabilities and shared name slot as their Unix
-/// socket listener so `ping` responses are identical over both transports.
+/// sites must pass the same capabilities and shared declaration slots as
+/// their Unix socket listener so `ping` responses are identical over both
+/// transports.
 pub fn start_websocket_server_with_capabilities(
     config: &WebSocketApiConfig,
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
     server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
 ) -> io::Result<Option<WebSocketServerHandle>> {
     let Some(spec) = websocket_api_spec(config)? else {
         return Ok(None);
@@ -373,6 +377,7 @@ pub fn start_websocket_server_with_capabilities(
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let server_name = server_name.clone();
+                    let server_reach = server_reach.clone();
                     let connection_running = Arc::clone(&listener_running);
                     let token = accept_token.clone();
                     std::thread::spawn(move || {
@@ -384,6 +389,7 @@ pub fn start_websocket_server_with_capabilities(
                             &connection_running,
                             capabilities,
                             &server_name,
+                            &server_reach,
                         ) {
                             warn!(peer = %peer, err = %err, "websocket api connection failed");
                         }
@@ -443,6 +449,7 @@ fn handle_ws_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> io::Result<()> {
     configure_accepted_ws_stream(&stream)?;
     let peer = stream.peer_addr().ok();
@@ -486,6 +493,7 @@ fn handle_ws_connection(
         running,
         capabilities,
         server_name,
+        server_reach,
     );
 
     // Best effort: tell well-behaved clients the server is done.
@@ -697,6 +705,7 @@ fn ws_request_loop(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> io::Result<()> {
     // Parity with the Unix socket: a client that completes the handshake
     // gets a bounded window to send its first request. Once the connection
@@ -724,6 +733,7 @@ fn ws_request_loop(
                     capabilities.clone(),
                     None,
                     server_name,
+                    server_reach,
                 )?;
             }
             Ok(Message::Binary(_)) => {
@@ -1126,6 +1136,7 @@ mod tests {
             bind: bind.map(str::to_string),
             token: token.map(str::to_string),
             name: None,
+            reach: None,
         }
     }
 
@@ -1511,6 +1522,7 @@ mod tests {
             EventHub::default(),
             None,
             crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string()),
+            crate::api::SharedServerReach::from_config(&WebSocketApiConfig::default()),
         )
         .unwrap();
         assert!(handle.is_none());
@@ -1527,12 +1539,14 @@ mod tests {
         let (api_tx, api_rx) = mpsc::unbounded_channel();
         let event_hub = EventHub::default();
         let server_name = crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string());
+        let config = spec_config(Some("127.0.0.1:0"), Some(TEST_TOKEN));
         let handle = start_websocket_server_with_capabilities(
-            &spec_config(Some("127.0.0.1:0"), Some(TEST_TOKEN)),
+            &config,
             api_tx,
             event_hub.clone(),
             None,
             server_name.clone(),
+            crate::api::SharedServerReach::from_config(&config),
         )
         .unwrap()
         .expect("listener should start when configured");

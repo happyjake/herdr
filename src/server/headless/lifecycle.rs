@@ -265,24 +265,31 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        // Keep the live name slot across the failed handoff so an earlier
-        // reload-applied rename survives the restored listeners.
+        // Keep the live declaration slots across the failed handoff so an
+        // earlier reload survives the restored listeners.
         let server_name = self
             .app
             .server_name
             .clone()
             .unwrap_or_else(|| api::SharedServerName::from_config(&self.websocket_api_config));
+        let server_reach = self
+            .app
+            .server_reach
+            .clone()
+            .unwrap_or_else(|| api::SharedServerReach::from_config(&self.websocket_api_config));
         let api_server = api::start_server_with_stop_control(
             api_tx.clone(),
             self.app.event_hub.clone(),
             self.should_quit.clone(),
             server_name.clone(),
+            server_reach.clone(),
         )?;
         let websocket_server = api::start_websocket_server(
             &self.websocket_api_config,
             api_tx,
             self.app.event_hub.clone(),
             server_name,
+            server_reach,
         )?;
 
         let client_path = client_socket_path();

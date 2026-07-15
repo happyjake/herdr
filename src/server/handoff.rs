@@ -782,6 +782,6 @@ mod tests {
     /// content) plus generous room for the snapshot and pane metadata.
     #[test]
     fn replay_budget_fits_manifest_frame_limit() {
-        assert!(MAX_REPLAY_BYTES_TOTAL * 2 + 2 * 1024 * 1024 <= MAX_MANIFEST_LINE_BYTES);
+        const { assert!(MAX_REPLAY_BYTES_TOTAL * 2 + 2 * 1024 * 1024 <= MAX_MANIFEST_LINE_BYTES) }
     }
 }
