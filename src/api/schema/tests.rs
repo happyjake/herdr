@@ -779,6 +779,9 @@ fn success_response_round_trips() {
                 detached_server_daemon: true,
             }),
             name: Some("the-mini".into()),
+            reach: Some("mini".into()),
+            session: Some("mobile".into()),
+            exe: Some("/opt/herdr".into()),
         },
     };
 
@@ -788,13 +791,24 @@ fn success_response_round_trips() {
 }
 
 #[test]
-fn pong_name_is_additive_for_older_peers() {
-    // A pong from a server that predates the name field must still parse —
-    // the field is additive and the protocol version did not bump.
+fn pong_declarations_are_additive_for_older_peers() {
+    // A pong from a server that predates the declaration fields must still
+    // parse — the fields are additive and the protocol version did not bump.
     let old_pong = r#"{"id":"req_old","result":{"type":"pong","version":"0.1.0","protocol":6}}"#;
     let restored: SuccessResponse = serde_json::from_str(old_pong).unwrap();
     match restored.result {
-        ResponseResult::Pong { name, .. } => assert_eq!(name, None),
+        ResponseResult::Pong {
+            name,
+            reach,
+            session,
+            exe,
+            ..
+        } => {
+            assert_eq!(name, None);
+            assert_eq!(reach, None);
+            assert_eq!(session, None);
+            assert_eq!(exe, None);
+        }
         other => panic!("expected pong, got {other:?}"),
     }
 }

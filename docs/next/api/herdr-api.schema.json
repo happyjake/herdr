@@ -8715,6 +8715,13 @@
                   ],
                   "default": null
                 },
+                "exe": {
+                  "description": "Absolute path of the running server executable. Reported live so\nclients do not depend on a remote shell's PATH or a stale config.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "name": {
                   "description": "Display name the server declares (`websocket_api.name`, falling\nback to the machine hostname). Additive: absent from pongs of\nolder servers, so the protocol version is unchanged. Display\nonly, never identity.",
                   "type": [
@@ -8726,6 +8733,20 @@
                   "format": "uint32",
                   "minimum": 0,
                   "type": "integer"
+                },
+                "reach": {
+                  "description": "Operator-declared route other machines use to open a shell on this\nserver. Additive and absent when `websocket_api.reach` is unset or\nempty; it is never inferred from the hostname or display name.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "session": {
+                  "description": "Live non-default herdr session name. The default session needs no\n`--session` argument and is represented by an absent field.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "pong",

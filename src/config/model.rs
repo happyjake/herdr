@@ -999,6 +999,12 @@ pub struct WebSocketApiConfig {
     /// never identity — clients compare servers by endpoint. A changed name
     /// is applied by `server.reload_config` without a restart.
     pub name: Option<String>,
+    /// Route other machines use to open a shell on this server, typically an
+    /// ssh alias. This is operator-declared because the running process cannot
+    /// infer another machine's ssh configuration. Unset or empty means no
+    /// reach has been declared. A changed reach is applied by
+    /// `server.reload_config` without a restart.
+    pub reach: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

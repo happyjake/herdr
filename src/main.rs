@@ -853,11 +853,13 @@ fn main() -> io::Result<()> {
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
     let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
+    let server_reach = api::SharedServerReach::from_config(&loaded_config.config.websocket_api);
     let _api_server = match api::start_server_with_capabilities(
         api_tx.clone(),
         event_hub.clone(),
         None,
         server_name.clone(),
+        server_reach.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -868,15 +870,16 @@ fn main() -> io::Result<()> {
         Err(err) => return Err(err),
     };
     // Optional WebSocket API listener; off unless configured. Uses the same
-    // capabilities and name slot as the socket server above so ping responses
-    // match. The handle must stay alive until shutdown: dropping it stops the
-    // listener.
+    // capabilities and declaration slots as the socket server above so ping
+    // responses match. The handle must stay alive until shutdown: dropping it
+    // stops the listener.
     let websocket_server = match api::start_websocket_server_with_capabilities(
         &loaded_config.config.websocket_api,
         api_tx,
         event_hub.clone(),
         None,
         server_name.clone(),
+        server_reach.clone(),
     ) {
         Ok(server) => server,
         Err(err) => {
@@ -956,6 +959,7 @@ fn main() -> io::Result<()> {
         );
         app.set_websocket_api_token(websocket_api_token);
         app.set_server_name(Some(server_name));
+        app.set_server_reach(Some(server_reach));
         let result = app.run(&mut terminal).await;
 
         // Reset modifyOtherKeys if we enabled it.

@@ -172,6 +172,9 @@ pub struct App {
     /// renames the server through this; every subsequent pong carries the
     /// new name on both transports without a restart.
     pub(crate) server_name: Option<crate::api::SharedServerName>,
+    /// Live operator-declared reach shared with both API listeners. Config
+    /// reload replaces or clears it for every subsequent pong.
+    pub(crate) server_reach: Option<crate::api::SharedServerReach>,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -832,6 +835,7 @@ impl App {
             config_reloaded_from_disk: false,
             websocket_api_token: None,
             server_name: None,
+            server_reach: None,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
@@ -1430,6 +1434,12 @@ impl App {
         self.server_name = server_name;
     }
 
+    /// Attach the declared-reach slot shared with the API listeners so config
+    /// reloads update the route for every subsequent pong.
+    pub(crate) fn set_server_reach(&mut self, server_reach: Option<crate::api::SharedServerReach>) {
+        self.server_reach = server_reach;
+    }
+
     pub(crate) fn take_config_reloaded_from_disk(&mut self) -> bool {
         let reloaded = self.config_reloaded_from_disk;
         self.config_reloaded_from_disk = false;
@@ -1651,7 +1661,7 @@ impl App {
         }
 
         if !invalid_section("websocket_api") {
-            // Only the token and the name are live-reloadable; the bind
+            // Only the token and server declarations are live-reloadable; the bind
             // address stays fixed until the server restarts. A reload that
             // would leave the bound listener without a usable token keeps
             // the current one instead.
@@ -1664,6 +1674,9 @@ impl App {
             // the machine hostname.
             if let Some(server_name) = &self.server_name {
                 server_name.apply_reloaded_config(&config.websocket_api);
+            }
+            if let Some(server_reach) = &self.server_reach {
+                server_reach.apply_reloaded_config(&config.websocket_api);
             }
         }
 

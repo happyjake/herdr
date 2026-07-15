@@ -127,16 +127,19 @@ The JSON API can optionally be served over WebSocket for non-terminal clients. T
 [websocket_api]
 bind = "100.64.0.5:4433"
 token = "minted-by-herdr-pair"
-name = "the-mini"
+name = "The Mini"
+reach = "the-mini"
 ```
 
 `bind` is the exact TCP address the listener binds; prefer a tailnet or loopback address. `token` is required whenever `bind` is set — the server refuses to start without it — and clients must present it during the WebSocket handshake, either as an `Authorization: Bearer <token>` header or as a `token` query parameter for clients that cannot set headers (browsers). Tokens may use ASCII letters, digits, and `-._~` only, so the query form never needs URL escaping. Handshakes with a missing or wrong token are rejected with HTTP 401 before any API request is processed.
 
 `name` is the optional display name the server declares about itself: it is returned in the `ping` response on every transport and embedded in the pairing QR payload so clients can show a friendly label. Unset or empty means the machine's hostname. Names are display only, never identity — clients tell servers apart by endpoint.
 
+`reach` is the optional route another machine uses to open a shell on this server, typically an exact SSH alias. It is kept separate from `name` because display styling and a working route can differ. Herdr never guesses reach from the display name or hostname; unset or empty means undeclared.
+
 Set `bind` by hand, then let [`herdr pair`](/docs/cli-reference/#pairing) manage the token: it mints and stores a fresh token, applies it to a running server, and prints the pairing payload as a QR code and plaintext. Re-running it rotates the token and invalidates the previous one.
 
-The transport is plain `ws://`; the network layer (for example your tailnet's WireGuard encryption) provides transport security. Changing `bind` requires a server restart — `server.reload_config` does not rebind the listener. A changed `token` or `name` is applied by `server.reload_config` without a restart; connections authorized before the change stay connected. See [Socket API](/docs/socket-api/) for the wire protocol.
+The transport is plain `ws://`; the network layer (for example your tailnet's WireGuard encryption) provides transport security. Changing `bind` requires a server restart — `server.reload_config` does not rebind the listener. A changed `token`, `name`, or `reach` is applied by `server.reload_config` without a restart; connections authorized before the change stay connected. See [Socket API](/docs/socket-api/) for the wire protocol.
 
 ## Keybindings
 

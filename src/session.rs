@@ -180,6 +180,15 @@ pub fn active_api_socket_path() -> PathBuf {
     api_socket_path_for(active_name().as_deref())
 }
 
+/// Return the active session name only when `--session <name>` addresses this
+/// server's effective API socket. A socket override can coexist with an
+/// inherited `HERDR_SESSION`, but advertising that name would route clients
+/// to the session's normal socket instead of this server.
+pub fn active_name_for_api_socket() -> Option<String> {
+    let name = active_name()?;
+    (active_api_socket_path() == api_socket_path_for(Some(&name))).then_some(name)
+}
+
 pub fn client_socket_path_for(name: Option<&str>) -> PathBuf {
     data_dir_for(name).join("herdr-client.sock")
 }

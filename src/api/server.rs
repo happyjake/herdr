@@ -89,6 +89,7 @@ pub(crate) fn start_server_with_stop_control(
     event_hub: EventHub,
     server_stop: Arc<AtomicBool>,
     server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
 ) -> std::io::Result<ServerHandle> {
     start_server_inner(
         api_tx,
@@ -96,6 +97,7 @@ pub(crate) fn start_server_with_stop_control(
         default_capabilities(),
         Some(server_stop),
         server_name,
+        server_reach,
     )
 }
 
@@ -104,6 +106,7 @@ pub fn start_server_with_capabilities(
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
     server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
 ) -> std::io::Result<ServerHandle> {
     start_server_inner(api_tx, event_hub, capabilities, None, server_name)
 }
@@ -142,6 +145,7 @@ fn start_server_inner(
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
                     let server_name = server_name.clone();
+                    let server_reach = server_reach.clone();
                     let connection_running = Arc::clone(&listener_running);
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection_with_stop(
@@ -152,6 +156,7 @@ fn start_server_inner(
                             capabilities,
                             server_stop.as_ref(),
                             &server_name,
+                            &server_reach,
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -206,6 +211,7 @@ fn handle_connection_with_stop(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -255,6 +261,7 @@ fn handle_connection_with_stop(
             capabilities,
             server_stop,
             server_name,
+            server_reach,
         ),
     }
 }
@@ -299,6 +306,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -403,6 +411,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
                 server_stop,
                 Some(response_write_rx),
                 server_name,
+                server_reach,
             );
             let result = write_message_allow_disconnect(transport, &response);
             let _ = response_write_tx.send(());
@@ -458,9 +467,10 @@ fn handle_request(
     server_stop: Option<&Arc<AtomicBool>>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
 ) -> String {
-    // The name is read per request, not captured at listener start, so a
-    // reloaded name shows up in the next pong on every transport.
+    // Declarations and runtime facts are read per request, so config
+    // reloads and the running process are reflected on every transport.
     if matches!(&request.method, Method::Ping(_)) {
         return serde_json::to_string(&SuccessResponse {
             id: request.id,
@@ -469,6 +479,12 @@ fn handle_request(
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
                 name: Some(server_name.current()),
+                reach: server_reach.current(),
+                session: crate::session::active_name_for_api_socket(),
+                exe: std::env::current_exe()
+                    .ok()
+                    .filter(|path| path.is_absolute() && path.is_file())
+                    .map(|path| path.display().to_string()),
             },
         })
         .unwrap_or_else(|_| {
@@ -1055,6 +1071,10 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn undeclared_server_reach() -> crate::api::SharedServerReach {
+        crate::api::SharedServerReach::from_config(&crate::config::WebSocketApiConfig::default())
+    }
+
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1283,6 +1303,7 @@ mod tests {
             None,
             None,
             &crate::api::SharedServerName::new("the-mini".to_string()),
+            &undeclared_server_reach(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1297,6 +1318,7 @@ mod tests {
     fn pong_reflects_a_renamed_server_without_restarting_anything() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let server_name = crate::api::SharedServerName::new("before".to_string());
+        let server_reach = undeclared_server_reach();
         let ping = |id: &str| {
             handle_request(
                 Request {
@@ -1308,6 +1330,7 @@ mod tests {
                 None,
                 None,
                 &server_name,
+                &server_reach,
             )
         };
 
@@ -1371,6 +1394,7 @@ mod tests {
         // thread — identically for every transport and server mode.
         let (tx, _) = mpsc::unbounded_channel();
         let server_name = crate::api::SharedServerName::new("test".to_string());
+        let server_reach = undeclared_server_reach();
         let create = |id: &str, bytes_b64: String| {
             handle_request(
                 Request {
@@ -1384,6 +1408,7 @@ mod tests {
                 None,
                 None,
                 &server_name,
+                &server_reach,
             )
         };
         let error_code = |response: &str| {
@@ -1444,6 +1469,7 @@ mod tests {
                 None,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             )
         });
 
@@ -1524,6 +1550,7 @@ mod tests {
             &running,
             None,
             &crate::api::SharedServerName::new("test".to_string()),
+            &undeclared_server_reach(),
         )
         .unwrap();
 
@@ -1559,6 +1586,7 @@ mod tests {
             &running,
             None,
             &crate::api::SharedServerName::new("test".to_string()),
+            &undeclared_server_reach(),
         )
         .unwrap();
 
@@ -1687,6 +1715,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1726,6 +1755,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1770,6 +1800,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1826,6 +1857,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1877,6 +1909,7 @@ mod tests {
                 &server_running,
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
             );
             done_tx.send(result).unwrap();
         });
