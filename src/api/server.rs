@@ -448,10 +448,7 @@ fn handle_request(
                 name: Some(server_name.current()),
                 reach: server_reach.current(),
                 session: crate::session::active_name_for_api_socket(),
-                exe: std::env::current_exe()
-                    .ok()
-                    .filter(|path| path.is_absolute() && path.is_file())
-                    .map(|path| path.display().to_string()),
+                exe: crate::api::server_executable::path_for_pong(),
             },
         })
         .unwrap_or_else(|_| {
@@ -1084,6 +1081,7 @@ mod tests {
                     tab_count: 0,
                     active_tab_id: String::new(),
                     agent_status: crate::api::schema::AgentStatus::Unknown,
+                    tokens: Default::default(),
                     worktree: None,
                 },
             },
@@ -1271,6 +1269,7 @@ mod tests {
                 },
                 &tx,
                 None,
+                None,
                 &server_name,
                 &server_reach,
             )
@@ -1367,7 +1366,15 @@ mod tests {
         let server_running = Arc::clone(&running);
         let event_hub = EventHub::default();
         let server_thread = std::thread::spawn(move || {
-            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+            handle_connection(
+                server,
+                &api_tx,
+                &event_hub,
+                &server_running,
+                None,
+                &crate::api::SharedServerName::new("test".to_string()),
+                &undeclared_server_reach(),
+            )
         });
 
         let msg = api_rx.blocking_recv().unwrap();
@@ -1512,7 +1519,16 @@ mod tests {
         client.flush().unwrap();
 
         let running = Arc::new(AtomicBool::new(true));
-        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        handle_connection(
+            server,
+            &api_tx,
+            &event_hub,
+            &running,
+            None,
+            &crate::api::SharedServerName::new("test".to_string()),
+            &undeclared_server_reach(),
+        )
+        .unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_close");

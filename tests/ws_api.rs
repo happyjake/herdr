@@ -10,9 +10,13 @@
 
 mod support;
 
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -668,6 +672,73 @@ fn pong_omits_exe_after_running_binary_is_unlinked() {
     assert!(
         ws_response["result"].get("exe").is_none(),
         "an unlinked running executable cannot be invoked: {ws_response}"
+    );
+    assert_eq!(ws_response["result"]["reach"], TEST_REACH);
+
+    cleanup_spawned_herdr(server.child, server.base);
+    cleanup_test_base(&executable_base);
+}
+
+#[test]
+fn pong_omits_exe_after_running_binary_is_replaced() {
+    let _lock = test_lock();
+    let executable_base = unique_test_dir();
+    fs::create_dir_all(&executable_base).unwrap();
+    let executable = executable_base.join("herdr-running-copy");
+    fs::copy(env!("CARGO_BIN_EXE_herdr"), &executable).unwrap();
+
+    let server = start_ws_test_server_with_executable_and_env(&executable, &[]);
+    let replacement = executable_base.join("herdr-replacement-copy");
+    fs::copy(env!("CARGO_BIN_EXE_herdr"), &replacement).unwrap();
+    fs::rename(&replacement, &executable).unwrap();
+    assert!(executable.is_file());
+
+    let request = r#"{"id":"req_replaced_exe","method":"ping","params":{}}"#;
+    let unix_response = unix_request(&server.socket_path, request);
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let ws_response = ws.request(request);
+
+    assert_eq!(unix_response, ws_response);
+    assert!(
+        ws_response["result"].get("exe").is_none(),
+        "a replacement file is not the running executable: {ws_response}"
+    );
+    assert_eq!(ws_response["result"]["reach"], TEST_REACH);
+
+    cleanup_spawned_herdr(server.child, server.base);
+    cleanup_test_base(&executable_base);
+}
+
+#[cfg(unix)]
+#[test]
+fn pong_omits_exe_when_running_path_is_not_utf8() {
+    let _lock = test_lock();
+    let executable_base = unique_test_dir();
+    fs::create_dir_all(&executable_base).unwrap();
+    let executable = executable_base.join(OsStr::from_bytes(b"herdr-\xff-running-copy"));
+    assert!(executable.to_str().is_none());
+    if let Err(err) = fs::copy(env!("CARGO_BIN_EXE_herdr"), &executable) {
+        #[cfg(target_os = "macos")]
+        if err.raw_os_error() == Some(libc::EILSEQ) {
+            // APFS rejects invalid-byte filenames before the server can be
+            // launched. Linux runs the real-process assertion below; do not
+            // replace it with an injected path that current_exe() never saw.
+            cleanup_test_base(&executable_base);
+            return;
+        }
+        panic!("copy server to non-UTF-8 executable path: {err}");
+    }
+
+    let server = start_ws_test_server_with_executable_and_env(&executable, &[]);
+    let request = r#"{"id":"req_non_utf8_exe","method":"ping","params":{}}"#;
+    let unix_response = unix_request(&server.socket_path, request);
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let ws_response = ws.request(request);
+
+    assert_eq!(unix_response, ws_response);
+    assert!(
+        ws_response["result"].get("exe").is_none(),
+        "a non-UTF-8 executable path cannot be advertised: {ws_response}"
     );
     assert_eq!(ws_response["result"]["reach"], TEST_REACH);
 

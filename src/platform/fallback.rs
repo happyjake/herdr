@@ -3,6 +3,15 @@ use std::process::Command;
 
 use super::{ClipboardImage, ForegroundJob, Signal};
 
+pub(super) fn executable_file_identity_platform(
+    _path: &std::path::Path,
+) -> std::io::Result<super::ExecutableFileIdentity> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "executable file identity is not supported on this platform",
+    ))
+}
+
 /// Unsupported platform stub.
 pub fn raise_server_nofile_limit() {}
 

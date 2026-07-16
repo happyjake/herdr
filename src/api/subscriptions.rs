@@ -135,7 +135,7 @@ impl ActiveSubscription {
             })),
             Subscription::WorkspaceReordered {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceReordered,
-                last_sequence: 0,
+                last_sequence: event_start_sequence,
             })),
             Subscription::WorkspaceClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceClosed,
@@ -689,6 +689,7 @@ mod tests {
             0,
             &api_tx,
             &event_hub,
+            0,
         )
         .expect("workspace metadata subscription");
 
