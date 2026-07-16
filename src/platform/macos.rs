@@ -23,6 +23,21 @@ pub(crate) use super::unix_common::{
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
+pub(super) fn executable_file_identity_platform(
+    path: &Path,
+) -> std::io::Result<super::ExecutableFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("executable path is not a file"));
+    }
+    Ok(super::ExecutableFileIdentity::new(
+        metadata.dev(),
+        metadata.ino(),
+    ))
+}
+
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     false
 }

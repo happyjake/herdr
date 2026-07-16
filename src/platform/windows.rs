@@ -364,6 +364,35 @@ static FOREGROUND_PROCESS_SNAPSHOT_CACHE: Mutex<ProcessSnapshotCache> =
 static FOREGROUND_SELECTION_CACHE: LazyLock<Mutex<ForegroundSelectionCache>> =
     LazyLock::new(|| Mutex::new(ForegroundSelectionCache::default()));
 
+pub(super) fn executable_file_identity_platform(
+    path: &std::path::Path,
+) -> std::io::Result<super::ExecutableFileIdentity> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("executable path is not a file"));
+    }
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle(), std::ptr::addr_of_mut!(information))
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok(super::ExecutableFileIdentity::new(
+        u64::from(information.dwVolumeSerialNumber),
+        file_index,
+    ))
+}
+
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     true
 }

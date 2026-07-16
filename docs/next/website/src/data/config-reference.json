@@ -1182,6 +1182,17 @@
           ]
         },
         {
+          "key": "ui.sound.agents.codebuddy",
+          "type": "enum",
+          "default": "\"default\"",
+          "description": "Sound override for detected CodeBuddy agents.",
+          "values": [
+            "default",
+            "on",
+            "off"
+          ]
+        },
+        {
           "key": "ui.sound.agents.codex",
           "type": "enum",
           "default": "\"default\"",
@@ -1429,6 +1440,36 @@
       ]
     },
     {
+      "id": "websocket-api",
+      "title": "WebSocket API",
+      "keys": [
+        {
+          "key": "websocket_api.bind",
+          "type": "string",
+          "default": "unset",
+          "description": "TCP address for the optional WebSocket JSON API listener, e.g. \"100.64.0.5:4433\". Unset (the default) keeps the listener off and opens no network port. The transport is plain ws:// and relies on the network layer (e.g. WireGuard) for encryption. Changes require a server restart."
+        },
+        {
+          "key": "websocket_api.token",
+          "type": "string",
+          "default": "unset",
+          "description": "Bearer token WebSocket clients must present during the handshake, via an Authorization header or a token query parameter. Required when bind is set. Restricted to ASCII letters, digits, and -._~. Rotated live by server.reload_config."
+        },
+        {
+          "key": "websocket_api.name",
+          "type": "string",
+          "default": "unset",
+          "description": "Display name the server declares in its ping pong, falling back to the machine hostname. Display only, never identity. Picked up live by server.reload_config."
+        },
+        {
+          "key": "websocket_api.reach",
+          "type": "string",
+          "default": "unset",
+          "description": "Operator-declared route other machines use to open a shell on this server, typically an ssh alias. Never inferred from the hostname or display name. Picked up live by server.reload_config."
+        }
+      ]
+    },
+    {
       "id": "advanced",
       "title": "Advanced",
       "keys": [
@@ -1437,6 +1478,18 @@
           "type": "integer",
           "default": "10000000",
           "description": "Maximum scrollback buffer size in bytes retained per pane terminal. The legacy key name `scrollback_lines` is accepted as an alias."
+        },
+        {
+          "key": "advanced.headless_min_cols",
+          "type": "integer",
+          "default": "180",
+          "description": "Minimum pane width in columns while no client is attached, so API readers such as the mobile client see agent output at real-terminal proportions. Values below 80 are raised to 80; an attached client's real terminal size always wins while connected."
+        },
+        {
+          "key": "advanced.headless_min_rows",
+          "type": "integer",
+          "default": "60",
+          "description": "Minimum pane height in rows while no client is attached. Values below 24 are raised to 24; an attached client's real terminal size always wins while connected."
         }
       ]
     },

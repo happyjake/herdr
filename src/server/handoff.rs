@@ -592,6 +592,7 @@ mod tests {
             cell_height_px: 0,
             keyboard_protocol_flags: 0,
             keyboard_protocol_ansi: None,
+            terminal_title: None,
             input_state: Some(crate::pane::InputState {
                 alternate_screen,
                 application_cursor: false,
@@ -616,6 +617,7 @@ mod tests {
                         cwd: "/tmp".into(),
                         label: None,
                         agent_name: None,
+                        managed_agent_kind: None,
                         agent_session: is_agent.then(|| crate::persist::PaneAgentSessionSnapshot {
                             source: "claude-hooks".into(),
                             agent: "claude".into(),
@@ -723,6 +725,6 @@ mod tests {
     /// content) plus generous room for the snapshot and pane metadata.
     #[test]
     fn replay_budget_fits_manifest_frame_limit() {
-        assert!(MAX_REPLAY_BYTES_TOTAL * 2 + 2 * 1024 * 1024 <= MAX_MANIFEST_LINE_BYTES);
+        const { assert!(MAX_REPLAY_BYTES_TOTAL * 2 + 2 * 1024 * 1024 <= MAX_MANIFEST_LINE_BYTES) }
     }
 }
