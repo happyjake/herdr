@@ -119,6 +119,13 @@ fn serve_with_timeouts(
         return Ok(());
     }
 
+    // Register before the open ack goes out: a cancel sweep triggered by the
+    // ack (or by anything the client does on seeing it) must find the stream,
+    // or the cancellation is silently lost and the stream idles to its read
+    // timeout instead of dispatching a close.
+    let stream_active = Arc::new(AtomicBool::new(true));
+    register_stream(&owner, &stream_active);
+
     if let Err(err) = write_json_message(
         &mut stream,
         &SuccessResponse {
@@ -126,6 +133,7 @@ fn serve_with_timeouts(
             result: ResponseResult::Ok {},
         },
     ) {
+        unregister_stream(&owner);
         clear_layer(&pane_id, &owner, api_tx);
         if is_connection_closed_error(&err) {
             return Ok(());
@@ -133,8 +141,6 @@ fn serve_with_timeouts(
         return Err(err);
     }
 
-    let stream_active = Arc::new(AtomicBool::new(true));
-    register_stream(&owner, &stream_active);
     let result = serve_frames(
         &mut stream,
         &request_id,
