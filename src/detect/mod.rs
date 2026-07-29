@@ -397,6 +397,17 @@ fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> Stri
         return wrapped_agent;
     }
 
+    // Some agents rewrite their argv after launch to set a process title,
+    // which can truncate or replace argv0 (e.g. kimi's title degrades to
+    // "kimi-co" when the original argv space is short, with env vars leaking
+    // into argv). The OS-reported process name still carries the real
+    // executable name, so try it when argv0 identified nothing.
+    if process.argv0.as_deref() != Some(process.name.as_str())
+        && identify_agent(&process.name).is_some()
+    {
+        return process.name.clone();
+    }
+
     effective.to_string()
 }
 
@@ -1103,6 +1114,25 @@ mod tests {
         assert_eq!(
             identify_agent_in_job(&job),
             Some((Agent::Hermes, "hermes".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_kimi_from_name_when_argv0_is_rewritten() {
+        // kimi rewrites its argv after launch to set a process title; when the
+        // original argv space is short (e.g. `kimi -y`), the title truncates
+        // to "kimi-co" and env vars leak into argv. The OS process name stays
+        // "kimi".
+        let mut kimi = foreground_process(42, "kimi", &["kimi-co", "COLORTERM=truecolor"]);
+        kimi.argv0 = Some("kimi-co".to_string());
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![kimi],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Kimi, "kimi".to_string()))
         );
     }
 
