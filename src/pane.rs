@@ -1116,28 +1116,6 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
-        match self {
-            PaneRuntimeIo::Actor(actor) => {
-                let actor = actor.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    if let Err(err) = actor.write_user_input(bytes).await {
-                        warn!(error = %err, "failed to send delayed PTY input");
-                    }
-                });
-            }
-            #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => {
-                let sender = sender.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = sender.send(bytes).await;
-                });
-            }
-        }
-    }
-
     fn shutdown(&self) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.shutdown(),
@@ -3162,10 +3140,6 @@ impl PaneRuntime {
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.paced_user_input
             .schedule_delayed_writes(self.io.user_input_writer(), delay, writes)
-    }
-
-    pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
-        self.io.send_bytes_after(bytes, delay);
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {

@@ -123,7 +123,15 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
             return encode_error(id, "agent_prompt_failed", err.to_string());
         }
-        runtime.send_bytes_after(Bytes::from(enter), AGENT_PROMPT_SUBMIT_DELAY);
+        // The submit Enter joins the same paced queue as pane.send_input so it
+        // can never overtake prompt text that is still draining behind an
+        // attachment delay; the wait starts when the text reaches the PTY.
+        if let Err(err) = runtime.schedule_delayed_user_input(
+            AGENT_PROMPT_SUBMIT_DELAY,
+            std::iter::once(Bytes::from(enter)),
+        ) {
+            return encode_error(id, "agent_prompt_failed", err.to_string());
+        }
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
@@ -350,7 +358,8 @@ mod tests {
         terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
         let (runtime, mut rx) =
             crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
-                80, 24, 0, b"", 1,
+                // The paced enter needs its own queue slot beside the text.
+                80, 24, 0, b"", 2,
             );
         runtime.test_process_pty_bytes(b"\x1b[?2004h");
         app.state.insert_test_runtime(pane_id, runtime);

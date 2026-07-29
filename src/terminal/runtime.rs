@@ -460,10 +460,6 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
-    pub fn send_bytes_after(&self, bytes: Bytes, delay: std::time::Duration) {
-        self.0.send_bytes_after(bytes, delay);
-    }
-
     pub fn schedule_delayed_user_input(
         &self,
         delay: std::time::Duration,
