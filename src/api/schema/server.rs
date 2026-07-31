@@ -24,4 +24,9 @@ pub struct ServerCapabilities {
     pub live_handoff: bool,
     #[serde(default)]
     pub detached_server_daemon: bool,
+    /// Whether `pane.send_input` dedupes by `send_id`, so a client may
+    /// safely re-issue an unacked send after a reconnect. Additive: absent
+    /// (false) in pongs of servers that predate it.
+    #[serde(default)]
+    pub send_affirm: bool,
 }

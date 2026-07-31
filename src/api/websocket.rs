@@ -337,6 +337,7 @@ pub fn start_websocket_server(
         Some(ServerCapabilities {
             live_handoff: crate::platform::capabilities().live_handoff,
             detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
+            send_affirm: true,
         }),
         server_name,
         server_reach,

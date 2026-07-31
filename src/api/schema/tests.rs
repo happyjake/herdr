@@ -746,6 +746,7 @@ fn success_response_round_trips() {
             capabilities: Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                send_affirm: true,
             }),
             name: Some("the-mini".into()),
             reach: Some("mini".into()),
