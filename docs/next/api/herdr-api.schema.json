@@ -778,6 +778,11 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "alternate_screen": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
+            },
             "cwd": {
               "type": [
                 "string",
@@ -3195,6 +3200,13 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "send_id": {
+              "description": "Client-generated identity of this logical send. When present, an id\nthe server already applied is acknowledged without writing again —\nthe re-affirmation contract behind the `send_affirm` capability.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "text": {
               "type": "string"
@@ -7997,6 +8009,11 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "alternate_screen": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
+            },
             "cwd": {
               "type": [
                 "string",
@@ -10651,6 +10668,11 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "send_affirm": {
+              "default": false,
+              "description": "Whether `pane.send_input` dedupes by `send_id`, so a client may\nsafely re-issue an unacked send after a reconnect. Additive: absent\n(false) in pongs of servers that predate it.",
               "type": "boolean"
             },
             "ssh_agent_registration": {

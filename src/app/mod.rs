@@ -19,6 +19,7 @@ mod git_refresh;
 mod ids;
 mod popup;
 mod runtime;
+mod send_affirm;
 mod session;
 pub mod state;
 mod tab_bar_status;
@@ -126,6 +127,9 @@ pub struct App {
     pub(crate) pending_worktree_remove_runtime_exits: HashMap<crate::layout::PaneId, usize>,
     pub(crate) pending_worktree_remove_runtime_restores: HashMap<crate::layout::PaneId, u64>,
     pub(crate) next_api_worktree_operation_id: u64,
+    /// Recently applied `pane.send_input` send_ids, so a client re-issuing
+    /// an unacked send after a reconnect is answered without a second write.
+    pub(crate) applied_send_ids: send_affirm::AppliedSendIds,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -599,6 +603,7 @@ impl App {
             pending_worktree_remove_runtime_exits: HashMap::new(),
             pending_worktree_remove_runtime_restores: HashMap::new(),
             next_api_worktree_operation_id: 1,
+            applied_send_ids: Default::default(),
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled

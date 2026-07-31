@@ -1932,6 +1932,14 @@ impl App {
         id: String,
         params: PaneSendInputParams,
     ) -> String {
+        if let Some(send_id) = params.send_id.as_deref() {
+            // A re-issued send the server already applied: acknowledge the
+            // affirmation without writing again — even if the pane has since
+            // closed, "applied" is the truthful answer.
+            if self.applied_send_ids.contains(send_id) {
+                return encode_success(id, ResponseResult::Ok {});
+            }
+        }
         let resolved = match self.resolve_pane_command_target(&id, &params.pane_id) {
             Ok(resolved) => resolved,
             Err(response) => return response,
@@ -1959,6 +1967,10 @@ impl App {
             if let Err(err) = write_send_input_segments(runtime, segments) {
                 return encode_error(id, "pane_send_failed", err);
             }
+        }
+
+        if let Some(send_id) = params.send_id {
+            self.applied_send_ids.record(send_id);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -3565,6 +3577,7 @@ mod tests {
                 pane_id,
                 text: "A != B".into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
 
@@ -3597,6 +3610,7 @@ mod tests {
                 pane_id,
                 text: String::new(),
                 keys: vec!["ctrl+j".into()],
+                send_id: None,
             }),
         });
 
@@ -3623,11 +3637,68 @@ mod tests {
                 pane_id,
                 text: "hello".into(),
                 keys: Vec::new(),
+                send_id: None,
             }),
         });
 
         assert_ok_response(&response, "req");
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"hello"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_with_seen_send_id_acks_without_rewriting() {
+        // The re-affirmation contract: a client that lost the ack re-issues
+        // the same send with the same send_id after reconnecting. The second
+        // request must answer ok while writing nothing to the pane.
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
+
+        let request = |req_id: &str| crate::api::schema::Request {
+            id: req_id.into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: pane_id.clone(),
+                text: "kick off".into(),
+                keys: Vec::new(),
+                send_id: Some("send-1".into()),
+            }),
+        };
+
+        let first = app.handle_api_request(request("req_a"));
+        assert_ok_response(&first, "req_a");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            bytes::Bytes::from_static(b"kick off")
+        );
+
+        let second = app.handle_api_request(request("req_b"));
+        assert_ok_response(&second, "req_b");
+        assert!(rx.try_recv().is_err(), "re-affirmation must not rewrite");
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_dedupes_by_send_id_not_by_content() {
+        // Distinct ids apply even with identical text; absent ids never
+        // dedupe — two id-less sends of the same text both write.
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(4);
+
+        let request = |req_id: &str, send_id: Option<&str>| crate::api::schema::Request {
+            id: req_id.into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id: pane_id.clone(),
+                text: "again".into(),
+                keys: Vec::new(),
+                send_id: send_id.map(str::to_string),
+            }),
+        };
+
+        assert_ok_response(&app.handle_api_request(request("req_a", Some("id-1"))), "req_a");
+        assert_ok_response(&app.handle_api_request(request("req_b", Some("id-2"))), "req_b");
+        assert_ok_response(&app.handle_api_request(request("req_c", None)), "req_c");
+        assert_ok_response(&app.handle_api_request(request("req_d", None)), "req_d");
+
+        for _ in 0..4 {
+            assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"again"));
+        }
         assert!(rx.try_recv().is_err());
     }
 
@@ -3646,6 +3717,7 @@ mod tests {
                 pane_id: terminal_id,
                 text: "echo safe".into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
 
@@ -3687,6 +3759,7 @@ mod tests {
                 pane_id: unknown_terminal_id.into(),
                 text: "do not send".into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
 
@@ -3729,6 +3802,7 @@ mod tests {
                 pane_id: stale_terminal_id.into(),
                 text: "do not send".into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
 
@@ -3776,6 +3850,7 @@ mod tests {
                 pane_id: "worker".into(),
                 text: "do not send".into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
 
@@ -3832,6 +3907,7 @@ mod tests {
                 pane_id: closed_terminal_id,
                 text: "do not send".into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
 
@@ -3853,6 +3929,7 @@ mod tests {
                 pane_id,
                 text: "hello".into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
         assert_ok_response(&response, "req");
@@ -3882,6 +3959,7 @@ mod tests {
                 pane_id,
                 text: String::new(),
                 keys: vec!["Escape".into(), "Enter".into()],
+                send_id: None,
             }),
         });
 
@@ -4052,6 +4130,7 @@ mod tests {
                 pane_id,
                 text: text.into(),
                 keys: vec!["Enter".into()],
+                send_id: None,
             }),
         });
         assert_ok_response(&response, "req");
@@ -4104,6 +4183,7 @@ mod tests {
                 pane_id,
                 text: "hello".into(),
                 keys: vec!["ctrl+h".into(), raw_key.clone()],
+                send_id: None,
             }),
         });
 

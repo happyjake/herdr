@@ -42,4 +42,9 @@ pub struct ServerCapabilities {
     /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
     #[serde(default)]
     pub ssh_agent_registration: bool,
+    /// Whether `pane.send_input` dedupes by `send_id`, so a client may
+    /// safely re-issue an unacked send after a reconnect. Additive: absent
+    /// (false) in pongs of servers that predate it.
+    #[serde(default)]
+    pub send_affirm: bool,
 }
