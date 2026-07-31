@@ -21,6 +21,7 @@ pub(crate) mod pane_graphics;
 mod popup;
 mod runtime;
 mod runtime_mutations;
+mod send_affirm;
 mod session;
 pub mod state;
 mod tab_bar_status;
@@ -126,6 +127,9 @@ pub struct App {
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
     pub(crate) next_api_worktree_operation_id: u64,
+    /// Recently applied `pane.send_input` send_ids, so a client re-issuing
+    /// an unacked send after a reconnect is answered without a second write.
+    pub(crate) applied_send_ids: send_affirm::AppliedSendIds,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
@@ -793,6 +797,7 @@ impl App {
             pending_api_worktree_removes: HashMap::new(),
             pending_api_worktree_remove_paths: HashMap::new(),
             next_api_worktree_operation_id: 1,
+            applied_send_ids: Default::default(),
             last_sidebar_divider_click: None,
             last_pane_click: None,
             pending_url_click_sources: HashSet::new(),

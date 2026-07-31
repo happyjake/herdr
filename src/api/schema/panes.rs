@@ -269,6 +269,11 @@ pub struct PaneSendInputParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    /// Client-generated identity of this logical send. When present, an id
+    /// the server already applied is acknowledged without writing again —
+    /// the re-affirmation contract behind the `send_affirm` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_id: Option<String>,
 }
 
 /// Mouse input addressed in zero-based terminal cells. Coordinates outside

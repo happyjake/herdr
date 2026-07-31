@@ -1057,6 +1057,7 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
         pane_id,
         text,
         keys: vec!["Enter".into()],
+        send_id: None,
     }))
 }
 
