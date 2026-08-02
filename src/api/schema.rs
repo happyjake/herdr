@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod agents;
 pub mod commands;
 pub mod common;
+pub mod credentials;
 pub mod events;
 pub mod integrations;
 pub(crate) mod operations;
@@ -18,6 +19,7 @@ pub mod worktrees;
 pub use agents::*;
 pub use commands::*;
 pub use common::*;
+pub use credentials::*;
 pub use events::*;
 pub use integrations::*;
 pub use panes::*;
@@ -147,6 +149,10 @@ operations::define_operations! {
     PluginPaneClose(PluginPaneCloseParams) => "plugin.pane.close", true, false;
     AttachmentCreate(AttachmentCreateParams) => "attachment.create", false, false;
     PaneSendMouse(PaneSendMouseParams) => "pane.send_mouse", true, false;
+    CredentialMint(CredentialMintParams) => "credential.mint", false, false;
+    CredentialList(CredentialActorParams) => "credential.list", false, false;
+    CredentialRevoke(CredentialRevokeParams) => "credential.revoke", false, false;
+    CredentialRevokeAll(CredentialActorParams) => "credential.revoke_all", false, false;
 }
 
 #[cfg(test)]

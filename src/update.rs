@@ -3056,6 +3056,8 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 send_affirm: false,
+                stream_multiplex: false,
+                credential_registry: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3132,6 +3134,8 @@ mod tests {
                     health_check: true,
                     ssh_agent_registration: false,
                     send_affirm: true,
+                    stream_multiplex: true,
+                    credential_registry: true,
                 }),
             },
         };
@@ -3392,6 +3396,8 @@ mod tests {
                     health_check: true,
                     ssh_agent_registration: false,
                     send_affirm: false,
+                    stream_multiplex: false,
+                    credential_registry: false,
                 }),
             },
         };

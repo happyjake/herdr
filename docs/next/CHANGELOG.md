@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+- The websocket API now keeps a credential registry per server: the pairing's managing credential plus limited credentials minted through `credential.mint`, listed with `credential.list`, and ended with `credential.revoke` / `credential.revoke_all`. Limited credentials drive the whole API but cannot manage the registry, and may revoke only themselves. Servers declare `credential_registry` in their `ping` capabilities; the protocol version is unchanged. Revocation is reported to the affected client as a terminal `credential_revoked` error on an established connection, so a browser can tell revocation from transient trouble.
+- Added `pane.send_mouse` to the socket API with live mouse-report and alternate-scroll routing, plus `PaneInfo.mouse_tracking` for clients that need to choose input behavior.
+- Added `PaneInfo.alternate_screen` so API clients can distinguish live alternate-screen panes from primary-screen prompts.
+
 ## [0.9.5] - 2026-10-14
 
 This is a hotfix release for v0.9.4. See the v0.9.4 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.4
@@ -428,8 +433,6 @@ This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature r
 - Added `ui.sidebar_start_collapsed` to launch Herdr with the sidebar collapsed. (#1463)
 - Added `ui.prompt_new_workspace_name` to ask for a workspace name before interactive TUI creation.
 - Added macOS support for the `HERDR_AGENT=<agent>` foreground-process hint, allowing agents hidden behind host-visible wrappers such as `nono` to use the named agent's screen manifest. (#679)
-- Added `pane.send_mouse` to the socket API with live mouse-report and alternate-scroll routing, plus `PaneInfo.mouse_tracking` for clients that need to choose input behavior.
-- Added `PaneInfo.alternate_screen` so API clients can distinguish live alternate-screen panes from primary-screen prompts.
 
 ### Changed
 - Agent commands now accept only a unique live agent name or the pane ID currently hosting that agent. Names are cleared when the occupant exits, is released, or is replaced. The old top-level `wait` commands were replaced by `agent wait` and `pane wait-output`, and `agent send` was replaced by `agent send-keys`.

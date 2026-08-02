@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::agents::AgentInfo;
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
+use super::credentials::CredentialInfo;
 use super::events::EventEnvelope;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
@@ -35,7 +36,13 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ErrorBody {
+    /// Stable machine-readable reason. Clients branch on this, never on
+    /// `message`. Credential-registry refusals use the codes published in
+    /// `CredentialRefusalCode`; any other code — including
+    /// `internal_error` and `server_unavailable` — is trouble to retry, not
+    /// a verdict about the caller's credential.
     pub code: String,
+    /// Human-readable detail. Not contracted; never parse it.
     pub message: String,
 }
 
@@ -297,6 +304,20 @@ pub enum ResponseResult {
     },
     PluginPaneClosed {
         pane_id: String,
+    },
+    CredentialMinted {
+        credential: CredentialInfo,
+        /// The minted credential's token, returned exactly once — the
+        /// registry stores only its fingerprint, so it cannot be re-read.
+        token: String,
+    },
+    CredentialList {
+        credentials: Vec<CredentialInfo>,
+    },
+    /// The credentials this request ended: one for `credential.revoke`,
+    /// every limited credential for `credential.revoke_all`.
+    CredentialRevoked {
+        revoked: Vec<String>,
     },
     ConfigReload {
         status: crate::config::ConfigReloadStatus,
