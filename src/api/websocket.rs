@@ -405,7 +405,7 @@ pub fn start_websocket_server_with_capabilities(
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                    wait_for_connection(&listener, CONNECTION_POLL_INTERVAL);
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) => {
@@ -425,6 +425,43 @@ pub fn start_websocket_server_with_capabilities(
     };
     info!(addr = %handle.local_addr(), "websocket api server listening");
     Ok(Some(handle))
+}
+
+/// Wait until the listener has a connection ready to accept, or until
+/// `timeout` elapses — whichever comes first.
+///
+/// The accept loop needs both halves: it must notice a client immediately,
+/// and it must observe the shutdown flag promptly enough that dropping the
+/// handle (a live handoff) releases the port. Sleeping between non-blocking
+/// accepts gives up the first half, and macOS makes that a real outage: it
+/// suspends a background daemon's timers once the machine idles with the lid
+/// shut, so the loop stops accepting for minutes at a time. The port keeps
+/// completing handshakes in the kernel throughout, so clients connect to a
+/// socket that never answers the upgrade and can only report an endless
+/// reconnect. Waiting on the socket itself is an I/O wake, which throttling
+/// does not defer — the same reason the Unix socket listener, which blocks in
+/// `accept`, never had the problem. The timeout now bounds only how long
+/// shutdown takes, not how late a client is noticed.
+#[cfg(unix)]
+fn wait_for_connection(listener: &TcpListener, timeout: Duration) {
+    use std::os::fd::AsRawFd;
+
+    let mut poll_fd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    // Any outcome — ready, timed out, or interrupted — means the same thing
+    // here: go round the loop, re-check the shutdown flag, retry the accept.
+    // A spurious wake costs one non-blocking accept, so errors need no
+    // handling of their own.
+    unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+}
+
+#[cfg(not(unix))]
+fn wait_for_connection(_listener: &TcpListener, timeout: Duration) {
+    std::thread::sleep(timeout);
 }
 
 fn bind_with_addr_in_use_retry(addr: SocketAddr) -> io::Result<TcpListener> {
@@ -1142,6 +1179,50 @@ mod tests {
             name: None,
             reach: None,
         }
+    }
+
+    /// The accept loop must wake on the socket, not on the clock. A sleeping
+    /// loop passes every functional test — it accepts everything, just late —
+    /// so the only honest assertion is the timing one: with a client already
+    /// waiting, the wait returns far sooner than its own timeout. Sleeping
+    /// for the timeout (what this replaced) fails here by two orders of
+    /// magnitude, which is the outage a throttled daemon actually suffers.
+    #[test]
+    fn wait_for_connection_returns_as_soon_as_a_client_is_waiting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+
+        let started = Instant::now();
+        wait_for_connection(&listener, Duration::from_secs(5));
+        let waited = started.elapsed();
+
+        assert!(
+            waited < Duration::from_secs(1),
+            "a pending connection should wake the wait at once, waited {waited:?}"
+        );
+    }
+
+    /// The other half of the contract: with nothing to accept, the wait still
+    /// gives up on schedule so the loop can observe the shutdown flag and
+    /// release the port for a live handoff.
+    #[test]
+    fn wait_for_connection_gives_up_at_the_timeout_when_no_client_arrives() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let started = Instant::now();
+        wait_for_connection(&listener, Duration::from_millis(150));
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= Duration::from_millis(100),
+            "the wait should hold for its timeout, returned after {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "the wait should not outlast its timeout, waited {waited:?}"
+        );
     }
 
     #[test]
