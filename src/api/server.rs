@@ -41,12 +41,23 @@ pub(super) trait ApiTransport {
     /// Write one JSON API message to the client.
     fn write_message(&mut self, message: &str) -> std::io::Result<()>;
 
-    /// Non-blocking probe: has the client torn down the request stream?
+    /// Non-blocking pump, called between stream ticks: service whatever the
+    /// client sent while a stream was running and report whether the peer is
+    /// still there.
     ///
-    /// Any readable payload also counts as torn down — a client that keeps
-    /// writing after starting a stream forfeits the connection, matching the
-    /// Unix socket's one-request-per-stream contract.
-    fn probe_closed(&mut self) -> std::io::Result<bool>;
+    /// What "whatever the client sent" means is the transport's call. The
+    /// Unix socket cannot multiplex — its stream *is* the connection — so any
+    /// readable payload counts as the client forfeiting it. A WebSocket is a
+    /// message channel, so it answers interleaved requests in place and keeps
+    /// the stream alive.
+    fn pump_inbound(&mut self) -> std::io::Result<PeerState>;
+}
+
+/// Whether a connection's peer is still around after a [`ApiTransport::pump_inbound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PeerState {
+    Alive,
+    Gone,
 }
 
 impl ApiTransport for LocalStream {
@@ -54,8 +65,12 @@ impl ApiTransport for LocalStream {
         write_text_line(self, message)
     }
 
-    fn probe_closed(&mut self) -> std::io::Result<bool> {
-        local_stream_peer_closed(self)
+    fn pump_inbound(&mut self) -> std::io::Result<PeerState> {
+        if local_stream_peer_closed(self)? {
+            Ok(PeerState::Gone)
+        } else {
+            Ok(PeerState::Alive)
+        }
     }
 }
 
@@ -116,6 +131,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         send_affirm: true,
+        stream_multiplex: true,
     })
 }
 
@@ -318,28 +334,13 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
         Method::PaneGraphicsStream(_) => {
             // Served at the connection layer for the local socket; other
             // transports cannot hand their raw stream over for frame data.
-            let response = serde_json::to_string(&ErrorResponse {
-                id: request_id.clone(),
-                error: ErrorBody {
-                    code: "unsupported_transport".into(),
-                    message: "pane.graphics.stream requires a dedicated local socket connection"
-                        .into(),
-                },
-            })
-            .map_err(std::io::Error::other)?;
-            let result = write_message_allow_disconnect(transport, &response);
-            match &result {
-                Ok(()) => crate::logging::api_request_completed(
-                    &request_id,
-                    method,
-                    api_response_outcome(&response),
-                    changes_ui,
-                ),
-                Err(err) => {
-                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
-                }
-            }
-            result
+            write_and_log_response(
+                transport,
+                &graphics_stream_unsupported_response(&request_id),
+                &request_id,
+                method,
+                changes_ui,
+            )
         }
         Method::EventsSubscribe(params) => {
             let result = stream_subscriptions(
@@ -400,36 +401,146 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
             let response = wait_for_output(request_id.clone(), params, transport, api_tx, running)?;
             finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
-        method_body => {
-            let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
-            let response = handle_request(
-                Request {
-                    id: request_id.clone(),
-                    method: method_body,
-                },
-                api_tx,
-                capabilities,
-                server_stop,
-                Some(response_write_rx),
-                server_name,
-                server_reach,
-            );
-            let result = write_message_allow_disconnect(transport, &response);
-            let _ = response_write_tx.send(());
-            match &result {
-                Ok(()) => crate::logging::api_request_completed(
-                    &request_id,
-                    method,
-                    api_response_outcome(&response),
-                    changes_ui,
-                ),
-                Err(err) => {
-                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
-                }
-            }
-            result
-        }
+        method_body => serve_simple_request(
+            Request {
+                id: request_id,
+                method: method_body,
+            },
+            transport,
+            api_tx,
+            capabilities,
+            server_stop,
+            server_name,
+            server_reach,
+        ),
     }
+}
+
+/// Write one response and record how it went. Every non-streaming answer ends
+/// here, so a request is never logged as completed without being written.
+fn write_and_log_response<T: ApiTransport>(
+    transport: &mut T,
+    response: &str,
+    request_id: &str,
+    method: &'static str,
+    changes_ui: bool,
+) -> std::io::Result<()> {
+    let result = write_message_allow_disconnect(transport, response);
+    match &result {
+        Ok(()) => crate::logging::api_request_completed(
+            request_id,
+            method,
+            api_response_outcome(response),
+            changes_ui,
+        ),
+        Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+    }
+    result
+}
+
+fn graphics_stream_unsupported_response(request_id: &str) -> String {
+    error_response_json(
+        request_id.to_string(),
+        "unsupported_transport",
+        "pane.graphics.stream requires a dedicated local socket connection".into(),
+    )
+}
+
+/// Dispatch one non-streaming request and write its response.
+fn serve_simple_request<T: ApiTransport>(
+    request: Request,
+    transport: &mut T,
+    api_tx: &ApiRequestSender,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+    server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
+) -> std::io::Result<()> {
+    let request_id = request.id.clone();
+    let method = api_method_name(&request.method);
+    let changes_ui = request_changes_ui(&request);
+    let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
+    let response = handle_request(
+        request,
+        api_tx,
+        capabilities,
+        server_stop,
+        Some(response_write_rx),
+        server_name,
+        server_reach,
+    );
+    let result = write_and_log_response(transport, &response, &request_id, method, changes_ui);
+    let _ = response_write_tx.send(());
+    result
+}
+
+/// Serve a request that arrived while this connection was already streaming.
+///
+/// Only transports that can multiplex call this. The connection thread is
+/// committed to the stream it is already running, so a request that would
+/// start a second stream is refused out loud rather than queued or dropped —
+/// silence is what made a swallowed request indistinguishable from a healthy
+/// idle connection.
+pub(super) fn serve_interleaved_request<T: ApiTransport>(
+    transport: &mut T,
+    text: &str,
+    api_tx: &ApiRequestSender,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+    server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
+) -> std::io::Result<()> {
+    let Some(request) = parse_api_request(transport, text)? else {
+        return Ok(());
+    };
+
+    let request_id = request.id.clone();
+    let method = api_method_name(&request.method);
+    let changes_ui = request_changes_ui(&request);
+    crate::logging::api_request_started(&request_id, method, changes_ui);
+
+    // A transport that multiplexes is by definition not a dedicated local
+    // socket, so this answer matches what the same request gets between
+    // requests rather than inventing a timing-dependent second one.
+    if matches!(request.method, Method::PaneGraphicsStream(_)) {
+        let response = graphics_stream_unsupported_response(&request_id);
+        return write_and_log_response(transport, &response, &request_id, method, changes_ui);
+    }
+
+    if method_starts_a_stream(&request.method) {
+        let response = error_response_json(
+            request_id.clone(),
+            "stream_busy",
+            format!(
+                "{method} needs its own connection; this connection is already serving a stream"
+            ),
+        );
+        return write_and_log_response(transport, &response, &request_id, method, changes_ui);
+    }
+
+    serve_simple_request(
+        request,
+        transport,
+        api_tx,
+        capabilities,
+        server_stop,
+        server_name,
+        server_reach,
+    )
+}
+
+/// Methods that take over the connection until the client goes away, and so
+/// cannot be served alongside a stream that is already running on it.
+fn method_starts_a_stream(method: &Method) -> bool {
+    matches!(
+        method,
+        Method::EventsSubscribe(_)
+            | Method::EventsWait(_)
+            | Method::AgentPrompt(_)
+            | Method::AgentWait(_)
+            | Method::PaneWaitForOutput(_)
+            | Method::PaneGraphicsStream(_)
+    )
 }
 
 fn finish_wait_response<T: ApiTransport>(
@@ -937,6 +1048,12 @@ fn write_json_message_allow_disconnect<T: ApiTransport, V: serde::Serialize>(
     write_message_allow_disconnect(transport, &encoded)
 }
 
+/// One tick of a streaming loop's connection housekeeping.
+///
+/// Not a pure predicate: this also services whatever the client sent while
+/// the stream was running, which on a multiplexing transport means answering
+/// interleaved requests. The name is kept for its call sites, which read as
+/// the stop check they gate.
 pub(super) fn should_stop_connection<T: ApiTransport>(
     transport: &mut T,
     running: &Arc<AtomicBool>,
@@ -945,7 +1062,7 @@ pub(super) fn should_stop_connection<T: ApiTransport>(
         return Ok(true);
     }
 
-    transport.probe_closed()
+    Ok(transport.pump_inbound()? == PeerState::Gone)
 }
 
 pub(super) fn dispatch_to_app_with_timeout(
@@ -1098,6 +1215,34 @@ mod tests {
         let client = crate::ipc::connect_local_stream(&path).unwrap();
         let server = listener.accept().unwrap();
         (client, server, path)
+    }
+
+    /// The websocket transport learned to serve requests that arrive while a
+    /// stream runs. The Unix socket must not: its stream *is* the connection,
+    /// there is no framing to multiplex over, so a client that keeps writing
+    /// after starting a stream still forfeits it.
+    #[test]
+    fn unix_stream_still_forfeits_the_connection_on_payload_during_a_stream() {
+        let (mut client, mut server, path) = local_stream_pair("pump-forfeit");
+
+        assert_eq!(server.pump_inbound().unwrap(), PeerState::Alive);
+
+        client
+            .write_all(b"{\"id\":\"late\",\"method\":\"ping\"}\n")
+            .unwrap();
+        client.flush().unwrap();
+
+        let mut forfeited = false;
+        for _ in 0..50 {
+            if server.pump_inbound().unwrap() == PeerState::Gone {
+                forfeited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(forfeited, "payload mid-stream must end the unix connection");
+
+        let _ = std::fs::remove_file(path);
     }
 
     fn pane_info(
@@ -1299,6 +1444,7 @@ mod tests {
                 live_handoff: true,
                 detached_server_daemon: true,
                 send_affirm: true,
+                stream_multiplex: true,
             }),
             None,
             None,

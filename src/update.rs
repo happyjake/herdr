@@ -2858,6 +2858,7 @@ mod tests {
                     live_handoff: true,
                     detached_server_daemon: true,
                     send_affirm: true,
+                    stream_multiplex: true,
                 }),
             },
         };

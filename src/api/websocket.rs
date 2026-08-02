@@ -14,8 +14,10 @@
 //! - a connection may carry sequential requests; the Unix socket serves one
 //!   request per connection. Each request still runs through the shared
 //!   dispatch path, so payloads are identical modulo framing.
-//! - `events.subscribe` dedicates the connection to the event stream until
-//!   the client disconnects, exactly like the Unix socket.
+//! - `events.subscribe` streams until the client disconnects, but unlike the
+//!   Unix socket it does not monopolize the connection: requests sent while
+//!   the stream runs are served in place and the stream keeps going. Only a
+//!   second *streaming* request is refused, with `stream_busy`.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -31,12 +33,12 @@ use tungstenite::handshake::HandshakeError;
 use tungstenite::http::StatusCode;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, WebSocketConfig};
-use tungstenite::{Message, WebSocket};
+use tungstenite::{Message, Utf8Bytes, WebSocket};
 
 use crate::api::schema::ServerCapabilities;
 use crate::api::server::{
-    handle_parsed_request, parse_api_request, ApiTransport, CONNECTION_POLL_INTERVAL,
-    INITIAL_REQUEST_TIMEOUT, MAX_INITIAL_REQUEST_BYTES,
+    handle_parsed_request, parse_api_request, serve_interleaved_request, ApiTransport, PeerState,
+    CONNECTION_POLL_INTERVAL, INITIAL_REQUEST_TIMEOUT, MAX_INITIAL_REQUEST_BYTES,
 };
 use crate::api::{ApiRequestSender, EventHub};
 use crate::config::WebSocketApiConfig;
@@ -54,6 +56,9 @@ const WS_IDLE_PING_AFTER: Duration = Duration::from_secs(30);
 /// Close a proven WebSocket client that stays fully silent this long.
 const WS_IDLE_CLOSE_AFTER: Duration = Duration::from_secs(90);
 const WS_IDLE_REAP_ERROR: &str = "timed out waiting for websocket pong after idle ping";
+/// Sent for a binary frame, whether it arrives between requests or during a
+/// stream: the API is one JSON message per text frame.
+const BINARY_FRAME_REFUSAL: &str = r#"{"id":"","error":{"code":"invalid_request","message":"invalid request: binary frames are not supported; send one JSON message per text frame"}}"#;
 /// How long a bind retries while the previous owner releases the port. A
 /// live handoff frees the TCP port only when the old server drops its
 /// listener, so the replacement server may briefly race it.
@@ -338,6 +343,7 @@ pub fn start_websocket_server(
             live_handoff: crate::platform::capabilities().live_handoff,
             detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
             send_affirm: true,
+            stream_multiplex: true,
         }),
         server_name,
         server_reach,
@@ -524,7 +530,16 @@ fn handle_ws_connection(
     // Handshake done; use bounded blocking reads so sparse frames wake the
     // connection thread immediately while shutdown and liveness checks are
     // still observed within one poll interval.
-    let mut transport = WsTransport::new(websocket, peer);
+    let mut transport = WsTransport::new(
+        websocket,
+        peer,
+        Arc::new(WsDispatch {
+            api_tx: api_tx.clone(),
+            capabilities: capabilities.clone(),
+            server_name: server_name.clone(),
+            server_reach: server_reach.clone(),
+        }),
+    );
     configure_established_ws_stream(transport.websocket.get_mut())?;
 
     let result = ws_request_loop(
@@ -780,9 +795,7 @@ fn ws_request_loop(
             Ok(Message::Binary(_)) => {
                 transport.mark_inbound();
                 first_request_deadline = None;
-                transport.write_message(
-                    r#"{"id":"","error":{"code":"invalid_request","message":"invalid request: binary frames are not supported; send one JSON message per text frame"}}"#,
-                )?;
+                transport.write_message(BINARY_FRAME_REFUSAL)?;
             }
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
                 transport.mark_inbound();
@@ -942,18 +955,34 @@ impl WsLiveness {
     }
 }
 
+/// What a websocket connection needs to answer a request on its own, without
+/// unwinding back to [`ws_request_loop`] first. Held behind an `Arc` so the
+/// transport can hand it to a dispatch call that borrows the transport itself.
+struct WsDispatch {
+    api_tx: ApiRequestSender,
+    capabilities: Option<ServerCapabilities>,
+    server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
+}
+
 struct WsTransport {
     websocket: WebSocket<WsTcpStream>,
     peer: Option<SocketAddr>,
     liveness: WsLiveness,
+    dispatch: Arc<WsDispatch>,
 }
 
 impl WsTransport {
-    fn new(websocket: WebSocket<WsTcpStream>, peer: Option<SocketAddr>) -> Self {
+    fn new(
+        websocket: WebSocket<WsTcpStream>,
+        peer: Option<SocketAddr>,
+        dispatch: Arc<WsDispatch>,
+    ) -> Self {
         Self {
             websocket,
             peer,
             liveness: WsLiveness::new(ws_liveness_timing()),
+            dispatch,
         }
     }
 
@@ -1123,34 +1152,76 @@ impl ApiTransport for WsTransport {
         }
     }
 
-    fn probe_closed(&mut self) -> io::Result<bool> {
-        self.websocket.get_mut().set_nonblocking(true)?;
-        let status = self.probe_closed_nonblocking();
-        let restore = configure_established_ws_stream(self.websocket.get_mut());
-        restore_io_result(status, restore)
+    fn pump_inbound(&mut self) -> io::Result<PeerState> {
+        loop {
+            // Read without blocking, but answer whatever arrived with the
+            // established blocking-with-timeout config, so a response written
+            // mid-stream behaves exactly like one written between requests.
+            self.websocket.get_mut().set_nonblocking(true)?;
+            let message = self.read_nonblocking();
+            let restore = configure_established_ws_stream(self.websocket.get_mut());
+            let message = restore_io_result(message, restore)?;
+
+            match message {
+                InboundFrame::Idle => return Ok(PeerState::Alive),
+                InboundFrame::Closed => return Ok(PeerState::Gone),
+                // A websocket is a message channel, so a client that
+                // subscribed and then sent a request gets that request served
+                // here and keeps its stream. Dropping the frame instead left
+                // the client waiting on a response that would never come.
+                InboundFrame::Text(text) => {
+                    let dispatch = Arc::clone(&self.dispatch);
+                    serve_interleaved_request(
+                        self,
+                        text.as_str(),
+                        &dispatch.api_tx,
+                        dispatch.capabilities.clone(),
+                        None,
+                        &dispatch.server_name,
+                        &dispatch.server_reach,
+                    )?;
+                }
+                InboundFrame::Binary => {
+                    self.write_message(BINARY_FRAME_REFUSAL)?;
+                }
+            }
+        }
     }
 }
 
+enum InboundFrame {
+    Idle,
+    Closed,
+    Text(Utf8Bytes),
+    Binary,
+}
+
 impl WsTransport {
-    fn probe_closed_nonblocking(&mut self) -> io::Result<bool> {
+    /// One non-blocking read, with control frames handled in place.
+    fn read_nonblocking(&mut self) -> io::Result<InboundFrame> {
         loop {
             match self.websocket.read() {
-                // Control frames keep the connection alive; anything else
-                // from a client that started a stream forfeits the
-                // connection, matching the Unix socket probe.
                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
                     self.mark_inbound();
                     self.flush_ignore_would_block()?;
                 }
-                Ok(Message::Close(_)) => return Ok(true),
-                Ok(_) => return Ok(true),
+                Ok(Message::Close(_)) => return Ok(InboundFrame::Closed),
+                Ok(Message::Text(text)) => {
+                    self.mark_inbound();
+                    return Ok(InboundFrame::Text(text));
+                }
+                Ok(Message::Binary(_)) => {
+                    self.mark_inbound();
+                    return Ok(InboundFrame::Binary);
+                }
+                Ok(Message::Frame(_)) => {}
                 Err(err) => {
                     return match classify_ws_error(err) {
                         WsErrorClass::WouldBlock => {
                             self.poll_liveness()?;
-                            Ok(false)
+                            Ok(InboundFrame::Idle)
                         }
-                        WsErrorClass::Closed => Ok(true),
+                        WsErrorClass::Closed => Ok(InboundFrame::Closed),
                         WsErrorClass::Failed(err) => Err(err),
                     };
                 }
@@ -1171,6 +1242,20 @@ mod tests {
     const TEST_TOKEN: &str = "test-token-1234";
 
     const TEST_SERVER_NAME: &str = "ws-test-server";
+
+    /// Dispatch context for transport-level tests that never reach the app.
+    /// The returned receiver is the app end; hold it for the test's lifetime.
+    fn test_dispatch() -> (Arc<WsDispatch>, mpsc::UnboundedReceiver<ApiRequestMessage>) {
+        let (api_tx, api_rx) = mpsc::unbounded_channel();
+        let config = spec_config(Some("127.0.0.1:0"), Some(TEST_TOKEN));
+        let dispatch = Arc::new(WsDispatch {
+            api_tx,
+            capabilities: None,
+            server_name: crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string()),
+            server_reach: crate::api::SharedServerReach::from_config(&config),
+        });
+        (dispatch, api_rx)
+    }
 
     fn spec_config(bind: Option<&str>, token: Option<&str>) -> WebSocketApiConfig {
         WebSocketApiConfig {
@@ -1388,15 +1473,21 @@ mod tests {
         drop(client);
     }
 
+    /// The pump reads without blocking but must hand the socket back in its
+    /// established blocking-with-timeout mode, so the response it writes and
+    /// the stream's next tick behave normally.
     #[test]
-    fn probe_closed_restores_blocking_mode_after_non_control_frame() {
+    fn pump_inbound_answers_a_non_control_frame_and_restores_blocking_mode() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+        let (answered_tx, answered_rx) = std::sync::mpsc::channel();
         let client = std::thread::spawn(move || {
             let (mut websocket, _) = tungstenite::connect(format!("ws://{addr}")).unwrap();
             websocket.send(Message::text("unexpected")).unwrap();
-            sent_tx.send(()).unwrap();
+            let answer = websocket.read().unwrap();
+            answered_tx
+                .send(answer.into_text().unwrap().to_string())
+                .unwrap();
             std::thread::sleep(Duration::from_millis(300));
         });
 
@@ -1404,18 +1495,22 @@ mod tests {
         configure_accepted_ws_stream(&stream).unwrap();
         let mut websocket = tungstenite::accept(WsTcpStream::new(stream)).unwrap();
         configure_established_ws_stream(websocket.get_mut()).unwrap();
-        let mut transport = WsTransport::new(websocket, Some(peer));
+        let (dispatch, _api_rx) = test_dispatch();
+        let mut transport = WsTransport::new(websocket, Some(peer), dispatch);
 
-        sent_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let mut saw_non_control = false;
-        for _ in 0..10 {
-            if transport.probe_closed().unwrap() {
-                saw_non_control = true;
+        let mut answer = None;
+        for _ in 0..50 {
+            assert_eq!(transport.pump_inbound().unwrap(), PeerState::Alive);
+            if let Ok(text) = answered_rx.try_recv() {
+                answer = Some(text);
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(saw_non_control);
+        let answer: serde_json::Value =
+            serde_json::from_str(&answer.expect("the frame must be answered, not dropped"))
+                .unwrap();
+        assert_eq!(answer["error"]["code"], "invalid_request");
 
         let started = Instant::now();
         let mut byte = [0];
@@ -1878,6 +1973,187 @@ mod tests {
         let event = read_json(&mut websocket);
         assert_eq!(event["event"], "workspace_focused");
         assert_eq!(event["data"]["workspace_id"], "w1");
+    }
+
+    /// The phone keeps one websocket open: it subscribes once and then issues
+    /// ordinary requests on that same connection. Before this was fixed, the
+    /// streaming loop's close probe consumed any inbound request frame and
+    /// read it as "peer went away" — so the request vanished with no response
+    /// and no error, and the subscription died silently while the socket
+    /// stayed open. The client's next event never came.
+    #[test]
+    fn subscription_connection_answers_interleaved_requests_and_keeps_streaming() {
+        let server = start_test_server();
+        let mut websocket = connect_authorized(&server);
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"sub_live","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"}],"live_only":true}}"#,
+            ))
+            .unwrap();
+        let ack = read_json(&mut websocket);
+        assert_eq!(ack["result"]["type"], "subscription_started");
+
+        // A request sent while the subscription streams must be answered.
+        websocket
+            .send(Message::text(
+                r#"{"id":"ping_during_stream","method":"ping","params":{}}"#,
+            ))
+            .unwrap();
+        let response = read_json(&mut websocket);
+        assert_eq!(response["id"], "ping_during_stream");
+        assert_eq!(response["result"]["type"], "pong");
+
+        // And the subscription must still be alive afterwards.
+        server.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: "w_after_interleaved_request".to_string(),
+            },
+        });
+
+        let event = read_json(&mut websocket);
+        assert_eq!(event["event"], "workspace_focused");
+        assert_eq!(event["data"]["workspace_id"], "w_after_interleaved_request");
+    }
+
+    /// One connection still serves one stream. A second streaming request
+    /// arriving mid-stream is refused out loud instead of being swallowed,
+    /// and refusing it must not take down the stream already running.
+    #[test]
+    fn interleaved_stream_request_is_refused_without_killing_the_live_subscription() {
+        let server = start_test_server();
+        let mut websocket = connect_authorized(&server);
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"sub_first","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"}],"live_only":true}}"#,
+            ))
+            .unwrap();
+        let ack = read_json(&mut websocket);
+        assert_eq!(ack["result"]["type"], "subscription_started");
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"sub_second","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"}]}}"#,
+            ))
+            .unwrap();
+        let refusal = read_json(&mut websocket);
+        assert_eq!(refusal["id"], "sub_second");
+        assert_eq!(refusal["error"]["code"], "stream_busy");
+
+        server.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: "w_after_refusal".to_string(),
+            },
+        });
+
+        let event = read_json(&mut websocket);
+        assert_eq!(event["event"], "workspace_focused");
+        assert_eq!(event["data"]["workspace_id"], "w_after_refusal");
+    }
+
+    /// The issue's run 2: a malformed frame sent on a subscription connection
+    /// was swallowed with no error at all, while the same malformed frame sent
+    /// before subscribing did get `invalid_request`. Malformed input must be
+    /// refused identically either side of a stream starting.
+    #[test]
+    fn malformed_frame_during_a_stream_gets_the_same_invalid_request_refusal() {
+        let server = start_test_server();
+        let mut websocket = connect_authorized(&server);
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"sub_malformed","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"}],"live_only":true}}"#,
+            ))
+            .unwrap();
+        let ack = read_json(&mut websocket);
+        assert_eq!(ack["result"]["type"], "subscription_started");
+
+        websocket.send(Message::text("this is not json")).unwrap();
+        let refusal = read_json(&mut websocket);
+        assert_eq!(refusal["error"]["code"], "invalid_request");
+
+        // The issue's run 2 called this ping "malformed" for its unexpected
+        // fields, but `ping` ignores unknown params — so the honest contract
+        // is that it is answered normally, which is what it never was.
+        websocket
+            .send(Message::text(
+                r#"{"id":"ping_extra_fields","method":"ping","params":{"unexpected":true}}"#,
+            ))
+            .unwrap();
+        let response = read_json(&mut websocket);
+        assert_eq!(response["id"], "ping_extra_fields");
+        assert_eq!(response["result"]["type"], "pong");
+
+        server.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: "w_after_malformed".to_string(),
+            },
+        });
+
+        let event = read_json(&mut websocket);
+        assert_eq!(event["data"]["workspace_id"], "w_after_malformed");
+    }
+
+    /// Binary frames are rejected the same way mid-stream as they are between
+    /// requests, and the rejection is not a reason to drop the subscription.
+    #[test]
+    fn binary_frame_during_a_stream_is_refused_without_killing_the_subscription() {
+        let server = start_test_server();
+        let mut websocket = connect_authorized(&server);
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"sub_binary","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"}],"live_only":true}}"#,
+            ))
+            .unwrap();
+        let ack = read_json(&mut websocket);
+        assert_eq!(ack["result"]["type"], "subscription_started");
+
+        websocket
+            .send(Message::Binary(vec![1, 2, 3].into()))
+            .unwrap();
+        let refusal = read_json(&mut websocket);
+        assert_eq!(refusal["error"]["code"], "invalid_request");
+
+        server.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: "w_after_binary".to_string(),
+            },
+        });
+
+        let event = read_json(&mut websocket);
+        assert_eq!(event["data"]["workspace_id"], "w_after_binary");
+    }
+
+    /// A client that closes mid-stream must still end the stream promptly.
+    #[test]
+    fn close_frame_during_a_stream_still_ends_the_connection() {
+        let server = start_test_server();
+        let mut websocket = connect_authorized(&server);
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"sub_close","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"}],"live_only":true}}"#,
+            ))
+            .unwrap();
+        let ack = read_json(&mut websocket);
+        assert_eq!(ack["result"]["type"], "subscription_started");
+
+        websocket.close(None).unwrap();
+        let started = Instant::now();
+        loop {
+            match websocket.read() {
+                Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => break,
+                Ok(_) => continue,
+                Err(err) => panic!("unexpected websocket error: {err:?}"),
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

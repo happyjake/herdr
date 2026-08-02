@@ -9923,6 +9923,11 @@
               "default": false,
               "description": "Whether `pane.send_input` dedupes by `send_id`, so a client may\nsafely re-issue an unacked send after a reconnect. Additive: absent\n(false) in pongs of servers that predate it.",
               "type": "boolean"
+            },
+            "stream_multiplex": {
+              "default": false,
+              "description": "Whether this server serves requests that arrive on a connection while\none of that connection's streams is running, so a client may subscribe\nonce and keep issuing requests on the same connection.\n\nIt describes the server, not one connection: transports that frame\nmessages (WebSocket) honor it, while the Unix socket cannot multiplex\nand still ends the connection on payload during a stream. Reported\nidentically on every transport, because the pong payload is contracted\nto be byte-identical across them. Additive: absent (false) in pongs of\nservers that predate it.",
+              "type": "boolean"
             }
           },
           "required": [

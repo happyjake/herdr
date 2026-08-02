@@ -705,7 +705,10 @@ Framing differences from the Unix socket:
 
 - Send one JSON message per text frame instead of one JSON line.
 - A connection may carry sequential requests: after a response you can send the next request on the same connection. (The Unix socket serves one request per connection.)
-- `events.subscribe` dedicates the connection to the event stream until the client disconnects, exactly like the Unix socket.
+- `events.subscribe` streams until the client disconnects, but it does not reserve the connection: requests sent while the stream is running are served in place and the stream keeps delivering events. (On the Unix socket, writing anything after starting a stream ends the connection.)
+- One stream at a time per connection. A second streaming request — `events.subscribe`, `events.wait`, `agent.prompt`, `agent.wait`, or `pane.wait_for_output` — sent while a stream is running is refused with `stream_busy`; the running stream is unaffected. Open a second connection for a second stream. (`pane.graphics.stream` still returns `unsupported_transport` over WebSocket, stream or no stream.)
+
+Clients can detect this without probing: the `ping` response advertises `capabilities.stream_multiplex`. It describes the server, not one connection — the pong payload is identical on every transport — so read it together with the transport you are on: WebSocket honors it, the Unix socket cannot multiplex.
 
 Authentication happens at the WebSocket handshake with the configured bearer token. Send an `Authorization: Bearer <token>` header, or a `token` query parameter from clients that cannot set headers:
 
