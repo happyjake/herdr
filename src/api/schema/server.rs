@@ -47,4 +47,23 @@ pub struct ServerCapabilities {
     /// (false) in pongs of servers that predate it.
     #[serde(default)]
     pub send_affirm: bool,
+    /// Whether this server serves requests that arrive on a connection while
+    /// one of that connection's streams is running, so a client may subscribe
+    /// once and keep issuing requests on the same connection.
+    ///
+    /// It describes the server, not one connection: transports that frame
+    /// messages (WebSocket) honor it, while the Unix socket cannot multiplex
+    /// and still ends the connection on payload during a stream. Reported
+    /// identically on every transport, because the pong payload is contracted
+    /// to be byte-identical across them. Additive: absent (false) in pongs of
+    /// servers that predate it.
+    #[serde(default)]
+    pub stream_multiplex: bool,
+    /// Whether this server keeps a credential registry (ADR-0026): the
+    /// pairing's managing credential plus any minted limited credentials,
+    /// with `credential.mint`, `credential.list`, `credential.revoke`, and
+    /// `credential.revoke_all`. Additive: absent (false) in pongs of servers
+    /// that predate it, which refuse the verbs as unparseable methods.
+    #[serde(default)]
+    pub credential_registry: bool,
 }

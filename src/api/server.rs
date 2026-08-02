@@ -42,12 +42,23 @@ pub(super) trait ApiTransport {
     /// Write one JSON API message to the client.
     fn write_message(&mut self, message: &str) -> std::io::Result<()>;
 
-    /// Non-blocking probe: has the client torn down the request stream?
+    /// Non-blocking pump, called between stream ticks: service whatever the
+    /// client sent while a stream was running and report whether the peer is
+    /// still there.
     ///
-    /// Any readable payload also counts as torn down — a client that keeps
-    /// writing after starting a stream forfeits the connection, matching the
-    /// Unix socket's one-request-per-stream contract.
-    fn probe_closed(&mut self) -> std::io::Result<bool>;
+    /// What "whatever the client sent" means is the transport's call. The
+    /// Unix socket cannot multiplex — its stream *is* the connection — so any
+    /// readable payload counts as the client forfeiting it. A WebSocket is a
+    /// message channel, so it answers interleaved requests in place and keeps
+    /// the stream alive.
+    fn pump_inbound(&mut self) -> std::io::Result<PeerState>;
+}
+
+/// Whether a connection's peer is still around after a [`ApiTransport::pump_inbound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PeerState {
+    Alive,
+    Gone,
 }
 
 impl ApiTransport for LocalStream {
@@ -55,8 +66,12 @@ impl ApiTransport for LocalStream {
         write_text_line(self, message)
     }
 
-    fn probe_closed(&mut self) -> std::io::Result<bool> {
-        local_stream_peer_closed(self)
+    fn pump_inbound(&mut self) -> std::io::Result<PeerState> {
+        if local_stream_peer_closed(self)? {
+            Ok(PeerState::Gone)
+        } else {
+            Ok(PeerState::Alive)
+        }
     }
 }
 
@@ -95,30 +110,18 @@ pub(crate) fn start_server_with_stop_control(
     start_server_inner(
         api_tx,
         event_hub,
-        default_capabilities(),
+        crate::api::credentials::process_registry(),
+        Some(crate::api::server_capabilities()),
         Some(server_stop),
         server_name,
         server_reach,
     )
 }
 
-/// The ping capabilities of this server, shared by every API transport so a
-/// pong reads the same over the unix socket and the websocket.
-pub(super) fn default_capabilities() -> Option<ServerCapabilities> {
-    Some(ServerCapabilities {
-        live_handoff: crate::platform::capabilities().live_handoff,
-        detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
-        endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
-        surface_interest: true,
-        health_check: true,
-        ssh_agent_registration: false,
-        send_affirm: true,
-    })
-}
-
 fn start_server_inner(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
+    credentials: crate::api::SharedCredentialRegistry,
     mut capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
     server_name: crate::api::SharedServerName,
@@ -170,6 +173,12 @@ fn start_server_inner(
                     let server_stop = server_stop.clone();
                     let server_name = server_name.clone();
                     let server_reach = server_reach.clone();
+                    // Owning the socket file is the credential here: the
+                    // local caller acts with managing authority unless it
+                    // names one of the registry's credentials explicitly.
+                    let credentials = crate::api::credentials::CredentialContext::local_socket(
+                        credentials.clone(),
+                    );
                     let connection_running = Arc::clone(&listener_running);
                     #[cfg(unix)]
                     let ssh_agents = ssh_agents.clone();
@@ -185,6 +194,7 @@ fn start_server_inner(
                             ssh_agents.as_ref(),
                             &server_name,
                             &server_reach,
+                            &credentials,
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -263,6 +273,11 @@ fn handle_connection(
         None,
         &crate::api::SharedServerName::new("test".to_string()),
         &crate::api::SharedServerReach::from_config(&crate::config::WebSocketApiConfig::default()),
+        &crate::api::credentials::CredentialContext::local_socket(
+            crate::api::credentials::SharedCredentialRegistry::open(
+                crate::api::credentials::test_registry_path("socket"),
+            ),
+        ),
     )
 }
 
@@ -277,6 +292,7 @@ fn handle_connection_with_stop(
     #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -311,6 +327,7 @@ fn handle_connection_with_stop(
             server_stop,
             server_name,
             server_reach,
+            credentials,
         ),
     }
 }
@@ -419,40 +436,31 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
     server_stop: Option<&Arc<AtomicBool>>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
+    // A credential revoked while this connection was open loses its access
+    // here, on its very next request, rather than at its next handshake.
+    if let Some(refusal) = credentials.revocation_refusal(&request_id) {
+        return write_and_log_response(transport, &refusal, &request_id, method, changes_ui);
+    }
+
     match request.method {
         Method::ServerSshAgentRegister(_) => {
             // Served at the connection layer for the local socket, where the
             // registration lasts as long as the connection; other transports
             // cannot hold that lease.
-            let response = serde_json::to_string(&ErrorResponse {
-                id: request_id.clone(),
-                error: ErrorBody {
-                    code: "unsupported_transport".into(),
-                    message:
-                        "server.ssh_agent.register requires a dedicated local socket connection"
-                            .into(),
-                },
-            })
-            .map_err(std::io::Error::other)?;
-            let result = write_message_allow_disconnect(transport, &response);
-            match &result {
-                Ok(()) => crate::logging::api_request_completed(
-                    &request_id,
-                    method,
-                    api_response_outcome(&response),
-                    changes_ui,
-                ),
-                Err(err) => {
-                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
-                }
-            }
-            result
+            write_and_log_response(
+                transport,
+                &ssh_agent_unsupported_response(&request_id),
+                &request_id,
+                method,
+                changes_ui,
+            )
         }
         Method::EventsSubscribe(params) => {
             let result = stream_subscriptions(
@@ -514,36 +522,154 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
                 wait_for_output(request_id.clone(), params, transport, api_tx, running)?;
             finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
-        method_body => {
-            let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
-            let response = handle_request(
-                Request {
-                    id: request_id.clone(),
-                    method: method_body,
-                },
-                api_tx,
-                capabilities,
-                server_stop,
-                Some(response_write_rx),
-                server_name,
-                server_reach,
-            );
-            let result = write_message_allow_disconnect(transport, &response);
-            let _ = response_write_tx.send(());
-            match &result {
-                Ok(()) => crate::logging::api_request_completed(
-                    &request_id,
-                    method,
-                    api_response_outcome(&response),
-                    changes_ui,
-                ),
-                Err(err) => {
-                    crate::logging::api_request_failed(&request_id, method, &err.to_string())
-                }
-            }
-            result
-        }
+        method_body => serve_simple_request(
+            Request {
+                id: request_id,
+                method: method_body,
+            },
+            transport,
+            api_tx,
+            capabilities,
+            server_stop,
+            server_name,
+            server_reach,
+            credentials,
+        ),
     }
+}
+
+/// Write one response and record how it went. Every non-streaming answer ends
+/// here, so a request is never logged as completed without being written.
+fn write_and_log_response<T: ApiTransport>(
+    transport: &mut T,
+    response: &str,
+    request_id: &str,
+    method: &'static str,
+    changes_ui: bool,
+) -> std::io::Result<()> {
+    let result = write_message_allow_disconnect(transport, response);
+    match &result {
+        Ok(()) => crate::logging::api_request_completed(
+            request_id,
+            method,
+            api_response_outcome(response),
+            changes_ui,
+        ),
+        Err(err) => crate::logging::api_request_failed(request_id, method, &err.to_string()),
+    }
+    result
+}
+
+fn ssh_agent_unsupported_response(request_id: &str) -> String {
+    error_response_json(
+        request_id.to_string(),
+        "unsupported_transport",
+        "server.ssh_agent.register requires a dedicated local socket connection".into(),
+    )
+}
+
+/// Dispatch one non-streaming request and write its response.
+fn serve_simple_request<T: ApiTransport>(
+    request: Request,
+    transport: &mut T,
+    api_tx: &ApiRequestSender,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+    server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
+) -> std::io::Result<()> {
+    let request_id = request.id.clone();
+    let method = api_method_name(&request.method);
+    let changes_ui = request_changes_ui(&request);
+    let (response_write_tx, response_write_rx) = std::sync::mpsc::channel();
+    let response = handle_request(
+        request,
+        api_tx,
+        capabilities,
+        server_stop,
+        Some(response_write_rx),
+        server_name,
+        server_reach,
+        credentials,
+    );
+    let result = write_and_log_response(transport, &response, &request_id, method, changes_ui);
+    let _ = response_write_tx.send(());
+    result
+}
+
+/// Serve a request that arrived while this connection was already streaming.
+///
+/// Only transports that can multiplex call this. The connection thread is
+/// committed to the stream it is already running, so a request that would
+/// start a second stream is refused out loud rather than queued or dropped —
+/// silence is what made a swallowed request indistinguishable from a healthy
+/// idle connection.
+pub(super) fn serve_interleaved_request<T: ApiTransport>(
+    transport: &mut T,
+    text: &str,
+    api_tx: &ApiRequestSender,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+    server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
+) -> std::io::Result<()> {
+    let Some(request) = parse_api_request(transport, text)? else {
+        return Ok(());
+    };
+
+    let request_id = request.id.clone();
+    let method = api_method_name(&request.method);
+    let changes_ui = request_changes_ui(&request);
+    crate::logging::api_request_started(&request_id, method, changes_ui);
+
+    if let Some(refusal) = credentials.revocation_refusal(&request_id) {
+        return write_and_log_response(transport, &refusal, &request_id, method, changes_ui);
+    }
+
+    // A transport that multiplexes is by definition not a dedicated local
+    // socket, so this answer matches what the same request gets between
+    // requests rather than inventing a timing-dependent second one.
+    if matches!(request.method, Method::ServerSshAgentRegister(_)) {
+        let response = ssh_agent_unsupported_response(&request_id);
+        return write_and_log_response(transport, &response, &request_id, method, changes_ui);
+    }
+
+    if method_starts_a_stream(&request.method) {
+        let response = error_response_json(
+            request_id.clone(),
+            "stream_busy",
+            format!(
+                "{method} needs its own connection; this connection is already serving a stream"
+            ),
+        );
+        return write_and_log_response(transport, &response, &request_id, method, changes_ui);
+    }
+
+    serve_simple_request(
+        request,
+        transport,
+        api_tx,
+        capabilities,
+        server_stop,
+        server_name,
+        server_reach,
+        credentials,
+    )
+}
+
+/// Methods that take over the connection until the client goes away, and so
+/// cannot be served alongside a stream that is already running on it.
+fn method_starts_a_stream(method: &Method) -> bool {
+    matches!(
+        method,
+        Method::EventsSubscribe(_)
+            | Method::EventsWait(_)
+            | Method::AgentPrompt(_)
+            | Method::AgentWait(_)
+            | Method::PaneWaitForOutput(_)
+    )
 }
 
 fn finish_wait_response<T: ApiTransport>(
@@ -583,6 +709,7 @@ fn handle_request(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> String {
     // Declarations and runtime facts are read per request, so config
     // reloads and the running process are reflected on every transport.
@@ -636,6 +763,18 @@ fn handle_request(
         Method::AttachmentCreate(params) => {
             crate::api::attachment::handle_create(request.id, &params)
         }
+        // The credential registry is runtime state beside the session, not
+        // app state, so it is served here on the connection thread — the one
+        // place both transports pass through, which is what makes the verbs
+        // identical over the Unix socket and the WebSocket.
+        Method::CredentialMint(params) => credentials.serve_mint(request.id, &params),
+        Method::CredentialList(params) => {
+            credentials.serve_list(request.id, params.acting_token.as_deref())
+        }
+        Method::CredentialRevoke(params) => credentials.serve_revoke(request.id, &params),
+        Method::CredentialRevokeAll(params) => {
+            credentials.serve_revoke_all(request.id, params.acting_token.as_deref())
+        }
         method => dispatch_to_app(
             Request {
                 id: request.id,
@@ -659,6 +798,10 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
         Method::AttachmentCreate(_) => "attachment.create",
+        Method::CredentialMint(_) => "credential.mint",
+        Method::CredentialList(_) => "credential.list",
+        Method::CredentialRevoke(_) => "credential.revoke",
+        Method::CredentialRevokeAll(_) => "credential.revoke_all",
         Method::NotificationShow(_) => "notification.show",
         Method::ProductAnnouncementDismiss(_) => "product_announcement.dismiss",
         Method::ReleaseNotesDismiss(_) => "release_notes.dismiss",
@@ -1082,6 +1225,12 @@ fn write_json_message_allow_disconnect<T: ApiTransport, V: serde::Serialize>(
     write_message_allow_disconnect(transport, &encoded)
 }
 
+/// One tick of a streaming loop's connection housekeeping.
+///
+/// Not a pure predicate: this also services whatever the client sent while
+/// the stream was running, which on a multiplexing transport means answering
+/// interleaved requests. The name is kept for its call sites, which read as
+/// the stop check they gate.
 pub(super) fn should_stop_connection<T: ApiTransport>(
     transport: &mut T,
     running: &Arc<AtomicBool>,
@@ -1090,7 +1239,7 @@ pub(super) fn should_stop_connection<T: ApiTransport>(
         return Ok(true);
     }
 
-    transport.probe_closed()
+    Ok(transport.pump_inbound()? == PeerState::Gone)
 }
 
 pub(super) fn dispatch_to_app_with_timeout(
@@ -1226,6 +1375,16 @@ mod tests {
         crate::api::SharedServerReach::from_config(&crate::config::WebSocketApiConfig::default())
     }
 
+    /// A local-socket caller against a registry of its own, so credential
+    /// state never leaks between tests or into the developer's session dir.
+    fn test_credentials() -> crate::api::credentials::CredentialContext {
+        crate::api::credentials::CredentialContext::local_socket(
+            crate::api::credentials::SharedCredentialRegistry::open(
+                crate::api::credentials::test_registry_path("socket"),
+            ),
+        )
+    }
+
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1278,6 +1437,7 @@ mod tests {
                 &crate::api::SharedServerReach::from_config(
                     &crate::config::WebSocketApiConfig::default(),
                 ),
+                &test_credentials(),
             )
             .unwrap();
         });
@@ -1302,6 +1462,34 @@ mod tests {
         drop(registry);
         fs::remove_file(api_path).unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The websocket transport learned to serve requests that arrive while a
+    /// stream runs. The Unix socket must not: its stream *is* the connection,
+    /// there is no framing to multiplex over, so a client that keeps writing
+    /// after starting a stream still forfeits it.
+    #[test]
+    fn unix_stream_still_forfeits_the_connection_on_payload_during_a_stream() {
+        let (mut client, mut server, path) = local_stream_pair("pump-forfeit");
+
+        assert_eq!(server.pump_inbound().unwrap(), PeerState::Alive);
+
+        client
+            .write_all(b"{\"id\":\"late\",\"method\":\"ping\"}\n")
+            .unwrap();
+        client.flush().unwrap();
+
+        let mut forfeited = false;
+        for _ in 0..50 {
+            if server.pump_inbound().unwrap() == PeerState::Gone {
+                forfeited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(forfeited, "payload mid-stream must end the unix connection");
+
+        let _ = std::fs::remove_file(path);
     }
 
     fn pane_info(
@@ -1597,11 +1785,14 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 send_affirm: true,
+                stream_multiplex: true,
+                credential_registry: true,
             }),
             None,
             None,
             &crate::api::SharedServerName::new("the-mini".to_string()),
             &undeclared_server_reach(),
+            &test_credentials(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1629,6 +1820,7 @@ mod tests {
                 None,
                 &server_name,
                 &server_reach,
+                &test_credentials(),
             )
         };
 
@@ -1660,6 +1852,7 @@ mod tests {
             None,
             &server_name,
             &undeclared_server_reach(),
+            &test_credentials(),
         );
 
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1678,6 +1871,7 @@ mod tests {
             None,
             &server_name,
             &undeclared_server_reach(),
+            &test_credentials(),
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
@@ -1709,6 +1903,7 @@ mod tests {
                 None,
                 &server_name,
                 &server_reach,
+                &test_credentials(),
             )
         };
         let error_code = |response: &str| {
@@ -1770,6 +1965,7 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
+                &test_credentials(),
             )
         });
 

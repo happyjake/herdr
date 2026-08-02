@@ -426,6 +426,8 @@ mod tests {
                 health_check: true,
                 ssh_agent_registration: false,
                 send_affirm: false,
+                stream_multiplex: false,
+                credential_registry: false,
             }),
         }
     }

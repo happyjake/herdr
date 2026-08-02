@@ -5,6 +5,7 @@
 ## [0.9.1] - 2026-09-16
 
 ### Added
+- The websocket API now keeps a credential registry per server: the pairing's managing credential plus limited credentials minted through `credential.mint`, listed with `credential.list`, and ended with `credential.revoke` / `credential.revoke_all`. Limited credentials drive the whole API but cannot manage the registry, and may revoke only themselves. Servers declare `credential_registry` in their `ping` capabilities; the protocol version is unchanged. Revocation is reported to the affected client as a terminal `credential_revoked` error on an established connection, so a browser can tell revocation from transient trouble.
 - Control agents, panes, workspaces, and worktrees on saved SSH machines with `herdr --machine <label-or-id>`. Commands use the saved machine's session without needing an open Herdr window. Update Herdr on both machines to use CLI forwarding; failed remote commands never fall back to Local. (#3918)
 - Connect to Windows SSH hosts from Linux, macOS, or Windows. Interactive setup can install or update the complete Windows package after confirmation; background reconnects never install updates. (#3651, #3701, #3661, #3687, thanks @JJLiebig)
 - Edit names, filters, and search text at the cursor instead of only at the end. Herdr inputs now support character and word movement, Home/End, deletion, and familiar Ctrl+A/E/K/U/W/Y shortcuts, including Unicode text. (#1803, #3698, thanks @markjaquith)
