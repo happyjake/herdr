@@ -620,13 +620,7 @@ mod tests {
     fn test_credentials() -> crate::api::credentials::CredentialContext {
         crate::api::credentials::CredentialContext::local_socket(
             crate::api::credentials::SharedCredentialRegistry::open(
-                std::env::temp_dir()
-                    .join(format!(
-                        "herdr-graphics-credentials-{}-{:?}",
-                        std::process::id(),
-                        std::thread::current().id()
-                    ))
-                    .join("credentials.json"),
+                crate::api::credentials::test_registry_path("graphics"),
             ),
         )
     }

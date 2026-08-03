@@ -233,7 +233,8 @@ impl WsAuthError {
 /// parameter.
 ///
 /// Any live credential is accepted — the pairing's managing credential and
-/// every minted limited one alike (ADR-0026). The tier travels with the
+/// every minted limited one alike (ADR-0026) — and so is one this server
+/// has revoked, which is admitted only to be told so on the socket. The tier travels with the
 /// connection and decides only what the credential may then manage; a
 /// limited credential drives the whole pane API exactly like the managing
 /// one. An unknown or revoked credential is a `wrong_token` rejection,
@@ -242,7 +243,7 @@ pub(crate) fn authorize_ws_request(
     authorization: Option<&str>,
     query: Option<&str>,
     credentials: &crate::api::SharedCredentialRegistry,
-) -> Result<crate::api::credentials::AuthenticatedCredential, WsAuthError> {
+) -> Result<crate::api::credentials::HandshakeOutcome, WsAuthError> {
     if let Some(authorization) = authorization {
         let Some(presented) = bearer_token(authorization) else {
             return Err(WsAuthError::MalformedAuthorization);
@@ -260,10 +261,15 @@ pub(crate) fn authorize_ws_request(
 fn check_token(
     presented: &str,
     credentials: &crate::api::SharedCredentialRegistry,
-) -> Result<crate::api::credentials::AuthenticatedCredential, WsAuthError> {
-    credentials
-        .authenticate(presented)
-        .ok_or(WsAuthError::WrongToken)
+) -> Result<crate::api::credentials::HandshakeOutcome, WsAuthError> {
+    match credentials.authenticate_handshake(presented) {
+        // A credential this server revoked is admitted so the verdict can be
+        // delivered as JSON; only a token it never issued keeps the opaque
+        // 401 a browser cannot read anything out of.
+        outcome @ (crate::api::credentials::HandshakeOutcome::Live(_)
+        | crate::api::credentials::HandshakeOutcome::Revoked { .. }) => Ok(outcome),
+        crate::api::credentials::HandshakeOutcome::Unknown => Err(WsAuthError::WrongToken),
+    }
 }
 
 fn bearer_token(authorization: &str) -> Option<&str> {
@@ -338,13 +344,7 @@ pub fn start_websocket_server(
         api_tx,
         event_hub,
         crate::api::credentials::process_registry(),
-        Some(ServerCapabilities {
-            live_handoff: crate::platform::capabilities().live_handoff,
-            detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
-            send_affirm: true,
-            stream_multiplex: true,
-            credential_registry: true,
-        }),
+        Some(crate::api::server_capabilities()),
         server_name,
         server_reach,
     )
@@ -509,7 +509,7 @@ fn handle_ws_connection(
     let stream = WsTcpStream::new(stream);
 
     let mut auth_error = None;
-    let mut authenticated = None;
+    let mut authenticated: Option<crate::api::credentials::HandshakeOutcome> = None;
     let websocket = match accept_websocket(stream, credentials, &mut auth_error, &mut authenticated)
     {
         Ok(websocket) => websocket,
@@ -540,8 +540,25 @@ fn handle_ws_connection(
         debug!(peer = %format_peer(peer), "websocket api handshake produced no credential");
         return Ok(());
     };
-    let credential_context =
-        crate::api::credentials::CredentialContext::connection(credentials.clone(), authenticated);
+    let credential_context = match authenticated {
+        crate::api::credentials::HandshakeOutcome::Live(credential) => {
+            crate::api::credentials::CredentialContext::connection(credentials.clone(), credential)
+        }
+        crate::api::credentials::HandshakeOutcome::Revoked { credential_id } => {
+            info!(
+                peer = %format_peer(peer),
+                credential_id = %credential_id,
+                "websocket api connection admitted to report a revoked credential"
+            );
+            crate::api::credentials::CredentialContext::revoked_connection(
+                credentials.clone(),
+                credential_id,
+            )
+        }
+        // `check_token` turns an unrecognized token into a handshake
+        // rejection, so this cannot be reached from the accept path.
+        crate::api::credentials::HandshakeOutcome::Unknown => return Ok(()),
+    };
 
     // Handshake done; use bounded blocking reads so sparse frames wake the
     // connection thread immediately while shutdown and liveness checks are
@@ -709,7 +726,7 @@ fn accept_websocket(
     stream: WsTcpStream,
     credentials: &crate::api::SharedCredentialRegistry,
     auth_error: &mut Option<WsAuthError>,
-    authenticated: &mut Option<crate::api::credentials::AuthenticatedCredential>,
+    authenticated: &mut Option<crate::api::credentials::HandshakeOutcome>,
 ) -> Result<WebSocket<WsTcpStream>, tungstenite::Error> {
     // The Err type is tungstenite's `ErrorResponse`; the `Callback` trait
     // fixes this signature, so the variant cannot be boxed away.
@@ -803,6 +820,10 @@ fn ws_request_loop(
                 let Some(request) = parse_api_request(transport, text.as_str())? else {
                     continue;
                 };
+                // Read before serving: this is exactly what makes dispatch
+                // answer with the refusal below, and the verdict it writes
+                // is terminal — a revoked connection is served nothing else.
+                let revoked = credentials.is_revoked();
                 handle_parsed_request(
                     request,
                     transport,
@@ -815,6 +836,15 @@ fn ws_request_loop(
                     server_reach,
                     credentials,
                 )?;
+                if revoked {
+                    transport.note_revocation_verdict_sent();
+                    debug!(
+                        peer = %format_peer(transport.peer),
+                        credential_id = credentials.credential_id().unwrap_or("unknown"),
+                        "closing websocket api connection after its revocation verdict"
+                    );
+                    return Ok(());
+                }
             }
             Ok(Message::Binary(_)) => {
                 transport.mark_inbound();
@@ -839,12 +869,15 @@ fn ws_request_loop(
                     // Checked on the idle path, so a request that arrives
                     // after a revoke is still answered with its own refusal
                     // (the code the client keys its wipe path on) before the
-                    // connection goes. An idle or streaming connection has
-                    // nothing to answer, so it simply ends here — within one
-                    // poll interval of the revoke.
+                    // connection goes. An idle connection has no request to
+                    // answer, so it is told off-id instead — a bare close
+                    // would be indistinguishable from transient trouble —
+                    // and then ends, within one poll interval of the revoke.
                     if credentials.is_revoked() {
+                        transport.send_revocation_verdict_once(credentials)?;
                         debug!(
                             peer = %format_peer(transport.peer),
+                            credential_id = credentials.credential_id().unwrap_or("unknown"),
                             "closing websocket api connection: credential revoked"
                         );
                         return Ok(());
@@ -1008,6 +1041,11 @@ struct WsTransport {
     peer: Option<SocketAddr>,
     liveness: WsLiveness,
     dispatch: Arc<WsDispatch>,
+    /// Whether this connection has already been told its credential is
+    /// revoked. The verdict is terminal, so it is written exactly once
+    /// however the connection reaches its end — held stream, idle poll, or
+    /// an answered request.
+    revocation_verdict_sent: bool,
 }
 
 impl WsTransport {
@@ -1021,7 +1059,29 @@ impl WsTransport {
             peer,
             liveness: WsLiveness::new(ws_liveness_timing()),
             dispatch,
+            revocation_verdict_sent: false,
         }
+    }
+
+    /// Deliver the terminal `credential_revoked` verdict, at most once.
+    fn send_revocation_verdict_once(
+        &mut self,
+        credentials: &crate::api::credentials::CredentialContext,
+    ) -> io::Result<()> {
+        if self.revocation_verdict_sent {
+            return Ok(());
+        }
+        self.revocation_verdict_sent = true;
+        let verdict = credentials.revocation_verdict();
+        match self.write_message(&verdict) {
+            Err(err) if is_connection_closed_error(&err) => Ok(()),
+            result => result,
+        }
+    }
+
+    /// Record that dispatch already answered a request with the verdict.
+    fn note_revocation_verdict_sent(&mut self) {
+        self.revocation_verdict_sent = true;
     }
 
     fn read_message(
@@ -1193,8 +1253,12 @@ impl ApiTransport for WsTransport {
     fn pump_inbound(&mut self) -> io::Result<PeerState> {
         // Revoking a credential must end the streams it already holds, not
         // only refuse its next request: a subscribed browser that kept its
-        // events would stay lit after the phone logged it out.
+        // events would stay lit after the phone logged it out. It is told
+        // why first — a stream that just stops is what transient trouble
+        // looks like, and the client would retry forever instead of wiping.
         if self.dispatch.credentials.is_revoked() {
+            let credentials = Arc::clone(&self.dispatch);
+            self.send_revocation_verdict_once(&credentials.credentials)?;
             debug!(peer = %format_peer(self.peer), "websocket api connection dropped: credential revoked");
             return Ok(PeerState::Gone);
         }
@@ -1578,25 +1642,12 @@ mod tests {
         client.join().unwrap();
     }
 
-    /// A registry file nobody else in this test binary shares.
-    fn unique_registry_path() -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir()
-            .join(format!(
-                "herdr-ws-credentials-{}-{nanos}",
-                std::process::id()
-            ))
-            .join("credentials.json")
-    }
-
     /// A registry whose managing credential is the test token — the shape
     /// every handshake authenticates against.
     fn test_registry() -> crate::api::SharedCredentialRegistry {
-        let registry =
-            crate::api::credentials::SharedCredentialRegistry::open(unique_registry_path());
+        let registry = crate::api::credentials::SharedCredentialRegistry::open(
+            crate::api::credentials::test_registry_path("ws"),
+        );
         registry.attach_managing_token(SharedWebSocketToken::new(TEST_TOKEN.to_string()));
         registry
     }
@@ -1657,13 +1708,16 @@ mod tests {
             (None, Some(format!("token={TEST_TOKEN}"))),
             (None, Some(format!("a=1&token={TEST_TOKEN}&b=2"))),
         ] {
-            let credential =
+            let outcome =
                 authorize_ws_request(header.as_deref(), query.as_deref(), &registry).unwrap();
-            assert_eq!(
-                credential.tier,
-                crate::api::schema::CredentialTier::Managing,
-                "{header:?} {query:?}"
-            );
+            match outcome {
+                crate::api::credentials::HandshakeOutcome::Live(credential) => assert_eq!(
+                    credential.tier,
+                    crate::api::schema::CredentialTier::Managing,
+                    "{header:?} {query:?}"
+                ),
+                other => panic!("{header:?} {query:?}: expected a live credential, got {other:?}"),
+            }
         }
     }
 
@@ -1675,16 +1729,29 @@ mod tests {
         let registry = test_registry();
         let (info, token) = registry.mint(Some("desk browser".into())).unwrap();
 
-        let credential =
+        let outcome =
             authorize_ws_request(Some(&format!("Bearer {token}")), None, &registry).unwrap();
 
-        assert_eq!(credential.credential_id, info.credential_id);
-        assert_eq!(credential.tier, crate::api::schema::CredentialTier::Limited);
+        match outcome {
+            crate::api::credentials::HandshakeOutcome::Live(credential) => {
+                assert_eq!(credential.credential_id, info.credential_id);
+                assert_eq!(credential.tier, crate::api::schema::CredentialTier::Limited);
+            }
+            other => panic!("expected a live credential, got {other:?}"),
+        }
 
-        // ...and stops the moment it is revoked.
+        // Once revoked it stops being honored — but it is still recognized,
+        // so the handshake admits it to say so rather than closing blind.
         registry.revoke_limited(&info.credential_id).unwrap();
+        match authorize_ws_request(Some(&format!("Bearer {token}")), None, &registry).unwrap() {
+            crate::api::credentials::HandshakeOutcome::Revoked { credential_id } => {
+                assert_eq!(credential_id, info.credential_id)
+            }
+            other => panic!("expected a revoked verdict, got {other:?}"),
+        }
+        // A token this server never issued stays an opaque rejection.
         assert_eq!(
-            authorize_ws_request(Some(&format!("Bearer {token}")), None, &registry).unwrap_err(),
+            authorize_ws_request(Some("Bearer never-minted"), None, &registry).unwrap_err(),
             WsAuthError::WrongToken
         );
     }
@@ -1851,10 +1918,11 @@ mod tests {
 
     /// The listener's half of ADR-0026: a minted credential connects like
     /// any other, and a revoke reaches the connection it already holds —
-    /// refused by code on its next request, and rejected at its next
-    /// handshake.
+    /// refused by code on its very next request. What that credential meets
+    /// when it comes back is
+    /// [`a_revoked_credential_connects_and_is_told_so_in_json`].
     #[test]
-    fn a_revoked_credential_is_refused_on_its_next_request_and_at_its_next_handshake() {
+    fn a_revoked_credential_is_refused_on_its_next_request() {
         let server = start_test_server();
         let (info, token) = server.credentials.mint(Some("browser".into())).unwrap();
 
@@ -1887,11 +1955,79 @@ mod tests {
         let refused = read_json(&mut websocket);
         assert_eq!(refused["id"], "req_after_revoke");
         assert_eq!(refused["error"]["code"], "credential_revoked", "{refused}");
+        // The managing credential is untouched by the browser's revoke.
+        let mut managing = connect_authorized(&server);
+        managing
+            .send(Message::text(
+                r#"{"id":"req_managing_after_revoke","method":"ping","params":{}}"#,
+            ))
+            .unwrap();
+        assert_eq!(read_json(&mut managing)["result"]["type"], "pong");
+        let _ = url;
+    }
 
-        let mut request = url.into_client_request().unwrap();
+    /// A browser cannot see why a handshake failed, so a credential this
+    /// server revoked must be let onto the socket and told in JSON — and
+    /// told nothing else. An arbitrary bad token keeps its opaque 401.
+    #[test]
+    fn a_revoked_credential_connects_and_is_told_so_in_json() {
+        let server = start_test_server();
+        let (info, token) = server.credentials.mint(Some("browser".into())).unwrap();
+        server
+            .credentials
+            .revoke_limited(&info.credential_id)
+            .unwrap();
+
+        let url = format!("ws://{}", server.handle.local_addr());
+        let mut request = url.clone().into_client_request().unwrap();
         request.headers_mut().insert(
             tungstenite::http::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
+        );
+        let (mut websocket, _response) =
+            tungstenite::connect(request).expect("a revoked credential is let on to be told why");
+        set_client_read_timeout(&websocket);
+
+        // Any request it makes gets the verdict, not an answer.
+        websocket
+            .send(Message::text(
+                r#"{"id":"req_revoked_reconnect","method":"pane.list","params":{}}"#,
+            ))
+            .unwrap();
+        let refused = read_json(&mut websocket);
+        assert_eq!(refused["id"], "req_revoked_reconnect");
+        assert_eq!(refused["error"]["code"], "credential_revoked", "{refused}");
+        assert!(refused.get("result").is_none(), "{refused}");
+
+        // The verdict is terminal: the connection ends, having served
+        // nothing else.
+        let mut closed = false;
+        for _ in 0..50 {
+            match websocket.read() {
+                Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => {
+                    closed = true;
+                    break;
+                }
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                Ok(other) => panic!("a revoked connection served something: {other:?}"),
+                Err(tungstenite::Error::Io(err))
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(err) => panic!("unexpected websocket error: {err}"),
+            }
+        }
+        assert!(
+            closed,
+            "the revoked connection must be closed after its verdict"
+        );
+
+        // A token this server never minted is still an opaque rejection.
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            tungstenite::http::header::AUTHORIZATION,
+            "Bearer never-minted-token".parse().unwrap(),
         );
         match tungstenite::connect(request).unwrap_err() {
             tungstenite::Error::Http(response) => {

@@ -110,7 +110,7 @@ pub(crate) fn start_server_with_stop_control(
         api_tx,
         event_hub,
         crate::api::credentials::process_registry(),
-        default_capabilities(),
+        Some(crate::api::server_capabilities()),
         Some(server_stop),
         server_name,
         server_reach,
@@ -134,16 +134,6 @@ pub fn start_server_with_capabilities(
         server_name,
         server_reach,
     )
-}
-
-fn default_capabilities() -> Option<ServerCapabilities> {
-    Some(ServerCapabilities {
-        live_handoff: crate::platform::capabilities().live_handoff,
-        detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
-        send_affirm: true,
-        stream_multiplex: true,
-        credential_registry: true,
-    })
 }
 
 fn start_server_inner(
@@ -1250,7 +1240,7 @@ mod tests {
     fn test_credentials() -> crate::api::credentials::CredentialContext {
         crate::api::credentials::CredentialContext::local_socket(
             crate::api::credentials::SharedCredentialRegistry::open(
-                unique_test_path("credentials").join("credentials.json"),
+                crate::api::credentials::test_registry_path("socket"),
             ),
         )
     }
