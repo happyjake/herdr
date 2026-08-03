@@ -109,6 +109,7 @@ pub(crate) fn start_server_with_stop_control(
     start_server_inner(
         api_tx,
         event_hub,
+        crate::api::credentials::process_registry(),
         default_capabilities(),
         Some(server_stop),
         server_name,
@@ -119,11 +120,20 @@ pub(crate) fn start_server_with_stop_control(
 pub fn start_server_with_capabilities(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
+    credentials: crate::api::SharedCredentialRegistry,
     capabilities: Option<ServerCapabilities>,
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
 ) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, capabilities, None, server_name)
+    start_server_inner(
+        api_tx,
+        event_hub,
+        credentials,
+        capabilities,
+        None,
+        server_name,
+        server_reach,
+    )
 }
 
 fn default_capabilities() -> Option<ServerCapabilities> {
@@ -132,15 +142,18 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
         send_affirm: true,
         stream_multiplex: true,
+        credential_registry: true,
     })
 }
 
 fn start_server_inner(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
+    credentials: crate::api::SharedCredentialRegistry,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<Arc<AtomicBool>>,
     server_name: crate::api::SharedServerName,
+    server_reach: crate::api::SharedServerReach,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -163,6 +176,12 @@ fn start_server_inner(
                     let server_stop = server_stop.clone();
                     let server_name = server_name.clone();
                     let server_reach = server_reach.clone();
+                    // Owning the socket file is the credential here: the
+                    // local caller acts with managing authority unless it
+                    // names one of the registry's credentials explicitly.
+                    let credentials = crate::api::credentials::CredentialContext::local_socket(
+                        credentials.clone(),
+                    );
                     let connection_running = Arc::clone(&listener_running);
                     std::thread::spawn(move || {
                         if let Err(err) = handle_connection_with_stop(
@@ -174,6 +193,7 @@ fn start_server_inner(
                             server_stop.as_ref(),
                             &server_name,
                             &server_reach,
+                            &credentials,
                         ) {
                             warn!(err = %err, "api connection failed");
                         }
@@ -229,6 +249,7 @@ fn handle_connection_with_stop(
     server_stop: Option<&Arc<AtomicBool>>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
@@ -279,6 +300,7 @@ fn handle_connection_with_stop(
             server_stop,
             server_name,
             server_reach,
+            credentials,
         ),
     }
 }
@@ -324,11 +346,18 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
     server_stop: Option<&Arc<AtomicBool>>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
     crate::logging::api_request_started(&request_id, method, changes_ui);
+
+    // A credential revoked while this connection was open loses its access
+    // here, on its very next request, rather than at its next handshake.
+    if let Some(refusal) = credentials.revocation_refusal(&request_id) {
+        return write_and_log_response(transport, &refusal, &request_id, method, changes_ui);
+    }
 
     match request.method {
         Method::PaneGraphicsStream(_) => {
@@ -412,6 +441,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
             server_stop,
             server_name,
             server_reach,
+            credentials,
         ),
     }
 }
@@ -455,6 +485,7 @@ fn serve_simple_request<T: ApiTransport>(
     server_stop: Option<&Arc<AtomicBool>>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -468,6 +499,7 @@ fn serve_simple_request<T: ApiTransport>(
         Some(response_write_rx),
         server_name,
         server_reach,
+        credentials,
     );
     let result = write_and_log_response(transport, &response, &request_id, method, changes_ui);
     let _ = response_write_tx.send(());
@@ -489,6 +521,7 @@ pub(super) fn serve_interleaved_request<T: ApiTransport>(
     server_stop: Option<&Arc<AtomicBool>>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let Some(request) = parse_api_request(transport, text)? else {
         return Ok(());
@@ -498,6 +531,10 @@ pub(super) fn serve_interleaved_request<T: ApiTransport>(
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
     crate::logging::api_request_started(&request_id, method, changes_ui);
+
+    if let Some(refusal) = credentials.revocation_refusal(&request_id) {
+        return write_and_log_response(transport, &refusal, &request_id, method, changes_ui);
+    }
 
     // A transport that multiplexes is by definition not a dedicated local
     // socket, so this answer matches what the same request gets between
@@ -526,6 +563,7 @@ pub(super) fn serve_interleaved_request<T: ApiTransport>(
         server_stop,
         server_name,
         server_reach,
+        credentials,
     )
 }
 
@@ -580,6 +618,7 @@ fn handle_request(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> String {
     // Declarations and runtime facts are read per request, so config
     // reloads and the running process are reflected on every transport.
@@ -625,6 +664,18 @@ fn handle_request(
         Method::AttachmentCreate(params) => {
             crate::api::attachment::handle_create(request.id, &params)
         }
+        // The credential registry is runtime state beside the session, not
+        // app state, so it is served here on the connection thread — the one
+        // place both transports pass through, which is what makes the verbs
+        // identical over the Unix socket and the WebSocket.
+        Method::CredentialMint(params) => credentials.serve_mint(request.id, &params),
+        Method::CredentialList(params) => {
+            credentials.serve_list(request.id, params.acting_token.as_deref())
+        }
+        Method::CredentialRevoke(params) => credentials.serve_revoke(request.id, &params),
+        Method::CredentialRevokeAll(params) => {
+            credentials.serve_revoke_all(request.id, params.acting_token.as_deref())
+        }
         method => dispatch_to_app(
             Request {
                 id: request.id,
@@ -647,6 +698,10 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
         Method::AttachmentCreate(_) => "attachment.create",
+        Method::CredentialMint(_) => "credential.mint",
+        Method::CredentialList(_) => "credential.list",
+        Method::CredentialRevoke(_) => "credential.revoke",
+        Method::CredentialRevokeAll(_) => "credential.revoke_all",
         Method::NotificationShow(_) => "notification.show",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
@@ -1190,6 +1245,16 @@ mod tests {
         crate::api::SharedServerReach::from_config(&crate::config::WebSocketApiConfig::default())
     }
 
+    /// A local-socket caller against a registry of its own, so credential
+    /// state never leaks between tests or into the developer's session dir.
+    fn test_credentials() -> crate::api::credentials::CredentialContext {
+        crate::api::credentials::CredentialContext::local_socket(
+            crate::api::credentials::SharedCredentialRegistry::open(
+                unique_test_path("credentials").join("credentials.json"),
+            ),
+        )
+    }
+
     fn unique_test_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1445,11 +1510,13 @@ mod tests {
                 detached_server_daemon: true,
                 send_affirm: true,
                 stream_multiplex: true,
+                credential_registry: true,
             }),
             None,
             None,
             &crate::api::SharedServerName::new("the-mini".to_string()),
             &undeclared_server_reach(),
+            &test_credentials(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1477,6 +1544,7 @@ mod tests {
                 None,
                 &server_name,
                 &server_reach,
+                &test_credentials(),
             )
         };
 
@@ -1555,6 +1623,7 @@ mod tests {
                 None,
                 &server_name,
                 &server_reach,
+                &test_credentials(),
             )
         };
         let error_code = |response: &str| {
@@ -1616,6 +1685,7 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
+                &test_credentials(),
             )
         });
 
@@ -1658,6 +1728,7 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
+                &test_credentials(),
             )
         });
 
@@ -1705,6 +1776,7 @@ mod tests {
             None,
             &crate::api::SharedServerName::new("test".to_string()),
             &undeclared_server_reach(),
+            &test_credentials(),
         )
         .unwrap();
 
@@ -1741,6 +1813,7 @@ mod tests {
             None,
             &crate::api::SharedServerName::new("test".to_string()),
             &undeclared_server_reach(),
+            &test_credentials(),
         )
         .unwrap();
 
@@ -1811,6 +1884,7 @@ mod tests {
             None,
             &crate::api::SharedServerName::new("test".to_string()),
             &undeclared_server_reach(),
+            &test_credentials(),
         )
         .unwrap();
 
@@ -1879,6 +1953,7 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
+                &test_credentials(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1919,6 +1994,7 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
+                &test_credentials(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1964,6 +2040,7 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
+                &test_credentials(),
             );
             done_tx.send(result).unwrap();
         });
@@ -2021,6 +2098,7 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
+                &test_credentials(),
             );
             done_tx.send(result).unwrap();
         });
@@ -2073,6 +2151,7 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
+                &test_credentials(),
             );
             done_tx.send(result).unwrap();
         });

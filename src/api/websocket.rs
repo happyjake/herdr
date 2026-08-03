@@ -226,35 +226,44 @@ impl WsAuthError {
     }
 }
 
-/// Validate handshake credentials. The Authorization header is authoritative
-/// when present; the `token` query parameter exists for clients that cannot
-/// set headers on a WebSocket upgrade (browsers). A malformed header fails
-/// closed instead of falling back to the query parameter.
+/// Validate handshake credentials against the registry. The Authorization
+/// header is authoritative when present; the `token` query parameter exists
+/// for clients that cannot set headers on a WebSocket upgrade (browsers). A
+/// malformed header fails closed instead of falling back to the query
+/// parameter.
+///
+/// Any live credential is accepted — the pairing's managing credential and
+/// every minted limited one alike (ADR-0026). The tier travels with the
+/// connection and decides only what the credential may then manage; a
+/// limited credential drives the whole pane API exactly like the managing
+/// one. An unknown or revoked credential is a `wrong_token` rejection,
+/// indistinguishable from any other 401 by design.
 pub(crate) fn authorize_ws_request(
     authorization: Option<&str>,
     query: Option<&str>,
-    expected_token: &str,
-) -> Result<(), WsAuthError> {
+    credentials: &crate::api::SharedCredentialRegistry,
+) -> Result<crate::api::credentials::AuthenticatedCredential, WsAuthError> {
     if let Some(authorization) = authorization {
         let Some(presented) = bearer_token(authorization) else {
             return Err(WsAuthError::MalformedAuthorization);
         };
-        return check_token(presented, expected_token);
+        return check_token(presented, credentials);
     }
 
     if let Some(presented) = query_token(query) {
-        return check_token(presented, expected_token);
+        return check_token(presented, credentials);
     }
 
     Err(WsAuthError::MissingToken)
 }
 
-fn check_token(presented: &str, expected: &str) -> Result<(), WsAuthError> {
-    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
-        Ok(())
-    } else {
-        Err(WsAuthError::WrongToken)
-    }
+fn check_token(
+    presented: &str,
+    credentials: &crate::api::SharedCredentialRegistry,
+) -> Result<crate::api::credentials::AuthenticatedCredential, WsAuthError> {
+    credentials
+        .authenticate(presented)
+        .ok_or(WsAuthError::WrongToken)
 }
 
 fn bearer_token(authorization: &str) -> Option<&str> {
@@ -278,19 +287,8 @@ fn query_token(query: Option<&str>) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-/// Compare tokens without an early exit, so the comparison time does not
-/// depend on how many leading bytes match. Length mismatches return early;
-/// leaking the token length is acceptable.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+// Presented tokens are compared inside the registry, which compares
+// fingerprints without an early exit; nothing here needs the raw token.
 
 pub struct WebSocketServerHandle {
     thread: Option<std::thread::JoinHandle<()>>,
@@ -339,11 +337,13 @@ pub fn start_websocket_server(
         config,
         api_tx,
         event_hub,
+        crate::api::credentials::process_registry(),
         Some(ServerCapabilities {
             live_handoff: crate::platform::capabilities().live_handoff,
             detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
             send_affirm: true,
             stream_multiplex: true,
+            credential_registry: true,
         }),
         server_name,
         server_reach,
@@ -358,6 +358,7 @@ pub fn start_websocket_server_with_capabilities(
     config: &WebSocketApiConfig,
     api_tx: ApiRequestSender,
     event_hub: EventHub,
+    credentials: crate::api::SharedCredentialRegistry,
     capabilities: Option<ServerCapabilities>,
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
@@ -374,7 +375,10 @@ pub fn start_websocket_server_with_capabilities(
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
     let token = SharedWebSocketToken::new(spec.token);
-    let accept_token = token.clone();
+    // The registry reads the managing credential through the live slot, so a
+    // `herdr pair` rotation applied by a config reload is recognized as a
+    // rotation of that one credential without any further plumbing.
+    credentials.attach_managing_token(token.clone());
 
     let thread = std::thread::spawn(move || {
         loop {
@@ -389,11 +393,11 @@ pub fn start_websocket_server_with_capabilities(
                     let server_name = server_name.clone();
                     let server_reach = server_reach.clone();
                     let connection_running = Arc::clone(&listener_running);
-                    let token = accept_token.clone();
+                    let credentials = credentials.clone();
                     std::thread::spawn(move || {
                         if let Err(err) = handle_ws_connection(
                             stream,
-                            &token,
+                            &credentials,
                             &api_tx,
                             &event_hub,
                             &connection_running,
@@ -490,7 +494,7 @@ fn bind_with_addr_in_use_retry(addr: SocketAddr) -> io::Result<TcpListener> {
 
 fn handle_ws_connection(
     stream: TcpStream,
-    expected_token: &SharedWebSocketToken,
+    credentials: &crate::api::SharedCredentialRegistry,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -505,7 +509,9 @@ fn handle_ws_connection(
     let stream = WsTcpStream::new(stream);
 
     let mut auth_error = None;
-    let websocket = match accept_websocket(stream, expected_token, &mut auth_error) {
+    let mut authenticated = None;
+    let websocket = match accept_websocket(stream, credentials, &mut auth_error, &mut authenticated)
+    {
         Ok(websocket) => websocket,
         Err(err) => {
             match auth_error {
@@ -527,6 +533,16 @@ fn handle_ws_connection(
         }
     };
 
+    // The connection acts as the credential it presented, for its whole
+    // life: the tier is never re-read from the payload, and a revoke ends
+    // this connection's access rather than only its next handshake.
+    let Some(authenticated) = authenticated else {
+        debug!(peer = %format_peer(peer), "websocket api handshake produced no credential");
+        return Ok(());
+    };
+    let credential_context =
+        crate::api::credentials::CredentialContext::connection(credentials.clone(), authenticated);
+
     // Handshake done; use bounded blocking reads so sparse frames wake the
     // connection thread immediately while shutdown and liveness checks are
     // still observed within one poll interval.
@@ -538,6 +554,7 @@ fn handle_ws_connection(
             capabilities: capabilities.clone(),
             server_name: server_name.clone(),
             server_reach: server_reach.clone(),
+            credentials: credential_context.clone(),
         }),
     );
     configure_established_ws_stream(transport.websocket.get_mut())?;
@@ -550,6 +567,7 @@ fn handle_ws_connection(
         capabilities,
         server_name,
         server_reach,
+        &credential_context,
     );
 
     // Best effort: tell well-behaved clients the server is done.
@@ -689,8 +707,9 @@ fn format_peer(peer: Option<SocketAddr>) -> String {
 
 fn accept_websocket(
     stream: WsTcpStream,
-    expected_token: &SharedWebSocketToken,
+    credentials: &crate::api::SharedCredentialRegistry,
     auth_error: &mut Option<WsAuthError>,
+    authenticated: &mut Option<crate::api::credentials::AuthenticatedCredential>,
 ) -> Result<WebSocket<WsTcpStream>, tungstenite::Error> {
     // The Err type is tungstenite's `ErrorResponse`; the `Callback` trait
     // fixes this signature, so the variant cannot be boxed away.
@@ -710,11 +729,14 @@ fn accept_websocket(
             None => None,
         };
 
-        // Read the expected token at handshake time, not listener start, so a
-        // rotated token is enforced on the very next connection attempt.
-        let expected_token = expected_token.current();
-        match authorize_ws_request(authorization, request.uri().query(), &expected_token) {
-            Ok(()) => Ok(response),
+        // Credentials are read at handshake time, not listener start, so a
+        // rotation or a revoke is enforced on the very next connection
+        // attempt.
+        match authorize_ws_request(authorization, request.uri().query(), credentials) {
+            Ok(credential) => {
+                *authenticated = Some(credential);
+                Ok(response)
+            }
             Err(reason) => {
                 *auth_error = Some(reason);
                 Err(unauthorized_response())
@@ -762,6 +784,7 @@ fn ws_request_loop(
     capabilities: Option<ServerCapabilities>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> io::Result<()> {
     // Parity with the Unix socket: a client that completes the handshake
     // gets a bounded window to send its first request. Once the connection
@@ -790,6 +813,7 @@ fn ws_request_loop(
                     None,
                     server_name,
                     server_reach,
+                    credentials,
                 )?;
             }
             Ok(Message::Binary(_)) => {
@@ -811,6 +835,19 @@ fn ws_request_loop(
                             io::ErrorKind::TimedOut,
                             "timed out reading api request",
                         ));
+                    }
+                    // Checked on the idle path, so a request that arrives
+                    // after a revoke is still answered with its own refusal
+                    // (the code the client keys its wipe path on) before the
+                    // connection goes. An idle or streaming connection has
+                    // nothing to answer, so it simply ends here — within one
+                    // poll interval of the revoke.
+                    if credentials.is_revoked() {
+                        debug!(
+                            peer = %format_peer(transport.peer),
+                            "closing websocket api connection: credential revoked"
+                        );
+                        return Ok(());
                     }
                     if first_request_deadline.is_none() {
                         transport.poll_liveness()?;
@@ -963,6 +1000,7 @@ struct WsDispatch {
     capabilities: Option<ServerCapabilities>,
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
+    credentials: crate::api::credentials::CredentialContext,
 }
 
 struct WsTransport {
@@ -1153,6 +1191,13 @@ impl ApiTransport for WsTransport {
     }
 
     fn pump_inbound(&mut self) -> io::Result<PeerState> {
+        // Revoking a credential must end the streams it already holds, not
+        // only refuse its next request: a subscribed browser that kept its
+        // events would stay lit after the phone logged it out.
+        if self.dispatch.credentials.is_revoked() {
+            debug!(peer = %format_peer(self.peer), "websocket api connection dropped: credential revoked");
+            return Ok(PeerState::Gone);
+        }
         loop {
             // Read without blocking, but answer whatever arrived with the
             // established blocking-with-timeout config, so a response written
@@ -1179,6 +1224,7 @@ impl ApiTransport for WsTransport {
                         None,
                         &dispatch.server_name,
                         &dispatch.server_reach,
+                        &dispatch.credentials,
                     )?;
                 }
                 InboundFrame::Binary => {
@@ -1253,6 +1299,7 @@ mod tests {
             capabilities: None,
             server_name: crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string()),
             server_reach: crate::api::SharedServerReach::from_config(&config),
+            credentials: crate::api::credentials::CredentialContext::local_socket(test_registry()),
         });
         (dispatch, api_rx)
     }
@@ -1531,115 +1578,140 @@ mod tests {
         client.join().unwrap();
     }
 
+    /// A registry file nobody else in this test binary shares.
+    fn unique_registry_path() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!(
+                "herdr-ws-credentials-{}-{nanos}",
+                std::process::id()
+            ))
+            .join("credentials.json")
+    }
+
+    /// A registry whose managing credential is the test token — the shape
+    /// every handshake authenticates against.
+    fn test_registry() -> crate::api::SharedCredentialRegistry {
+        let registry =
+            crate::api::credentials::SharedCredentialRegistry::open(unique_registry_path());
+        registry.attach_managing_token(SharedWebSocketToken::new(TEST_TOKEN.to_string()));
+        registry
+    }
+
     #[test]
     fn authorize_rejects_missing_token() {
-        assert_eq!(
-            authorize_ws_request(None, None, TEST_TOKEN),
-            Err(WsAuthError::MissingToken)
-        );
-        assert_eq!(
-            authorize_ws_request(None, Some("other=1"), TEST_TOKEN),
-            Err(WsAuthError::MissingToken)
-        );
-        assert_eq!(
-            authorize_ws_request(None, Some("token="), TEST_TOKEN),
-            Err(WsAuthError::MissingToken)
-        );
+        let registry = test_registry();
+        for query in [None, Some("other=1"), Some("token=")] {
+            assert_eq!(
+                authorize_ws_request(None, query, &registry).unwrap_err(),
+                WsAuthError::MissingToken,
+                "{query:?}"
+            );
+        }
     }
 
     #[test]
     fn authorize_rejects_malformed_authorization_headers() {
+        let registry = test_registry();
         for header in ["Basic dXNlcjpwdw==", "Bearer", "Bearer   ", "token abc", ""] {
             assert_eq!(
-                authorize_ws_request(Some(header), None, TEST_TOKEN),
-                Err(WsAuthError::MalformedAuthorization),
+                authorize_ws_request(Some(header), None, &registry).unwrap_err(),
+                WsAuthError::MalformedAuthorization,
                 "{header:?}"
             );
         }
     }
 
     #[test]
-    fn authorize_rejects_wrong_tokens() {
-        assert_eq!(
-            authorize_ws_request(Some("Bearer wrong-token"), None, TEST_TOKEN),
-            Err(WsAuthError::WrongToken)
-        );
-        assert_eq!(
-            authorize_ws_request(None, Some("token=wrong-token"), TEST_TOKEN),
-            Err(WsAuthError::WrongToken)
-        );
-        // Prefixes and extensions of the real token must not pass.
-        assert_eq!(
-            authorize_ws_request(None, Some(&format!("token={TEST_TOKEN}x")), TEST_TOKEN),
-            Err(WsAuthError::WrongToken)
-        );
-        assert_eq!(
-            authorize_ws_request(
-                Some(&format!("Bearer {}", &TEST_TOKEN[..TEST_TOKEN.len() - 1])),
+    fn authorize_rejects_tokens_that_are_in_no_registry() {
+        let registry = test_registry();
+        let wrong = [
+            (Some("Bearer wrong-token".to_string()), None),
+            (None, Some("token=wrong-token".to_string())),
+            // Prefixes and extensions of a live credential must not pass.
+            (None, Some(format!("token={TEST_TOKEN}x"))),
+            (
+                Some(format!("Bearer {}", &TEST_TOKEN[..TEST_TOKEN.len() - 1])),
                 None,
-                TEST_TOKEN
             ),
-            Err(WsAuthError::WrongToken)
-        );
+        ];
+        for (header, query) in wrong {
+            assert_eq!(
+                authorize_ws_request(header.as_deref(), query.as_deref(), &registry).unwrap_err(),
+                WsAuthError::WrongToken,
+                "{header:?} {query:?}"
+            );
+        }
     }
 
     #[test]
-    fn authorize_accepts_valid_bearer_header() {
-        assert_eq!(
-            authorize_ws_request(Some(&format!("Bearer {TEST_TOKEN}")), None, TEST_TOKEN),
-            Ok(())
-        );
-        // Scheme is case-insensitive per RFC 7235.
-        assert_eq!(
-            authorize_ws_request(Some(&format!("bearer {TEST_TOKEN}")), None, TEST_TOKEN),
-            Ok(())
-        );
+    fn authorize_accepts_the_managing_credential_by_header_or_query() {
+        let registry = test_registry();
+        for (header, query) in [
+            (Some(format!("Bearer {TEST_TOKEN}")), None),
+            // Scheme is case-insensitive per RFC 7235.
+            (Some(format!("bearer {TEST_TOKEN}")), None),
+            (None, Some(format!("token={TEST_TOKEN}"))),
+            (None, Some(format!("a=1&token={TEST_TOKEN}&b=2"))),
+        ] {
+            let credential =
+                authorize_ws_request(header.as_deref(), query.as_deref(), &registry).unwrap();
+            assert_eq!(
+                credential.tier,
+                crate::api::schema::CredentialTier::Managing,
+                "{header:?} {query:?}"
+            );
+        }
     }
 
+    /// ADR-0026: a minted limited credential opens its own connection. The
+    /// handshake accepts it exactly like the pairing token; only what it may
+    /// then manage differs.
     #[test]
-    fn authorize_accepts_valid_query_token() {
+    fn authorize_accepts_a_minted_limited_credential() {
+        let registry = test_registry();
+        let (info, token) = registry.mint(Some("desk browser".into())).unwrap();
+
+        let credential =
+            authorize_ws_request(Some(&format!("Bearer {token}")), None, &registry).unwrap();
+
+        assert_eq!(credential.credential_id, info.credential_id);
+        assert_eq!(credential.tier, crate::api::schema::CredentialTier::Limited);
+
+        // ...and stops the moment it is revoked.
+        registry.revoke_limited(&info.credential_id).unwrap();
         assert_eq!(
-            authorize_ws_request(None, Some(&format!("token={TEST_TOKEN}")), TEST_TOKEN),
-            Ok(())
-        );
-        assert_eq!(
-            authorize_ws_request(
-                None,
-                Some(&format!("a=1&token={TEST_TOKEN}&b=2")),
-                TEST_TOKEN
-            ),
-            Ok(())
+            authorize_ws_request(Some(&format!("Bearer {token}")), None, &registry).unwrap_err(),
+            WsAuthError::WrongToken
         );
     }
 
     #[test]
     fn authorize_prefers_header_over_query_and_fails_closed() {
+        let registry = test_registry();
         // A malformed header must not fall back to a valid query token.
         assert_eq!(
             authorize_ws_request(
                 Some("Basic abc"),
                 Some(&format!("token={TEST_TOKEN}")),
-                TEST_TOKEN
-            ),
-            Err(WsAuthError::MalformedAuthorization)
+                &registry
+            )
+            .unwrap_err(),
+            WsAuthError::MalformedAuthorization
         );
         // A wrong header must not fall back either.
         assert_eq!(
             authorize_ws_request(
                 Some("Bearer wrong"),
                 Some(&format!("token={TEST_TOKEN}")),
-                TEST_TOKEN
-            ),
-            Err(WsAuthError::WrongToken)
+                &registry
+            )
+            .unwrap_err(),
+            WsAuthError::WrongToken
         );
-    }
-
-    #[test]
-    fn constant_time_eq_matches_equality() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]
@@ -1700,6 +1772,7 @@ mod tests {
             &WebSocketApiConfig::default(),
             api_tx,
             EventHub::default(),
+            test_registry(),
             None,
             crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string()),
             crate::api::SharedServerReach::from_config(&WebSocketApiConfig::default()),
@@ -1711,20 +1784,27 @@ mod tests {
     struct TestServer {
         handle: WebSocketServerHandle,
         server_name: crate::api::SharedServerName,
+        credentials: crate::api::SharedCredentialRegistry,
         _api_rx: mpsc::UnboundedReceiver<ApiRequestMessage>,
         event_hub: EventHub,
     }
 
     fn start_test_server() -> TestServer {
+        start_test_server_with_capabilities(None)
+    }
+
+    fn start_test_server_with_capabilities(capabilities: Option<ServerCapabilities>) -> TestServer {
         let (api_tx, api_rx) = mpsc::unbounded_channel();
         let event_hub = EventHub::default();
         let server_name = crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string());
         let config = spec_config(Some("127.0.0.1:0"), Some(TEST_TOKEN));
+        let credentials = test_registry();
         let handle = start_websocket_server_with_capabilities(
             &config,
             api_tx,
             event_hub.clone(),
-            None,
+            credentials.clone(),
+            capabilities,
             server_name.clone(),
             crate::api::SharedServerReach::from_config(&config),
         )
@@ -1733,6 +1813,7 @@ mod tests {
         TestServer {
             handle,
             server_name,
+            credentials,
             _api_rx: api_rx,
             event_hub,
         }
@@ -1766,6 +1847,86 @@ mod tests {
                 other => panic!("unexpected websocket message: {other:?}"),
             }
         }
+    }
+
+    /// The listener's half of ADR-0026: a minted credential connects like
+    /// any other, and a revoke reaches the connection it already holds —
+    /// refused by code on its next request, and rejected at its next
+    /// handshake.
+    #[test]
+    fn a_revoked_credential_is_refused_on_its_next_request_and_at_its_next_handshake() {
+        let server = start_test_server();
+        let (info, token) = server.credentials.mint(Some("browser".into())).unwrap();
+
+        let url = format!("ws://{}", server.handle.local_addr());
+        let mut request = url.clone().into_client_request().unwrap();
+        request.headers_mut().insert(
+            tungstenite::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let (mut websocket, _response) = tungstenite::connect(request).unwrap();
+        set_client_read_timeout(&websocket);
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"req_live","method":"ping","params":{}}"#,
+            ))
+            .unwrap();
+        assert_eq!(read_json(&mut websocket)["result"]["type"], "pong");
+
+        server
+            .credentials
+            .revoke_limited(&info.credential_id)
+            .unwrap();
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"req_after_revoke","method":"ping","params":{}}"#,
+            ))
+            .unwrap();
+        let refused = read_json(&mut websocket);
+        assert_eq!(refused["id"], "req_after_revoke");
+        assert_eq!(refused["error"]["code"], "credential_revoked", "{refused}");
+
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            tungstenite::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        match tungstenite::connect(request).unwrap_err() {
+            tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED)
+            }
+            other => panic!("expected http 401 rejection, got: {other:?}"),
+        }
+    }
+
+    /// The capability is how a client tells a registry-bearing server from
+    /// one that would refuse the verbs as unknown methods.
+    #[test]
+    fn pong_advertises_the_credential_registry_capability() {
+        let server = start_test_server_with_capabilities(Some(ServerCapabilities {
+            live_handoff: false,
+            detached_server_daemon: false,
+            send_affirm: true,
+            stream_multiplex: true,
+            credential_registry: true,
+        }));
+        let mut websocket = connect_authorized(&server);
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"req_capability","method":"ping","params":{}}"#,
+            ))
+            .unwrap();
+        let pong = read_json(&mut websocket);
+
+        assert_eq!(pong["result"]["capabilities"]["credential_registry"], true);
+        assert_eq!(
+            pong["result"]["protocol"],
+            crate::protocol::PROTOCOL_VERSION,
+            "the registry is additive; the protocol version does not move"
+        );
     }
 
     #[test]

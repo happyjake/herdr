@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::agents::AgentInfo;
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
+use super::credentials::CredentialInfo;
 use super::events::EventEnvelope;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
@@ -294,6 +295,20 @@ pub enum ResponseResult {
     },
     PluginPaneClosed {
         pane_id: String,
+    },
+    CredentialMinted {
+        credential: CredentialInfo,
+        /// The minted credential's token, returned exactly once — the
+        /// registry stores only its fingerprint, so it cannot be re-read.
+        token: String,
+    },
+    CredentialList {
+        credentials: Vec<CredentialInfo>,
+    },
+    /// The credentials this request ended: one for `credential.revoke`,
+    /// every limited credential for `credential.revoke_all`.
+    CredentialRevoked {
+        revoked: Vec<String>,
     },
     ConfigReload {
         status: crate::config::ConfigReloadStatus,

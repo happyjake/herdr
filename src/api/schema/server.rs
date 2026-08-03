@@ -41,4 +41,11 @@ pub struct ServerCapabilities {
     /// servers that predate it.
     #[serde(default)]
     pub stream_multiplex: bool,
+    /// Whether this server keeps a credential registry (ADR-0026): the
+    /// pairing's managing credential plus any minted limited credentials,
+    /// with `credential.mint`, `credential.list`, `credential.revoke`, and
+    /// `credential.revoke_all`. Additive: absent (false) in pongs of servers
+    /// that predate it, which refuse the verbs as unparseable methods.
+    #[serde(default)]
+    pub credential_registry: bool,
 }

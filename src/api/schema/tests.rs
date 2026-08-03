@@ -779,6 +779,7 @@ fn success_response_round_trips() {
                 detached_server_daemon: true,
                 send_affirm: true,
                 stream_multiplex: true,
+                credential_registry: true,
             }),
             name: Some("the-mini".into()),
             reach: Some("mini".into()),

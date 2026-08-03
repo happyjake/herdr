@@ -614,6 +614,22 @@ fn read_should_retry(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local-socket caller against a registry of its own, so credential
+    /// state never leaks between tests or into the developer's session dir.
+    fn test_credentials() -> crate::api::credentials::CredentialContext {
+        crate::api::credentials::CredentialContext::local_socket(
+            crate::api::credentials::SharedCredentialRegistry::open(
+                std::env::temp_dir()
+                    .join(format!(
+                        "herdr-graphics-credentials-{}-{:?}",
+                        std::process::id(),
+                        std::thread::current().id()
+                    ))
+                    .join("credentials.json"),
+            ),
+        )
+    }
     use crate::api::schema::{ErrorResponse, Method, ResponseResult, SuccessResponse};
     use crate::api::ApiRequestMessage;
     #[cfg(unix)]
@@ -726,6 +742,7 @@ mod tests {
                 &crate::api::SharedServerReach::from_config(
                     &crate::config::WebSocketApiConfig::default(),
                 ),
+                &test_credentials(),
             )
         });
 
@@ -801,6 +818,7 @@ mod tests {
                 &crate::api::SharedServerReach::from_config(
                     &crate::config::WebSocketApiConfig::default(),
                 ),
+                &test_credentials(),
             )
         });
 
@@ -908,6 +926,7 @@ mod tests {
                 &crate::api::SharedServerReach::from_config(
                     &crate::config::WebSocketApiConfig::default(),
                 ),
+                &test_credentials(),
             )
         });
 
