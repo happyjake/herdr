@@ -1987,3 +1987,492 @@ fn listening_tcp_local_ports(pid: u32) -> Vec<u16> {
     ports.dedup();
     ports
 }
+
+// ---- The credential registry (ADR-0026) ----
+//
+// The verbs are served on the connection thread, the one place both
+// transports pass through, so these tests drive them over the Unix socket
+// and the WebSocket alike and compare the payloads. What differs between the
+// transports is only who the caller is: a WebSocket connection acts as the
+// credential it presented at the handshake, while the local socket owner
+// acts with managing authority (and may name a credential explicitly, which
+// is how limited-tier behavior is reachable there at all).
+
+fn mint_request(id: &str, label: &str) -> String {
+    format!(r#"{{"id":"{id}","method":"credential.mint","params":{{"label":"{label}"}}}}"#)
+}
+
+fn list_request(id: &str) -> String {
+    format!(r#"{{"id":"{id}","method":"credential.list","params":{{}}}}"#)
+}
+
+fn revoke_request(id: &str, credential_id: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","method":"credential.revoke","params":{{"credential_id":"{credential_id}"}}}}"#
+    )
+}
+
+fn minted_credential(response: &serde_json::Value) -> (String, String) {
+    assert_eq!(
+        response["result"]["type"], "credential_minted",
+        "expected a mint, got: {response}"
+    );
+    (
+        response["result"]["credential"]["credential_id"]
+            .as_str()
+            .expect("minted credential id")
+            .to_string(),
+        response["result"]["token"]
+            .as_str()
+            .expect("minted token")
+            .to_string(),
+    )
+}
+
+fn listed_ids(response: &serde_json::Value) -> Vec<String> {
+    response["result"]["credentials"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a credential list, got: {response}"))
+        .iter()
+        .map(|credential| credential["credential_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A listing minus its live clock. `last_seen_unix` moves with every
+/// request — the connection that asks is itself observed — so the two
+/// transports can only be compared on the facts that hold still.
+fn without_last_seen(response: &serde_json::Value) -> serde_json::Value {
+    let mut value = response.clone();
+    if let Some(credentials) = value["result"]["credentials"].as_array_mut() {
+        for credential in credentials {
+            credential
+                .as_object_mut()
+                .expect("credential object")
+                .remove("last_seen_unix");
+        }
+    }
+    value
+}
+
+fn registry_file_path(config_home: &Path) -> PathBuf {
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    config_home.join(app_dir).join("credentials.json")
+}
+
+#[test]
+fn credential_verbs_answer_identically_over_unix_socket_and_websocket() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+
+    // The capability rides the pong, and the pong stays byte-identical
+    // across transports. `protocol` is unchanged: the verbs are additive.
+    let ping = r#"{"id":"req_credential_cap","method":"ping","params":{}}"#;
+    let mut unix_reader = JsonLineReader::connect(&server.socket_path);
+    unix_reader.send_line(ping);
+    let unix_raw = unix_reader.read_raw_line(Duration::from_secs(5));
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    ws.send(ping);
+    let ws_raw = ws.read_raw(Duration::from_secs(5));
+    assert_eq!(unix_raw, ws_raw, "raw pong payloads must be identical");
+    let pong: serde_json::Value = serde_json::from_str(&ws_raw).unwrap();
+    assert_eq!(pong["result"]["capabilities"]["credential_registry"], true);
+
+    // Minting works from either transport and never returns a stored secret
+    // twice: the token appears in the mint response and nowhere else.
+    let over_socket = unix_request(
+        &server.socket_path,
+        &mint_request("req_mint_socket", "over-socket"),
+    );
+    let over_websocket = ws.request(&mint_request("req_mint_ws", "over-websocket"));
+    let (socket_id, socket_token) = minted_credential(&over_socket);
+    let (ws_id, ws_token) = minted_credential(&over_websocket);
+    assert_ne!(socket_id, ws_id);
+    assert_ne!(socket_token, ws_token);
+    for (label, response) in [
+        ("over-socket", &over_socket),
+        ("over-websocket", &over_websocket),
+    ] {
+        assert_eq!(response["result"]["credential"]["tier"], "limited");
+        assert_eq!(response["result"]["credential"]["label"], label);
+        assert!(
+            response["result"]["credential"]["created_at_unix"]
+                .as_u64()
+                .is_some_and(|created| created > 0),
+            "{response}"
+        );
+        assert!(
+            response["result"]["credential"]
+                .get("last_seen_unix")
+                .is_none(),
+            "an unused credential has no last-seen: {response}"
+        );
+        assert_eq!(
+            response["result"]["token"].as_str().map(str::len),
+            Some(43),
+            "{response}"
+        );
+    }
+
+    // One registry, whichever transport asks.
+    let list = list_request("req_credential_list");
+    let unix_list = unix_request(&server.socket_path, &list);
+    let ws_list = ws.request(&list);
+    assert_eq!(without_last_seen(&unix_list), without_last_seen(&ws_list));
+    let ids = listed_ids(&unix_list);
+    assert_eq!(ids.len(), 3, "managing plus both mints: {unix_list}");
+    assert_eq!(unix_list["result"]["credentials"][0]["tier"], "managing");
+    assert!(ids.contains(&socket_id) && ids.contains(&ws_id), "{ids:?}");
+    // Listing reports credentials, never their tokens.
+    assert!(!unix_list.to_string().contains(&socket_token));
+    assert!(!unix_list.to_string().contains(&ws_token));
+
+    // A revoke over one transport is live on the other, and the second
+    // attempt is refused identically — refusals carry no clocks, so these
+    // payloads compare whole.
+    let revoke = revoke_request("req_credential_revoke", &ws_id);
+    let revoked = unix_request(&server.socket_path, &revoke);
+    assert_eq!(revoked["result"]["type"], "credential_revoked");
+    assert_eq!(revoked["result"]["revoked"], serde_json::json!([ws_id]));
+    let unix_again = unix_request(&server.socket_path, &revoke);
+    let ws_again = ws.request(&revoke);
+    assert_eq!(unix_again["error"]["code"], "credential_not_found");
+    assert_eq!(unix_again, ws_again);
+
+    // revoke_all ends every limited credential at once and keeps managing.
+    ws.request(&mint_request("req_mint_extra", "extra"));
+    let revoke_all =
+        r#"{"id":"req_credential_revoke_all","method":"credential.revoke_all","params":{}}"#;
+    let all = unix_request(&server.socket_path, revoke_all);
+    assert_eq!(all["result"]["type"], "credential_revoked");
+    assert_eq!(
+        all["result"]["revoked"].as_array().map(Vec::len),
+        Some(2),
+        "the surviving mints must end together: {all}"
+    );
+    let after = ws.request(revoke_all);
+    assert_eq!(
+        after["result"]["revoked"],
+        serde_json::json!([]),
+        "a second revoke_all has nothing left to end: {after}"
+    );
+    let remaining = unix_request(&server.socket_path, &list_request("req_credential_left"));
+    assert_eq!(listed_ids(&remaining).len(), 1, "{remaining}");
+    assert_eq!(remaining["result"]["credentials"][0]["tier"], "managing");
+
+    // The managing credential is untouched by any of it.
+    let pong = ws.request(r#"{"id":"req_credential_still","method":"ping","params":{}}"#);
+    assert_eq!(pong["result"]["type"], "pong");
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn a_limited_credential_drives_the_pane_api_but_cannot_manage_the_registry() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let mut managing = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let minted = managing.request(&mint_request("req_link_mint", "desk browser"));
+    let (limited_id, limited_token) = minted_credential(&minted);
+    let peer = managing.request(&mint_request("req_link_peer", "other browser"));
+    let (peer_id, _peer_token) = minted_credential(&peer);
+
+    // A minted credential connects and drives the whole pane API — the same
+    // payload the managing credential gets. That is what "limited" does not
+    // mean: it is limited in authority over the registry, nothing else.
+    let mut limited = WsClient::connect(server.ws_addr, &limited_token);
+    let pane_list = r#"{"id":"req_link_panes","method":"pane.list","params":{}}"#;
+    assert_eventually_identical(
+        "pane.list for a limited credential",
+        || managing.request(pane_list),
+        || limited.request(pane_list),
+    );
+
+    // Every management verb is refused with a code, not a silence.
+    for request in [
+        mint_request("req_link_mint_denied", "peer"),
+        list_request("req_link_list_denied"),
+        revoke_request("req_link_revoke_denied", &peer_id),
+    ] {
+        let refused = limited.request(&request);
+        assert_eq!(
+            refused["error"]["code"], "credential_forbidden",
+            "limited credentials may not manage the registry: {refused}"
+        );
+    }
+    // ...and the peer it tried to revoke is still standing.
+    let listed = managing.request(&list_request("req_link_after_denied"));
+    assert!(listed_ids(&listed).contains(&peer_id), "{listed}");
+
+    // The connection cannot claim to be someone else, either.
+    let impersonation = limited.request(&format!(
+        r#"{{"id":"req_link_impersonate","method":"credential.list","params":{{"acting_token":"{TEST_TOKEN}"}}}}"#
+    ));
+    assert_eq!(impersonation["error"]["code"], "invalid_params");
+
+    // Self-revoke is the one management act a limited credential may do, and
+    // it ends that credential's access on its very next request — the code
+    // a client keys its wipe-and-relink path on.
+    let goodbye = limited
+        .request(r#"{"id":"req_link_self_revoke","method":"credential.revoke","params":{}}"#);
+    assert_eq!(
+        goodbye["result"]["revoked"],
+        serde_json::json!([limited_id]),
+        "{goodbye}"
+    );
+    let refused = limited.request(r#"{"id":"req_link_after_self","method":"ping","params":{}}"#);
+    assert_eq!(refused["error"]["code"], "credential_revoked", "{refused}");
+    expect_handshake_rejected(server.ws_addr, &limited_token);
+
+    // The phone is untouched by the browser logging itself out.
+    let pong = managing.request(r#"{"id":"req_link_phone","method":"ping","params":{}}"#);
+    assert_eq!(pong["result"]["type"], "pong");
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+/// Revoking must reach a browser that is sitting on an open subscription,
+/// not just refuse its next request: "log that browser out" has to mean the
+/// browser goes dark wherever it is.
+#[test]
+fn revoking_a_credential_ends_the_stream_it_already_holds() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let mut managing = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let minted = managing.request(&mint_request("req_stream_mint", "browser"));
+    let (limited_id, limited_token) = minted_credential(&minted);
+
+    let mut limited = WsClient::connect(server.ws_addr, &limited_token);
+    let ack = limited.request(
+        r#"{"id":"req_stream_sub","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"}],"live_only":true}}"#,
+    );
+    assert_eq!(ack["result"]["type"], "subscription_started");
+
+    let revoked = unix_request(
+        &server.socket_path,
+        &revoke_request("req_stream_revoke", &limited_id),
+    );
+    assert_eq!(
+        revoked["result"]["revoked"],
+        serde_json::json!([limited_id])
+    );
+
+    wait_for_websocket_close(&mut limited.websocket, Duration::from_secs(5));
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+/// The Unix socket has no handshake, so a caller there names the credential
+/// it acts as. That is the transport's own affordance — owning the socket
+/// file is already full authority — and it is what makes the tier rules
+/// observable over both transports.
+#[test]
+fn tier_rules_and_last_seen_hold_over_the_unix_socket_too() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+
+    let minted = unix_request(
+        &server.socket_path,
+        &mint_request("req_socket_mint", "socket browser"),
+    );
+    let (limited_id, limited_token) = minted_credential(&minted);
+    let peer = unix_request(
+        &server.socket_path,
+        &mint_request("req_socket_peer", "peer"),
+    );
+    let (peer_id, _peer_token) = minted_credential(&peer);
+
+    // Last-seen is server-observed: absent until the credential is used,
+    // and reported through list afterwards.
+    let before = unix_request(&server.socket_path, &list_request("req_socket_before"));
+    let entry_before = before["result"]["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|credential| credential["credential_id"] == limited_id.as_str())
+        .cloned()
+        .expect("minted credential is listed");
+    assert!(entry_before.get("last_seen_unix").is_none(), "{before}");
+
+    // Acting as the limited credential, every management verb is refused.
+    for params in [
+        format!(r#"{{"label":"nope","acting_token":"{limited_token}"}}"#),
+        format!(r#"{{"acting_token":"{limited_token}"}}"#),
+        format!(r#"{{"credential_id":"{peer_id}","acting_token":"{limited_token}"}}"#),
+    ]
+    .iter()
+    .zip(["credential.mint", "credential.list", "credential.revoke"])
+    .map(|(params, method)| {
+        format!(r#"{{"id":"req_socket_denied","method":"{method}","params":{params}}}"#)
+    }) {
+        let refused = unix_request(&server.socket_path, &params);
+        assert_eq!(
+            refused["error"]["code"], "credential_forbidden",
+            "{params} -> {refused}"
+        );
+    }
+
+    let mut limited = WsClient::connect(server.ws_addr, &limited_token);
+    let pong = limited.request(r#"{"id":"req_socket_use","method":"ping","params":{}}"#);
+    assert_eq!(pong["result"]["type"], "pong");
+
+    let after = unix_request(&server.socket_path, &list_request("req_socket_after"));
+    let entry_after = after["result"]["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|credential| credential["credential_id"] == limited_id.as_str())
+        .cloned()
+        .expect("minted credential is still listed");
+    let last_seen = entry_after["last_seen_unix"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a used credential reports last-seen: {after}"));
+    assert!(
+        last_seen >= entry_after["created_at_unix"].as_u64().unwrap(),
+        "{after}"
+    );
+
+    // Self-revoke works over this transport too, and only for itself.
+    let goodbye = unix_request(
+        &server.socket_path,
+        &format!(
+            r#"{{"id":"req_socket_self","method":"credential.revoke","params":{{"acting_token":"{limited_token}"}}}}"#
+        ),
+    );
+    assert_eq!(
+        goodbye["result"]["revoked"],
+        serde_json::json!([limited_id])
+    );
+    let gone = unix_request(
+        &server.socket_path,
+        &format!(
+            r#"{{"id":"req_socket_gone","method":"credential.list","params":{{"acting_token":"{limited_token}"}}}}"#
+        ),
+    );
+    assert_eq!(gone["error"]["code"], "credential_revoked", "{gone}");
+    let survivors = unix_request(&server.socket_path, &list_request("req_socket_survivors"));
+    assert!(listed_ids(&survivors).contains(&peer_id), "{survivors}");
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+/// The registry is runtime state beside the session: a restart keeps every
+/// credential, `herdr pair` rotates the managing credential alone, and
+/// config.toml learns nothing about any of it.
+#[test]
+fn the_registry_survives_restart_and_a_repair_rotates_only_the_managing_credential() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let config_home = server.base.join("config");
+    let runtime_dir = server.base.join("runtime");
+    let ws_port = server.ws_addr.port();
+
+    let mut managing = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let first = managing.request(&mint_request("req_persist_first", "phone-linked"));
+    let (first_id, first_token) = minted_credential(&first);
+    let second = managing.request(&mint_request("req_persist_second", "desk"));
+    let (second_id, second_token) = minted_credential(&second);
+    let managing_id_before =
+        listed_ids(&managing.request(&list_request("req_persist_before")))[0].clone();
+
+    // Nothing about the registry lives in config.toml, and the file beside
+    // the session holds fingerprints rather than credentials.
+    for needle in [&first_id, &first_token, &second_id, &second_token] {
+        assert!(
+            !stored_config_contains(&config_home, needle),
+            "config.toml must not learn about the registry: {needle}"
+        );
+    }
+    let registry_path = registry_file_path(&config_home);
+    let stored = fs::read_to_string(&registry_path)
+        .unwrap_or_else(|err| panic!("registry at {}: {err}", registry_path.display()));
+    assert!(stored.contains(&first_id), "{stored}");
+    for token in [&first_token, &second_token, &TEST_TOKEN.to_string()] {
+        assert!(
+            !stored.contains(token),
+            "the registry stores no tokens: {stored}"
+        );
+    }
+
+    // Restart the server on the same config, socket, and port.
+    drop(managing);
+    drop(server.child);
+    let child = spawn_herdr_with_launch(
+        Path::new(env!("CARGO_BIN_EXE_herdr")),
+        &config_home,
+        &runtime_dir,
+        Some(&server.socket_path),
+        None,
+        &websocket_section(ws_port),
+        &[],
+    );
+    wait_for_socket(&server.socket_path, Duration::from_secs(5));
+    wait_for_ws_listener(server.ws_addr, Duration::from_secs(5));
+
+    let restarted = unix_request(&server.socket_path, &list_request("req_persist_restart"));
+    let ids = listed_ids(&restarted);
+    assert!(
+        ids.contains(&first_id) && ids.contains(&second_id),
+        "every credential survives a restart: {restarted}"
+    );
+    let mut limited = WsClient::connect(server.ws_addr, &first_token);
+    assert_eq!(
+        limited.request(r#"{"id":"req_persist_use","method":"ping","params":{}}"#)["result"]
+            ["type"],
+        "pong"
+    );
+
+    // Re-pairing mints a new managing credential. The old pairing token
+    // stops authenticating; every limited credential stands.
+    let pair = run_pair_cli(&config_home, &runtime_dir, &server.socket_path);
+    assert_eq!(pair.exit_code, 0, "stderr:\n{}", pair.stderr);
+    let rotated = minted_token_from_pair_stdout(&pair.stdout);
+    expect_handshake_rejected(server.ws_addr, TEST_TOKEN);
+
+    let mut repaired = WsClient::connect(server.ws_addr, &rotated);
+    let listed = repaired.request(&list_request("req_persist_rotated"));
+    let ids = listed_ids(&listed);
+    assert_eq!(listed["result"]["credentials"][0]["tier"], "managing");
+    assert_ne!(
+        ids[0], managing_id_before,
+        "a re-pair starts a new managing credential: {listed}"
+    );
+    assert!(
+        ids.contains(&first_id) && ids.contains(&second_id),
+        "limited credentials survive a rotation: {listed}"
+    );
+    for token in [&first_token, &second_token] {
+        let mut survivor = WsClient::connect(server.ws_addr, token);
+        assert_eq!(
+            survivor.request(r#"{"id":"req_persist_survivor","method":"ping","params":{}}"#)
+                ["result"]["type"],
+            "pong"
+        );
+    }
+
+    cleanup_spawned_herdr(child, server.base);
+}
+
+/// A server that predates the registry cannot parse the verbs at all: the
+/// method is unknown, so it answers `invalid_request` with an empty response
+/// id, on either transport. That refusal — not a timeout, not a silence — is
+/// what capability absence looks like to a client.
+#[test]
+fn an_unknown_credential_verb_is_refused_the_way_an_older_server_refuses_all_of_them() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+
+    let request = r#"{"id":"req_unknown_verb","method":"credential.unheard_of","params":{}}"#;
+    let unix_response = unix_request(&server.socket_path, request);
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let ws_response = ws.request(request);
+
+    assert_eq!(unix_response, ws_response);
+    assert_eq!(unix_response["id"], "");
+    assert_eq!(unix_response["error"]["code"], "invalid_request");
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
