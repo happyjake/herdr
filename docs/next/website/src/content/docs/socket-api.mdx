@@ -990,6 +990,88 @@ Errors look like this:
 }
 ```
 
+## Credential registry
+
+A server honors a registry of credentials rather than a single token: one
+**managing** credential — the token `herdr pair` mints into
+`[websocket_api].token`, rotated by re-pairing — plus any **limited**
+credentials the managing credential has minted, for example one per linked
+browser. Every live credential authenticates the WebSocket handshake and
+drives the whole API; the tier decides only who may manage the registry.
+
+The registry is runtime state stored beside the session, not configuration.
+Minting never edits `config.toml`, a restart keeps every credential, and
+re-pairing rotates the managing credential alone — limited credentials
+survive it. Credentials are stored as fingerprints: a minted token is
+returned once, at mint time, and cannot be read back.
+
+Servers that support this declare `credential_registry: true` in the `ping`
+capabilities. Older servers cannot parse the methods and answer
+`invalid_request`; the protocol version is unchanged.
+
+| Method | Who may call it | Params |
+| --- | --- | --- |
+| `credential.mint` | managing only | `label` (optional) |
+| `credential.list` | managing only | — |
+| `credential.revoke` | managing, or any credential on itself | `credential_id` (optional; absent means the caller) |
+| `credential.revoke_all` | managing only | — |
+
+```json
+{ "id": "req_1", "method": "credential.mint", "params": { "label": "desk browser" } }
+```
+
+```json
+{
+  "id": "req_1",
+  "result": {
+    "type": "credential_minted",
+    "credential": {
+      "credential_id": "cred_7f3a1c0d9b2e4a61",
+      "tier": "limited",
+      "label": "desk browser",
+      "created_at_unix": 1781043522
+    },
+    "token": "0Zx3…"
+  }
+}
+```
+
+`credential.list` returns `credential_list` with one `credential` object per
+live credential, managing first, each carrying `credential_id`, `tier`,
+`label`, `created_at_unix`, and `last_seen_unix` once the credential has been
+used. Tokens are never listed. `credential.revoke` and `credential.revoke_all`
+both return `credential_revoked` with the `revoked` array of ended
+`credential_id`s.
+
+Over the Unix socket there is no handshake, so the caller acts as the
+managing credential by default — owning the socket file is already full
+authority over the server. A local caller may act as a specific credential by
+passing its token as `acting_token`; on an authenticated transport the
+credential presented at the handshake is the actor and `acting_token` is
+refused.
+
+### Refusals a credential client must branch on
+
+Three codes are verdicts about the caller's credential. Everything else —
+`internal_error`, `server_unavailable`, `invalid_params`, a dropped
+connection — is trouble: retry, and change nothing stored locally.
+
+| Code | Meaning | What a client should do |
+| --- | --- | --- |
+| `credential_revoked` | The credential is gone from this server: revoked, or never issued here. | Discard it and pair or link again. Retrying never succeeds. |
+| `credential_forbidden` | Live credential, wrong tier: a limited credential may not mint, list, or revoke another. | Nothing; the credential still works for everything else. |
+| `credential_not_found` | No credential with that `credential_id` is in the registry. | Refresh the list; the caller's own credential is unaffected. |
+
+`credential_revoked` is deliverable on an established connection, because a
+browser cannot read a rejected handshake's HTTP status — a 401 and a dead
+endpoint are the same opaque close. A credential the server revoked is
+therefore admitted at the handshake and answered with `credential_revoked`,
+and a connection whose credential is revoked while it is open is answered the
+same way — including one holding an `events.subscribe` stream, which receives
+the refusal with an empty response `id` before the socket closes. The verdict
+is terminal: nothing else is served on that connection. A token the server
+never issued still gets the plain handshake rejection.
+
 ## Protocol stability
 
 Herdr has a protocol version for client/server compatibility. Protocol changes

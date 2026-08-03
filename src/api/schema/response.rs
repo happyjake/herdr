@@ -36,7 +36,13 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ErrorBody {
+    /// Stable machine-readable reason. Clients branch on this, never on
+    /// `message`. Credential-registry refusals use the codes published in
+    /// `CredentialRefusalCode`; any other code — including
+    /// `internal_error` and `server_unavailable` — is trouble to retry, not
+    /// a verdict about the caller's credential.
     pub code: String,
+    /// Human-readable detail. Not contracted; never parse it.
     pub message: String,
 }
 

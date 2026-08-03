@@ -3,14 +3,38 @@
   "protocol": 21,
   "schema_version": 1,
   "schemas": {
+    "credential_refusal_code": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "The refusals a credential verb can answer with, and what each one means\nto the holder of the credential.\n\nA client must be able to implement the revocation-versus-trouble branch\nfrom these three codes alone. Anything else — `internal_error`,\n`server_unavailable`, `invalid_params`, a dropped connection — is\ntrouble: retry, and change nothing locally.",
+      "oneOf": [
+        {
+          "const": "credential_revoked",
+          "description": "This credential no longer exists on this server: it was revoked, or\nit is not one this server issued. The holder should discard it and\npair or link again; retrying will never succeed.\n\nDelivered as a JSON error on an established connection — including to\na connection whose credential was revoked under it, and to a revoked\ncredential that reconnects — because a browser cannot read a\nhandshake's HTTP status. It is terminal: the server serves nothing\nelse on that connection and then closes it.",
+          "type": "string"
+        },
+        {
+          "const": "credential_forbidden",
+          "description": "The credential is live but its tier does not permit this: a limited\ncredential may not mint, list, or revoke another credential. The\ncredential itself is unaffected and stays usable for everything else.",
+          "type": "string"
+        },
+        {
+          "const": "credential_not_found",
+          "description": "No credential with that `credential_id` is in this server's registry\n— already revoked, or never here. The caller's own credential is\nunaffected.",
+          "type": "string"
+        }
+      ],
+      "title": "CredentialRefusalCode"
+    },
     "error_response": {
       "$defs": {
         "ErrorBody": {
           "properties": {
             "code": {
+              "description": "Stable machine-readable reason. Clients branch on this, never on\n`message`. Credential-registry refusals use the codes published in\n`CredentialRefusalCode`; any other code — including\n`internal_error` and `server_unavailable` — is trouble to retry, not\na verdict about the caller's credential.",
               "type": "string"
             },
             "message": {
+              "description": "Human-readable detail. Not contracted; never parse it.",
               "type": "string"
             }
           },

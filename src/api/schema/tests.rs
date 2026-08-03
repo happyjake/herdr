@@ -39,6 +39,7 @@ fn protocol_schema_document() -> serde_json::Value {
             "request": protocol_schema_entry::<Request>("request"),
             "success_response": protocol_schema_entry::<SuccessResponse>("success_response"),
             "error_response": protocol_schema_entry::<ErrorResponse>("error_response"),
+            "credential_refusal_code": protocol_schema_entry::<CredentialRefusalCode>("credential_refusal_code"),
             "event": protocol_schema_entry::<EventEnvelope>("event"),
             "subscription_event": protocol_schema_entry::<SubscriptionEventEnvelope>("subscription_event"),
         },
