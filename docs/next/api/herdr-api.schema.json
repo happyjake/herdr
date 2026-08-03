@@ -1731,6 +1731,54 @@
           ],
           "type": "object"
         },
+        "CredentialActorParams": {
+          "description": "The credential a local-socket caller acts as.\n\nAuthenticated transports carry the acting credential themselves — a\nWebSocket connection acts as the credential it presented at the\nhandshake, and sending this field there is refused. The Unix socket has\nno handshake: owning the socket file is already full authority over the\nserver, so a caller there may act as the managing credential (the\ndefault) or name one of the registry's credentials explicitly.",
+          "properties": {
+            "acting_token": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "CredentialMintParams": {
+          "properties": {
+            "acting_token": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "description": "Display label for the holder, e.g. the linked browser's device name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "CredentialRevokeParams": {
+          "properties": {
+            "acting_token": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "credential_id": {
+              "description": "The credential to end. Absent means the caller's own credential —\nhow a limited credential logs itself out.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "EmptyParams": {
           "type": "object"
         },
@@ -4591,6 +4639,70 @@
         {
           "properties": {
             "method": {
+              "const": "credential.mint",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialMintParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialActorParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.revoke",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialRevokeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.revoke_all",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialActorParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "notification.show",
               "type": "string"
             },
@@ -6433,6 +6545,58 @@
             "failed"
           ],
           "type": "string"
+        },
+        "CredentialInfo": {
+          "description": "One credential as the registry reports it. Never carries a token: a\nminted token is returned once, at mint time, and stored only as a\nfingerprint afterwards.",
+          "properties": {
+            "created_at_unix": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "credential_id": {
+              "type": "string"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_seen_unix": {
+              "description": "Unix seconds of the last request this credential made, absent until\nit has been used. Server-observed, which is what makes the phone's\nlinked-browsers panel a report rather than local bookkeeping.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "tier": {
+              "$ref": "#/schemas/success_response/$defs/CredentialTier"
+            }
+          },
+          "required": [
+            "credential_id",
+            "tier",
+            "created_at_unix"
+          ],
+          "type": "object"
+        },
+        "CredentialTier": {
+          "description": "What a credential is allowed to do (ADR-0026).\n\nA server honors one managing credential — the pairing's token — and any\nnumber of limited credentials it has minted. Both drive the whole pane\nAPI; the tier decides only who may manage the registry itself.",
+          "oneOf": [
+            {
+              "const": "managing",
+              "description": "The pairing's credential: mints, lists, and revokes. Rotated by\nre-running `herdr pair`, never revoked through the API.",
+              "type": "string"
+            },
+            {
+              "const": "limited",
+              "description": "A minted credential: full pane access, and may revoke only itself.",
+              "type": "string"
+            }
+          ]
         },
         "EventData": {
           "oneOf": [
@@ -9868,6 +10032,66 @@
             },
             {
               "properties": {
+                "credential": {
+                  "$ref": "#/schemas/success_response/$defs/CredentialInfo"
+                },
+                "token": {
+                  "description": "The minted credential's token, returned exactly once — the\nregistry stores only its fingerprint, so it cannot be re-read.",
+                  "type": "string"
+                },
+                "type": {
+                  "const": "credential_minted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "credential",
+                "token"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "credentials": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/CredentialInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "credential_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "credentials"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The credentials this request ended: one for `credential.revoke`,\nevery limited credential for `credential.revoke_all`.",
+              "properties": {
+                "revoked": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "credential_revoked",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "revoked"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "diagnostics": {
                   "items": {
                     "type": "string"
@@ -9905,6 +10129,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "credential_registry": {
+              "default": false,
+              "description": "Whether this server keeps a credential registry (ADR-0026): the\npairing's managing credential plus any minted limited credentials,\nwith `credential.mint`, `credential.list`, `credential.revoke`, and\n`credential.revoke_all`. Additive: absent (false) in pongs of servers\nthat predate it, which refuse the verbs as unparseable methods.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

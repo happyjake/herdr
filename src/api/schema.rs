@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod agents;
 pub mod common;
+pub mod credentials;
 pub mod events;
 pub mod integrations;
 pub mod panes;
@@ -15,6 +16,7 @@ pub mod worktrees;
 
 pub use agents::*;
 pub use common::*;
+pub use credentials::*;
 pub use events::*;
 pub use integrations::*;
 pub use panes::*;
@@ -57,6 +59,19 @@ pub enum Method {
     ServerReloadAgentManifests(EmptyParams),
     #[serde(rename = "attachment.create")]
     AttachmentCreate(AttachmentCreateParams),
+    // The credential registry (ADR-0026). Additive verbs: a server that
+    // predates them cannot parse the method and answers `invalid_request`,
+    // which is how a client learns the capability is absent. `protocol` is
+    // unchanged; `credential_registry` in the pong capabilities is the
+    // positive signal.
+    #[serde(rename = "credential.mint")]
+    CredentialMint(CredentialMintParams),
+    #[serde(rename = "credential.list")]
+    CredentialList(CredentialActorParams),
+    #[serde(rename = "credential.revoke")]
+    CredentialRevoke(CredentialRevokeParams),
+    #[serde(rename = "credential.revoke_all")]
+    CredentialRevokeAll(CredentialActorParams),
     #[serde(rename = "notification.show")]
     NotificationShow(NotificationShowParams),
     #[serde(rename = "client.window_title.set")]

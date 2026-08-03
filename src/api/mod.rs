@@ -1,5 +1,6 @@
 mod attachment;
 pub mod client;
+pub(crate) mod credentials;
 mod event_hub;
 pub mod schema;
 mod server;
@@ -11,6 +12,7 @@ mod subscriptions;
 mod wait;
 mod websocket;
 
+pub use credentials::SharedCredentialRegistry;
 pub use event_hub::EventHub;
 pub(crate) use server::cancel_inactive_pane_graphics_streams;
 pub use server::{start_server, start_server_with_capabilities, ServerHandle};

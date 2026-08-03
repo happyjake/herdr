@@ -2745,6 +2745,7 @@ mod tests {
                     detached_server_daemon: true,
                     send_affirm: true,
                     stream_multiplex: true,
+                    credential_registry: true,
                 }),
             },
         };
