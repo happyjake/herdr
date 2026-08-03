@@ -2632,3 +2632,50 @@ fn monolithic_mode_advertises_the_credential_registry_capability() {
 
     cleanup_spawned_herdr(child, base);
 }
+
+/// The stolen-phone case, end to end: `credential.revoke_all` logs every
+/// linked browser out at once, and every one of them must be able to find
+/// that out. A revocation store that forgot the oldest of a batch would
+/// leave those browsers retrying against a silent rejection forever.
+#[test]
+fn revoke_all_leaves_every_logged_out_browser_able_to_learn_it() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let mut managing = WsClient::connect(server.ws_addr, TEST_TOKEN);
+
+    // Comfortably more than any per-batch limit the registry has ever had.
+    let mut tokens = Vec::new();
+    for index in 0..70 {
+        let minted = managing.request(&mint_request(
+            &format!("req_bulk_mint_{index}"),
+            &format!("browser {index}"),
+        ));
+        let (_id, token) = minted_credential(&minted);
+        tokens.push(token);
+    }
+
+    let ended = unix_request(
+        &server.socket_path,
+        r#"{"id":"req_bulk_revoke_all","method":"credential.revoke_all","params":{}}"#,
+    );
+    assert_eq!(
+        ended["result"]["revoked"].as_array().map(Vec::len),
+        Some(tokens.len()),
+        "{ended}"
+    );
+
+    for (index, token) in tokens.iter().enumerate() {
+        let mut returning = WsClient::connect(server.ws_addr, token);
+        let refused = returning.request(&format!(
+            r#"{{"id":"req_bulk_return_{index}","method":"ping","params":{{}}}}"#
+        ));
+        assert_eq!(
+            refused["error"]["code"],
+            "credential_revoked",
+            "browser {index} of {} could not learn it was logged out: {refused}",
+            tokens.len()
+        );
+    }
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
