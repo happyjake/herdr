@@ -857,11 +857,15 @@ fn main() -> io::Result<()> {
     let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
     let server_reach = api::SharedServerReach::from_config(&loaded_config.config.websocket_api);
     let credentials = api::credentials::process_registry();
+    // Monolithic mode declares the same capabilities as the headless server:
+    // it is the same binary serving the same API, and a client that read a
+    // missing declaration as "too old" would refuse features this server has.
+    let capabilities = api::server_capabilities();
     let _api_server = match api::start_server_with_capabilities(
         api_tx.clone(),
         event_hub.clone(),
         credentials.clone(),
-        None,
+        Some(capabilities.clone()),
         server_name.clone(),
         server_reach.clone(),
     ) {
@@ -882,7 +886,7 @@ fn main() -> io::Result<()> {
         api_tx,
         event_hub.clone(),
         credentials,
-        None,
+        Some(capabilities),
         server_name.clone(),
         server_reach.clone(),
     ) {
