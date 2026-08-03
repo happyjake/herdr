@@ -18,6 +18,49 @@ pub enum CredentialTier {
     Limited,
 }
 
+/// The refusals a credential verb can answer with, and what each one means
+/// to the holder of the credential.
+///
+/// A client must be able to implement the revocation-versus-trouble branch
+/// from these three codes alone. Anything else — `internal_error`,
+/// `server_unavailable`, `invalid_params`, a dropped connection — is
+/// trouble: retry, and change nothing locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum CredentialRefusalCode {
+    /// This credential no longer exists on this server: it was revoked, or
+    /// it is not one this server issued. The holder should discard it and
+    /// pair or link again; retrying will never succeed.
+    ///
+    /// Delivered as a JSON error on an established connection — including to
+    /// a connection whose credential was revoked under it, and to a revoked
+    /// credential that reconnects — because a browser cannot read a
+    /// handshake's HTTP status. It is terminal: the server serves nothing
+    /// else on that connection and then closes it.
+    #[serde(rename = "credential_revoked")]
+    Revoked,
+    /// The credential is live but its tier does not permit this: a limited
+    /// credential may not mint, list, or revoke another credential. The
+    /// credential itself is unaffected and stays usable for everything else.
+    #[serde(rename = "credential_forbidden")]
+    Forbidden,
+    /// No credential with that `credential_id` is in this server's registry
+    /// — already revoked, or never here. The caller's own credential is
+    /// unaffected.
+    #[serde(rename = "credential_not_found")]
+    NotFound,
+}
+
+impl CredentialRefusalCode {
+    /// The exact string that appears in `ErrorBody.code`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Revoked => "credential_revoked",
+            Self::Forbidden => "credential_forbidden",
+            Self::NotFound => "credential_not_found",
+        }
+    }
+}
+
 /// One credential as the registry reports it. Never carries a token: a
 /// minted token is returned once, at mint time, and stored only as a
 /// fingerprint afterwards.

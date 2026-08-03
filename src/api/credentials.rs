@@ -31,8 +31,8 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::api::schema::{
-    CredentialInfo, CredentialMintParams, CredentialRevokeParams, CredentialTier, ErrorBody,
-    ErrorResponse, ResponseResult, SuccessResponse,
+    CredentialInfo, CredentialMintParams, CredentialRefusalCode, CredentialRevokeParams,
+    CredentialTier, ErrorBody, ErrorResponse, ResponseResult, SuccessResponse,
 };
 use crate::api::SharedWebSocketToken;
 
@@ -52,18 +52,30 @@ const LIMITED_TOKEN_BYTES: usize = 32;
 /// Labels are display strings for the phone's linked-browsers panel.
 const MAX_LABEL_LEN: usize = 120;
 
+/// How many revoked credentials the registry remembers, and for how long.
+///
+/// A tombstone is what lets a returning holder be *told* it was revoked
+/// instead of meeting an opaque 401 (a browser cannot read a handshake
+/// status). Forgetting one never grants anything — the token is not live
+/// either way — so the bound is safe: the worst case is that a browser
+/// revoked long ago, and already told so on the connection it held at the
+/// time, falls back to today's silent rejection. The cap is what keeps a
+/// server that mints and revokes often from growing this file without end.
+const MAX_TOMBSTONES: usize = 64;
+const TOMBSTONE_TTL_SECS: u64 = 90 * 24 * 60 * 60;
+
 /// How stale a persisted `last_seen` may get. Requests touch last-seen in
 /// memory on every call; the file is rewritten at most this often so a busy
 /// connection does not turn every request into a disk write.
 const LAST_SEEN_PERSIST_INTERVAL_SECS: u64 = 60;
 
-/// Refusals a client can act on. Only these three mean "this credential is
-/// not allowed to do this" — everything else (`internal_error`,
-/// `server_unavailable`, transport trouble) is trouble, not a verdict, and a
-/// client must never wipe its credentials over one.
-pub(crate) const CODE_FORBIDDEN: &str = "credential_forbidden";
-pub(crate) const CODE_NOT_FOUND: &str = "credential_not_found";
-pub(crate) const CODE_REVOKED: &str = "credential_revoked";
+/// Refusals a client can act on. The wire meaning of each is published in
+/// [`CredentialRefusalCode`], which is the contract a client implements the
+/// revocation-versus-trouble branch from; these are the same strings, taken
+/// from there so the code and the published schema cannot drift.
+const CODE_FORBIDDEN: &str = CredentialRefusalCode::Forbidden.as_str();
+const CODE_NOT_FOUND: &str = CredentialRefusalCode::NotFound.as_str();
+const CODE_REVOKED: &str = CredentialRefusalCode::Revoked.as_str();
 
 /// One sentence for every revoked-credential refusal, so a client keys on
 /// the code and can still show something true.
@@ -94,6 +106,18 @@ impl StoredCredential {
     }
 }
 
+/// A credential that was live and is not any more.
+///
+/// Only its fingerprint and identity are kept, exactly like a live entry, so
+/// the file still holds no secrets. Oldest-first pruning is in
+/// [`push_tombstone`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RevokedCredential {
+    id: String,
+    fingerprint: String,
+    revoked_at_unix: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RegistryFile {
     version: u32,
@@ -101,6 +125,8 @@ struct RegistryFile {
     managing: Option<StoredCredential>,
     #[serde(default)]
     limited: Vec<StoredCredential>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revoked: Vec<RevokedCredential>,
 }
 
 impl Default for RegistryFile {
@@ -109,6 +135,7 @@ impl Default for RegistryFile {
             version: REGISTRY_VERSION,
             managing: None,
             limited: Vec::new(),
+            revoked: Vec::new(),
         }
     }
 }
@@ -120,8 +147,39 @@ pub(crate) struct AuthenticatedCredential {
     pub(crate) tier: CredentialTier,
 }
 
+/// What a presented token turned out to be.
+///
+/// The three cases are deliberately distinct at the handshake: a browser
+/// cannot read an HTTP status or body, so telling a revoked credential apart
+/// from a token this server never issued is what lets one be answered in
+/// JSON on an established connection while the other keeps its opaque 401.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HandshakeOutcome {
+    Live(AuthenticatedCredential),
+    /// A credential this server minted and has since revoked.
+    Revoked {
+        credential_id: String,
+    },
+    /// Not a credential of this server's, now or ever (as far as it
+    /// remembers).
+    Unknown,
+}
+
+/// Whether this registry may be written at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegistryFormat {
+    Writable,
+    /// The file on disk was written by a newer herdr. Its contents are
+    /// intact and meaningful to that version, so this one refuses every
+    /// write rather than downgrading a user's credentials away.
+    Newer {
+        file_version: u32,
+    },
+}
+
 struct RegistryState {
     path: PathBuf,
+    format: RegistryFormat,
     file: RegistryFile,
     /// What `last_seen_unix` was when the file was last written, per id, so
     /// the throttle knows when the file has drifted far enough to rewrite.
@@ -157,11 +215,12 @@ impl SharedCredentialRegistry {
     /// because a side file went bad would take the whole server down, and
     /// the managing credential still authenticates from config.
     pub(crate) fn open(path: PathBuf) -> Self {
-        let file = load_registry_file(&path);
+        let (file, format) = load_registry_file(&path);
         let persisted_last_seen = last_seen_index(&file);
         Self {
             state: Arc::new(Mutex::new(RegistryState {
                 path,
+                format,
                 file,
                 persisted_last_seen,
             })),
@@ -192,12 +251,28 @@ impl SharedCredentialRegistry {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Recognize a presented token.
+    /// Whether a presented token is live, and as whom.
     ///
-    /// Any live credential authenticates; the tier decides only what the
-    /// caller may then do. Marks the credential seen, which is what makes
-    /// `credential.list`'s `last_seen_unix` a server-verified fact.
-    pub(crate) fn authenticate(&self, presented: &str) -> Option<AuthenticatedCredential> {
+    /// Test-only: every caller in the server takes the three-way outcome
+    /// instead, so that no path can quietly collapse "revoked" into
+    /// "unknown" — that distinction is the whole revocation-discovery
+    /// contract.
+    #[cfg(test)]
+    fn authenticate(&self, presented: &str) -> Option<AuthenticatedCredential> {
+        match self.authenticate_handshake(presented) {
+            HandshakeOutcome::Live(credential) => Some(credential),
+            HandshakeOutcome::Revoked { .. } | HandshakeOutcome::Unknown => None,
+        }
+    }
+
+    /// Recognize a presented token, including one this server revoked.
+    ///
+    /// A live credential is marked seen, which is what makes
+    /// `credential.list`'s `last_seen_unix` a server-verified fact. Only
+    /// [`HandshakeOutcome::Live`] is honored; the revoked case is
+    /// recognition, not access — it exists so the holder can be told what
+    /// happened over a transport that can carry a reason.
+    pub(crate) fn authenticate_handshake(&self, presented: &str) -> HandshakeOutcome {
         let fingerprint = fingerprint(presented);
         let managing_token = self.managing_token();
         let mut state = self.lock();
@@ -209,7 +284,7 @@ impl SharedCredentialRegistry {
                 let id = managing.id.clone();
                 managing.last_seen_unix = Some(now);
                 persist_last_seen(&mut state, &id, now);
-                return Some(AuthenticatedCredential {
+                return HandshakeOutcome::Live(AuthenticatedCredential {
                     credential_id: id,
                     tier: CredentialTier::Managing,
                 });
@@ -227,12 +302,27 @@ impl SharedCredentialRegistry {
                 credential.last_seen_unix = Some(now);
                 credential.id.clone()
             });
-        let id = found?;
-        persist_last_seen(&mut state, &id, now);
-        Some(AuthenticatedCredential {
-            credential_id: id,
-            tier: CredentialTier::Limited,
-        })
+        if let Some(id) = found {
+            persist_last_seen(&mut state, &id, now);
+            return HandshakeOutcome::Live(AuthenticatedCredential {
+                credential_id: id,
+                tier: CredentialTier::Limited,
+            });
+        }
+
+        match state.file.revoked.iter().find(|tombstone| {
+            constant_time_eq(tombstone.fingerprint.as_bytes(), fingerprint.as_bytes())
+        }) {
+            Some(tombstone) => HandshakeOutcome::Revoked {
+                credential_id: tombstone.id.clone(),
+            },
+            None => HandshakeOutcome::Unknown,
+        }
+    }
+
+    #[cfg(test)]
+    fn tombstone_count_for_test(&self) -> usize {
+        self.lock().file.revoked.len()
     }
 
     /// Mark an already-authenticated credential seen, reporting whether it
@@ -296,24 +386,34 @@ impl SharedCredentialRegistry {
         };
 
         let mut state = self.lock();
-        state.file.limited.push(credential.clone());
-        save(&mut state)?;
+        let mut candidate = state.file.clone();
+        candidate.limited.push(credential.clone());
+        commit(&mut state, candidate)?;
         Ok((credential.info(CredentialTier::Limited), token))
     }
 
     /// Revoke one limited credential by id.
+    ///
+    /// The new registry is written before it is believed: a revoke that
+    /// cannot be persisted must leave the world exactly as it was, or the
+    /// grant would come back on the next restart while the caller had been
+    /// told it was gone.
     pub(crate) fn revoke_limited(&self, credential_id: &str) -> io::Result<bool> {
         let mut state = self.lock();
-        let before = state.file.limited.len();
-        state
+        let Some(position) = state
             .file
             .limited
-            .retain(|credential| credential.id != credential_id);
-        if state.file.limited.len() == before {
+            .iter()
+            .position(|credential| credential.id == credential_id)
+        else {
             return Ok(false);
-        }
+        };
+
+        let mut candidate = state.file.clone();
+        let removed = candidate.limited.remove(position);
+        push_tombstone(&mut candidate, removed);
+        commit(&mut state, candidate)?;
         state.persisted_last_seen.remove(credential_id);
-        save(&mut state)?;
         Ok(true)
     }
 
@@ -321,19 +421,19 @@ impl SharedCredentialRegistry {
     /// The managing credential is untouched: it rotates with `herdr pair`.
     pub(crate) fn revoke_all_limited(&self) -> io::Result<Vec<String>> {
         let mut state = self.lock();
-        let revoked: Vec<String> = state
-            .file
-            .limited
-            .drain(..)
-            .map(|credential| credential.id)
+        let mut candidate = state.file.clone();
+        let ended: Vec<StoredCredential> = candidate.limited.drain(..).collect();
+        let revoked: Vec<String> = ended
+            .iter()
+            .map(|credential| credential.id.clone())
             .collect();
-        if revoked.is_empty() {
-            return Ok(revoked);
+        for credential in ended {
+            push_tombstone(&mut candidate, credential);
         }
+        commit(&mut state, candidate)?;
         for id in &revoked {
             state.persisted_last_seen.remove(id);
         }
-        save(&mut state)?;
         Ok(revoked)
     }
 
@@ -350,6 +450,27 @@ impl SharedCredentialRegistry {
             .as_ref()
             .is_some_and(|managing| managing.id == credential_id)
     }
+}
+
+/// A registry path for tests, under the crate's own `target` directory.
+///
+/// Deliberately not the process temp dir: another test in this binary
+/// redirects `TMPDIR` and then deletes that directory
+/// (`remote::unix::tests::local_forward_socket_path_falls_back_to_tmp_when_dir_is_long`),
+/// which would delete a concurrent test's registry out from under it.
+#[cfg(test)]
+pub(crate) fn test_registry_path(name: &str) -> PathBuf {
+    let unique = format!(
+        "{name}-{}-{}-{:?}",
+        std::process::id(),
+        unix_nanos(),
+        std::thread::current().id()
+    );
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-credentials")
+        .join(unique)
+        .join(CREDENTIALS_FILE)
 }
 
 /// The process-wide registry, beside the active session.
@@ -392,8 +513,28 @@ fn sync_managing(state: &mut RegistryState, managing_token: Option<&str>) {
         created_at_unix: unix_now(),
         last_seen_unix: None,
     });
-    if let Err(err) = save(state) {
+    // Memory first here, unlike a mint or a revoke: the managing
+    // credential's value is decided by config, not by this file, so a failed
+    // write must not stop the freshly paired client from authenticating. The
+    // file catches up on the next successful write or the next start.
+    if let Err(err) = save_current(state) {
         warn!(err = %err, "failed to record the rotated managing credential");
+    }
+}
+
+/// Remember a revoked credential, oldest first out.
+fn push_tombstone(file: &mut RegistryFile, credential: StoredCredential) {
+    let now = unix_now();
+    file.revoked.push(RevokedCredential {
+        id: credential.id,
+        fingerprint: credential.fingerprint,
+        revoked_at_unix: now,
+    });
+    file.revoked
+        .retain(|tombstone| now.saturating_sub(tombstone.revoked_at_unix) < TOMBSTONE_TTL_SECS);
+    if file.revoked.len() > MAX_TOMBSTONES {
+        let excess = file.revoked.len() - MAX_TOMBSTONES;
+        file.revoked.drain(..excess);
     }
 }
 
@@ -410,7 +551,7 @@ fn persist_last_seen(state: &mut RegistryState, credential_id: &str, now: u64) {
         return;
     }
     state.persisted_last_seen.insert(credential_id.into(), now);
-    if let Err(err) = save(state) {
+    if let Err(err) = save_current(state) {
         warn!(err = %err, "failed to persist credential last-seen");
     }
 }
@@ -427,46 +568,102 @@ fn last_seen_index(file: &RegistryFile) -> HashMap<String, u64> {
         .collect()
 }
 
-fn load_registry_file(path: &Path) -> RegistryFile {
+/// Read the registry, reporting whether it may be written back.
+///
+/// A missing or unparseable file starts empty and writable — unparseable
+/// bytes carry nothing to protect. A file from a *newer* herdr is different:
+/// it is intact and meaningful there, so it is preserved and this version
+/// refuses to write over it. An unreadable file is never fatal: the server
+/// must still serve, and the managing credential authenticates from config.
+fn load_registry_file(path: &Path) -> (RegistryFile, RegistryFormat) {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return RegistryFile::default(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return (RegistryFile::default(), RegistryFormat::Writable)
+        }
         Err(err) => {
             warn!(path = %path.display(), err = %err, "failed to read credential registry, starting empty");
-            return RegistryFile::default();
+            return (RegistryFile::default(), RegistryFormat::Writable);
         }
     };
 
+    let file_version = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    if file_version > u64::from(REGISTRY_VERSION) {
+        warn!(
+            path = %path.display(),
+            file_version,
+            supported = REGISTRY_VERSION,
+            "credential registry was written by a newer herdr; keeping it as found and refusing to write to it"
+        );
+        return (
+            RegistryFile::default(),
+            RegistryFormat::Newer {
+                file_version: file_version.try_into().unwrap_or(u32::MAX),
+            },
+        );
+    }
+
     match serde_json::from_str::<RegistryFile>(&content) {
-        Ok(file) if file.version <= REGISTRY_VERSION => file,
-        Ok(file) => {
-            warn!(
-                file_version = file.version,
-                supported = REGISTRY_VERSION,
-                "credential registry is from a newer herdr, ignoring it"
-            );
-            RegistryFile::default()
-        }
+        Ok(file) => (file, RegistryFormat::Writable),
         Err(err) => {
             warn!(path = %path.display(), err = %err, "failed to parse credential registry, starting empty");
-            RegistryFile::default()
+            (RegistryFile::default(), RegistryFormat::Writable)
         }
     }
+}
+
+/// Adopt a candidate registry only once it is safely on disk.
+///
+/// Authority-changing edits (mint, revoke, revoke-all) go through here so a
+/// storage failure leaves memory and disk agreeing on the old state: a
+/// half-applied revoke would answer a retry with `credential_not_found` —
+/// which reads as confirmation — and hand the grant back at the next start.
+fn commit(state: &mut RegistryState, candidate: RegistryFile) -> io::Result<()> {
+    write_registry_file(&state.path, &state.format, &candidate)?;
+    state.file = candidate;
+    Ok(())
+}
+
+/// Best-effort write of the live registry, for the facts memory already
+/// owns: last-seen clocks and the managing entry config decides.
+fn save_current(state: &mut RegistryState) -> io::Result<()> {
+    write_registry_file(&state.path, &state.format, &state.file)
 }
 
 /// Write the registry through a temp file so a crash mid-write cannot leave
 /// a half-written registry — losing the file would lock every linked browser
 /// out at once.
-fn save(state: &mut RegistryState) -> io::Result<()> {
-    state.file.version = REGISTRY_VERSION;
-    let json = serde_json::to_string_pretty(&state.file)?;
-    if let Some(parent) = state.path.parent() {
+fn write_registry_file(
+    path: &Path,
+    format: &RegistryFormat,
+    file: &RegistryFile,
+) -> io::Result<()> {
+    if let RegistryFormat::Newer { file_version } = format {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the credential registry at {} was written by a newer herdr \
+                 (format {file_version}, this build supports {REGISTRY_VERSION}); \
+                 refusing to overwrite it — run the newer herdr, or move that \
+                 file aside to start a fresh registry",
+                path.display()
+            ),
+        ));
+    }
+
+    let mut file = file.clone();
+    file.version = REGISTRY_VERSION;
+    let json = serde_json::to_string_pretty(&file)?;
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp_path = state.path.with_extension("json.tmp");
+    let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, &json)?;
     restrict_registry_permissions(&tmp_path)?;
-    if let Err(err) = std::fs::rename(&tmp_path, &state.path) {
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
@@ -569,6 +766,13 @@ enum Actor {
         credential_id: String,
         tier: CredentialTier,
     },
+    /// A connection that presented a credential this server has revoked.
+    ///
+    /// It is admitted deliberately: a browser cannot read a handshake's
+    /// status or body, so a 401 and a dead endpoint look the same to it and
+    /// revocation would be invisible. Admitted, it can be told in JSON — and
+    /// told nothing else.
+    RevokedConnection { credential_id: String },
 }
 
 /// The acting credential, resolved against the registry at request time.
@@ -598,6 +802,35 @@ impl CredentialContext {
         }
     }
 
+    /// A connection admitted only to be told its credential is gone.
+    pub(crate) fn revoked_connection(
+        registry: SharedCredentialRegistry,
+        credential_id: String,
+    ) -> Self {
+        Self {
+            registry,
+            actor: Actor::RevokedConnection { credential_id },
+        }
+    }
+
+    /// The credential this connection presented, revoked or not. For logs.
+    pub(crate) fn credential_id(&self) -> Option<&str> {
+        match &self.actor {
+            Actor::LocalSocket => None,
+            Actor::Connection { credential_id, .. }
+            | Actor::RevokedConnection { credential_id } => Some(credential_id),
+        }
+    }
+
+    /// The terminal verdict frame, for a transport that must deliver it
+    /// without a request to answer — a held stream, or an idle connection
+    /// whose credential was revoked under it. Answered off-id (empty id),
+    /// the same shape this API already uses for refusals that belong to no
+    /// request; only the code decides what it means.
+    pub(crate) fn revocation_verdict(&self) -> String {
+        error_json("", CODE_REVOKED, REVOKED_MESSAGE.into())
+    }
+
     /// Re-check the connection's own credential before serving a request,
     /// and mark it seen. `Some(response)` is a refusal to write instead of
     /// serving: the credential was revoked while the connection was open, so
@@ -619,6 +852,7 @@ impl CredentialContext {
     pub(crate) fn is_revoked(&self) -> bool {
         match &self.actor {
             Actor::LocalSocket => false,
+            Actor::RevokedConnection { .. } => true,
             // A managing connection keeps its grant for its lifetime. The
             // only thing that removes its entry is a re-pair, and rotation
             // has never severed connections that already authenticated
@@ -643,6 +877,7 @@ impl CredentialContext {
     /// connection cannot claim to be someone else.
     fn resolve(&self, acting_token: Option<&str>) -> Result<ResolvedActor, (&'static str, String)> {
         match (&self.actor, acting_token) {
+            (Actor::RevokedConnection { .. }, _) => Err((CODE_REVOKED, REVOKED_MESSAGE.into())),
             (Actor::Connection { .. }, Some(_)) => Err((
                 "invalid_params",
                 "acting_token is not accepted on an authenticated connection; \
@@ -671,16 +906,22 @@ impl CredentialContext {
                     None => Err((CODE_REVOKED, REVOKED_MESSAGE.into())),
                 }
             }
-            (Actor::LocalSocket, Some(token)) => match self.registry.authenticate(token) {
-                Some(credential) => Ok(ResolvedActor {
-                    credential_id: Some(credential.credential_id),
-                    tier: credential.tier,
-                }),
-                None => Err((
-                    CODE_REVOKED,
-                    "the presented credential is not in this server's registry".into(),
-                )),
-            },
+            (Actor::LocalSocket, Some(token)) => {
+                match self.registry.authenticate_handshake(token) {
+                    HandshakeOutcome::Live(credential) => Ok(ResolvedActor {
+                        credential_id: Some(credential.credential_id),
+                        tier: credential.tier,
+                    }),
+                    // Both refusals carry the same code on purpose: to the
+                    // holder of a token this server will not honor, "revoked"
+                    // and "never mine" call for the same wipe.
+                    HandshakeOutcome::Revoked { .. } => Err((CODE_REVOKED, REVOKED_MESSAGE.into())),
+                    HandshakeOutcome::Unknown => Err((
+                        CODE_REVOKED,
+                        "the presented credential is not in this server's registry".into(),
+                    )),
+                }
+            }
             // Owning the socket file is managing authority by itself: it is
             // the same access `herdr pair` and `herdr server stop` already
             // have, so there is nothing weaker to fall back to.
@@ -831,11 +1072,13 @@ fn forbidden(request_id: &str, action: &str) -> String {
 
 fn internal_error(request_id: &str, err: &io::Error) -> String {
     // Storage trouble is trouble, never a verdict about the credential: a
-    // client that wiped itself over this would lose a working grant.
+    // client that wiped itself over this would lose a working grant. The
+    // registry is written before it is believed, so this also states a fact:
+    // nothing changed, and the same request can simply be retried.
     error_json(
         request_id,
         "internal_error",
-        format!("failed to update the credential registry: {err}"),
+        format!("the credential registry could not be updated: {err}; nothing changed"),
     )
 }
 
@@ -869,13 +1112,7 @@ mod tests {
     use super::*;
 
     fn temp_registry_path(name: &str) -> PathBuf {
-        std::env::temp_dir()
-            .join(format!(
-                "herdr-credentials-{name}-{}-{}",
-                std::process::id(),
-                unix_nanos()
-            ))
-            .join(CREDENTIALS_FILE)
+        test_registry_path(name)
     }
 
     fn registry_with_managing(name: &str, token: &str) -> (SharedCredentialRegistry, PathBuf) {
@@ -1036,6 +1273,164 @@ mod tests {
         );
         registry.revoke_limited(&info.credential_id).unwrap();
         assert_eq!(registry.mark_seen(&info.credential_id), None);
+    }
+
+    /// A browser cannot read a 401 (PROTOCOL-NOTES: a rejected handshake and
+    /// a dead endpoint are the same opaque close), so the server has to be
+    /// able to tell a credential it revoked from one that never existed.
+    #[test]
+    fn a_revoked_credential_stays_distinguishable_from_one_that_never_existed() {
+        let (registry, _path) = registry_with_managing("tombstone", "pair-token");
+        let (info, token) = registry.mint(Some("browser".into())).unwrap();
+
+        registry.revoke_limited(&info.credential_id).unwrap();
+
+        match registry.authenticate_handshake(&token) {
+            HandshakeOutcome::Revoked { credential_id } => {
+                assert_eq!(credential_id, info.credential_id)
+            }
+            other => panic!("a revoked credential must be recognized: {other:?}"),
+        }
+        assert!(matches!(
+            registry.authenticate_handshake("never-minted-token"),
+            HandshakeOutcome::Unknown
+        ));
+        // It is recognized, not honored: nothing about it is live.
+        assert!(registry.authenticate(&token).is_none());
+        assert_eq!(registry.list().len(), 1);
+    }
+
+    #[test]
+    fn revoke_all_tombstones_every_credential_it_ends() {
+        let (registry, _path) = registry_with_managing("tombstone-all", "pair-token");
+        let (_first, first_token) = registry.mint(None).unwrap();
+        let (_second, second_token) = registry.mint(None).unwrap();
+
+        registry.revoke_all_limited().unwrap();
+
+        for token in [&first_token, &second_token] {
+            assert!(matches!(
+                registry.authenticate_handshake(token),
+                HandshakeOutcome::Revoked { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn tombstones_survive_a_restart_and_stay_bounded() {
+        let path = temp_registry_path("tombstone-bound");
+        let registry = SharedCredentialRegistry::open(path.clone());
+        registry.attach_managing_token(SharedWebSocketToken::new("pair-token".to_string()));
+
+        let mut tokens = Vec::new();
+        for _ in 0..(MAX_TOMBSTONES + 3) {
+            let (info, token) = registry.mint(None).unwrap();
+            registry.revoke_limited(&info.credential_id).unwrap();
+            tokens.push(token);
+        }
+
+        let restarted = SharedCredentialRegistry::open(path);
+        // The newest are still recognized...
+        assert!(matches!(
+            restarted.authenticate_handshake(tokens.last().unwrap()),
+            HandshakeOutcome::Revoked { .. }
+        ));
+        // ...and the oldest have aged out into a plain unknown token, which
+        // is a refusal either way.
+        assert!(matches!(
+            restarted.authenticate_handshake(&tokens[0]),
+            HandshakeOutcome::Unknown
+        ));
+        assert_eq!(restarted.tombstone_count_for_test(), MAX_TOMBSTONES);
+    }
+
+    /// A revoke that cannot be persisted must not half-happen: the on-disk
+    /// grant would outlive the in-memory one and come back on restart, while
+    /// the caller's retry would read `credential_not_found` as confirmation.
+    #[cfg(unix)]
+    #[test]
+    fn a_revoke_that_cannot_be_saved_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (registry, path) = registry_with_managing("revoke-io-fail", "pair-token");
+        let (first, first_token) = registry.mint(Some("first".into())).unwrap();
+        let (_second, second_token) = registry.mint(Some("second".into())).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let dir = path.parent().unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let single = registry.revoke_limited(&first.credential_id);
+        let all = registry.revoke_all_limited();
+        // Read while the directory is still unwritable, so nothing this test
+        // does afterwards can be mistaken for the revoke's own writes.
+        let after = std::fs::read_to_string(&path).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(single.is_err(), "an unwritable registry must fail loudly");
+        assert!(all.is_err(), "{all:?}");
+        assert_eq!(after, before, "a failed revoke must not touch the file");
+        // Nothing moved in memory either: both credentials still
+        // authenticate and neither was tombstoned.
+        assert!(registry.authenticate(&first_token).is_some());
+        assert!(registry.authenticate(&second_token).is_some());
+        assert!(matches!(
+            registry.authenticate_handshake(&first_token),
+            HandshakeOutcome::Live(_)
+        ));
+        assert_eq!(registry.list().len(), 3);
+
+        // And once the disk is writable again the revoke goes through.
+        assert!(registry.revoke_limited(&first.credential_id).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mint_that_cannot_be_saved_leaves_no_live_credential() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (registry, path) = registry_with_managing("mint-io-fail", "pair-token");
+        registry.mint(None).unwrap();
+        let dir = path.parent().unwrap();
+
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let minted = registry.mint(Some("doomed".into()));
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(minted.is_err(), "an unwritable registry must fail loudly");
+        assert_eq!(
+            registry.list().len(),
+            2,
+            "a mint that was never stored must not be live"
+        );
+    }
+
+    /// A temporary downgrade must not eat the newer server's registry: the
+    /// file is left exactly as found and every write is refused.
+    #[test]
+    fn a_registry_from_a_newer_herdr_is_never_overwritten() {
+        let path = temp_registry_path("newer-format");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let newer = serde_json::json!({
+            "version": REGISTRY_VERSION + 7,
+            "limited": [{
+                "id": "cred_from_the_future",
+                "fingerprint": fingerprint("future-token"),
+                "created_at_unix": 1,
+                "unknown_future_field": true,
+            }],
+        })
+        .to_string();
+        std::fs::write(&path, &newer).unwrap();
+
+        let registry = SharedCredentialRegistry::open(path.clone());
+        registry.attach_managing_token(SharedWebSocketToken::new("pair-token".to_string()));
+
+        // The pairing still works — it authenticates from config, not here.
+        assert!(registry.authenticate("pair-token").is_some());
+        // Every write is refused, and the file is untouched.
+        assert!(registry.mint(Some("nope".into())).is_err());
+        assert!(registry.revoke_all_limited().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
     }
 
     #[test]

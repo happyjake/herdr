@@ -110,13 +110,7 @@ pub fn start_server(
         api_tx,
         event_hub,
         crate::api::credentials::process_registry(),
-        Some(ServerCapabilities {
-            live_handoff: crate::platform::capabilities().live_handoff,
-            detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
-            send_affirm: true,
-            stream_multiplex: true,
-            credential_registry: true,
-        }),
+        Some(crate::api::server_capabilities()),
         server_name,
         server_reach,
     )
@@ -1142,7 +1136,7 @@ mod tests {
     fn test_credentials() -> crate::api::credentials::CredentialContext {
         crate::api::credentials::CredentialContext::local_socket(
             crate::api::credentials::SharedCredentialRegistry::open(
-                unique_test_path("credentials").join("credentials.json"),
+                crate::api::credentials::test_registry_path("socket"),
             ),
         )
     }
