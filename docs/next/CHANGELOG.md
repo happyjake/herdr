@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- The websocket API now keeps a credential registry per server: the pairing's managing credential plus limited credentials minted through `credential.mint`, listed with `credential.list`, and ended with `credential.revoke` / `credential.revoke_all`. Limited credentials drive the whole API but cannot manage the registry, and may revoke only themselves. Servers declare `credential_registry` in their `ping` capabilities; the protocol version is unchanged. Revocation is reported to the affected client as a terminal `credential_revoked` error on an established connection, so a browser can tell revocation from transient trouble.
+
 ### Changed
 - Agent status indicators now use the same static workspace marks across the sidebar, navigator, and mobile views, eliminating continuous spinner rendering while agents work.
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
