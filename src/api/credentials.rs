@@ -52,17 +52,31 @@ const LIMITED_TOKEN_BYTES: usize = 32;
 /// Labels are display strings for the phone's linked-browsers panel.
 const MAX_LABEL_LEN: usize = 120;
 
-/// How many revoked credentials the registry remembers, and for how long.
+/// How long a revoked credential stays discoverable.
 ///
 /// A tombstone is what lets a returning holder be *told* it was revoked
 /// instead of meeting an opaque 401 (a browser cannot read a handshake
-/// status). Forgetting one never grants anything — the token is not live
-/// either way — so the bound is safe: the worst case is that a browser
-/// revoked long ago, and already told so on the connection it held at the
-/// time, falls back to today's silent rejection. The cap is what keeps a
-/// server that mints and revokes often from growing this file without end.
-const MAX_TOMBSTONES: usize = 64;
+/// status), so **age is the policy**: within this window a revocation is
+/// never forgotten, whatever else has happened since. Past it, the holder
+/// falls back to a silent rejection — by then it has had ninety days to
+/// come back and be told, and it was already told on the connection it held
+/// when the revoke landed.
 const TOMBSTONE_TTL_SECS: u64 = 90 * 24 * 60 * 60;
+
+/// Hard ceiling on remembered revocations, so the file cannot grow without
+/// end — not a working limit.
+///
+/// It is deliberately far out of reach of real use: revoking every browser
+/// of a large fleet, or unlinking and re-linking one daily, does not come
+/// near it. Reaching it means averaging ~45 revocations a day for the whole
+/// ninety-day window. The cost of holding it is small — a tombstone is an
+/// id, a fingerprint, and a timestamp, about 150 bytes of JSON, so a full
+/// store is well under a megabyte — which is exactly why the ceiling can be
+/// set high enough that count pressure never evicts a recent revocation.
+/// A server that does hit it keeps the newest and logs that it is dropping
+/// revocations; forgetting one silently is what would leave a logged-out
+/// browser retrying forever.
+const MAX_TOMBSTONES: usize = 4096;
 
 /// How stale a persisted `last_seen` may get. Requests touch last-seen in
 /// memory on every call; the file is rewritten at most this often so a busy
@@ -320,11 +334,6 @@ impl SharedCredentialRegistry {
         }
     }
 
-    #[cfg(test)]
-    fn tombstone_count_for_test(&self) -> usize {
-        self.lock().file.revoked.len()
-    }
-
     /// Mark an already-authenticated credential seen, reporting whether it
     /// is still live. This is the per-request check that turns a revoke into
     /// enforcement on an open connection instead of a request to disconnect.
@@ -411,7 +420,7 @@ impl SharedCredentialRegistry {
 
         let mut candidate = state.file.clone();
         let removed = candidate.limited.remove(position);
-        push_tombstone(&mut candidate, removed);
+        push_tombstone(&mut candidate, removed, unix_now());
         commit(&mut state, candidate)?;
         state.persisted_last_seen.remove(credential_id);
         Ok(true)
@@ -427,9 +436,16 @@ impl SharedCredentialRegistry {
             .iter()
             .map(|credential| credential.id.clone())
             .collect();
-        for credential in ended {
-            push_tombstone(&mut candidate, credential);
-        }
+        // One timestamp and one prune for the whole batch: revoking every
+        // credential at once must leave every one of them discoverable, not
+        // let the last few evict the first few.
+        let now = unix_now();
+        candidate.revoked.extend(
+            ended
+                .into_iter()
+                .map(|credential| tombstone(credential, now)),
+        );
+        prune_tombstones(&mut candidate.revoked, now);
         commit(&mut state, candidate)?;
         for id in &revoked {
             state.persisted_last_seen.remove(id);
@@ -522,20 +538,43 @@ fn sync_managing(state: &mut RegistryState, managing_token: Option<&str>) {
     }
 }
 
-/// Remember a revoked credential, oldest first out.
-fn push_tombstone(file: &mut RegistryFile, credential: StoredCredential) {
-    let now = unix_now();
-    file.revoked.push(RevokedCredential {
+/// Remember a revoked credential.
+fn push_tombstone(file: &mut RegistryFile, credential: StoredCredential, now: u64) {
+    file.revoked.push(tombstone(credential, now));
+    prune_tombstones(&mut file.revoked, now);
+}
+
+fn tombstone(credential: StoredCredential, now: u64) -> RevokedCredential {
+    RevokedCredential {
         id: credential.id,
         fingerprint: credential.fingerprint,
         revoked_at_unix: now,
-    });
-    file.revoked
-        .retain(|tombstone| now.saturating_sub(tombstone.revoked_at_unix) < TOMBSTONE_TTL_SECS);
-    if file.revoked.len() > MAX_TOMBSTONES {
-        let excess = file.revoked.len() - MAX_TOMBSTONES;
-        file.revoked.drain(..excess);
     }
+}
+
+/// Evict by age, and only then by count.
+///
+/// Nothing still inside [`TOMBSTONE_TTL_SECS`] is dropped to make room for
+/// something newer: a revocation the holder has not yet come back to learn
+/// about is precisely the one worth keeping, and a small count cap that
+/// evicted it would turn a bulk revoke — log every browser out at once —
+/// into a set of browsers that can never find out. Only a store that is
+/// still over the ceiling with every entry recent loses anything, and it
+/// says so.
+fn prune_tombstones(revoked: &mut Vec<RevokedCredential>, now: u64) {
+    revoked.retain(|tombstone| now.saturating_sub(tombstone.revoked_at_unix) < TOMBSTONE_TTL_SECS);
+    if revoked.len() <= MAX_TOMBSTONES {
+        return;
+    }
+
+    let dropped = revoked.len() - MAX_TOMBSTONES;
+    warn!(
+        dropped,
+        ceiling = MAX_TOMBSTONES,
+        "credential revocation history is full; forgetting the oldest still-recent revocations, \
+         whose holders will now meet a silent rejection instead of being told they were revoked"
+    );
+    revoked.drain(..dropped);
 }
 
 /// Record a fresh last-seen, rewriting the file only when the persisted copy
@@ -1316,32 +1355,114 @@ mod tests {
         }
     }
 
+    /// Bulk revocation is the stolen-phone case, and every browser it logs
+    /// out has to be able to find that out. A count cap that evicted recent
+    /// tombstones would turn "log them all out" into "log them all out and
+    /// tell none of them", leaving each retrying against a silent 401.
     #[test]
-    fn tombstones_survive_a_restart_and_stay_bounded() {
-        let path = temp_registry_path("tombstone-bound");
+    fn revoking_far_more_credentials_than_the_old_cap_leaves_them_all_discoverable() {
+        let path = temp_registry_path("tombstone-bulk");
         let registry = SharedCredentialRegistry::open(path.clone());
         registry.attach_managing_token(SharedWebSocketToken::new("pair-token".to_string()));
 
         let mut tokens = Vec::new();
-        for _ in 0..(MAX_TOMBSTONES + 3) {
-            let (info, token) = registry.mint(None).unwrap();
-            registry.revoke_limited(&info.credential_id).unwrap();
+        for _ in 0..70 {
+            let (_info, token) = registry.mint(None).unwrap();
             tokens.push(token);
         }
+        assert_eq!(registry.revoke_all_limited().unwrap().len(), 70);
 
+        for (index, token) in tokens.iter().enumerate() {
+            assert!(
+                matches!(
+                    registry.authenticate_handshake(token),
+                    HandshakeOutcome::Revoked { .. }
+                ),
+                "credential {index} of a bulk revoke lost its tombstone"
+            );
+        }
+
+        // ...and still after a restart, which is when the holder usually
+        // comes back.
         let restarted = SharedCredentialRegistry::open(path);
-        // The newest are still recognized...
-        assert!(matches!(
-            restarted.authenticate_handshake(tokens.last().unwrap()),
-            HandshakeOutcome::Revoked { .. }
-        ));
-        // ...and the oldest have aged out into a plain unknown token, which
-        // is a refusal either way.
-        assert!(matches!(
-            restarted.authenticate_handshake(&tokens[0]),
-            HandshakeOutcome::Unknown
-        ));
-        assert_eq!(restarted.tombstone_count_for_test(), MAX_TOMBSTONES);
+        for token in &tokens {
+            assert!(matches!(
+                restarted.authenticate_handshake(token),
+                HandshakeOutcome::Revoked { .. }
+            ));
+        }
+    }
+
+    /// The other way a FIFO cap loses a revocation: not one big batch, but
+    /// a steady trickle of later ones behind it.
+    #[test]
+    fn later_revocations_do_not_push_out_an_earlier_one() {
+        let (registry, _path) = registry_with_managing("tombstone-trickle", "pair-token");
+        let (first, first_token) = registry
+            .mint(Some("the browser that matters".into()))
+            .unwrap();
+        registry.revoke_limited(&first.credential_id).unwrap();
+
+        for _ in 0..80 {
+            let (info, _token) = registry.mint(None).unwrap();
+            registry.revoke_limited(&info.credential_id).unwrap();
+        }
+
+        match registry.authenticate_handshake(&first_token) {
+            HandshakeOutcome::Revoked { credential_id } => {
+                assert_eq!(credential_id, first.credential_id)
+            }
+            other => panic!("an earlier revocation was pushed out: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tombstones_past_the_ttl_are_evicted_and_recent_ones_are_kept() {
+        let now = 10 * TOMBSTONE_TTL_SECS;
+        let entry = |name: &str, revoked_at_unix: u64| RevokedCredential {
+            id: name.to_string(),
+            fingerprint: fingerprint(name),
+            revoked_at_unix,
+        };
+        let mut revoked = vec![
+            entry("ancient", now - TOMBSTONE_TTL_SECS - 1),
+            entry("just_expired", now - TOMBSTONE_TTL_SECS),
+            entry("just_inside", now - TOMBSTONE_TTL_SECS + 1),
+            entry("fresh", now),
+        ];
+
+        prune_tombstones(&mut revoked, now);
+
+        let kept: Vec<&str> = revoked.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(kept, vec!["just_inside", "fresh"]);
+    }
+
+    /// The ceiling is a backstop against unbounded growth, not a working
+    /// limit. If it is ever reached with everything recent, the newest are
+    /// what survive — and [`prune_tombstones`] logs that it is dropping
+    /// revocations rather than doing it quietly.
+    #[test]
+    fn the_tombstone_ceiling_keeps_the_newest_when_everything_is_recent() {
+        let now = TOMBSTONE_TTL_SECS;
+        let mut revoked: Vec<RevokedCredential> = (0..MAX_TOMBSTONES + 10)
+            .map(|index| RevokedCredential {
+                id: format!("cred_{index}"),
+                fingerprint: fingerprint(&format!("token-{index}")),
+                revoked_at_unix: now,
+            })
+            .collect();
+
+        prune_tombstones(&mut revoked, now);
+
+        assert_eq!(revoked.len(), MAX_TOMBSTONES);
+        assert_eq!(
+            revoked.first().map(|entry| entry.id.as_str()),
+            Some("cred_10")
+        );
+        assert_eq!(
+            revoked.last().map(|entry| entry.id.as_str()),
+            Some(format!("cred_{}", MAX_TOMBSTONES + 9).as_str())
+        );
     }
 
     /// A revoke that cannot be persisted must not half-happen: the on-disk
