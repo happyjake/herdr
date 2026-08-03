@@ -163,6 +163,38 @@ fn spawn_herdr_with_launch(
     websocket_section: &str,
     extra_env: &[(&str, &str)],
 ) -> SpawnedHerdr {
+    spawn_herdr_with_launch_mode(
+        executable,
+        config_home,
+        runtime_dir,
+        socket_override,
+        session_name,
+        websocket_section,
+        extra_env,
+        LaunchMode::Server,
+    )
+}
+
+/// How the spawned herdr runs. Monolithic mode (plain `herdr`) starts the
+/// same listeners from `main.rs` rather than from the headless server, so it
+/// is its own path through the API declarations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaunchMode {
+    Server,
+    Monolithic,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_herdr_with_launch_mode(
+    executable: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_override: Option<&Path>,
+    session_name: Option<&str>,
+    websocket_section: &str,
+    extra_env: &[(&str, &str)],
+    mode: LaunchMode,
+) -> SpawnedHerdr {
     // Debug builds read the herdr-dev config dir; write the release dir too
     // so the fixture does not depend on the build profile.
     for dir in ["herdr", "herdr-dev"] {
@@ -190,7 +222,9 @@ fn spawn_herdr_with_launch(
         cmd.arg("--session");
         cmd.arg(session_name);
     }
-    cmd.arg("server");
+    if mode == LaunchMode::Server {
+        cmd.arg("server");
+    }
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     if let Some(socket_override) = socket_override {
@@ -2225,7 +2259,11 @@ fn a_limited_credential_drives_the_pane_api_but_cannot_manage_the_registry() {
     );
     let refused = limited.request(r#"{"id":"req_link_after_self","method":"ping","params":{}}"#);
     assert_eq!(refused["error"]["code"], "credential_revoked", "{refused}");
-    expect_handshake_rejected(server.ws_addr, &limited_token);
+    // Coming back gets the same verdict rather than a silent rejection —
+    // a browser cannot read a 401, so revocation has to be sayable.
+    let mut returning = WsClient::connect(server.ws_addr, &limited_token);
+    let refused = returning.request(r#"{"id":"req_link_return","method":"ping","params":{}}"#);
+    assert_eq!(refused["error"]["code"], "credential_revoked", "{refused}");
 
     // The phone is untouched by the browser logging itself out.
     let pong = managing.request(r#"{"id":"req_link_phone","method":"ping","params":{}}"#);
@@ -2260,6 +2298,14 @@ fn revoking_a_credential_ends_the_stream_it_already_holds() {
         serde_json::json!([limited_id])
     );
 
+    // The browser must be told *why* its stream ended. A bare close is what
+    // transient trouble looks like, so the verdict has to arrive as JSON
+    // before the socket goes.
+    let verdict = limited.read_json(Duration::from_secs(5));
+    assert_eq!(
+        verdict["error"]["code"], "credential_revoked",
+        "a revoked stream must carry its verdict: {verdict}"
+    );
     wait_for_websocket_close(&mut limited.websocket, Duration::from_secs(5));
 
     cleanup_spawned_herdr(server.child, server.base);
@@ -2475,4 +2521,114 @@ fn an_unknown_credential_verb_is_refused_the_way_an_older_server_refuses_all_of_
     assert_eq!(unix_response["error"]["code"], "invalid_request");
 
     cleanup_spawned_herdr(server.child, server.base);
+}
+
+/// The revocation-discovery contract: a linked browser must be able to tell
+/// "my credential was revoked" (wipe, return to the QR) from "transient
+/// trouble" (retry, change nothing). A browser cannot read a handshake's
+/// HTTP status, so the verdict has to arrive as JSON on an established
+/// connection — on reconnect as much as mid-session.
+#[test]
+fn a_revoked_browser_is_told_so_on_reconnect_over_both_transports() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let mut managing = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let minted = managing.request(&mint_request("req_wipe_mint", "browser"));
+    let (limited_id, limited_token) = minted_credential(&minted);
+
+    let revoked = unix_request(
+        &server.socket_path,
+        &revoke_request("req_wipe_revoke", &limited_id),
+    );
+    assert_eq!(
+        revoked["result"]["revoked"],
+        serde_json::json!([limited_id])
+    );
+
+    // WebSocket: the handshake is accepted so the verdict can be delivered,
+    // and every request gets it — no pane data, no subscription, no state.
+    for request in [
+        r#"{"id":"req_wipe_panes","method":"pane.list","params":{}}"#,
+        r#"{"id":"req_wipe_sub","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"}]}}"#,
+    ] {
+        let mut returning = WsClient::connect(server.ws_addr, &limited_token);
+        let refused = returning.request(request);
+        assert_eq!(
+            refused["error"]["code"], "credential_revoked",
+            "{request} -> {refused}"
+        );
+        assert!(refused.get("result").is_none(), "{refused}");
+    }
+
+    // The verdict is terminal: the socket closes after it.
+    let mut returning = WsClient::connect(server.ws_addr, &limited_token);
+    let refused = returning.request(r#"{"id":"req_wipe_ping","method":"ping","params":{}}"#);
+    assert_eq!(refused["error"]["code"], "credential_revoked", "{refused}");
+    assert_eq!(refused["id"], "req_wipe_ping");
+    wait_for_websocket_close(&mut returning.websocket, Duration::from_secs(5));
+
+    // Unix socket: the same verdict, by the same code.
+    let refused = unix_request(
+        &server.socket_path,
+        &format!(
+            r#"{{"id":"req_wipe_socket","method":"credential.list","params":{{"acting_token":"{limited_token}"}}}}"#
+        ),
+    );
+    assert_eq!(refused["error"]["code"], "credential_revoked", "{refused}");
+
+    // A token this server never minted stays an opaque rejection: only a
+    // credential the server actually revoked earns the verdict.
+    expect_handshake_rejected(server.ws_addr, "never-minted-token-000");
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+/// Monolithic mode (plain `herdr`) starts its listeners from `main.rs`, not
+/// from the headless server. It must declare the same capabilities, or a
+/// client reads a capable server as one too old to link against.
+#[test]
+fn monolithic_mode_advertises_the_credential_registry_capability() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let ws_port = pick_free_port();
+    let ws_addr: SocketAddr = format!("127.0.0.1:{ws_port}").parse().unwrap();
+
+    let child = spawn_herdr_with_launch_mode(
+        Path::new(env!("CARGO_BIN_EXE_herdr")),
+        &config_home,
+        &runtime_dir,
+        Some(&socket_path),
+        None,
+        &websocket_section(ws_port),
+        &[],
+        LaunchMode::Monolithic,
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(10));
+    wait_for_ws_listener(ws_addr, Duration::from_secs(10));
+
+    let ping = r#"{"id":"req_monolithic_cap","method":"ping","params":{}}"#;
+    let unix_response = unix_request(&socket_path, ping);
+    let mut ws = WsClient::connect(ws_addr, TEST_TOKEN);
+    let ws_response = ws.request(ping);
+
+    assert_eq!(
+        unix_response, ws_response,
+        "both transports declare the same capabilities in monolithic mode"
+    );
+    assert_eq!(
+        unix_response["result"]["capabilities"]["credential_registry"], true,
+        "{unix_response}"
+    );
+
+    // And the verbs actually work there.
+    let minted = unix_request(
+        &socket_path,
+        &mint_request("req_monolithic_mint", "browser"),
+    );
+    assert_eq!(minted["result"]["credential"]["tier"], "limited");
+
+    cleanup_spawned_herdr(child, base);
 }
