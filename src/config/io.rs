@@ -763,7 +763,7 @@ mod tests {
     #[test]
     fn live_reload_parses_websocket_api_section_without_diagnostics() {
         let loaded = load_live_config_from_str(
-            "[websocket_api]\nbind = \"127.0.0.1:4433\"\ntoken = \"secret\"\nname = \"the-mini\"\n",
+            "[websocket_api]\nbind = \"127.0.0.1:4433\"\ntoken = \"secret\"\nname = \"home-box\"\n",
         )
         .unwrap();
 
@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(loaded.config.websocket_api.token.as_deref(), Some("secret"));
         assert_eq!(
             loaded.config.websocket_api.name.as_deref(),
-            Some("the-mini")
+            Some("home-box")
         );
     }
 
@@ -805,8 +805,35 @@ mod tests {
         assert_eq!(empty.config.websocket_api.reach.as_deref(), Some(""));
         assert!(empty.diagnostics.is_empty(), "{:?}", empty.diagnostics);
 
-        let set = load_live_config_from_str("[websocket_api]\nreach = \"mc4\"\n").unwrap();
-        assert_eq!(set.config.websocket_api.reach.as_deref(), Some("mc4"));
+        let set = load_live_config_from_str("[websocket_api]\nreach = \"gpu-box\"\n").unwrap();
+        assert_eq!(set.config.websocket_api.reach.as_deref(), Some("gpu-box"));
+        assert!(set.diagnostics.is_empty(), "{:?}", set.diagnostics);
+    }
+
+    #[test]
+    fn websocket_api_advertised_endpoint_parses_absent_empty_and_set() {
+        // Absent: pairing stays on the bind-derived url.
+        let absent =
+            load_live_config_from_str("[websocket_api]\nbind = \"127.0.0.1:4433\"\n").unwrap();
+        assert_eq!(absent.config.websocket_api.advertised_endpoint, None);
+
+        // Empty: parses like `name`; downstream treats it as undeclared.
+        let empty =
+            load_live_config_from_str("[websocket_api]\nadvertised_endpoint = \"\"\n").unwrap();
+        assert_eq!(
+            empty.config.websocket_api.advertised_endpoint.as_deref(),
+            Some("")
+        );
+        assert!(empty.diagnostics.is_empty(), "{:?}", empty.diagnostics);
+
+        let set = load_live_config_from_str(
+            "[websocket_api]\nadvertised_endpoint = \"wss://a-host.example.net\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            set.config.websocket_api.advertised_endpoint.as_deref(),
+            Some("wss://a-host.example.net")
+        );
         assert!(set.diagnostics.is_empty(), "{:?}", set.diagnostics);
     }
 

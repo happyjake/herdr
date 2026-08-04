@@ -277,12 +277,16 @@ impl HeadlessServer {
             .server_reach
             .clone()
             .unwrap_or_else(|| api::SharedServerReach::from_config(&self.websocket_api_config));
+        let advertised_endpoint = self.app.advertised_endpoint.clone().unwrap_or_else(|| {
+            api::SharedAdvertisedEndpoint::from_config(&self.websocket_api_config)
+        });
         let api_server = api::start_server_with_stop_control(
             api_tx.clone(),
             self.app.event_hub.clone(),
             self.should_quit.clone(),
             server_name.clone(),
             server_reach.clone(),
+            advertised_endpoint.clone(),
         )?;
         let websocket_server = api::start_websocket_server(
             &self.websocket_api_config,
@@ -290,6 +294,7 @@ impl HeadlessServer {
             self.app.event_hub.clone(),
             server_name,
             server_reach,
+            advertised_endpoint,
         )?;
 
         let client_path = client_socket_path();

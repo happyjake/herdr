@@ -173,6 +173,9 @@ pub struct App {
     /// Live operator-declared reach shared with both API listeners. Config
     /// reload replaces or clears it for every subsequent pong.
     pub(crate) server_reach: Option<crate::api::SharedServerReach>,
+    /// Live advertised endpoint shared with both API listeners. Config
+    /// reload replaces or clears it for every subsequent pong.
+    pub(crate) advertised_endpoint: Option<crate::api::SharedAdvertisedEndpoint>,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -644,6 +647,7 @@ impl App {
             websocket_api_token: None,
             server_name: None,
             server_reach: None,
+            advertised_endpoint: None,
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
@@ -787,6 +791,15 @@ impl App {
     /// reloads update the route for every subsequent pong.
     pub(crate) fn set_server_reach(&mut self, server_reach: Option<crate::api::SharedServerReach>) {
         self.server_reach = server_reach;
+    }
+
+    /// Attach the advertised-endpoint slot shared with the API listeners so
+    /// config reloads move the declared url for every subsequent pong.
+    pub(crate) fn set_advertised_endpoint(
+        &mut self,
+        advertised_endpoint: Option<crate::api::SharedAdvertisedEndpoint>,
+    ) {
+        self.advertised_endpoint = advertised_endpoint;
     }
 
     pub(crate) fn take_config_reloaded_from_disk(&mut self) -> bool {
@@ -1004,6 +1017,12 @@ impl App {
             }
             if let Some(server_reach) = &self.server_reach {
                 server_reach.apply_reloaded_config(&config.websocket_api);
+            }
+            // An endpoint no client could dial clears the declaration rather
+            // than publishing it: the pong promises exactly what a pairing
+            // payload would carry.
+            if let Some(advertised_endpoint) = &self.advertised_endpoint {
+                advertised_endpoint.apply_reloaded_config(&config.websocket_api);
             }
         }
 

@@ -1,3 +1,4 @@
+mod advertised_endpoint;
 mod attachment;
 pub mod client;
 pub(crate) mod credentials;
@@ -12,6 +13,8 @@ mod subscriptions;
 mod wait;
 mod websocket;
 
+pub use advertised_endpoint::SharedAdvertisedEndpoint;
+pub(crate) use advertised_endpoint::{declared_advertised_endpoint, normalize_advertised_endpoint};
 pub use credentials::SharedCredentialRegistry;
 pub use event_hub::EventHub;
 pub use server::ServerHandle;
@@ -25,6 +28,8 @@ pub(crate) use websocket::valid_token_chars as valid_websocket_token_chars;
 pub use websocket::{
     start_websocket_server, SharedWebSocketToken, WebSocketServerHandle,
 };
+#[cfg(test)]
+pub(crate) use websocket::start_websocket_server_with_capabilities;
 
 use std::path::PathBuf;
 

@@ -65,6 +65,15 @@ pub enum ResponseResult {
         /// empty; it is never inferred from the hostname or display name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reach: Option<String>,
+        /// Url this server declares clients should dial to reach it
+        /// (`websocket_api.advertised_endpoint`), for when something else
+        /// fronts the listener — a TLS terminating proxy, for instance. In
+        /// the same canonical form the pairing payload carries. Additive and
+        /// absent when nothing is declared, or when what is declared is not a
+        /// url a client could dial; it is never synthesized from the address
+        /// the connection arrived on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advertised_endpoint: Option<String>,
         /// Live non-default herdr session name. The default session needs no
         /// `--session` argument and is represented by an absent field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
