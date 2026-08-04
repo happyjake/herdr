@@ -422,14 +422,52 @@ const MAX_FOREGROUND_ANCESTRY: usize = 16;
 /// A process group outlives its leader (a pipeline whose first command
 /// exited still holds the terminal), so the group id is not always a live
 /// pid. Leader first — the cheap, common case — then any live member.
+/// Member enumeration scans the machine, and a dead-leader pipeline can
+/// hold the terminal for hours of repeated cwd calls, so the member that
+/// answered is remembered per group and revalidated with one getpgid per
+/// call — membership is checked, never trusted, so a died member costs
+/// exactly one fresh enumeration. (A recycled pid landing in the same
+/// group could fool the check; that coincidence only risks reading a
+/// wrong cwd until the next call.)
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn live_foreground_group_member(foreground_process_group: u32) -> Option<u32> {
     if process_parent_and_name(foreground_process_group).is_some() {
         return Some(foreground_process_group);
     }
-    process_group_member_pids(foreground_process_group)
+    let cache = dead_leader_member_cache();
+    if let Ok(mut members) = cache.lock() {
+        if let Some(&member) = members.get(&foreground_process_group) {
+            let pgid = unsafe { libc::getpgid(member as libc::pid_t) };
+            if pgid == foreground_process_group as libc::pid_t {
+                return Some(member);
+            }
+            members.remove(&foreground_process_group);
+        }
+    }
+    let found = process_group_member_pids(foreground_process_group)
         .into_iter()
-        .find(|pid| process_parent_and_name(*pid).is_some())
+        .find(|pid| process_parent_and_name(*pid).is_some());
+    if let Ok(mut members) = cache.lock() {
+        if members.len() > 64 {
+            members.clear();
+        }
+        match found {
+            Some(member) => {
+                members.insert(foreground_process_group, member);
+            }
+            None => {
+                members.remove(&foreground_process_group);
+            }
+        }
+    }
+    found
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn dead_leader_member_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u32, u32>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -752,6 +790,20 @@ mod tests {
             unsafe { libc::getpgid(member as libc::pid_t) },
             leader as libc::pid_t
         );
+        // The remembered member is revalidated, never trusted: once it dies
+        // the resolver must not serve it again.
+        unsafe {
+            libc::kill(member as libc::pid_t, libc::SIGKILL);
+        }
+        let gone = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while process_parent_and_name(member).is_some() && std::time::Instant::now() < gone {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            process_parent_and_name(member).is_none(),
+            "member must be gone"
+        );
+        assert_ne!(live_foreground_group_member(leader), Some(member));
     }
 
     #[test]
