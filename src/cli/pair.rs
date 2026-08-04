@@ -20,10 +20,16 @@
 //!   and will not grow one for a CLI message; the proof falls back to the
 //!   listener behind the proxy and every outcome names the printed url as not
 //!   dialed.
-//! - **A refused handshake identifies nobody.** The listener's answer to an
-//!   unknown token is deliberately opaque, so it is indistinguishable from any
-//!   other service's refusal. Attributing a refusal would need protocol
+//! - **A refused handshake identifies nobody, and nothing here can find out.**
+//!   The listener's answer to an unknown token is deliberately opaque, so it is
+//!   indistinguishable from any other service's refusal — including a proxy
+//!   that rejects before forwarding. Attributing one would need protocol
 //!   evidence in the rejection, which is a server change, not a pairing one.
+//!   Nor can the refusing process be discovered from here: a url may be served
+//!   from another machine, and a local socket listing names processes whose
+//!   config is their own. The report therefore offers no discovery step and no
+//!   remedy for this outcome; it states what was dialed and what was written,
+//!   and stops.
 //! - **No server can be tied to a config file.** A config path and a socket
 //!   path are set independently and nothing records the pairing, so the reload
 //!   is an ordered attempt and never evidence about which server serves the
@@ -1212,18 +1218,23 @@ fn activation_report(
                 0,
             )
         }
+        // Nothing may be offered here as a next step. Naming a way to find
+        // the refusing process would be inventing one: an anonymous status
+        // identifies nobody, a remotely served url is not a local process at
+        // all, and a socket a listing could name reloads that process's own
+        // config — which is the independence the known limits at the top of
+        // this module already record. This ends on the two facts the operator
+        // owns and leaves the inference to them.
         TokenActivation::RefusedWithoutIdentifying { status, reload } => (
             format!(
                 "{rotation}. {}, and a handshake on {dialed} presenting the new token was refused \
                  with http {status}.\n\
-                 warning: the printed token did not get in, and the refusal names no one: herdr \
-                 answers an unknown token with the same opaque refusal any other service would, and \
-                 whatever answered may be something in front of the listener rather than a herdr \
-                 server at all. Which process refused, and which config it holds, are not \
-                 established. Find out what serves {dialed} — `herdr session list --json` names \
-                 each running server and its socket path — and if that turns out to be a herdr \
-                 server, `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or a \
-                 restart is what makes it read {}.{unexercised}",
+                 warning: the printed token did not get in. The refusal names no one: herdr answers \
+                 an unknown token with the same opaque refusal any other service would, and whatever \
+                 answered may be something in front of the listener rather than a herdr server. \
+                 Which process refused, and which config it holds, are not established here. The two \
+                 facts to work from are that the new token is now in {}, and that {dialed} refused \
+                 it.{unexercised}",
                 reload_clause(reload),
                 config_path.display()
             ),
@@ -2743,9 +2754,12 @@ mod tests {
         };
         let failed_clause =
             "A reload request to /home/u/.config/herdr/herdr.sock did not come back readable: boom";
+        // Pinned in full, because subtraction is the fix here: nothing in
+        // this sentence may offer a way to find the refusing process or
+        // promise that a reload reaches it.
         let refusal_warning = |dialed: &str| {
             format!(
-            "warning: the printed token did not get in, and the refusal names no one: herdr answers an unknown token with the same opaque refusal any other service would, and whatever answered may be something in front of the listener rather than a herdr server at all. Which process refused, and which config it holds, are not established. Find out what serves {dialed} — `herdr session list --json` names each running server and its socket path — and if that turns out to be a herdr server, `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or a restart is what makes it read /home/u/.config/herdr/config.toml."
+            "warning: the printed token did not get in. The refusal names no one: herdr answers an unknown token with the same opaque refusal any other service would, and whatever answered may be something in front of the listener rather than a herdr server. Which process refused, and which config it holds, are not established here. The two facts to work from are that the new token is now in /home/u/.config/herdr/config.toml, and that {dialed} refused it."
         )
         };
         let rows = vec![
@@ -2982,6 +2996,22 @@ mod tests {
                     !report.contains("the printed payload works"),
                     "a url that was never dialed may not be promised: {report}"
                 );
+            }
+            // Subtraction has to stay subtracted. An anonymous refusal may
+            // not point at a way to identify who refused, and may not promise
+            // that reloading anything reaches them: a listing names local
+            // sockets, not the process serving a url, and reloading one makes
+            // it read its own config.
+            if matches!(
+                activation,
+                TokenActivation::RefusedWithoutIdentifying { .. }
+            ) {
+                for offered in ["session list", "reload-config", "restart"] {
+                    assert!(
+                        !report.contains(offered),
+                        "an anonymous refusal may not offer {offered:?}: {report}"
+                    );
+                }
             }
             // The reload attempt is stated in every outcome that carries one,
             // rather than being replaced by what the handshake found.
