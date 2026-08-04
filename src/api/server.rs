@@ -118,6 +118,7 @@ pub(crate) fn start_server_with_stop_control(
     server_stop: ServerStop,
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
+    advertised_endpoint: crate::api::SharedAdvertisedEndpoint,
 ) -> std::io::Result<ServerHandle> {
     start_server_inner(
         api_tx,
@@ -127,6 +128,7 @@ pub(crate) fn start_server_with_stop_control(
         Some(server_stop),
         server_name,
         server_reach,
+        advertised_endpoint,
     )
 }
 
@@ -138,6 +140,7 @@ fn start_server_inner(
     server_stop: Option<ServerStop>,
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
+    advertised_endpoint: crate::api::SharedAdvertisedEndpoint,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -187,6 +190,7 @@ fn start_server_inner(
                 let server_stop = server_stop.clone();
                 let server_name = server_name.clone();
                 let server_reach = server_reach.clone();
+                let advertised_endpoint = advertised_endpoint.clone();
                 // Local socket ownership grants managing authority unless the
                 // request explicitly selects a registry credential.
                 let credentials = crate::api::credentials::CredentialContext::local_socket(
@@ -207,6 +211,7 @@ fn start_server_inner(
                         ssh_agents.as_ref(),
                         &server_name,
                         &server_reach,
+                        &advertised_endpoint,
                         &credentials,
                     ) {
                         warn!(err = %err, "api connection failed");
@@ -390,6 +395,9 @@ fn handle_connection(
         None,
         &crate::api::SharedServerName::new("test".to_string()),
         &crate::api::SharedServerReach::from_config(&crate::config::WebSocketApiConfig::default()),
+        &crate::api::SharedAdvertisedEndpoint::from_config(
+            &crate::config::WebSocketApiConfig::default(),
+        ),
         &crate::api::credentials::CredentialContext::local_socket(
             crate::api::credentials::SharedCredentialRegistry::open(
                 crate::api::credentials::test_registry_path("socket"),
@@ -409,6 +417,7 @@ fn handle_connection_with_stop(
     #[cfg(unix)] ssh_agents: Option<&crate::platform::ssh_agent::SshAgentRegistry>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -444,6 +453,7 @@ fn handle_connection_with_stop(
             server_stop,
             server_name,
             server_reach,
+            advertised_endpoint,
             credentials,
         ),
     }
@@ -553,6 +563,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
     server_stop: Option<&ServerStop>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
@@ -649,6 +660,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
             server_stop,
             server_name,
             server_reach,
+            advertised_endpoint,
             credentials,
         ),
     }
@@ -693,6 +705,7 @@ fn serve_simple_request<T: ApiTransport>(
     server_stop: Option<&ServerStop>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
@@ -711,6 +724,7 @@ fn serve_simple_request<T: ApiTransport>(
         Some(response_write_rx),
         server_name,
         server_reach,
+        advertised_endpoint,
         credentials,
     );
     let result = write_and_log_response(transport, &response, &request_id, method, changes_ui);
@@ -733,6 +747,7 @@ pub(super) fn serve_interleaved_request<T: ApiTransport>(
     server_stop: Option<&ServerStop>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let Some(request) = parse_api_request(transport, text)? else {
@@ -775,6 +790,7 @@ pub(super) fn serve_interleaved_request<T: ApiTransport>(
         server_stop,
         server_name,
         server_reach,
+        advertised_endpoint,
         credentials,
     )
 }
@@ -830,6 +846,7 @@ fn handle_request(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
+    advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> String {
     // Declarations and runtime facts are read per request, so config
@@ -843,6 +860,7 @@ fn handle_request(
                 capabilities,
                 name: Some(server_name.current()),
                 reach: server_reach.current(),
+                advertised_endpoint: advertised_endpoint.current(),
                 session: crate::session::active_name_for_api_socket(),
                 exe: crate::api::server_executable::path_for_pong(),
             },
@@ -1389,6 +1407,12 @@ mod tests {
         crate::api::SharedServerReach::from_config(&crate::config::WebSocketApiConfig::default())
     }
 
+    fn undeclared_advertised_endpoint() -> crate::api::SharedAdvertisedEndpoint {
+        crate::api::SharedAdvertisedEndpoint::from_config(
+            &crate::config::WebSocketApiConfig::default(),
+        )
+    }
+
     /// A local-socket caller against a registry of its own, so credential
     /// state never leaks between tests or into the developer's session dir.
     fn test_credentials() -> crate::api::credentials::CredentialContext {
@@ -1451,6 +1475,7 @@ mod tests {
                 &crate::api::SharedServerReach::from_config(
                     &crate::config::WebSocketApiConfig::default(),
                 ),
+                &undeclared_advertised_endpoint(),
                 &test_credentials(),
             )
             .unwrap();
@@ -1630,6 +1655,7 @@ mod tests {
             None,
             crate::api::SharedServerName::new("test".into()),
             undeclared_server_reach(),
+            undeclared_advertised_endpoint(),
         );
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
 
@@ -1833,6 +1859,7 @@ mod tests {
             None,
             &crate::api::SharedServerName::new("the-mini".to_string()),
             &undeclared_server_reach(),
+            &undeclared_advertised_endpoint(),
             &test_credentials(),
         );
 
@@ -1849,6 +1876,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let server_name = crate::api::SharedServerName::new("before".to_string());
         let server_reach = undeclared_server_reach();
+        let advertised_endpoint = undeclared_advertised_endpoint();
         let ping = |id: &str| {
             handle_request(
                 Request {
@@ -1862,6 +1890,7 @@ mod tests {
                 None,
                 &server_name,
                 &server_reach,
+                &advertised_endpoint,
                 &test_credentials(),
             )
         };
@@ -1883,6 +1912,9 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let stop = ServerStop::default();
         let server_name = crate::api::SharedServerName::new("test".to_string());
+        let server_reach = undeclared_server_reach();
+        let advertised_endpoint = undeclared_advertised_endpoint();
+        let credentials = test_credentials();
         let response = handle_request(
             Request {
                 id: "priority_stop".into(),
@@ -1894,8 +1926,9 @@ mod tests {
             Some("pid 42 (herdr)".into()),
             None,
             &server_name,
-            &undeclared_server_reach(),
-            &test_credentials(),
+            &server_reach,
+            &advertised_endpoint,
+            &credentials,
         );
 
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1920,12 +1953,79 @@ mod tests {
             None,
             None,
             &server_name,
-            &undeclared_server_reach(),
-            &test_credentials(),
+            &server_reach,
+            &advertised_endpoint,
+            &credentials,
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
         assert_eq!(rejected["error"]["code"], "server_unavailable");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pong_publishes_the_advertised_endpoint_only_once_one_is_declared() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let server_name = crate::api::SharedServerName::new("the-mini".to_string());
+        let server_reach = undeclared_server_reach();
+        let advertised_endpoint = undeclared_advertised_endpoint();
+        let ping = |id: &str| {
+            handle_request(
+                Request {
+                    id: id.into(),
+                    method: Method::Ping(crate::api::schema::PingParams::default()),
+                },
+                &tx,
+                None,
+                None,
+                None,
+                None,
+                &server_name,
+                &server_reach,
+                &advertised_endpoint,
+                &test_credentials(),
+            )
+        };
+
+        // Nothing declared: the field is absent from the message, rather than
+        // present and empty or synthesized from wherever the request arrived.
+        let undeclared = ping("req_undeclared");
+        assert!(
+            !undeclared.contains("advertised_endpoint"),
+            "a server that declares no endpoint must publish no field: {undeclared}"
+        );
+
+        // Declared: exactly the canonical form a pairing payload carries, so
+        // a client reading either one dials the same url.
+        let changed =
+            advertised_endpoint.apply_reloaded_config(&crate::config::WebSocketApiConfig {
+                advertised_endpoint: Some("  WSS://a-host.example.net:8443/  ".to_string()),
+                ..crate::config::WebSocketApiConfig::default()
+            });
+        assert!(changed);
+
+        let declared = ping("req_declared");
+        assert!(
+            declared.contains(r#""advertised_endpoint":"wss://a-host.example.net:8443""#),
+            "{declared}"
+        );
+
+        // The addition is additive: the fields a client already reads keep
+        // their names, their values, and the protocol version.
+        assert!(declared.contains(r#""type":"pong""#), "{declared}");
+        assert!(declared.contains(r#""name":"the-mini""#), "{declared}");
+        assert!(
+            declared.contains(&format!(
+                r#""protocol":{}"#,
+                crate::protocol::PROTOCOL_VERSION
+            )),
+            "{declared}"
+        );
+
+        // Withdrawn again by the same reload path, and the field goes with it.
+        assert!(advertised_endpoint
+            .apply_reloaded_config(&crate::config::WebSocketApiConfig::default()));
+        let withdrawn = ping("req_withdrawn");
+        assert!(!withdrawn.contains("advertised_endpoint"), "{withdrawn}");
     }
 
     #[test]
@@ -1939,6 +2039,7 @@ mod tests {
         let (tx, _) = mpsc::unbounded_channel();
         let server_name = crate::api::SharedServerName::new("test".to_string());
         let server_reach = undeclared_server_reach();
+        let advertised_endpoint = undeclared_advertised_endpoint();
         let create = |id: &str, bytes_b64: String| {
             handle_request(
                 Request {
@@ -1954,6 +2055,7 @@ mod tests {
                 None,
                 &server_name,
                 &server_reach,
+                &advertised_endpoint,
                 &test_credentials(),
             )
         };
@@ -2017,6 +2119,7 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
+                &undeclared_advertised_endpoint(),
                 &test_credentials(),
             )
         });
