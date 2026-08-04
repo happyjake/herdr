@@ -289,22 +289,28 @@ fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
     // One trailing slash is the same url; the query form appends its own.
     let authority = authority.strip_suffix('/').unwrap_or(authority);
     if authority.is_empty() {
-        return Err("no host to dial".to_string());
+        return Err(no_host_remedy());
     }
     if authority.chars().any(char::is_whitespace) {
-        return Err("a host cannot contain whitespace".to_string());
+        return Err(format!(
+            "a host cannot contain whitespace; declare it as one unbroken url, \
+             e.g. {ENDPOINT_EXAMPLE}"
+        ));
     }
     if authority.contains('@') {
-        return Err("credentials do not belong in a pairing endpoint".to_string());
+        return Err(format!(
+            "credentials do not belong in a pairing endpoint; \
+             declare the host alone and let the token carry authorization, \
+             e.g. {ENDPOINT_EXAMPLE}"
+        ));
     }
     // A backslash separates path segments for ws/wss just as `/` does, so it
     // smuggles in exactly what the next check refuses.
     if authority.contains(['/', '?', '#', '\\']) {
-        return Err(
+        return Err(format!(
             "a path, query, or fragment would be lost when the token is appended; \
-             declare scheme, host, and optional port only"
-                .to_string(),
-        );
+             declare scheme, host, and optional port only, e.g. {ENDPOINT_EXAMPLE}"
+        ));
     }
 
     let (host, port) = split_host_and_port(authority)?;
@@ -314,6 +320,16 @@ fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
     }
 
     Ok(format!("{scheme}://{authority}"))
+}
+
+/// The shape every structural refusal points back at. A refusal owes the
+/// operator a form they can paste, so no message may end without one.
+const ENDPOINT_EXAMPLE: &str = "wss://a-host.example.net:8443";
+
+/// The remedy for "there is no host here", shared by the empty authority and
+/// the empty bare host, which are the same mistake seen at two depths.
+fn no_host_remedy() -> String {
+    format!("no host to dial; declare scheme, host, and optional port, e.g. {ENDPOINT_EXAMPLE}")
 }
 
 /// One half of an authority's host: what shape a client will read it as.
@@ -329,13 +345,18 @@ enum HostForm<'a> {
 /// from a host with a port.
 fn split_host_and_port(authority: &str) -> Result<(HostForm<'_>, Option<&str>), String> {
     if let Some(rest) = authority.strip_prefix('[') {
-        let (host, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| "unterminated ipv6 literal; brackets must be closed".to_string())?;
+        let (host, tail) = rest.split_once(']').ok_or_else(|| {
+            "unterminated ipv6 literal; brackets must be closed, \
+             e.g. wss://[fd7a::1]:8443"
+                .to_string()
+        })?;
         let port = match tail {
             "" => None,
             tail => Some(tail.strip_prefix(':').ok_or_else(|| {
-                format!("expected a port after the ipv6 literal, found {tail:?}")
+                format!(
+                    "expected a port after the ipv6 literal, found {tail:?}; \
+                     write it as wss://[fd7a::1]:8443"
+                )
             })?),
         };
         return Ok((HostForm::Ipv6Literal(host), port));
@@ -360,8 +381,9 @@ fn validate_host(host: HostForm<'_>) -> Result<(), String> {
             return match literal.parse::<std::net::Ipv6Addr>() {
                 Ok(_) => Ok(()),
                 Err(_) => Err(format!(
-                    "{literal:?} is bracketed but is not an ipv6 address; \
-                     brackets are only for ipv6 literals"
+                    "{literal:?} is bracketed but is not an ipv6 address, and brackets \
+                     are only for ipv6 literals; write an address as wss://[fd7a::1]:8443 \
+                     or a name without brackets as {ENDPOINT_EXAMPLE}"
                 )),
             }
         }
@@ -369,7 +391,7 @@ fn validate_host(host: HostForm<'_>) -> Result<(), String> {
     };
 
     if host.is_empty() {
-        return Err("no host to dial".to_string());
+        return Err(no_host_remedy());
     }
 
     // A client reads a host whose last label looks like a number — in any
@@ -395,24 +417,31 @@ fn validate_host(host: HostForm<'_>) -> Result<(), String> {
     // label it leaves behind is not a label to validate.
     let name = host.strip_suffix('.').unwrap_or(host);
     if name.len() > 253 {
-        return Err("a host name cannot exceed 253 characters".to_string());
+        return Err(format!(
+            "a host name cannot exceed 253 characters; declare the name the proxy \
+             actually serves, e.g. {ENDPOINT_EXAMPLE}"
+        ));
     }
 
     let labels: Vec<&str> = name.split('.').collect();
     for label in &labels {
         if label.is_empty() {
             return Err(format!(
-                "{host:?} has an empty label; a host name cannot contain \"..\" or start with a dot"
+                "{host:?} has an empty label, and a host name cannot contain \"..\" \
+                 or start with a dot; write the labels out, e.g. {ENDPOINT_EXAMPLE}"
             ));
         }
         if label.len() > 63 {
             return Err(format!(
-                "{host:?} has a label longer than 63 characters, which no resolver accepts"
+                "{host:?} has a label longer than 63 characters, which no resolver \
+                 accepts; keep each label at 63 or fewer, e.g. {ENDPOINT_EXAMPLE}"
             ));
         }
         if label.starts_with('-') || label.ends_with('-') {
             return Err(format!(
-                "{host:?} has a label starting or ending with a hyphen"
+                "{host:?} has a label starting or ending with a hyphen, which is not \
+                 a resolvable name; hyphens may only sit inside a label, \
+                 e.g. {ENDPOINT_EXAMPLE}"
             ));
         }
         if !label
@@ -480,18 +509,31 @@ fn validate_port(port: &str) -> Result<(), String> {
         ));
     }
     if port.len() > 1 && port.starts_with('0') {
-        return Err(format!(
-            "{port:?} has a leading zero, which a client strips before dialling; \
-             write the port plainly, e.g. {}",
-            port.trim_start_matches('0')
-        ));
+        // Only name the stripped value when it is itself dialable: "00"
+        // strips to nothing and "099999" strips to a number this function
+        // would refuse on the next line, and a remedy the operator cannot
+        // use is the same as naming no remedy at all.
+        if let Some(canonical) = port
+            .trim_start_matches('0')
+            .parse::<u16>()
+            .ok()
+            .filter(|canonical| *canonical != 0)
+        {
+            return Err(format!(
+                "{port:?} has a leading zero, which a client strips before dialling; \
+                 write the port plainly, e.g. {canonical}"
+            ));
+        }
+        return Err(port_range_remedy(port));
     }
     match port.parse::<u16>() {
-        Ok(0) | Err(_) => Err(format!(
-            "{port:?} is not a port a client could dial; use 1-65535"
-        )),
+        Ok(0) | Err(_) => Err(port_range_remedy(port)),
         Ok(_) => Ok(()),
     }
+}
+
+fn port_range_remedy(port: &str) -> String {
+    format!("{port:?} is not a port a client could dial; use a port in 1-65535, e.g. 8443")
 }
 
 /// Resolve the configured bind address into the listener this command works
@@ -1003,7 +1045,7 @@ mod tests {
             // A scheme no websocket client can dial.
             ("https://a-host.example.ts.net", "cannot dial", "wss://"),
             // Scheme but no host.
-            ("wss://", "no host", ""),
+            ("wss://", "no host", "wss://a-host.example.net:8443"),
             // Anything past the authority would be dropped or mangled.
             (
                 "wss://a-host.example.ts.net/api",
@@ -1019,25 +1061,46 @@ mod tests {
             // same hazard as "/api" wearing a different costume: a client
             // reads the host as "a-host" and the rest as a path.
             ("wss://a-host\\api", "path", "host, and optional port only"),
-            ("wss://user@a-host.example.ts.net", "credentials", ""),
-            ("wss://a host.example.ts.net", "whitespace", ""),
+            (
+                "wss://user@a-host.example.ts.net",
+                "credentials",
+                "wss://a-host.example.net:8443",
+            ),
+            (
+                "wss://a host.example.ts.net",
+                "whitespace",
+                "wss://a-host.example.net:8443",
+            ),
             // Ports must be dialled as the digits written.
-            ("wss://a-host.example.ts.net:0", "1-65535", ""),
-            ("wss://a-host.example.ts.net:99999", "1-65535", ""),
+            ("wss://a-host.example.ts.net:0", "1-65535", "e.g. 8443"),
+            ("wss://a-host.example.ts.net:99999", "1-65535", "e.g. 8443"),
             ("wss://a-host.example.ts.net:https", "plain digits", "8443"),
             // A signed port parses in rust but throws in a client.
             ("wss://a-host.example.ts.net:+443", "plain digits", "8443"),
             // A leading-zero port is stripped by a client, so the payload
             // text would stop naming the port actually dialled.
             ("wss://a-host.example.ts.net:0443", "leading zero", "443"),
+            // An all-zero port strips to nothing and a leading-zero port
+            // over the range strips to a value this function would refuse
+            // anyway, so neither may be echoed back as the remedy.
+            ("wss://a-host.example.ts.net:00", "1-65535", "e.g. 8443"),
+            ("wss://a-host.example.ts.net:099999", "1-65535", "e.g. 8443"),
             // An unbracketed ipv6 literal is ambiguous with host:port.
             ("wss://fd7a::1", "brackets", "[fd7a::1]:8443"),
-            ("wss://[fd7a::1", "brackets", ""),
+            ("wss://[fd7a::1", "brackets", "wss://[fd7a::1]:8443"),
             // Brackets promise an ipv6 address; a client throws when the
             // contents are not one, rather than reading them as a name.
-            ("wss://[not-an-ip]", "not an ipv6 address", ""),
-            ("wss://[not-an-ip]:8443", "not an ipv6 address", ""),
-            ("wss://[]", "not an ipv6 address", ""),
+            (
+                "wss://[not-an-ip]",
+                "not an ipv6 address",
+                "without brackets",
+            ),
+            (
+                "wss://[not-an-ip]:8443",
+                "not an ipv6 address",
+                "wss://[fd7a::1]:8443",
+            ),
+            ("wss://[]", "not an ipv6 address", "wss://[fd7a::1]:8443"),
             // Number-shaped hosts: a client either throws (proxy.0x10,
             // 10.0.0.999, 1.2.3.4.5) or dials an address that shares no text
             // with what was written (0x7f000001 and 0177.0.0.1 become
@@ -1054,16 +1117,41 @@ mod tests {
             ("wss://10.0.0.999", "ipv4", "0-255"),
             ("wss://1.2.3.4.5", "ipv4", "100.64.0.5"),
             // Empty labels are not names.
-            ("wss://a-host..example.net", "empty label", ""),
-            ("wss://.example.net", "empty label", ""),
+            (
+                "wss://a-host..example.net",
+                "empty label",
+                "wss://a-host.example.net:8443",
+            ),
+            (
+                "wss://.example.net",
+                "empty label",
+                "wss://a-host.example.net:8443",
+            ),
             // Hyphen-edged labels are not resolvable names.
-            ("wss://-a-host.example.net", "hyphen", ""),
-            ("wss://a-host-.example.net", "hyphen", ""),
+            (
+                "wss://-a-host.example.net",
+                "hyphen",
+                "only sit inside a label",
+            ),
+            (
+                "wss://a-host-.example.net",
+                "hyphen",
+                "wss://a-host.example.net:8443",
+            ),
             // Non-ascii is refused rather than converted: applying idna by
             // hand is the class this validator refuses to enter, so the
             // refusal owes the operator the punycode form instead.
             ("wss://naïve.example.net", "ascii", "punycode (xn--)"),
         ] {
+            // `contains("")` is true of every string, so an empty expectation
+            // would assert nothing while reading like a check. Fail the row
+            // outright rather than let it pass vacuously.
+            assert!(
+                !expected_reason.is_empty() && !expected_remedy.is_empty(),
+                "{configured:?}: both expectations must be substantive; \
+                 an empty one asserts nothing"
+            );
+
             let reason = declared(configured)
                 .expect_err(&format!("{configured:?} must be refused, not encoded"));
             assert!(
