@@ -28,14 +28,15 @@ pub(crate) fn declared_advertised_endpoint(configured: Option<&str>) -> Option<&
 }
 
 /// Validate a declared endpoint and return its canonical form: a lowercase
-/// `ws`/`wss` scheme, the host as configured, and the optional port.
+/// `ws`/`wss` scheme, the host as configured, the optional port, and the
+/// optional path without a trailing slash.
 ///
 /// This validator is deliberately a STRICT SUBSET of what a client can dial.
 /// The invariant is one-directional: **every value it accepts must parse, in
-/// a client, to exactly the host and port configured.** Refusing something a
-/// client could have dialled is acceptable and must state the canonical form
-/// to use instead. Accepting something a client rejects — or dials as
-/// something else — is the only defect.
+/// a client, to exactly the host, port, and path configured.** Refusing
+/// something a client could have dialled is acceptable and must state the
+/// canonical form to use instead. Accepting something a client rejects — or
+/// dials as something else — is the only defect.
 ///
 /// Judge every future question about this function by that invariant. It is
 /// what lets the rules below stay small: they do not reimplement WHATWG URL
@@ -43,8 +44,17 @@ pub(crate) fn declared_advertised_endpoint(configured: Option<&str>) -> Option<&
 /// adding here), they only carve out a region where this function and a
 /// client provably agree. Minting a payload costs a token rotation, so a
 /// value we misjudge is a QR that fails after the credential has moved.
+///
+/// A path is inside that region because the payload appends its query to the
+/// declared url whole — `{endpoint}/?token=…` — so `wss://a-host/herdr-ws` is
+/// dialled as `wss://a-host/herdr-ws/?token=…`, which a client reads back as
+/// the host `a-host` and the path `/herdr-ws/`. What the path is appended to
+/// still has to be text a client dials unchanged, so the path rules below are
+/// narrow for the same reason the host rules are. A query, a fragment, and
+/// credentials stay refused: those collide with what the payload appends
+/// rather than surviving in front of it.
 pub(crate) fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
-    let (scheme, authority) = advertised
+    let (scheme, rest) = advertised
         .split_once("://")
         .ok_or_else(|| "expected a ws:// or wss:// url".to_string())?;
 
@@ -55,30 +65,54 @@ pub(crate) fn normalize_advertised_endpoint(advertised: &str) -> Result<String, 
         ));
     }
 
-    // One trailing slash is the same url; the query form appends its own.
-    let authority = authority.strip_suffix('/').unwrap_or(authority);
-    if authority.is_empty() {
-        return Err(no_host_remedy());
-    }
-    if authority.chars().any(char::is_whitespace) {
+    if rest.chars().any(char::is_whitespace) {
         return Err(format!(
-            "a host cannot contain whitespace; declare it as one unbroken url, \
+            "a url cannot contain whitespace; declare it as one unbroken url, \
              e.g. {ENDPOINT_EXAMPLE}"
         ));
+    }
+    // A backslash separates path segments for ws/wss just as `/` does, so a
+    // client dials a url spelled differently than the one declared.
+    if rest.contains('\\') {
+        return Err(format!(
+            "a backslash is read as a path separator, so a client would dial a url \
+             spelled differently than the one declared; write path separators as \
+             forward slashes, e.g. {PATH_EXAMPLE}"
+        ));
+    }
+    // Whichever delimiter the url reaches first decides the refusal: a `?`
+    // after a `#` is part of that fragment, not a query.
+    if let Some(delimiter) = rest.find(['?', '#']) {
+        return Err(if rest[delimiter..].starts_with('#') {
+            format!(
+                "a fragment is never sent to a server, so it cannot be part of the url \
+                 a client dials; declare scheme, host, optional port, and optional path \
+                 only, e.g. {PATH_EXAMPLE}"
+            )
+        } else {
+            format!(
+                "a query would collide with the token the pairing payload appends; \
+                 declare scheme, host, optional port, and optional path only, \
+                 e.g. {PATH_EXAMPLE}"
+            )
+        });
+    }
+
+    // One trailing slash is the same url; the payload appends its own.
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+
+    if authority.is_empty() {
+        return Err(no_host_remedy());
     }
     if authority.contains('@') {
         return Err(format!(
             "credentials do not belong in a pairing endpoint; \
              declare the host alone and let the token carry authorization, \
              e.g. {ENDPOINT_EXAMPLE}"
-        ));
-    }
-    // A backslash separates path segments for ws/wss just as `/` does, so it
-    // smuggles in exactly what the next check refuses.
-    if authority.contains(['/', '?', '#', '\\']) {
-        return Err(format!(
-            "a path, query, or fragment would be lost when the token is appended; \
-             declare scheme, host, and optional port only, e.g. {ENDPOINT_EXAMPLE}"
         ));
     }
 
@@ -88,12 +122,21 @@ pub(crate) fn normalize_advertised_endpoint(advertised: &str) -> Result<String, 
         validate_port(port)?;
     }
 
-    Ok(format!("{scheme}://{authority}"))
+    match path {
+        Some(path) => {
+            validate_path(path)?;
+            Ok(format!("{scheme}://{authority}/{path}"))
+        }
+        None => Ok(format!("{scheme}://{authority}")),
+    }
 }
 
 /// The shape every structural refusal points back at. A refusal owes the
 /// operator a form they can paste, so no message may end without one.
 const ENDPOINT_EXAMPLE: &str = "wss://a-host.example.net:8443";
+
+/// The same, for the refusals a path reaches: it names where a path goes.
+const PATH_EXAMPLE: &str = "wss://a-host.example.net/herdr-ws";
 
 /// The remedy for "there is no host here", shared by the empty authority and
 /// the empty bare host, which are the same mistake seen at two depths.
@@ -265,6 +308,54 @@ fn is_canonical_dotted_quad(host: &str) -> bool {
         }
     }
     octets == 4
+}
+
+/// Accept only paths a client dials as the characters written. The path
+/// arrives here without its leading slash and without a trailing one.
+///
+/// Narrow, for the same reason the host rules are narrow: what a client does
+/// to a path before dialling it is not one rule, and the invariant only needs
+/// the region where nothing is done to it at all.
+fn validate_path(path: &str) -> Result<(), String> {
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            return Err(format!(
+                "a path segment cannot be empty; write single slashes between the \
+                 segments, e.g. {PATH_EXAMPLE}"
+            ));
+        }
+        // A client resolves dot segments while parsing, so "/api/../herdr-ws"
+        // is dialled as "/herdr-ws" — a different path than the one written.
+        if segment == "." || segment == ".." {
+            return Err(format!(
+                "{segment:?} is resolved away before a client dials, so it would dial a \
+                 different path than the one declared; write the path out, \
+                 e.g. {PATH_EXAMPLE}"
+            ));
+        }
+        if segment.contains('%') {
+            return Err(format!(
+                "a percent escape is not preserved identically by every client and proxy, \
+                 so the path dialled would not reliably be the one declared; write the \
+                 path in plain characters, e.g. {PATH_EXAMPLE}"
+            ));
+        }
+        // The claim is only about what is accepted: these characters ride
+        // through a client untouched. Others may too — being stricter than a
+        // client is allowed, and being wrong about one is not.
+        if !segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+        {
+            return Err(format!(
+                "{segment:?} is not a path segment this endpoint can promise to round-trip; \
+                 a path may hold only ascii letters, digits, hyphens, dots, underscores, \
+                 and tildes, which every client dials unchanged, e.g. {PATH_EXAMPLE}"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Accept only ports a client dials as the digits configured. `parse::<u16>`
