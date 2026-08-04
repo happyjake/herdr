@@ -856,6 +856,8 @@ fn main() -> io::Result<()> {
     let event_hub = api::EventHub::default();
     let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
     let server_reach = api::SharedServerReach::from_config(&loaded_config.config.websocket_api);
+    let advertised_endpoint =
+        api::SharedAdvertisedEndpoint::from_config(&loaded_config.config.websocket_api);
     let credentials = api::credentials::process_registry();
     // Monolithic mode declares the same capabilities as the headless server:
     // it is the same binary serving the same API, and a client that read a
@@ -868,6 +870,7 @@ fn main() -> io::Result<()> {
         Some(capabilities.clone()),
         server_name.clone(),
         server_reach.clone(),
+        advertised_endpoint.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -889,6 +892,7 @@ fn main() -> io::Result<()> {
         Some(capabilities),
         server_name.clone(),
         server_reach.clone(),
+        advertised_endpoint.clone(),
     ) {
         Ok(server) => server,
         Err(err) => {
@@ -969,6 +973,7 @@ fn main() -> io::Result<()> {
         app.set_websocket_api_token(websocket_api_token);
         app.set_server_name(Some(server_name));
         app.set_server_reach(Some(server_reach));
+        app.set_advertised_endpoint(Some(advertised_endpoint));
         let result = app.run(&mut terminal).await;
 
         // Reset modifyOtherKeys if we enabled it.

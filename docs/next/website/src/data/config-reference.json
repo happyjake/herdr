@@ -1465,7 +1465,7 @@
           "key": "websocket_api.advertised_endpoint",
           "type": "string",
           "default": "unset",
-          "description": "URL clients should dial to reach this listener, e.g. \"wss://a-host.example.net\", for when a proxy fronts it. Scheme, host, and optional port only; ws:// or wss://. Unset keeps the bind-derived ws:// url. Used by the pairing payload."
+          "description": "URL clients should dial to reach this listener, e.g. \"wss://a-host.example.net\", for when a proxy fronts it. Scheme, host, and optional port only; ws:// or wss://. Unset keeps the bind-derived ws:// url. Used by the pairing payload and published in the ping pong. Picked up live by server.reload_config."
         },
         {
           "key": "websocket_api.reach",

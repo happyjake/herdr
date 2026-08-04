@@ -784,6 +784,7 @@ fn success_response_round_trips() {
             }),
             name: Some("the-mini".into()),
             reach: Some("mini".into()),
+            advertised_endpoint: Some("wss://a-host.example.net:8443".into()),
             session: Some("mobile".into()),
             exe: Some("/opt/herdr".into()),
         },
@@ -804,12 +805,14 @@ fn pong_declarations_are_additive_for_older_peers() {
         ResponseResult::Pong {
             name,
             reach,
+            advertised_endpoint,
             session,
             exe,
             ..
         } => {
             assert_eq!(name, None);
             assert_eq!(reach, None);
+            assert_eq!(advertised_endpoint, None);
             assert_eq!(session, None);
             assert_eq!(exe, None);
         }

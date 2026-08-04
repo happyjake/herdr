@@ -693,7 +693,7 @@ A successful response includes the same `id`:
 {"id":"req_1","result":{"type":"pong"}}
 ```
 
-The `ping` response also carries the server's version, protocol, capabilities, and its declared display name (`websocket_api.name`, defaulting to the machine hostname) — identical over the Unix socket and the WebSocket transport. It may also carry `reach`, the operator-declared route to the server; `session`, the live non-default Herdr session name; and `exe`, the absolute path of the running executable. `reach` is omitted when unset or empty, and `session` is omitted for the default session. These fields are additive: clients talking to older servers must treat them as optional.
+The `ping` response also carries the server's version, protocol, capabilities, and its declared display name (`websocket_api.name`, defaulting to the machine hostname) — identical over the Unix socket and the WebSocket transport. It may also carry `reach`, the operator-declared route to the server; `advertised_endpoint`, the URL the server declares clients should dial to reach it ([`websocket_api.advertised_endpoint`](/docs/configuration/#websocket-api-listener)), in the same canonical form the pairing payload carries; `session`, the live non-default Herdr session name; and `exe`, the absolute path of the running executable. `reach` is omitted when unset or empty, `advertised_endpoint` is omitted when nothing dialable is declared, and `session` is omitted for the default session. These fields are additive: clients talking to older servers must treat them as optional.
 
 Event subscriptions keep the connection open after the initial response.
 

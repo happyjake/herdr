@@ -8735,6 +8735,13 @@
           "oneOf": [
             {
               "properties": {
+                "advertised_endpoint": {
+                  "description": "Url this server declares clients should dial to reach it\n(`websocket_api.advertised_endpoint`), for when something else\nfronts the listener — a TLS terminating proxy, for instance. In\nthe same canonical form the pairing payload carries. Additive and\nabsent when nothing is declared, or when what is declared is not a\nurl a client could dial; it is never synthesized from the address\nthe connection arrived on.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "capabilities": {
                   "anyOf": [
                     {

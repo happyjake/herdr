@@ -1,3 +1,4 @@
+mod advertised_endpoint;
 mod attachment;
 pub mod client;
 pub(crate) mod credentials;
@@ -12,6 +13,8 @@ mod subscriptions;
 mod wait;
 mod websocket;
 
+pub use advertised_endpoint::SharedAdvertisedEndpoint;
+pub(crate) use advertised_endpoint::{declared_advertised_endpoint, normalize_advertised_endpoint};
 pub use credentials::SharedCredentialRegistry;
 pub use event_hub::EventHub;
 pub(crate) use server::start_server_with_stop_control;

@@ -1005,10 +1005,12 @@ pub struct WebSocketApiConfig {
     /// payload names the reachable url instead of the bind address, which
     /// only describes the local socket. Must be a `ws://` or `wss://` url
     /// carrying scheme, host, and optional port and nothing else; `herdr
-    /// pair` refuses to print a payload it cannot make connectable. Unset or
-    /// empty (the default) keeps the bind-derived `ws://<bind>` url. The
-    /// pairing payload is built from the config file on every run, so a
-    /// changed endpoint needs no server restart.
+    /// pair` refuses to print a payload it cannot make connectable, and the
+    /// `ping` pong publishes nothing rather than a url no client could dial.
+    /// Unset or empty (the default) keeps the bind-derived `ws://<bind>` url.
+    /// A changed endpoint needs no server restart: the pairing payload is
+    /// built from the config file on every run, and `server.reload_config`
+    /// republishes it in the pong.
     pub advertised_endpoint: Option<String>,
     /// Route other machines use to open a shell on this server, typically an
     /// ssh alias. This is operator-declared because the running process cannot
