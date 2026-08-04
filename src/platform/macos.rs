@@ -817,6 +817,10 @@ pub(crate) fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
     Some((info.pbi_ppid, name))
 }
 
+pub(crate) fn process_group_member_pids(process_group_id: u32) -> Vec<u32> {
+    process_group_pids(process_group_id)
+}
+
 fn process_argv(pid: u32) -> Option<Vec<String>> {
     let buf = kern_procargs2(pid)?;
     procargs2_argv(&buf)

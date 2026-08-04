@@ -390,6 +390,26 @@ pub(crate) fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
     process_ppid_and_comm_from_stat(&stat)
 }
 
+pub(crate) fn process_group_member_pids(process_group_id: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .filter(|name| name.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if process_pgrp_and_comm(pid)
+            .is_some_and(|(pgrp, _)| pgrp == process_group_id as i32)
+        {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
 fn process_ppid_and_comm_from_stat(stat: &str) -> Option<(u32, String)> {
     let close = stat.rfind(')')?;
     let comm = stat.get(1 + stat.find('(')?..close)?.to_string();

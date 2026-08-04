@@ -381,7 +381,8 @@ pub fn pane_shell_cwd(
     if !is_pane_shell_process_name(&child_name) {
         return process_cwd(child_pid);
     }
-    let Some(mut current) = foreground_process_group else {
+    let Some(mut current) = foreground_process_group.and_then(live_foreground_group_member)
+    else {
         return process_cwd(child_pid);
     };
     for _ in 0..MAX_FOREGROUND_ANCESTRY {
@@ -417,6 +418,19 @@ pub fn pane_shell_cwd(
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FOREGROUND_ANCESTRY: usize = 16;
+
+/// A process group outlives its leader (a pipeline whose first command
+/// exited still holds the terminal), so the group id is not always a live
+/// pid. Leader first — the cheap, common case — then any live member.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn live_foreground_group_member(foreground_process_group: u32) -> Option<u32> {
+    if process_parent_and_name(foreground_process_group).is_some() {
+        return Some(foreground_process_group);
+    }
+    process_group_member_pids(foreground_process_group)
+        .into_iter()
+        .find(|pid| process_parent_and_name(*pid).is_some())
+}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_agent_hint(_pid: u32) -> Option<crate::detect::Agent> {
@@ -524,30 +538,56 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
-    // Fixtures get their own process group so cleanup can kill the whole
-    // tree — Child::kill alone would leave nested shells and sleeps alive,
-    // which nextest reports as leaky tests.
+    // Fixtures run in their own process group and group-kill it on Drop,
+    // so a panicking assertion cannot leak nested shells or sleeps
+    // (nextest reports leaked descendants as leaky tests).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn spawn_fixture(
-        program: &str,
-        args: &[&str],
-        cwd: Option<&std::path::Path>,
-    ) -> std::process::Child {
+    struct Fixture {
+        child: Option<std::process::Child>,
+        pid: u32,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Fixture {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        /// Reap the root process (the group leader) while keeping the
+        /// group-kill on Drop — for tests that need a dead leader.
+        fn reap_root(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.pid as i32), libc::SIGKILL);
+            }
+            if let Some(mut child) = self.child.take() {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_fixture(program: &str, args: &[&str], cwd: Option<&std::path::Path>) -> Fixture {
         use std::os::unix::process::CommandExt as _;
         let mut cmd = std::process::Command::new(program);
         cmd.args(args).process_group(0);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
-        cmd.spawn().unwrap()
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn kill_fixture(mut child: std::process::Child) {
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        let spawned = cmd.spawn().unwrap();
+        let pid = spawned.id();
+        Fixture {
+            child: Some(spawned),
+            pid,
         }
-        let _ = child.wait();
     }
 
     // Matcher-based on purpose: macOS /bin/sh reports kernel comm "bash",
@@ -598,8 +638,8 @@ mod tests {
             &["-c", &format!("cd \"{}\" && sleep 30; :", target.display())],
             None,
         );
-        let seen = poll_pane_shell_cwd_until(child.id(), Some(child.id()), &target);
-        kill_fixture(child);
+        let seen = poll_pane_shell_cwd_until(child.pid(), Some(child.pid()), &target);
+        drop(child);
         let _ = std::fs::remove_dir_all(&target);
         assert_eq!(seen.as_deref(), Some(target.as_path()));
     }
@@ -620,10 +660,10 @@ mod tests {
             ],
             None,
         );
-        let inner = wait_for_descendant(child.id(), is_pane_shell_process_name).expect("nested shell appears");
+        let inner = wait_for_descendant(child.pid(), is_pane_shell_process_name).expect("nested shell appears");
         let foreground = wait_for_descendant(inner, |comm| comm == "sleep").expect("program appears");
-        let seen = poll_pane_shell_cwd_until(child.id(), Some(foreground), &target);
-        kill_fixture(child);
+        let seen = poll_pane_shell_cwd_until(child.pid(), Some(foreground), &target);
+        drop(child);
         let _ = std::fs::remove_dir_all(&target);
         assert_eq!(seen.as_deref(), Some(target.as_path()));
     }
@@ -649,13 +689,13 @@ mod tests {
             ],
             None,
         );
-        let tool_shell = wait_for_descendant(child.id(), is_pane_shell_process_name).expect("tool shell appears");
+        let tool_shell = wait_for_descendant(child.pid(), is_pane_shell_process_name).expect("tool shell appears");
         // Give the tool shell time to reach the target before asserting the
         // guard holds anyway.
         let _ = poll_pane_shell_cwd_until(tool_shell, Some(tool_shell), &target);
-        let seen = pane_shell_cwd(child.id(), Some(tool_shell));
-        let direct = process_cwd(child.id());
-        kill_fixture(child);
+        let seen = pane_shell_cwd(child.pid(), Some(tool_shell));
+        let direct = process_cwd(child.pid());
+        drop(child);
         let _ = std::fs::remove_dir_all(&target);
         assert_ne!(seen.as_deref(), Some(target.as_path()));
         assert_eq!(seen, direct);
@@ -680,13 +720,38 @@ mod tests {
             ],
             Some(&home),
         );
-        let background = wait_for_descendant(child.id(), is_pane_shell_process_name).expect("background job appears");
+        let background = wait_for_descendant(child.pid(), is_pane_shell_process_name).expect("background job appears");
         let _ = poll_pane_shell_cwd_until(background, Some(background), &target);
-        let seen = pane_shell_cwd(child.id(), Some(child.id()));
-        kill_fixture(child);
+        let seen = pane_shell_cwd(child.pid(), Some(child.pid()));
+        drop(child);
         let _ = std::fs::remove_dir_all(&target);
         let _ = std::fs::remove_dir_all(&home);
         assert_eq!(seen.as_deref(), Some(home.as_path()));
+    }
+
+    // A pipeline whose first command exited leaves a foreground group
+    // whose leader pid is gone while members still hold the terminal.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_foreground_group_member_survives_a_dead_leader() {
+        let mut fixture = spawn_fixture("/bin/sh", &["-c", "sleep 30 & :"], None);
+        let leader = fixture.pid();
+        fixture.reap_root();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while process_parent_and_name(leader).is_some() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            process_parent_and_name(leader).is_none(),
+            "group leader must be gone"
+        );
+        let member = live_foreground_group_member(leader).expect("a live member is found");
+        assert_ne!(member, leader);
+        assert_eq!(
+            unsafe { libc::getpgid(member as libc::pid_t) },
+            leader as libc::pid_t
+        );
     }
 
     #[test]
