@@ -61,7 +61,19 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
-    let addr = match pairing_endpoint(config.websocket_api.bind.as_deref()) {
+    // The advertised endpoint is resolved first because it decides how much
+    // the bind address still has to carry: once a proxy fronts the listener,
+    // the bind is only the local socket to install the token on.
+    let advertised = match advertised_endpoint(config.websocket_api.advertised_endpoint.as_deref())
+    {
+        Ok(advertised) => advertised,
+        Err(unavailable) => {
+            eprint!("{}", unavailable.explanation(&config_path));
+            return Ok(1);
+        }
+    };
+
+    let addr = match pairing_endpoint(config.websocket_api.bind.as_deref(), advertised.is_some()) {
         Ok(addr) => addr,
         Err(unavailable) => {
             eprint!("{}", unavailable.explanation(&config_path));
@@ -69,14 +81,10 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
-    let endpoint = match pairing_base_url(config.websocket_api.advertised_endpoint.as_deref(), addr)
-    {
-        Ok(endpoint) => endpoint,
-        Err(unavailable) => {
-            eprint!("{}", unavailable.explanation(&config_path));
-            return Ok(1);
-        }
-    };
+    let endpoint = advertised.unwrap_or_else(|| format!("ws://{addr}"));
+    // A wildcard listener has no address to dial as written; locally it
+    // answers on loopback at the same port.
+    let local_listener = local_listener_address(addr);
 
     let name = crate::api::resolve_server_name(&config.websocket_api);
 
@@ -105,7 +113,7 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
         .token
         .as_deref()
         .is_some_and(|token| !token.is_empty());
-    let activation = apply_token_to_running_server(addr);
+    let activation = apply_token_to_running_server(local_listener);
 
     let payload = PairingPayload {
         endpoint,
@@ -127,7 +135,8 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     println!("  {}", payload.url());
     println!();
 
-    let (report, exit_code) = activation_report(&activation, previous_token_existed, addr);
+    let (report, exit_code) =
+        activation_report(&activation, previous_token_existed, local_listener);
     println!("{report}");
     Ok(exit_code)
 }
@@ -229,34 +238,38 @@ impl PairingUnavailable {
     }
 }
 
-/// The base URL the pairing payload is built from, without a trailing slash.
+/// The declared endpoint in canonical form, or `None` when none is declared.
 ///
 /// The bind address describes the local socket, which is the reachable url
 /// only when nothing fronts the listener. An operator who puts a proxy in
-/// front declares `websocket_api.advertised_endpoint`, and that wins; unset
-/// keeps the bind-derived `ws://<bind>` form.
-fn pairing_base_url(
-    advertised: Option<&str>,
-    addr: SocketAddr,
-) -> Result<String, PairingUnavailable> {
+/// front declares `websocket_api.advertised_endpoint`, and that wins; unset,
+/// empty, or whitespace keeps the bind-derived `ws://<bind>` form.
+fn advertised_endpoint(advertised: Option<&str>) -> Result<Option<String>, PairingUnavailable> {
     let advertised = match advertised.map(str::trim) {
-        None | Some("") => return Ok(format!("ws://{addr}")),
+        None | Some("") => return Ok(None),
         Some(advertised) => advertised,
     };
 
-    normalize_advertised_endpoint(advertised).map_err(|reason| {
-        PairingUnavailable::InvalidAdvertisedEndpoint {
+    normalize_advertised_endpoint(advertised)
+        .map(Some)
+        .map_err(|reason| PairingUnavailable::InvalidAdvertisedEndpoint {
             advertised: advertised.to_string(),
             reason,
-        }
-    })
+        })
 }
 
 /// Validate a declared endpoint and return its canonical form: a lowercase
-/// `ws`/`wss` scheme, the host as configured, and the optional port. A
-/// payload nobody can connect to is worse than no payload, so anything the
-/// listener's clients could not dial — another scheme, a path, credentials,
-/// an out-of-range port — is refused with the reason instead of printed.
+/// `ws`/`wss` scheme, the host as configured, and the optional port.
+///
+/// The judge of this value is not this function but the URL parser in
+/// whatever client scans the QR, and minting a payload costs a token
+/// rotation. So the rules here track what a WHATWG URL parser does with the
+/// authority of a `ws`/`wss` url, using only what std offers: a host is
+/// either an IPv4 literal, a bracketed IPv6 literal, or a DNS name, and
+/// anything a client would parse differently — a path hiding behind a
+/// backslash, brackets around something that is not an address, a dotted
+/// number that is not a valid IPv4 — is refused with the reason instead of
+/// encoded into a QR that fails after the credential has already rotated.
 fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
     let (scheme, authority) = advertised
         .split_once("://")
@@ -280,7 +293,9 @@ fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
     if authority.contains('@') {
         return Err("credentials do not belong in a pairing endpoint".to_string());
     }
-    if authority.contains(['/', '?', '#']) {
+    // A backslash separates path segments for ws/wss just as `/` does, so it
+    // smuggles in exactly what the next check refuses.
+    if authority.contains(['/', '?', '#', '\\']) {
         return Err(
             "a path, query, or fragment would be lost when the token is appended; \
              declare scheme, host, and optional port only"
@@ -289,9 +304,7 @@ fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
     }
 
     let (host, port) = split_host_and_port(authority)?;
-    if host.is_empty() {
-        return Err("no host to dial".to_string());
-    }
+    validate_host(host)?;
     if let Some(port) = port {
         match port.parse::<u16>() {
             Ok(0) | Err(_) => {
@@ -306,10 +319,18 @@ fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{authority}"))
 }
 
+/// One half of an authority's host: what shape a client will read it as.
+enum HostForm<'a> {
+    /// Bracketed, so a client parses the contents as an IPv6 address.
+    Ipv6Literal(&'a str),
+    /// Everything else: an IPv4 literal or a DNS name.
+    Bare(&'a str),
+}
+
 /// Split an authority into host and optional port. IPv6 literals must be
 /// bracketed, as URLs require: without brackets `fd7a::1` is indistinguishable
 /// from a host with a port.
-fn split_host_and_port(authority: &str) -> Result<(&str, Option<&str>), String> {
+fn split_host_and_port(authority: &str) -> Result<(HostForm<'_>, Option<&str>), String> {
     if let Some(rest) = authority.strip_prefix('[') {
         let (host, tail) = rest
             .split_once(']')
@@ -320,7 +341,7 @@ fn split_host_and_port(authority: &str) -> Result<(&str, Option<&str>), String> 
                 format!("expected a port after the ipv6 literal, found {tail:?}")
             })?),
         };
-        return Ok((host, port));
+        return Ok((HostForm::Ipv6Literal(host), port));
     }
 
     match authority.rsplit_once(':') {
@@ -328,15 +349,99 @@ fn split_host_and_port(authority: &str) -> Result<(&str, Option<&str>), String> 
         Some((host, _)) if host.contains(':') => Err(
             "an ipv6 literal must be wrapped in brackets, e.g. wss://[fd7a::1]:8443".to_string(),
         ),
-        Some((host, port)) => Ok((host, Some(port))),
-        None => Ok((authority, None)),
+        Some((host, port)) => Ok((HostForm::Bare(host), Some(port))),
+        None => Ok((HostForm::Bare(authority), None)),
     }
 }
 
-/// Resolve the configured bind address into the endpoint clients connect to.
-/// The payload must decode to a working endpoint, so addresses that cannot
-/// be dialed as printed are rejected with an explanation.
-fn pairing_endpoint(bind: Option<&str>) -> Result<SocketAddr, PairingUnavailable> {
+/// Accept only hosts a client's URL parser resolves the same way we do.
+fn validate_host(host: HostForm<'_>) -> Result<(), String> {
+    let host = match host {
+        // Brackets promise an IPv6 address, so the contents must be one:
+        // a client throws on anything else rather than treating it as a name.
+        HostForm::Ipv6Literal(literal) => {
+            return match literal.parse::<std::net::Ipv6Addr>() {
+                Ok(_) => Ok(()),
+                Err(_) => Err(format!(
+                    "{literal:?} is bracketed but is not an ipv6 address; \
+                     brackets are only for ipv6 literals"
+                )),
+            }
+        }
+        HostForm::Bare(host) => host,
+    };
+
+    if host.is_empty() {
+        return Err("no host to dial".to_string());
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+
+    // A trailing dot is the DNS root and names an absolute host; the empty
+    // label it leaves behind is not a label to validate.
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.len() > 253 {
+        return Err("a host name cannot exceed 253 characters".to_string());
+    }
+
+    let labels: Vec<&str> = name.split('.').collect();
+    for label in &labels {
+        if label.is_empty() {
+            return Err(format!(
+                "{host:?} has an empty label; a host name cannot contain \"..\" or start with a dot"
+            ));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "{host:?} has a label longer than 63 characters, which no resolver accepts"
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "{host:?} has a label starting or ending with a hyphen"
+            ));
+        }
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "{host:?} is not an ipv4 literal, a bracketed ipv6 literal, or a host name; \
+                 a name may hold only ascii letters, digits, hyphens, and underscores. \
+                 A non-ascii name has to be declared in its punycode (xn--) form, \
+                 which is what a client resolves it to anyway"
+            ));
+        }
+    }
+
+    // A URL parser reads a host whose last label is all digits as an IPv4
+    // address, and rejects it when the digits are not one — so a name like
+    // "10.0.0.999" is not a name to fall back on, it is a broken address.
+    if labels
+        .last()
+        .is_some_and(|label| label.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err(format!(
+            "{host:?} ends in a number, so a client reads it as an ipv4 address, \
+             but it is not a valid one; use a dotted quad such as 100.64.0.5"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Resolve the configured bind address into the listener this command works
+/// against. Without an advertised endpoint it is also what clients dial, so
+/// addresses that cannot be dialed as printed are rejected — unless an
+/// advertised endpoint carries the payload instead, in which case the bind
+/// is only the local socket to install the token on and no longer has to be
+/// dialable from elsewhere. A wildcard bind is the ordinary shape for a
+/// listener behind a proxy, which is exactly what advertising exists for.
+fn pairing_endpoint(
+    bind: Option<&str>,
+    endpoint_is_advertised: bool,
+) -> Result<SocketAddr, PairingUnavailable> {
     let bind = match bind {
         None | Some("") => return Err(PairingUnavailable::NotConfigured),
         Some(bind) => bind,
@@ -350,20 +455,39 @@ fn pairing_endpoint(bind: Option<&str>) -> Result<SocketAddr, PairingUnavailable
             },
         )?;
 
-    if addr.ip().is_unspecified() {
-        return Err(PairingUnavailable::UnusableBind {
-            bind: bind.to_string(),
-            reason: "clients cannot dial the wildcard address; bind a concrete address such as the machine's tailnet IP".to_string(),
-        });
-    }
+    // Port 0 is checked first because it is fatal either way: the OS picks
+    // the port at bind time, so neither this command nor whatever fronts the
+    // listener knows where to reach it, and advertising cannot make up for it.
     if addr.port() == 0 {
         return Err(PairingUnavailable::UnusableBind {
             bind: bind.to_string(),
-            reason: "port 0 makes the OS pick a random port, so the printed endpoint would not match the listener".to_string(),
+            reason: "port 0 makes the OS pick a random port, so nothing knows which port the listener ends up on".to_string(),
+        });
+    }
+    if addr.ip().is_unspecified() && !endpoint_is_advertised {
+        return Err(PairingUnavailable::UnusableBind {
+            bind: bind.to_string(),
+            reason: "clients cannot dial the wildcard address; bind a concrete address such as the machine's tailnet IP, or declare websocket_api.advertised_endpoint".to_string(),
         });
     }
 
     Ok(addr)
+}
+
+/// Where this command dials the listener to install the freshly minted
+/// token. A wildcard bind accepts on every interface but is not an address
+/// to connect to, and locally it always answers on loopback at the same
+/// port; skipping the reload instead would leave a running server on the old
+/// token while the QR advertises the new one.
+fn local_listener_address(addr: SocketAddr) -> SocketAddr {
+    if !addr.ip().is_unspecified() {
+        return addr;
+    }
+    let loopback = match addr.ip() {
+        std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    };
+    SocketAddr::new(loopback, addr.port())
 }
 
 fn mint_token() -> std::io::Result<String> {
@@ -526,21 +650,45 @@ mod tests {
         assert_ne!(first, second, "two mints must not collide");
     }
 
+    /// The canonical endpoint for a declared value, or the reason it is not
+    /// one. Mirrors what `run_pair_command` does before minting anything.
+    fn declared(advertised: &str) -> Result<String, String> {
+        match advertised_endpoint(Some(advertised)) {
+            Ok(Some(endpoint)) => Ok(endpoint),
+            Ok(None) => panic!("{advertised:?} was read as undeclared"),
+            Err(PairingUnavailable::InvalidAdvertisedEndpoint {
+                advertised: value,
+                reason,
+            }) => {
+                assert_eq!(value, advertised.trim(), "the refusal must quote the value");
+                Err(reason)
+            }
+            Err(other) => {
+                panic!("{advertised:?}: expected InvalidAdvertisedEndpoint, got {other:?}")
+            }
+        }
+    }
+
     #[test]
     fn pairing_endpoint_requires_a_configured_bind() {
         assert_eq!(
-            pairing_endpoint(None),
+            pairing_endpoint(None, false),
             Err(PairingUnavailable::NotConfigured)
         );
         assert_eq!(
-            pairing_endpoint(Some("")),
+            pairing_endpoint(Some(""), false),
+            Err(PairingUnavailable::NotConfigured)
+        );
+        // An advertised endpoint does not stand in for a listener.
+        assert_eq!(
+            pairing_endpoint(None, true),
             Err(PairingUnavailable::NotConfigured)
         );
     }
 
     #[test]
     fn pairing_endpoint_rejects_unparseable_binds() {
-        match pairing_endpoint(Some("not-an-address")) {
+        match pairing_endpoint(Some("not-an-address"), false) {
             Err(PairingUnavailable::InvalidBind { bind, .. }) => assert_eq!(bind, "not-an-address"),
             other => panic!("expected InvalidBind, got {other:?}"),
         }
@@ -549,7 +697,7 @@ mod tests {
     #[test]
     fn pairing_endpoint_rejects_addresses_that_cannot_be_dialed_as_printed() {
         for bind in ["0.0.0.0:4433", "[::]:4433"] {
-            match pairing_endpoint(Some(bind)) {
+            match pairing_endpoint(Some(bind), false) {
                 Err(PairingUnavailable::UnusableBind { reason, .. }) => {
                     assert!(reason.contains("wildcard"), "{bind}: {reason}");
                 }
@@ -557,7 +705,7 @@ mod tests {
             }
         }
 
-        match pairing_endpoint(Some("127.0.0.1:0")) {
+        match pairing_endpoint(Some("127.0.0.1:0"), false) {
             Err(PairingUnavailable::UnusableBind { reason, .. }) => {
                 assert!(reason.contains("port 0"), "{reason}");
             }
@@ -566,12 +714,81 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_bind_is_usable_once_an_endpoint_is_advertised() {
+        // The deployment this feature exists for: the listener accepts on
+        // every interface and a proxy in front is what clients dial. Nothing
+        // derives the payload from the bind any more, so it need not be
+        // dialable from elsewhere.
+        for bind in ["0.0.0.0:4433", "[::]:4433"] {
+            assert_eq!(
+                pairing_endpoint(Some(bind), true),
+                Ok(addr(bind)),
+                "{bind} must be accepted when an endpoint is advertised"
+            );
+        }
+
+        // Port 0 stays fatal either way: the port is not known until the
+        // server binds, so neither this command nor a proxy can find it.
+        for advertised in [false, true] {
+            match pairing_endpoint(Some("0.0.0.0:0"), advertised) {
+                Err(PairingUnavailable::UnusableBind { reason, .. }) => {
+                    assert!(reason.contains("port 0"), "{advertised}: {reason}");
+                }
+                other => panic!("{advertised}: expected UnusableBind, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_token_is_installed_on_loopback_when_the_listener_binds_the_wildcard() {
+        // A wildcard bind is not an address to connect to, but the listener
+        // does answer locally on loopback at the same port. Dialing that is
+        // what keeps the running server's token in step with the printed QR.
+        assert_eq!(
+            local_listener_address(addr("0.0.0.0:4433")),
+            addr("127.0.0.1:4433")
+        );
+        assert_eq!(
+            local_listener_address(addr("[::]:4433")),
+            addr("[::1]:4433")
+        );
+
+        // A concrete bind is already the address to dial, unchanged.
+        for bind in ["100.64.0.5:4433", "127.0.0.1:4433", "[fd7a::1]:8443"] {
+            assert_eq!(local_listener_address(addr(bind)), addr(bind), "{bind}");
+        }
+    }
+
+    /// The claim the wildcard resolution rests on, against a real socket: a
+    /// listener that accepted the wildcard address answers on loopback at the
+    /// port it was given, so the resolved address is one this command can
+    /// actually dial to install the token.
+    #[test]
+    fn a_wildcard_listener_answers_on_the_resolved_loopback_address() {
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wildcard");
+        let bound = listener.local_addr().expect("bound address");
+        assert!(bound.ip().is_unspecified(), "{bound}");
+
+        let dial_target = local_listener_address(bound);
+
+        assert_eq!(dial_target.port(), bound.port());
+        assert!(dial_target.ip().is_loopback(), "{dial_target}");
+        assert!(
+            listener_is_reachable(dial_target),
+            "a wildcard listener must answer on {dial_target}"
+        );
+    }
+
+    #[test]
     fn pairing_endpoint_accepts_concrete_addresses() {
         assert_eq!(
-            pairing_endpoint(Some("100.64.0.5:4433")),
+            pairing_endpoint(Some("100.64.0.5:4433"), false),
             Ok(addr("100.64.0.5:4433"))
         );
-        assert_eq!(pairing_endpoint(Some("[::1]:4433")), Ok(addr("[::1]:4433")));
+        assert_eq!(
+            pairing_endpoint(Some("[::1]:4433"), false),
+            Ok(addr("[::1]:4433"))
+        );
     }
 
     #[test]
@@ -614,23 +831,20 @@ mod tests {
 
     #[test]
     fn without_an_advertised_endpoint_the_payload_url_is_bind_derived() {
-        let endpoint = pairing_base_url(None, addr("100.64.0.5:4433")).unwrap();
-        assert_eq!(endpoint, "ws://100.64.0.5:4433");
+        // Undeclared: nothing to resolve, so the bind carries the payload.
+        assert_eq!(advertised_endpoint(None), Ok(None));
 
         // Empty and whitespace-only values mean undeclared, like `name`.
         for unset in ["", "   "] {
-            assert_eq!(
-                pairing_base_url(Some(unset), addr("100.64.0.5:4433")).unwrap(),
-                "ws://100.64.0.5:4433",
-                "{unset:?}"
-            );
+            assert_eq!(advertised_endpoint(Some(unset)), Ok(None), "{unset:?}");
         }
 
         let payload = PairingPayload {
-            endpoint,
+            endpoint: format!("ws://{}", addr("100.64.0.5:4433")),
             token: "tok".to_string(),
             name: "the-mini".to_string(),
         };
+        assert_eq!(payload.endpoint, "ws://100.64.0.5:4433");
         assert_eq!(
             payload.url(),
             "ws://100.64.0.5:4433/?token=tok&name=the-mini"
@@ -639,10 +853,8 @@ mod tests {
 
     #[test]
     fn an_advertised_endpoint_replaces_the_bind_derived_url() {
-        let bind = addr("100.64.0.5:4433");
-
         // A proxy-fronted server names the url clients should dial instead.
-        let endpoint = pairing_base_url(Some("wss://a-host.example.ts.net"), bind).unwrap();
+        let endpoint = declared("wss://a-host.example.ts.net").unwrap();
         assert_eq!(endpoint, "wss://a-host.example.ts.net");
 
         let payload = PairingPayload {
@@ -656,17 +868,35 @@ mod tests {
         );
     }
 
+    /// Every host shape a client's URL parser accepts must survive with the
+    /// exact bytes it was configured with — the payload is only useful if it
+    /// still names the same server after canonicalization.
     #[test]
     fn an_advertised_endpoint_keeps_the_configured_scheme_host_and_port() {
-        let bind = addr("100.64.0.5:4433");
-
         for (configured, expected) in [
+            // A plain single-label host.
+            ("wss://a-host", "wss://a-host"),
             ("wss://a-host.example.ts.net", "wss://a-host.example.ts.net"),
             ("ws://a-host.example.ts.net", "ws://a-host.example.ts.net"),
+            // The shape this ships against: a magicdns fqdn with an explicit
+            // port, hyphens and digits in the labels.
             (
-                "wss://a-host.example.ts.net:8443",
-                "wss://a-host.example.ts.net:8443",
+                "wss://a-host-2.tailnet-name.ts.net:8443",
+                "wss://a-host-2.tailnet-name.ts.net:8443",
             ),
+            // Underscores appear in internal names; a client accepts them.
+            (
+                "wss://an_internal.host.local",
+                "wss://an_internal.host.local",
+            ),
+            // A trailing dot is the dns root, and names the same host.
+            ("wss://a-host.example.net.", "wss://a-host.example.net."),
+            // Ipv4 literals, with and without a port.
+            ("wss://100.64.0.5", "wss://100.64.0.5"),
+            ("wss://100.64.0.5:8443", "wss://100.64.0.5:8443"),
+            // Bracketed ipv6 literals, with and without a port.
+            ("wss://[fd7a::1]", "wss://[fd7a::1]"),
+            ("wss://[fd7a::1]:8443", "wss://[fd7a::1]:8443"),
             // One trailing slash is the same url; the query form appends its own.
             (
                 "wss://a-host.example.ts.net/",
@@ -679,20 +909,20 @@ mod tests {
             ),
             // Schemes are case-insensitive; the payload carries the canonical form.
             ("WSS://a-host.example.ts.net", "wss://a-host.example.ts.net"),
-            ("wss://[fd7a::1]:8443", "wss://[fd7a::1]:8443"),
         ] {
             assert_eq!(
-                pairing_base_url(Some(configured), bind).unwrap(),
-                expected,
+                declared(configured),
+                Ok(expected.to_string()),
                 "{configured:?}"
             );
         }
     }
 
+    /// The real judge of this value is the URL parser in whatever client
+    /// scans the QR, and minting costs a token rotation — so anything a
+    /// client would parse differently, or refuse, must be refused here first.
     #[test]
     fn a_malformed_advertised_endpoint_refuses_to_print_a_payload() {
-        let bind = addr("100.64.0.5:4433");
-
         for (configured, expected_reason) in [
             // No scheme at all: nothing says how to dial it.
             ("a-host.example.ts.net", "ws:// or wss://"),
@@ -703,6 +933,10 @@ mod tests {
             // Anything past the authority would be dropped or mangled.
             ("wss://a-host.example.ts.net/api", "path"),
             ("wss://a-host.example.ts.net/?token=x", "path"),
+            // A backslash is a path separator for ws/wss, so this is the
+            // same hazard as "/api" wearing a different costume: a client
+            // reads the host as "a-host" and the rest as a path.
+            ("wss://a-host\\api", "path"),
             ("wss://user@a-host.example.ts.net", "credentials"),
             ("wss://a host.example.ts.net", "whitespace"),
             // Ports must be dialable.
@@ -712,19 +946,29 @@ mod tests {
             // An unbracketed ipv6 literal is ambiguous with host:port.
             ("wss://fd7a::1", "brackets"),
             ("wss://[fd7a::1", "brackets"),
+            // Brackets promise an ipv6 address; a client throws when the
+            // contents are not one, rather than reading them as a name.
+            ("wss://[not-an-ip]", "not an ipv6 address"),
+            ("wss://[not-an-ip]:8443", "not an ipv6 address"),
+            ("wss://[]", "not an ipv6 address"),
+            // A host ending in a number is read as ipv4, so it must be one.
+            ("wss://10.0.0.999", "ipv4"),
+            ("wss://1.2.3.4.5", "ipv4"),
+            // Empty labels are not names.
+            ("wss://a-host..example.net", "empty label"),
+            ("wss://.example.net", "empty label"),
+            // Hyphen-edged labels are not resolvable names.
+            ("wss://-a-host.example.net", "hyphen"),
+            ("wss://a-host-.example.net", "hyphen"),
+            // Non-ascii needs punycode before it can ride a payload.
+            ("wss://naïve.example.net", "ascii"),
         ] {
-            match pairing_base_url(Some(configured), bind) {
-                Err(PairingUnavailable::InvalidAdvertisedEndpoint { advertised, reason }) => {
-                    assert_eq!(advertised, configured.trim());
-                    assert!(
-                        reason.contains(expected_reason),
-                        "{configured:?}: expected {expected_reason:?} in {reason:?}"
-                    );
-                }
-                other => {
-                    panic!("{configured:?}: expected InvalidAdvertisedEndpoint, got {other:?}")
-                }
-            }
+            let reason = declared(configured)
+                .expect_err(&format!("{configured:?} must be refused, not encoded"));
+            assert!(
+                reason.contains(expected_reason),
+                "{configured:?}: expected {expected_reason:?} in {reason:?}"
+            );
         }
     }
 

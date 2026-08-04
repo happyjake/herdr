@@ -145,7 +145,9 @@ bind = "100.64.0.5:4433"
 advertised_endpoint = "wss://a-host.example.net"
 ```
 
-It must be a `ws://` or `wss://` URL carrying scheme, host, and optional port and nothing else: `herdr pair` refuses to print a payload it cannot make connectable, naming what is wrong, rather than encoding a QR nobody can scan into a connection. Unset or empty keeps the bind-derived `ws://<bind>` URL exactly as before.
+It must be a `ws://` or `wss://` URL carrying scheme, host, and optional port and nothing else, with a host a URL parser reads the same way Herdr does — an IPv4 literal, a bracketed IPv6 literal, or a host name. `herdr pair` validates it before minting anything and refuses to print a payload it cannot make connectable, naming what is wrong, rather than encoding a QR nobody can scan into a connection. Unset or empty keeps the bind-derived `ws://<bind>` URL exactly as before.
+
+Declaring an advertised endpoint also makes a wildcard `bind` usable: `0.0.0.0:4433` is the ordinary listener shape behind a proxy, and while it is refused on its own (no client can dial it), with an advertised endpoint nothing derives the payload from it any more. `herdr pair` still installs the freshly minted token on the running server, reaching a wildcard listener on loopback at the same port. A `bind` port of `0` stays an error either way, since nothing can know which port the listener ends up on.
 
 Set `bind` by hand, then let [`herdr pair`](/docs/cli-reference/#pairing) manage the token: it mints and stores a fresh token, applies it to a running server, and prints the pairing payload as a QR code and plaintext. Re-running it rotates the token and invalidates the previous one.
 
