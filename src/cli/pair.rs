@@ -4,18 +4,23 @@
 //!
 //! The token is stored in `[websocket_api].token` in config.toml, so the
 //! server honors it across restarts. Re-running the command mints a fresh
-//! token and replaces the stored one; a running server is asked to reload its
-//! config so the previous token stops authenticating immediately. When the
-//! listener is not configured the command explains what to enable instead of
-//! printing a payload that cannot work.
+//! token and replaces the stored one; the server that reads that config file
+//! is asked to reload it so the previous token stops authenticating
+//! immediately, and the new token is then presented to the listener, so what
+//! the command reports is what a client would find. When the listener is not
+//! configured the command explains what to enable instead of printing a
+//! payload that cannot work.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::handshake::HandshakeError;
+use tungstenite::http::StatusCode;
 
-use crate::api::client::{ApiClient, ApiClientError};
+use crate::api::client::{ApiClient, ApiClientError, ConnectionTarget};
 use crate::api::schema::{EmptyParams, Method, Request};
 
 /// 256 bits of OS randomness per token. Encoded as base64url without
@@ -24,6 +29,12 @@ use crate::api::schema::{EmptyParams, Method, Request};
 const TOKEN_BYTES: usize = 32;
 
 const LISTENER_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long the token handshake may take once the listener has accepted the
+/// connection. The address dialed is this machine's own listener, so a slow
+/// answer says something other than a herdr listener holds the port rather
+/// than that the network is busy.
+const TOKEN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(String::as_str) {
@@ -108,12 +119,14 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     }
     std::fs::write(&config_path, updated)?;
 
-    let previous_token_existed = config
+    let previous_token = config
         .websocket_api
         .token
         .as_deref()
-        .is_some_and(|token| !token.is_empty());
-    let activation = apply_token_to_running_server(local_listener);
+        .filter(|token| !token.is_empty());
+    let previous_token_existed = previous_token.is_some();
+    let activation =
+        apply_token_to_running_server(&config_path, local_listener, &token, previous_token);
 
     let payload = PairingPayload {
         endpoint,
@@ -135,8 +148,12 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
     println!("  {}", payload.url());
     println!();
 
-    let (report, exit_code) =
-        activation_report(&activation, previous_token_existed, local_listener);
+    let (report, exit_code) = activation_report(
+        &activation,
+        previous_token_existed,
+        local_listener,
+        &config_path,
+    );
     println!("{report}");
     Ok(exit_code)
 }
@@ -375,37 +392,101 @@ fn qr_code_text(url: &str) -> Result<String, String> {
         .build())
 }
 
-/// Whether and how the freshly stored token reached a live listener.
+/// The control sockets pairing will ask to reload, in the order it tries
+/// them. At most two: a config file selected explicitly has a server whose
+/// home directory is that config's own, and there is also whatever server
+/// this command's own environment addresses.
 #[derive(Debug, PartialEq, Eq)]
-enum TokenActivation {
-    /// No herdr server is running; the stored token applies at next start.
-    NoServer,
-    /// The running server reloaded its config and the listener answers.
-    LiveNow,
-    /// The running server reloaded its config, but nothing is listening on
-    /// the configured address — the bind was added after the server started.
-    NeedsListenerRestart,
-    /// A server is running but the reload failed; the previous token may
-    /// still authenticate until a reload or restart succeeds.
+struct ControlSockets {
+    /// The socket of a server living in the config file's own directory.
+    owning: Option<PathBuf>,
+    /// The socket a server started in this command's environment serves.
+    ambient: PathBuf,
+}
+
+impl ControlSockets {
+    fn in_order(&self) -> Vec<&PathBuf> {
+        self.owning
+            .iter()
+            .chain(std::iter::once(&self.ambient))
+            .collect()
+    }
+}
+
+/// Resolve the control sockets to try for the server that reads
+/// `config_path`.
+///
+/// This is a preference order, not a lookup: no config file records which
+/// server reads it, and no server directory records which config it read.
+///
+/// `ambient` is the socket a server started in this command's own environment
+/// serves, and it is the right one whenever the config being paired is that
+/// environment's own config — the ordinary one-config machine, and a named
+/// session, which shares that config file. When the config file was selected
+/// explicitly and is some other file, the ambient socket belongs to a server
+/// that need never have read it: a machine can run one server per config, and
+/// dialing the ambient socket alone is how pairing came to write a token into
+/// one config and reload a server holding another. The server whose home
+/// directory is the config's own is tried first there.
+///
+/// Nothing here is allowed to stand in for proof. Whichever socket answers,
+/// only presenting the token to the listener decides what gets reported.
+fn control_sockets_for_config(
+    config_path: &Path,
+    environment_config_path: &Path,
+    ambient: PathBuf,
+) -> ControlSockets {
+    let owning = if config_path == environment_config_path {
+        None
+    } else {
+        config_path
+            .parent()
+            .map(crate::session::api_socket_path_in)
+            .filter(|owning| *owning != ambient)
+    };
+    ControlSockets { owning, ambient }
+}
+
+/// Which server was asked to reload the config, and what came back.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigReload {
+    /// A server answered on this control socket and reloaded its config.
+    Reloaded { socket: PathBuf },
+    /// No server answered any control socket that was tried.
+    NoServer { socket: PathBuf },
+    /// A server answered and the reload failed.
     Failed(String),
 }
 
-fn apply_token_to_running_server(addr: SocketAddr) -> TokenActivation {
-    let response = ApiClient::local().request_value(&Request {
-        id: "cli:pair:reload-config".into(),
-        method: Method::ServerReloadConfig(EmptyParams::default()),
-    });
+/// Ask the first server that answers to reload its config. A socket nothing
+/// is listening on is not a failure — it only means that server is not
+/// running — so the next candidate is tried.
+fn reload_config_of_owning_server(sockets: &ControlSockets) -> ConfigReload {
+    let mut unanswered: Option<PathBuf> = None;
+    for socket in sockets.in_order() {
+        match reload_config_at(socket) {
+            ConfigReload::NoServer { socket } => unanswered = unanswered.or(Some(socket)),
+            answered => return answered,
+        }
+    }
+    ConfigReload::NoServer {
+        socket: unanswered.unwrap_or_else(|| sockets.ambient.clone()),
+    }
+}
+
+fn reload_config_at(socket: &Path) -> ConfigReload {
+    let response = ApiClient::for_target(ConnectionTarget::SocketPath(socket.to_path_buf()))
+        .request_value(&Request {
+            id: "cli:pair:reload-config".into(),
+            method: Method::ServerReloadConfig(EmptyParams::default()),
+        });
 
     match response {
-        Ok(_) => {
-            if listener_is_reachable(addr) {
-                TokenActivation::LiveNow
-            } else {
-                TokenActivation::NeedsListenerRestart
-            }
-        }
+        Ok(_) => ConfigReload::Reloaded {
+            socket: socket.to_path_buf(),
+        },
         Err(ApiClientError::ErrorResponse(response)) => {
-            TokenActivation::Failed(response.error.message)
+            ConfigReload::Failed(response.error.message)
         }
         Err(ApiClientError::Io(err))
             if matches!(
@@ -413,52 +494,296 @@ fn apply_token_to_running_server(addr: SocketAddr) -> TokenActivation {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            TokenActivation::NoServer
+            ConfigReload::NoServer {
+                socket: socket.to_path_buf(),
+            }
         }
-        Err(err) => TokenActivation::Failed(err.to_string()),
+        Err(err) => ConfigReload::Failed(err.to_string()),
     }
 }
 
-fn listener_is_reachable(addr: SocketAddr) -> bool {
-    std::net::TcpStream::connect_timeout(&addr, LISTENER_PROBE_TIMEOUT).is_ok()
+/// What presenting a token to the listener established. Every variant is an
+/// observation: the handshake either completed, was refused, found nothing to
+/// talk to, or ended without answering the question.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenProof {
+    /// The listener completed the handshake for this token.
+    Accepted,
+    /// The listener answered the handshake by refusing the token.
+    Refused,
+    /// Nothing accepted a connection on the address.
+    NoListener,
+    /// Something answered, but neither accepted nor refused the token.
+    Inconclusive(String),
 }
 
-/// Human-readable outcome plus the process exit code. Exit is non-zero only
-/// when a running server could not be updated — the one case where the
-/// printed payload might not authenticate while the old token still does.
+/// Open a connection to the local listener, or say what its absence proves.
+/// A refused connection and a connect timeout are the two shapes of "nothing
+/// is serving this address"; any other error is a fact about this machine
+/// rather than about the listener, so it proves nothing either way.
+fn connect_to_listener(addr: SocketAddr) -> Result<std::net::TcpStream, TokenProof> {
+    match std::net::TcpStream::connect_timeout(&addr, LISTENER_PROBE_TIMEOUT) {
+        Ok(stream) => Ok(stream),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(TokenProof::NoListener)
+        }
+        Err(err) => Err(TokenProof::Inconclusive(format!(
+            "could not connect to {addr}: {err}"
+        ))),
+    }
+}
+
+/// Present `token` to the listener the way the printed payload does — as the
+/// `token` query parameter — and report what the handshake proved. Using the
+/// credential is the only check that distinguishes a listener holding this
+/// token from a listener holding some other one, which is the whole
+/// difference between a payload that works and a payload that does not.
+fn probe_token(addr: SocketAddr, token: &str) -> TokenProof {
+    let stream = match connect_to_listener(addr) {
+        Ok(stream) => stream,
+        Err(proof) => return proof,
+    };
+    if let Err(err) = stream
+        .set_read_timeout(Some(TOKEN_HANDSHAKE_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(TOKEN_HANDSHAKE_TIMEOUT)))
+    {
+        return TokenProof::Inconclusive(format!("could not bound the handshake: {err}"));
+    }
+
+    // The token charset is URL-unreserved by construction, so the query form
+    // needs no escaping here either.
+    let request = match format!("ws://{addr}/?token={token}").into_client_request() {
+        Ok(request) => request,
+        Err(err) => {
+            return TokenProof::Inconclusive(format!(
+                "could not build a handshake for {addr}: {err}"
+            ));
+        }
+    };
+
+    match tungstenite::client::client(request, stream) {
+        Ok((mut websocket, _response)) => {
+            // Nothing is sent on the connection: the handshake is the whole
+            // proof, and closing it looks to the server like any other client
+            // that connected and left.
+            let _ = websocket.close(None);
+            let _ = websocket.flush();
+            TokenProof::Accepted
+        }
+        Err(HandshakeError::Failure(tungstenite::Error::Http(response))) => {
+            if matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ) {
+                TokenProof::Refused
+            } else {
+                TokenProof::Inconclusive(format!(
+                    "the listener answered the handshake with http {}",
+                    response.status()
+                ))
+            }
+        }
+        Err(err) => TokenProof::Inconclusive(format!("the handshake did not complete: {err}")),
+    }
+}
+
+/// What presenting the previous token proved after the rotation.
+#[derive(Debug, PartialEq, Eq)]
+enum PreviousTokenProof {
+    /// There was no previous token, or presenting it proved nothing.
+    Unproven,
+    /// Presenting the previous token was refused: the rotation took effect.
+    Refused,
+    /// The previous token was still accepted after the rotation.
+    StillAccepted,
+}
+
+/// Whether and how the freshly stored token reached a live listener. Every
+/// variant names something this command observed — a control socket that
+/// answered or did not, and a handshake that was accepted, refused, or never
+/// answered the question.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenActivation {
+    /// A handshake presenting the new token was accepted. `previous_token`
+    /// carries what presenting the previous one proved.
+    LiveNow { previous_token: PreviousTokenProof },
+    /// No server answered a control socket and nothing is listening on the
+    /// bind address; the stored token applies at next start.
+    NoServer { socket: PathBuf },
+    /// A server reloaded its config, but nothing is listening on the
+    /// configured address — the bind was added after the server started.
+    NeedsListenerRestart,
+    /// A listener answers on the bind address and refused the new token, so
+    /// whatever serves that address is not running the config just written.
+    NotAccepted { reload: ConfigReload },
+    /// A listener answered but neither accepted nor refused the token.
+    Unverified { reason: String },
+    /// A server answered and the reload failed; the previous token may still
+    /// authenticate until a reload or restart succeeds.
+    Failed(String),
+}
+
+fn apply_token_to_running_server(
+    config_path: &Path,
+    addr: SocketAddr,
+    token: &str,
+    previous_token: Option<&str>,
+) -> TokenActivation {
+    let sockets = control_sockets_for_config(
+        config_path,
+        &crate::config::config_dir().join("config.toml"),
+        crate::api::socket_path(),
+    );
+    let reload = reload_config_of_owning_server(&sockets);
+    if let ConfigReload::Failed(reason) = reload {
+        return TokenActivation::Failed(reason);
+    }
+
+    let new_token = probe_token(addr, token);
+    // The claim that the previous token stopped working is a second fact, so
+    // it takes a second handshake; it is only worth asking once the listener
+    // has been shown to be the one holding the new token.
+    let previous_token = match (&new_token, previous_token) {
+        (TokenProof::Accepted, Some(previous)) => Some(probe_token(addr, previous)),
+        _ => None,
+    };
+
+    decide_activation(reload, new_token, previous_token)
+}
+
+/// Turn the reload outcome and the handshakes into the one state they
+/// support. Nothing is inferred here that was not observed: a reload that
+/// succeeded never implies the token is live, and a listener that answers
+/// never implies it accepts anything.
+fn decide_activation(
+    reload: ConfigReload,
+    new_token: TokenProof,
+    previous_token: Option<TokenProof>,
+) -> TokenActivation {
+    match (reload, new_token) {
+        (ConfigReload::Failed(reason), _) => TokenActivation::Failed(reason),
+        (_, TokenProof::Accepted) => TokenActivation::LiveNow {
+            previous_token: match previous_token {
+                Some(TokenProof::Refused) => PreviousTokenProof::Refused,
+                Some(TokenProof::Accepted) => PreviousTokenProof::StillAccepted,
+                _ => PreviousTokenProof::Unproven,
+            },
+        },
+        (ConfigReload::Reloaded { .. }, TokenProof::NoListener) => {
+            TokenActivation::NeedsListenerRestart
+        }
+        (ConfigReload::NoServer { socket }, TokenProof::NoListener) => {
+            TokenActivation::NoServer { socket }
+        }
+        (reload, TokenProof::Refused) => TokenActivation::NotAccepted { reload },
+        (_, TokenProof::Inconclusive(reason)) => TokenActivation::Unverified { reason },
+    }
+}
+
+/// Human-readable outcome plus the process exit code.
+///
+/// Exit is non-zero when the printed payload was observed not to work, and
+/// when it could not be shown to work while something answers on the bind
+/// address. A state that is understood and has a next step — no server yet,
+/// no listener yet — exits zero; an unknown one does not, because a payload
+/// nobody has connected with is exactly what this command used to report as
+/// live.
 fn activation_report(
     activation: &TokenActivation,
     previous_token_existed: bool,
     addr: SocketAddr,
+    config_path: &Path,
 ) -> (String, i32) {
     let rotation = if previous_token_existed {
         "Rotated: the previous token was replaced in config.toml"
     } else {
         "Stored the first token in config.toml"
     };
+    let accepted = format!("a handshake on {addr} presenting the new token was accepted");
 
     match activation {
-        TokenActivation::NoServer => (
-            format!("{rotation}. No running herdr server was detected; the token takes effect when the server starts."),
+        TokenActivation::NoServer { socket } => (
+            format!(
+                "{rotation}. No running herdr server answered the control socket at {}, \
+                 and nothing is listening on {addr}; the token takes effect when the server starts.",
+                socket.display()
+            ),
             0,
         ),
-        TokenActivation::LiveNow => {
-            let invalidated = if previous_token_existed {
-                " The previous token is no longer accepted."
-            } else {
-                ""
-            };
-            (
-                format!("{rotation} and applied to the running server; the listener accepts the new token now.{invalidated}"),
+        TokenActivation::LiveNow { previous_token } => match previous_token {
+            PreviousTokenProof::Refused => (
+                format!(
+                    "{rotation} and applied to the running server: {accepted}, \
+                     and one presenting the previous token was refused."
+                ),
                 0,
-            )
-        }
+            ),
+            PreviousTokenProof::StillAccepted => (
+                format!(
+                    "{rotation} and applied to the running server: {accepted}, \
+                     but one presenting the previous token was accepted too.\n\
+                     warning: the previous token has not stopped authenticating. \
+                     Restart the herdr server serving {addr} before treating it as revoked."
+                ),
+                1,
+            ),
+            PreviousTokenProof::Unproven if previous_token_existed => (
+                format!(
+                    "{rotation} and applied to the running server: {accepted}.\n\
+                     Whether the previous token still authenticates was not established."
+                ),
+                0,
+            ),
+            PreviousTokenProof::Unproven => (
+                format!("{rotation} and applied to the running server: {accepted}."),
+                0,
+            ),
+        },
         TokenActivation::NeedsListenerRestart => (
             format!(
                 "{rotation} and the running server reloaded its config, but nothing is listening on {addr} yet.\n\
                  Restart the herdr server so it binds the websocket listener, then scan."
             ),
             0,
+        ),
+        TokenActivation::NotAccepted { reload } => {
+            let observed = match reload {
+                ConfigReload::Reloaded { socket } => format!(
+                    "{rotation}, and the server at {} reloaded its config, but a handshake on {addr} \
+                     presenting the new token was refused.",
+                    socket.display()
+                ),
+                _ => format!(
+                    "{rotation}, but no herdr server answered a control socket, and a handshake on \
+                     {addr} presenting the new token was refused."
+                ),
+            };
+            (
+                format!(
+                    "{observed}\n\
+                     warning: the printed token does not authenticate. Whatever serves {addr} has not \
+                     applied {}: it is a different server, or it did not reload. Find it with \
+                     `herdr session list --json`, then reload it with \
+                     `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or restart it; \
+                     the printed payload works once it does.",
+                    config_path.display()
+                ),
+                1,
+            )
+        }
+        TokenActivation::Unverified { reason } => (
+            format!(
+                "{rotation}, but whether the listener on {addr} accepts the new token could not be \
+                 established: {reason}.\n\
+                 warning: nothing has connected with the printed token. Restart the herdr server \
+                 serving {addr}, or connect with the token yourself, before relying on it."
+            ),
+            1,
         ),
         TokenActivation::Failed(reason) => (
             format!(
@@ -632,7 +957,7 @@ mod tests {
         assert_eq!(dial_target.port(), bound.port());
         assert!(dial_target.ip().is_loopback(), "{dial_target}");
         assert!(
-            listener_is_reachable(dial_target),
+            connect_to_listener(dial_target).is_ok(),
             "a wildcard listener must answer on {dial_target}"
         );
     }
@@ -1239,33 +1564,340 @@ mod tests {
         );
     }
 
+    /// The control socket is resolved from the config file being written,
+    /// because on a machine running one server per config the socket this
+    /// command's own environment names need never belong to a server that
+    /// ever read that file.
+    #[test]
+    fn the_control_socket_follows_the_config_being_written() {
+        let ambient = PathBuf::from("/home/u/.config/herdr/herdr.sock");
+        let environment_config = PathBuf::from("/home/u/.config/herdr/config.toml");
+
+        // The ordinary one-config machine: the config being paired is this
+        // environment's own, so the socket it names is a server that reads it.
+        assert_eq!(
+            control_sockets_for_config(&environment_config, &environment_config, ambient.clone()),
+            ControlSockets {
+                owning: None,
+                ambient: ambient.clone(),
+            }
+        );
+
+        // A named session serves its own socket and shares the same config
+        // file, so that socket stays the one to reload.
+        let session = PathBuf::from("/home/u/.config/herdr/sessions/mobile/herdr.sock");
+        assert_eq!(
+            control_sockets_for_config(&environment_config, &environment_config, session.clone()),
+            ControlSockets {
+                owning: None,
+                ambient: session,
+            }
+        );
+
+        // A config file selected explicitly: the server whose home directory
+        // is that config's own comes first, and the ambient socket — which
+        // may be a server holding an entirely different config — only after.
+        let selected = PathBuf::from("/home/u/.config/herdr-second/config.toml");
+        let owning = PathBuf::from("/home/u/.config/herdr-second/herdr.sock");
+        let sockets = control_sockets_for_config(&selected, &environment_config, ambient.clone());
+        assert_eq!(
+            sockets,
+            ControlSockets {
+                owning: Some(owning.clone()),
+                ambient: ambient.clone(),
+            }
+        );
+        assert_eq!(sockets.in_order(), vec![&owning, &ambient]);
+
+        // A different file in the same directory is the same server; nothing
+        // is dialed twice.
+        let sibling = PathBuf::from("/home/u/.config/herdr/other.toml");
+        assert_eq!(
+            control_sockets_for_config(&sibling, &environment_config, ambient.clone()),
+            ControlSockets {
+                owning: None,
+                ambient,
+            }
+        );
+    }
+
+    /// The defect this command carried: a reload that succeeded and an
+    /// address that answers say nothing about which token the listener
+    /// holds. Only the handshake decides.
+    #[test]
+    fn only_an_accepted_handshake_is_reported_as_live() {
+        let socket = PathBuf::from("/home/u/.config/herdr/herdr.sock");
+        let reloaded = || ConfigReload::Reloaded {
+            socket: socket.clone(),
+        };
+        let no_server = || ConfigReload::NoServer {
+            socket: socket.clone(),
+        };
+
+        // A reloaded server plus a refused handshake is the shape that used
+        // to print "the listener accepts the new token now".
+        assert_eq!(
+            decide_activation(reloaded(), TokenProof::Refused, None),
+            TokenActivation::NotAccepted { reload: reloaded() }
+        );
+        assert_eq!(
+            decide_activation(no_server(), TokenProof::Refused, None),
+            TokenActivation::NotAccepted {
+                reload: no_server()
+            }
+        );
+
+        // Live means observed live, and the previous token's fate is a
+        // separate observation rather than something the first one implies.
+        assert_eq!(
+            decide_activation(reloaded(), TokenProof::Accepted, Some(TokenProof::Refused)),
+            TokenActivation::LiveNow {
+                previous_token: PreviousTokenProof::Refused
+            }
+        );
+        assert_eq!(
+            decide_activation(reloaded(), TokenProof::Accepted, Some(TokenProof::Accepted)),
+            TokenActivation::LiveNow {
+                previous_token: PreviousTokenProof::StillAccepted
+            }
+        );
+        assert_eq!(
+            decide_activation(reloaded(), TokenProof::Accepted, None),
+            TokenActivation::LiveNow {
+                previous_token: PreviousTokenProof::Unproven
+            }
+        );
+        assert_eq!(
+            decide_activation(
+                reloaded(),
+                TokenProof::Accepted,
+                Some(TokenProof::Inconclusive("eof".to_string()))
+            ),
+            TokenActivation::LiveNow {
+                previous_token: PreviousTokenProof::Unproven
+            }
+        );
+        // A listener holding the new token is live whether or not this
+        // command is the one that reached the server holding it.
+        assert_eq!(
+            decide_activation(no_server(), TokenProof::Accepted, Some(TokenProof::Refused)),
+            TokenActivation::LiveNow {
+                previous_token: PreviousTokenProof::Refused
+            }
+        );
+
+        assert_eq!(
+            decide_activation(reloaded(), TokenProof::NoListener, None),
+            TokenActivation::NeedsListenerRestart
+        );
+        assert_eq!(
+            decide_activation(no_server(), TokenProof::NoListener, None),
+            TokenActivation::NoServer {
+                socket: socket.clone()
+            }
+        );
+        assert_eq!(
+            decide_activation(
+                reloaded(),
+                TokenProof::Inconclusive("http 502".to_string()),
+                None
+            ),
+            TokenActivation::Unverified {
+                reason: "http 502".to_string()
+            }
+        );
+        // A failed reload is reported as failed whatever the listener says.
+        assert_eq!(
+            decide_activation(
+                ConfigReload::Failed("boom".to_string()),
+                TokenProof::Accepted,
+                None
+            ),
+            TokenActivation::Failed("boom".to_string())
+        );
+    }
+
+    /// A real listener, because the proof this command now rests on is a
+    /// real handshake: the same address answers, and the only thing that
+    /// tells the freshly minted token from the one it replaced is presenting
+    /// them.
+    #[test]
+    fn a_handshake_tells_the_new_token_from_the_previous_one() {
+        let listener = start_listener_holding("the-new-token");
+        let endpoint = listener.handle.local_addr();
+
+        assert_eq!(probe_token(endpoint, "the-new-token"), TokenProof::Accepted);
+        assert_eq!(
+            probe_token(endpoint, "the-previous-token"),
+            TokenProof::Refused
+        );
+
+        drop(listener);
+        assert_eq!(
+            probe_token(endpoint, "the-new-token"),
+            TokenProof::NoListener,
+            "a released port must not read as a listener"
+        );
+    }
+
+    /// Something else holding the port is not a herdr listener refusing the
+    /// token, and must not be reported as either.
+    #[test]
+    fn a_socket_that_never_answers_the_handshake_proves_nothing() {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = socket.local_addr().expect("bound address");
+        let accepter = std::thread::spawn(move || {
+            if let Ok((stream, _)) = socket.accept() {
+                drop(stream);
+            }
+        });
+
+        match probe_token(endpoint, "a-token") {
+            TokenProof::Inconclusive(reason) => assert!(reason.contains("handshake"), "{reason}"),
+            other => panic!("expected an inconclusive proof, got {other:?}"),
+        }
+
+        accepter.join().expect("accepter thread");
+    }
+
+    /// A listener holding `token`, to present tokens to.
+    struct TestListener {
+        handle: crate::api::WebSocketServerHandle,
+        _api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
+    }
+
+    fn start_listener_holding(token: &str) -> TestListener {
+        let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = crate::config::WebSocketApiConfig {
+            bind: Some("127.0.0.1:0".to_string()),
+            token: Some(token.to_string()),
+            ..Default::default()
+        };
+        let handle = crate::api::start_websocket_server_with_capabilities(
+            &config,
+            api_tx,
+            crate::api::EventHub::default(),
+            crate::api::SharedCredentialRegistry::open(
+                crate::api::credentials::test_registry_path("pair"),
+            ),
+            None,
+            crate::api::SharedServerName::from_config(&config),
+            crate::api::SharedServerReach::from_config(&config),
+        )
+        .expect("the listener starts")
+        .expect("bind is configured, so it binds");
+        TestListener {
+            handle,
+            _api_rx: api_rx,
+        }
+    }
+
+    /// Every outcome, whole-message. The wording is the deliverable here:
+    /// an operator who reads "applied and live" and finds it false stops
+    /// believing anything else this command prints, so each message is
+    /// asserted by equality rather than by substring, and each one names
+    /// only what was observed. A row per outcome means none of them can be
+    /// deleted or softened without failing.
     #[test]
     fn activation_report_spells_out_each_outcome() {
         let endpoint = addr("100.64.0.5:4433");
+        let config_path = Path::new("/home/u/.config/herdr/config.toml");
+        let socket = PathBuf::from("/home/u/.config/herdr/herdr.sock");
+        let rows = vec![
+            (
+                TokenActivation::NoServer {
+                    socket: socket.clone(),
+                },
+                true,
+                "Rotated: the previous token was replaced in config.toml. No running herdr server answered the control socket at /home/u/.config/herdr/herdr.sock, and nothing is listening on 100.64.0.5:4433; the token takes effect when the server starts.",
+                0,
+            ),
+            (
+                TokenActivation::LiveNow {
+                    previous_token: PreviousTokenProof::Refused,
+                },
+                true,
+                "Rotated: the previous token was replaced in config.toml and applied to the running server: a handshake on 100.64.0.5:4433 presenting the new token was accepted, and one presenting the previous token was refused.",
+                0,
+            ),
+            (
+                TokenActivation::LiveNow {
+                    previous_token: PreviousTokenProof::Unproven,
+                },
+                true,
+                "Rotated: the previous token was replaced in config.toml and applied to the running server: a handshake on 100.64.0.5:4433 presenting the new token was accepted.\nWhether the previous token still authenticates was not established.",
+                0,
+            ),
+            (
+                TokenActivation::LiveNow {
+                    previous_token: PreviousTokenProof::StillAccepted,
+                },
+                true,
+                "Rotated: the previous token was replaced in config.toml and applied to the running server: a handshake on 100.64.0.5:4433 presenting the new token was accepted, but one presenting the previous token was accepted too.\nwarning: the previous token has not stopped authenticating. Restart the herdr server serving 100.64.0.5:4433 before treating it as revoked.",
+                1,
+            ),
+            (
+                TokenActivation::LiveNow {
+                    previous_token: PreviousTokenProof::Unproven,
+                },
+                false,
+                "Stored the first token in config.toml and applied to the running server: a handshake on 100.64.0.5:4433 presenting the new token was accepted.",
+                0,
+            ),
+            (
+                TokenActivation::NeedsListenerRestart,
+                true,
+                "Rotated: the previous token was replaced in config.toml and the running server reloaded its config, but nothing is listening on 100.64.0.5:4433 yet.\nRestart the herdr server so it binds the websocket listener, then scan.",
+                0,
+            ),
+            (
+                TokenActivation::NotAccepted {
+                    reload: ConfigReload::Reloaded {
+                        socket: socket.clone(),
+                    },
+                },
+                true,
+                "Rotated: the previous token was replaced in config.toml, and the server at /home/u/.config/herdr/herdr.sock reloaded its config, but a handshake on 100.64.0.5:4433 presenting the new token was refused.\nwarning: the printed token does not authenticate. Whatever serves 100.64.0.5:4433 has not applied /home/u/.config/herdr/config.toml: it is a different server, or it did not reload. Find it with `herdr session list --json`, then reload it with `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or restart it; the printed payload works once it does.",
+                1,
+            ),
+            (
+                TokenActivation::NotAccepted {
+                    reload: ConfigReload::NoServer { socket },
+                },
+                true,
+                "Rotated: the previous token was replaced in config.toml, but no herdr server answered a control socket, and a handshake on 100.64.0.5:4433 presenting the new token was refused.\nwarning: the printed token does not authenticate. Whatever serves 100.64.0.5:4433 has not applied /home/u/.config/herdr/config.toml: it is a different server, or it did not reload. Find it with `herdr session list --json`, then reload it with `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or restart it; the printed payload works once it does.",
+                1,
+            ),
+            (
+                TokenActivation::Unverified {
+                    reason: "the handshake did not complete: eof".to_string(),
+                },
+                true,
+                "Rotated: the previous token was replaced in config.toml, but whether the listener on 100.64.0.5:4433 accepts the new token could not be established: the handshake did not complete: eof.\nwarning: nothing has connected with the printed token. Restart the herdr server serving 100.64.0.5:4433, or connect with the token yourself, before relying on it.",
+                1,
+            ),
+            (
+                TokenActivation::Failed("boom".to_string()),
+                true,
+                "Rotated: the previous token was replaced in config.toml, but applying it to the running server failed: boom.\nwarning: the previous token may still be accepted until `herdr server reload-config` succeeds or the server restarts.",
+                1,
+            ),
+        ];
 
-        let (no_server, code) = activation_report(&TokenActivation::NoServer, true, endpoint);
-        assert_eq!(code, 0);
-        assert!(no_server.contains("No running herdr server"));
+        for (activation, previous_token_existed, expected, expected_code) in rows {
+            let (report, code) =
+                activation_report(&activation, previous_token_existed, endpoint, config_path);
+            assert_eq!(report, expected, "report for {activation:?}");
+            assert_eq!(code, expected_code, "exit code for {activation:?}");
 
-        let (live, code) = activation_report(&TokenActivation::LiveNow, true, endpoint);
-        assert_eq!(code, 0);
-        assert!(live.contains("previous token is no longer accepted"));
-
-        let (first_pairing, code) = activation_report(&TokenActivation::LiveNow, false, endpoint);
-        assert_eq!(code, 0);
-        assert!(first_pairing.contains("first token"));
-        assert!(!first_pairing.contains("previous token"));
-
-        let (unbound, code) =
-            activation_report(&TokenActivation::NeedsListenerRestart, true, endpoint);
-        assert_eq!(code, 0);
-        assert!(unbound.contains("Restart the herdr server"));
-        assert!(unbound.contains("100.64.0.5:4433"));
-
-        let (failed, code) =
-            activation_report(&TokenActivation::Failed("boom".to_string()), true, endpoint);
-        assert_eq!(code, 1);
-        assert!(failed.contains("boom"));
-        assert!(failed.contains("previous token may still be accepted"));
+            // The sentence that used to be printed without evidence appears
+            // in exactly the outcome that has it: a handshake that was
+            // accepted. No other state may borrow it.
+            assert_eq!(
+                report.contains("presenting the new token was accepted"),
+                matches!(activation, TokenActivation::LiveNow { .. }),
+                "only an observed handshake may claim the token was accepted: {report}"
+            );
+        }
     }
 }
