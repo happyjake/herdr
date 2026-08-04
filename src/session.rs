@@ -167,7 +167,14 @@ pub fn data_dir_for(name: Option<&str>) -> PathBuf {
 }
 
 pub fn api_socket_path_for(name: Option<&str>) -> PathBuf {
-    data_dir_for(name).join("herdr.sock")
+    api_socket_path_in(&data_dir_for(name))
+}
+
+/// The api socket a server whose data directory is `dir` serves. Callers that
+/// know a server's directory but not its session name resolve its socket
+/// through here, so the file name stays defined in one place.
+pub fn api_socket_path_in(dir: &Path) -> PathBuf {
+    dir.join("herdr.sock")
 }
 
 pub fn active_api_socket_path() -> PathBuf {
