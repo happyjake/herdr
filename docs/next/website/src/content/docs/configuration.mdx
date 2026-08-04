@@ -137,9 +137,19 @@ reach = "the-mini"
 
 `reach` is the optional route another machine uses to open a shell on this server, typically an exact SSH alias. It is kept separate from `name` because display styling and a working route can differ. Herdr never guesses reach from the display name or hostname; unset or empty means undeclared.
 
+`advertised_endpoint` is the optional URL clients should dial to reach this listener. The bind address describes the local socket, which is the reachable URL only when nothing fronts it; declare an advertised endpoint when something does — a TLS terminating proxy, for instance — so the pairing payload names the URL that works:
+
+```toml
+[websocket_api]
+bind = "100.64.0.5:4433"
+advertised_endpoint = "wss://a-host.example.net"
+```
+
+It must be a `ws://` or `wss://` URL carrying scheme, host, and optional port and nothing else: `herdr pair` refuses to print a payload it cannot make connectable, naming what is wrong, rather than encoding a QR nobody can scan into a connection. Unset or empty keeps the bind-derived `ws://<bind>` URL exactly as before.
+
 Set `bind` by hand, then let [`herdr pair`](/docs/cli-reference/#pairing) manage the token: it mints and stores a fresh token, applies it to a running server, and prints the pairing payload as a QR code and plaintext. Re-running it rotates the token and invalidates the previous one.
 
-The transport is plain `ws://`; the network layer (for example your tailnet's WireGuard encryption) provides transport security. Changing `bind` requires a server restart — `server.reload_config` does not rebind the listener. A changed `token`, `name`, or `reach` is applied by `server.reload_config` without a restart; connections authorized before the change stay connected. See [Socket API](/docs/socket-api/) for the wire protocol.
+The listener itself speaks plain `ws://`; the network layer (for example your tailnet's WireGuard encryption) provides transport security, and a proxy in front of it can add TLS. Changing `bind` requires a server restart — `server.reload_config` does not rebind the listener. A changed `token`, `name`, or `reach` is applied by `server.reload_config` without a restart; connections authorized before the change stay connected. A changed `advertised_endpoint` needs no restart either — `herdr pair` reads it from the config file on every run. See [Socket API](/docs/socket-api/) for the wire protocol.
 
 ## Keybindings
 

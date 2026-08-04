@@ -1373,6 +1373,7 @@ mod tests {
             bind: bind.map(str::to_string),
             token: token.map(str::to_string),
             name: None,
+            advertised_endpoint: None,
             reach: None,
         }
     }

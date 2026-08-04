@@ -69,6 +69,15 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
+    let endpoint = match pairing_base_url(config.websocket_api.advertised_endpoint.as_deref(), addr)
+    {
+        Ok(endpoint) => endpoint,
+        Err(unavailable) => {
+            eprint!("{}", unavailable.explanation(&config_path));
+            return Ok(1);
+        }
+    };
+
     let name = crate::api::resolve_server_name(&config.websocket_api);
 
     let token = mint_token()?;
@@ -98,7 +107,11 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
         .is_some_and(|token| !token.is_empty());
     let activation = apply_token_to_running_server(addr);
 
-    let payload = PairingPayload { addr, token, name };
+    let payload = PairingPayload {
+        endpoint,
+        token,
+        name,
+    };
     match qr_code_text(&payload.url()) {
         Ok(qr) => {
             println!("Scan with the herdr mobile client:");
@@ -107,7 +120,7 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
         }
         Err(err) => eprintln!("warning: {err}; use the plaintext payload below"),
     }
-    println!("  endpoint  {}", payload.endpoint());
+    println!("  endpoint  {}", payload.endpoint);
     println!("  name      {}", payload.name);
     println!("  token     {}", payload.token);
     println!();
@@ -124,25 +137,22 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
 /// connectable form — the listener accepts the token as a query parameter
 /// and ignores the rest — that also carries the fields for clients that
 /// prefer `Authorization: Bearer` header auth. The name and token ride only
-/// the scannable URL: [`Self::endpoint`] stays bare, so pasting it never
-/// leaks a credential and renaming never changes a server's identity.
+/// the scannable URL: the endpoint stays bare, so pasting it never leaks a
+/// credential and renaming never changes a server's identity.
 struct PairingPayload {
-    addr: SocketAddr,
+    /// Base URL without a trailing slash, e.g. `ws://100.64.0.5:4433`.
+    endpoint: String,
     token: String,
     name: String,
 }
 
 impl PairingPayload {
-    fn endpoint(&self) -> String {
-        format!("ws://{}", self.addr)
-    }
-
     fn url(&self) -> String {
         // The token charset is URL-unreserved by construction, so the query
         // form needs no percent-encoding; the free-form name does.
         format!(
-            "ws://{}/?token={}&name={}",
-            self.addr,
+            "{}/?token={}&name={}",
+            self.endpoint,
             self.token,
             percent_encode_query_value(&self.name)
         )
@@ -175,6 +185,8 @@ enum PairingUnavailable {
     InvalidBind { bind: String, error: String },
     /// `bind` parses, but no client could reach the address as printed.
     UnusableBind { bind: String, reason: String },
+    /// `advertised_endpoint` is set but is not a url a client could dial.
+    InvalidAdvertisedEndpoint { advertised: String, reason: String },
 }
 
 impl PairingUnavailable {
@@ -207,7 +219,117 @@ impl PairingUnavailable {
                  Update the bind address and run `herdr pair` again; it will say whether a server restart is still needed.\n",
                 config_path.display()
             ),
+            Self::InvalidAdvertisedEndpoint { advertised, reason } => format!(
+                "error: websocket_api.advertised_endpoint {advertised:?} in {} is not a url a client could dial: {reason}.\n\
+                 Declare the url something else serves this listener at, e.g. \"wss://a-host.example.net\" — scheme, host, and optional port only.\n\
+                 Remove it to pair against the bind address instead.\n",
+                config_path.display()
+            ),
         }
+    }
+}
+
+/// The base URL the pairing payload is built from, without a trailing slash.
+///
+/// The bind address describes the local socket, which is the reachable url
+/// only when nothing fronts the listener. An operator who puts a proxy in
+/// front declares `websocket_api.advertised_endpoint`, and that wins; unset
+/// keeps the bind-derived `ws://<bind>` form.
+fn pairing_base_url(
+    advertised: Option<&str>,
+    addr: SocketAddr,
+) -> Result<String, PairingUnavailable> {
+    let advertised = match advertised.map(str::trim) {
+        None | Some("") => return Ok(format!("ws://{addr}")),
+        Some(advertised) => advertised,
+    };
+
+    normalize_advertised_endpoint(advertised).map_err(|reason| {
+        PairingUnavailable::InvalidAdvertisedEndpoint {
+            advertised: advertised.to_string(),
+            reason,
+        }
+    })
+}
+
+/// Validate a declared endpoint and return its canonical form: a lowercase
+/// `ws`/`wss` scheme, the host as configured, and the optional port. A
+/// payload nobody can connect to is worse than no payload, so anything the
+/// listener's clients could not dial — another scheme, a path, credentials,
+/// an out-of-range port — is refused with the reason instead of printed.
+fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
+    let (scheme, authority) = advertised
+        .split_once("://")
+        .ok_or_else(|| "expected a ws:// or wss:// url".to_string())?;
+
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "ws" && scheme != "wss" {
+        return Err(format!(
+            "a websocket client cannot dial {scheme}://; use ws:// or wss://"
+        ));
+    }
+
+    // One trailing slash is the same url; the query form appends its own.
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.is_empty() {
+        return Err("no host to dial".to_string());
+    }
+    if authority.chars().any(char::is_whitespace) {
+        return Err("a host cannot contain whitespace".to_string());
+    }
+    if authority.contains('@') {
+        return Err("credentials do not belong in a pairing endpoint".to_string());
+    }
+    if authority.contains(['/', '?', '#']) {
+        return Err(
+            "a path, query, or fragment would be lost when the token is appended; \
+             declare scheme, host, and optional port only"
+                .to_string(),
+        );
+    }
+
+    let (host, port) = split_host_and_port(authority)?;
+    if host.is_empty() {
+        return Err("no host to dial".to_string());
+    }
+    if let Some(port) = port {
+        match port.parse::<u16>() {
+            Ok(0) | Err(_) => {
+                return Err(format!(
+                    "{port:?} is not a port a client could dial; use 1-65535"
+                ))
+            }
+            Ok(_) => {}
+        }
+    }
+
+    Ok(format!("{scheme}://{authority}"))
+}
+
+/// Split an authority into host and optional port. IPv6 literals must be
+/// bracketed, as URLs require: without brackets `fd7a::1` is indistinguishable
+/// from a host with a port.
+fn split_host_and_port(authority: &str) -> Result<(&str, Option<&str>), String> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| "unterminated ipv6 literal; brackets must be closed".to_string())?;
+        let port = match tail {
+            "" => None,
+            tail => Some(tail.strip_prefix(':').ok_or_else(|| {
+                format!("expected a port after the ipv6 literal, found {tail:?}")
+            })?),
+        };
+        return Ok((host, port));
+    }
+
+    match authority.rsplit_once(':') {
+        // More than one colon means an unbracketed ipv6 literal.
+        Some((host, _)) if host.contains(':') => Err(
+            "an ipv6 literal must be wrapped in brackets, e.g. wss://[fd7a::1]:8443".to_string(),
+        ),
+        Some((host, port)) => Ok((host, Some(port))),
+        None => Ok((authority, None)),
     }
 }
 
@@ -376,6 +498,11 @@ fn print_pair_help() {
     eprintln!("[websocket_api].bind to be configured. Re-running rotates the token");
     eprintln!("and invalidates the previous one.");
     eprintln!();
+    eprintln!("When something else fronts the listener (a TLS terminating proxy,");
+    eprintln!("for instance), set [websocket_api].advertised_endpoint to the url");
+    eprintln!("clients should dial, e.g. \"wss://a-host.example.net\"; the payload");
+    eprintln!("names that instead of the bind address. Unset pairs against bind.");
+    eprintln!();
     eprintln!("The scannable URL also carries the server's display name so clients");
     eprintln!("can label the server before first connect: [websocket_api].name,");
     eprintln!("or the machine's hostname when unset. Display only, never identity.");
@@ -450,18 +577,18 @@ mod tests {
     #[test]
     fn payload_url_carries_endpoint_token_and_name_in_connectable_form() {
         let payload = PairingPayload {
-            addr: addr("100.64.0.5:4433"),
+            endpoint: "ws://100.64.0.5:4433".to_string(),
             token: "abcDEF123-_".to_string(),
             name: "the-mini".to_string(),
         };
-        assert_eq!(payload.endpoint(), "ws://100.64.0.5:4433");
+        assert_eq!(payload.endpoint, "ws://100.64.0.5:4433");
         assert_eq!(
             payload.url(),
             "ws://100.64.0.5:4433/?token=abcDEF123-_&name=the-mini"
         );
 
         let ipv6 = PairingPayload {
-            addr: addr("[::1]:4433"),
+            endpoint: "ws://[::1]:4433".to_string(),
             token: "t".to_string(),
             name: "n".to_string(),
         };
@@ -471,7 +598,7 @@ mod tests {
     #[test]
     fn payload_percent_encodes_the_name_and_keeps_the_endpoint_bare() {
         let payload = PairingPayload {
-            addr: addr("100.64.0.5:4433"),
+            endpoint: "ws://100.64.0.5:4433".to_string(),
             token: "tok".to_string(),
             name: "Can's Mini (büro)".to_string(),
         };
@@ -482,7 +609,139 @@ mod tests {
             "ws://100.64.0.5:4433/?token=tok&name=Can%27s%20Mini%20%28b%C3%BCro%29"
         );
         // The plaintext endpoint carries neither name nor token.
-        assert_eq!(payload.endpoint(), "ws://100.64.0.5:4433");
+        assert_eq!(payload.endpoint, "ws://100.64.0.5:4433");
+    }
+
+    #[test]
+    fn without_an_advertised_endpoint_the_payload_url_is_bind_derived() {
+        let endpoint = pairing_base_url(None, addr("100.64.0.5:4433")).unwrap();
+        assert_eq!(endpoint, "ws://100.64.0.5:4433");
+
+        // Empty and whitespace-only values mean undeclared, like `name`.
+        for unset in ["", "   "] {
+            assert_eq!(
+                pairing_base_url(Some(unset), addr("100.64.0.5:4433")).unwrap(),
+                "ws://100.64.0.5:4433",
+                "{unset:?}"
+            );
+        }
+
+        let payload = PairingPayload {
+            endpoint,
+            token: "tok".to_string(),
+            name: "the-mini".to_string(),
+        };
+        assert_eq!(
+            payload.url(),
+            "ws://100.64.0.5:4433/?token=tok&name=the-mini"
+        );
+    }
+
+    #[test]
+    fn an_advertised_endpoint_replaces_the_bind_derived_url() {
+        let bind = addr("100.64.0.5:4433");
+
+        // A proxy-fronted server names the url clients should dial instead.
+        let endpoint = pairing_base_url(Some("wss://a-host.example.ts.net"), bind).unwrap();
+        assert_eq!(endpoint, "wss://a-host.example.ts.net");
+
+        let payload = PairingPayload {
+            endpoint,
+            token: "abcDEF123-_".to_string(),
+            name: "the mini".to_string(),
+        };
+        assert_eq!(
+            payload.url(),
+            "wss://a-host.example.ts.net/?token=abcDEF123-_&name=the%20mini"
+        );
+    }
+
+    #[test]
+    fn an_advertised_endpoint_keeps_the_configured_scheme_host_and_port() {
+        let bind = addr("100.64.0.5:4433");
+
+        for (configured, expected) in [
+            ("wss://a-host.example.ts.net", "wss://a-host.example.ts.net"),
+            ("ws://a-host.example.ts.net", "ws://a-host.example.ts.net"),
+            (
+                "wss://a-host.example.ts.net:8443",
+                "wss://a-host.example.ts.net:8443",
+            ),
+            // One trailing slash is the same url; the query form appends its own.
+            (
+                "wss://a-host.example.ts.net/",
+                "wss://a-host.example.ts.net",
+            ),
+            // Surrounding whitespace is config noise, not part of the url.
+            (
+                "  wss://a-host.example.ts.net  ",
+                "wss://a-host.example.ts.net",
+            ),
+            // Schemes are case-insensitive; the payload carries the canonical form.
+            ("WSS://a-host.example.ts.net", "wss://a-host.example.ts.net"),
+            ("wss://[fd7a::1]:8443", "wss://[fd7a::1]:8443"),
+        ] {
+            assert_eq!(
+                pairing_base_url(Some(configured), bind).unwrap(),
+                expected,
+                "{configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_advertised_endpoint_refuses_to_print_a_payload() {
+        let bind = addr("100.64.0.5:4433");
+
+        for (configured, expected_reason) in [
+            // No scheme at all: nothing says how to dial it.
+            ("a-host.example.ts.net", "ws:// or wss://"),
+            // A scheme no websocket client can dial.
+            ("https://a-host.example.ts.net", "ws:// or wss://"),
+            // Scheme but no host.
+            ("wss://", "no host"),
+            // Anything past the authority would be dropped or mangled.
+            ("wss://a-host.example.ts.net/api", "path"),
+            ("wss://a-host.example.ts.net/?token=x", "path"),
+            ("wss://user@a-host.example.ts.net", "credentials"),
+            ("wss://a host.example.ts.net", "whitespace"),
+            // Ports must be dialable.
+            ("wss://a-host.example.ts.net:0", "port"),
+            ("wss://a-host.example.ts.net:99999", "port"),
+            ("wss://a-host.example.ts.net:https", "port"),
+            // An unbracketed ipv6 literal is ambiguous with host:port.
+            ("wss://fd7a::1", "brackets"),
+            ("wss://[fd7a::1", "brackets"),
+        ] {
+            match pairing_base_url(Some(configured), bind) {
+                Err(PairingUnavailable::InvalidAdvertisedEndpoint { advertised, reason }) => {
+                    assert_eq!(advertised, configured.trim());
+                    assert!(
+                        reason.contains(expected_reason),
+                        "{configured:?}: expected {expected_reason:?} in {reason:?}"
+                    );
+                }
+                other => {
+                    panic!("{configured:?}: expected InvalidAdvertisedEndpoint, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_advertised_endpoint_explanation_names_the_config_and_the_fix() {
+        let explanation = PairingUnavailable::InvalidAdvertisedEndpoint {
+            advertised: "https://a-host.example.ts.net".to_string(),
+            reason: "only ws:// or wss:// urls can be dialed".to_string(),
+        }
+        .explanation(Path::new("/home/u/config.toml"));
+
+        assert!(explanation.contains("advertised_endpoint"));
+        assert!(explanation.contains("https://a-host.example.ts.net"));
+        assert!(explanation.contains("only ws:// or wss:// urls can be dialed"));
+        assert!(explanation.contains("/home/u/config.toml"));
+        // An explanation never doubles as a payload.
+        assert!(!explanation.contains("?token="));
     }
 
     #[test]

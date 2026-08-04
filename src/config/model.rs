@@ -999,6 +999,17 @@ pub struct WebSocketApiConfig {
     /// never identity — clients compare servers by endpoint. A changed name
     /// is applied by `server.reload_config` without a restart.
     pub name: Option<String>,
+    /// URL clients should dial to reach this listener, e.g.
+    /// "wss://a-host.example.net". Declare it when something else fronts the
+    /// listener — a TLS terminating proxy, for instance — so the pairing
+    /// payload names the reachable url instead of the bind address, which
+    /// only describes the local socket. Must be a `ws://` or `wss://` url
+    /// carrying scheme, host, and optional port and nothing else; `herdr
+    /// pair` refuses to print a payload it cannot make connectable. Unset or
+    /// empty (the default) keeps the bind-derived `ws://<bind>` url. The
+    /// pairing payload is built from the config file on every run, so a
+    /// changed endpoint needs no server restart.
+    pub advertised_endpoint: Option<String>,
     /// Route other machines use to open a shell on this server, typically an
     /// ssh alias. This is operator-declared because the running process cannot
     /// infer another machine's ssh configuration. Unset or empty means no

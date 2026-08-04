@@ -785,6 +785,33 @@ mod tests {
     }
 
     #[test]
+    fn websocket_api_advertised_endpoint_parses_absent_empty_and_set() {
+        // Absent: pairing stays on the bind-derived url.
+        let absent =
+            load_live_config_from_str("[websocket_api]\nbind = \"127.0.0.1:4433\"\n").unwrap();
+        assert_eq!(absent.config.websocket_api.advertised_endpoint, None);
+
+        // Empty: parses like `name`; downstream treats it as undeclared.
+        let empty =
+            load_live_config_from_str("[websocket_api]\nadvertised_endpoint = \"\"\n").unwrap();
+        assert_eq!(
+            empty.config.websocket_api.advertised_endpoint.as_deref(),
+            Some("")
+        );
+        assert!(empty.diagnostics.is_empty(), "{:?}", empty.diagnostics);
+
+        let set = load_live_config_from_str(
+            "[websocket_api]\nadvertised_endpoint = \"wss://a-host.example.net\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            set.config.websocket_api.advertised_endpoint.as_deref(),
+            Some("wss://a-host.example.net")
+        );
+        assert!(set.diagnostics.is_empty(), "{:?}", set.diagnostics);
+    }
+
+    #[test]
     fn upsert_top_level_bool_replaces_existing_value() {
         let content = "onboarding = true\n[keys]\nprefix = \"ctrl+b\"\n";
         let updated = upsert_top_level_bool(content, "onboarding", false);
