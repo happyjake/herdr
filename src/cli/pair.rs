@@ -10,6 +10,30 @@
 //! the command reports is what a client would find. When the listener is not
 //! configured the command explains what to enable instead of printing a
 //! payload that cannot work.
+//!
+//! # Known limits of the proof
+//!
+//! These are accepted, not open work. Each one is a thing this command cannot
+//! observe, and the rule it follows is to say so rather than to guess:
+//!
+//! - **A `wss://` payload is never dialed.** This build carries no TLS client
+//!   and will not grow one for a CLI message; the proof falls back to the
+//!   listener behind the proxy and every outcome names the printed url as not
+//!   dialed.
+//! - **A refused handshake identifies nobody.** The listener's answer to an
+//!   unknown token is deliberately opaque, so it is indistinguishable from any
+//!   other service's refusal. Attributing a refusal would need protocol
+//!   evidence in the rejection, which is a server change, not a pairing one.
+//! - **No server can be tied to a config file.** A config path and a socket
+//!   path are set independently and nothing records the pairing, so the reload
+//!   is an ordered attempt and never evidence about which server serves the
+//!   payload.
+//! - **A reload reply that fails describes the reply.** A server can apply a
+//!   config perfectly and still answer unreadably, so nothing about server
+//!   state is inferred from a failed request.
+//! - **The bounds are wall-clock, and their workers outlive them.** A stalled
+//!   resolver or control socket is abandoned on its thread, which ends with
+//!   the process; the command reports a named outcome rather than waiting.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -474,8 +498,12 @@ enum ConfigReload {
     Reloaded { socket: PathBuf },
     /// No candidate produced a reload, and this is what each one did.
     NoAnswer { tried: Vec<ControlSocketAttempt> },
-    /// A server answered and the reload failed.
-    Failed { reason: String },
+    /// The request to this socket did not come back with an answer that could
+    /// be read. Deliberately named for the request rather than the server: a
+    /// truncated or malformed reply, and an i/o error mid-exchange, all land
+    /// here, and a server that applied the config perfectly can produce any
+    /// of them. Nothing about server state may be inferred from it.
+    RequestFailed { socket: PathBuf, reason: String },
 }
 
 /// What one control socket did when asked to reload.
@@ -489,16 +517,18 @@ struct ControlSocketAttempt {
 enum ControlSocketOutcome {
     /// Nothing is listening on the socket.
     NotRunning,
-    /// Something accepted the connection and did not answer in time.
-    Unanswered,
+    /// The attempt ran out of budget. Whether the connection was ever
+    /// completed is not knowable here — the bound spans connecting and
+    /// answering — so this says only that the request did not finish.
+    Unfinished,
 }
 
 impl ControlSocketAttempt {
     fn describe(&self) -> String {
         match self.outcome {
             ControlSocketOutcome::NotRunning => format!("{} (not running)", self.socket.display()),
-            ControlSocketOutcome::Unanswered => format!(
-                "{} (accepted the connection but did not answer within {}s)",
+            ControlSocketOutcome::Unfinished => format!(
+                "{} (the reload request did not finish within {}s)",
                 self.socket.display(),
                 CONTROL_SOCKET_TIMEOUT.as_secs()
             ),
@@ -550,7 +580,8 @@ fn reload_config_at(socket: &Path, timeout: Duration) -> ConfigReload {
         Ok(Ok(_)) => ConfigReload::Reloaded {
             socket: socket.to_path_buf(),
         },
-        Ok(Err(ApiClientError::ErrorResponse(response))) => ConfigReload::Failed {
+        Ok(Err(ApiClientError::ErrorResponse(response))) => ConfigReload::RequestFailed {
+            socket: socket.to_path_buf(),
             reason: response.error.message,
         },
         Ok(Err(ApiClientError::Io(err)))
@@ -561,10 +592,11 @@ fn reload_config_at(socket: &Path, timeout: Duration) -> ConfigReload {
         {
             unanswered(ControlSocketOutcome::NotRunning)
         }
-        Ok(Err(err)) => ConfigReload::Failed {
+        Ok(Err(err)) => ConfigReload::RequestFailed {
+            socket: socket.to_path_buf(),
             reason: err.to_string(),
         },
-        Err(_) => unanswered(ControlSocketOutcome::Unanswered),
+        Err(_) => unanswered(ControlSocketOutcome::Unfinished),
     }
 }
 
@@ -752,7 +784,7 @@ fn connect_to_target(dial: &DialTarget) -> Result<std::net::TcpStream, TokenProo
     match last_error {
         Some((addr, err)) if err.kind() == std::io::ErrorKind::TimedOut => {
             Err(TokenProof::Inconclusive(format!(
-                "nothing answered at {addr} within {}s",
+                "the connection to {addr} did not complete within {}s",
                 CONNECT_TIMEOUT.as_secs()
             )))
         }
@@ -793,12 +825,13 @@ fn probe_token_within(dial: &DialTarget, token: &str, budget: Duration) -> Token
     // under it keeps every read successful and the command open forever, and
     // a frame budget that only counts whole frames never trips either.
     let deadline = std::time::Instant::now() + budget;
-    if let Err(proof) = bound_reads_by(&stream, deadline, budget) {
-        return proof;
-    }
     if let Err(err) = stream.set_write_timeout(Some(budget)) {
         return TokenProof::Inconclusive(format!("could not bound the handshake: {err}"));
     }
+    let stream = DeadlineStream {
+        inner: stream,
+        deadline,
+    };
 
     // The token charset is URL-unreserved by construction, so the query form
     // needs no escaping here either; the prefix is the payload's own, so a
@@ -814,6 +847,12 @@ fn probe_token_within(dial: &DialTarget, token: &str, budget: Duration) -> Token
         }
     };
 
+    let expired = |budget| {
+        TokenProof::Inconclusive(format!(
+            "the exchange did not finish within {}",
+            format_budget(budget)
+        ))
+    };
     match tungstenite::client::client(request, stream) {
         Ok((websocket, _response)) => identify_herdr_peer(websocket, deadline, budget),
         // A refusal is a status and nothing else. Herdr answers an unknown
@@ -826,27 +865,51 @@ fn probe_token_within(dial: &DialTarget, token: &str, budget: Duration) -> Token
                 status: response.status().as_u16(),
             }
         }
+        Err(_) if std::time::Instant::now() >= deadline => expired(budget),
         Err(err) => TokenProof::Inconclusive(format!("the handshake did not complete: {err}")),
     }
 }
 
-/// Point the socket's read timeout at the shared deadline. Reads are bounded
-/// by what is left of the budget, so activity cannot extend it.
-fn bound_reads_by(
-    stream: &std::net::TcpStream,
+/// A stream whose reads are bounded by one absolute deadline.
+///
+/// A socket read timeout is a silence timer applied to a single syscall, and
+/// both the handshake and one `read()` of a frame issue several: a peer
+/// emitting a byte just under the interval keeps every syscall successful
+/// and the command blocked far past its budget. Recomputing the timeout from
+/// what is left of the deadline before each read is what makes the bound
+/// absolute — the budget is spent by the clock, not reset by traffic.
+struct DeadlineStream {
+    inner: std::net::TcpStream,
     deadline: std::time::Instant,
-    budget: Duration,
-) -> Result<(), TokenProof> {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(TokenProof::Inconclusive(format!(
-            "the exchange did not finish within {}",
-            format_budget(budget)
-        )));
+}
+
+impl std::io::Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the exchange ran out of time",
+            ));
+        }
+        // A sub-millisecond timeout rounds to zero on some platforms, which
+        // means "block forever" — the one value this must never set.
+        self.inner
+            .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+        self.inner.read(buf)
     }
-    stream
-        .set_read_timeout(Some(remaining))
-        .map_err(|err| TokenProof::Inconclusive(format!("could not bound the exchange: {err}")))
+}
+
+impl std::io::Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn format_budget(budget: Duration) -> String {
@@ -855,9 +918,9 @@ fn format_budget(budget: Duration) -> String {
 
 /// Ask the connected peer to identify itself as herdr, then close. Bounded by
 /// the same deadline the handshake ran under: what is being bounded is the
-/// whole exchange, not each read within it.
+/// whole exchange, and every read inside it.
 fn identify_herdr_peer(
-    mut websocket: tungstenite::WebSocket<std::net::TcpStream>,
+    mut websocket: tungstenite::WebSocket<DeadlineStream>,
     deadline: std::time::Instant,
     budget: Duration,
 ) -> TokenProof {
@@ -876,11 +939,16 @@ fn identify_herdr_peer(
 
     // Control frames and any traffic that is not this answer are skipped
     // rather than read as one; the frame budget bounds a peer that answers
-    // quickly and endlessly, the deadline one that answers slowly.
+    // quickly and endlessly, the deadline one that answers slowly — including
+    // one that never finishes a single frame, which the stream's own reads
+    // cut off.
     let mut proof = TokenProof::NotHerdr("it answered nothing".to_string());
     for _ in 0..PING_FRAME_BUDGET {
-        if let Err(expired) = bound_reads_by(websocket.get_ref(), deadline, budget) {
-            proof = expired;
+        if std::time::Instant::now() >= deadline {
+            proof = TokenProof::Inconclusive(format!(
+                "it did not answer within {}",
+                format_budget(budget)
+            ));
             break;
         }
         match websocket.read() {
@@ -1083,14 +1151,6 @@ fn activation_report(
              — then scan."
         )
     };
-    // A remedy may only promise as far as the proof reached: when the printed
-    // url was never dialed, applying the config makes the listener accept the
-    // token and says nothing about the path in front of it.
-    let once_applied = if scope.unexercised_printed_url.is_some() {
-        "the listener will accept the printed token once it does"
-    } else {
-        "the printed payload works once it does"
-    };
 
     match activation {
         TokenActivation::LiveNow {
@@ -1101,10 +1161,10 @@ fn activation_report(
             // mentioned only where it is news: a control socket that errored
             // is a separate fault the operator still owns.
             let reload_fault = match reload {
-                ConfigReload::Failed { reason } => format!(
-                    "\nwarning: asking a herdr server to reload its config failed: {reason}. The \
-                     token is live at {dialed} regardless, but that server is not reading its \
-                     config."
+                ConfigReload::RequestFailed { socket, reason } => format!(
+                    "\nnote: the reload request to {} did not come back readable: {reason}. That \
+                     describes the request, not what that server did with its config.",
+                    socket.display()
                 ),
                 _ => String::new(),
             };
@@ -1157,12 +1217,13 @@ fn activation_report(
                 "{rotation}. {}, and a handshake on {dialed} presenting the new token was refused \
                  with http {status}.\n\
                  warning: the printed token did not get in, and the refusal names no one: herdr \
-                 answers an unknown token with the same opaque refusal any other service would, so \
-                 whether a herdr listener judged this token is not established. If a herdr server \
-                 does serve {dialed}, it has not applied {}: find it with `herdr session list \
-                 --json`, then reload it with `HERDR_SOCKET_PATH=<its socket_path> herdr server \
-                 reload-config` or restart it, and {once_applied}. Otherwise check what holds that \
-                 url.{unexercised}",
+                 answers an unknown token with the same opaque refusal any other service would, and \
+                 whatever answered may be something in front of the listener rather than a herdr \
+                 server at all. Which process refused, and which config it holds, are not \
+                 established. Find out what serves {dialed} — `herdr session list --json` names \
+                 each running server and its socket path — and if that turns out to be a herdr \
+                 server, `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or a \
+                 restart is what makes it read {}.{unexercised}",
                 reload_clause(reload),
                 config_path.display()
             ),
@@ -1206,9 +1267,10 @@ fn reload_clause(reload: &ConfigReload) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        ConfigReload::Failed { reason } => {
-            format!("Asking a herdr server to reload its config failed: {reason}")
-        }
+        ConfigReload::RequestFailed { socket, reason } => format!(
+            "A reload request to {} did not come back readable: {reason}",
+            socket.display()
+        ),
     }
 }
 
@@ -1234,6 +1296,8 @@ fn print_pair_help() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
 
     fn addr(value: &str) -> SocketAddr {
@@ -2141,7 +2205,8 @@ mod tests {
                 outcome: ControlSocketOutcome::NotRunning,
             }],
         };
-        let failed = || ConfigReload::Failed {
+        let failed = || ConfigReload::RequestFailed {
+            socket: socket.clone(),
             reason: "boom".to_string(),
         };
         let refused = || TokenProof::RefusedWithoutIdentifying { status: 401 };
@@ -2386,34 +2451,44 @@ mod tests {
         }
     }
 
-    /// A peer that keeps the exchange alive without ever answering must end
-    /// in a named outcome, and the deadline is what has to end it: the peer
-    /// here sends a frame every 60ms forever, so every read succeeds, no
-    /// silence timer would ever fire, and the frame budget alone would take
-    /// longer than the budget allows. Watching it fire is the point — a
-    /// timeout nobody has seen trip is a claim, not a bound.
+    /// A peer that never stops sending and never finishes anything must end
+    /// in a named outcome, and the deadline is what has to end it.
+    ///
+    /// Both peers here drip *partial bytes* — an http header that never
+    /// completes, and a websocket frame that never completes — because that
+    /// is the shape a per-syscall read timeout cannot bound: the handshake
+    /// and a single `read()` each issue several reads, so a byte arriving
+    /// under the interval keeps every syscall successful while the exchange
+    /// makes no progress. A peer sending whole frames would only exercise the
+    /// outer loop, which was bounded already; this reaches the reads inside.
+    ///
+    /// Deleting the per-read recomputation fails this: both peers stop
+    /// dripping well after the budget, so the outcome becomes whatever their
+    /// close produces and the elapsed assertion trips.
     #[test]
-    fn a_peer_that_answers_forever_without_answering_hits_the_deadline() {
-        let peer = start_websocket_service_that_drips();
+    fn a_peer_that_drips_partial_bytes_hits_the_deadline() {
         let budget = Duration::from_millis(300);
 
-        let started = std::time::Instant::now();
-        let proof = probe_token_within(&local_dial(peer.addr), "a-token", budget);
-        let elapsed = started.elapsed();
+        for (what, addr) in [
+            ("an http header", start_service_that_drips_a_handshake()),
+            ("a websocket frame", start_service_that_drips_a_frame()),
+        ] {
+            let started = std::time::Instant::now();
+            let proof = probe_token_within(&local_dial(addr), "a-token", budget);
+            let elapsed = started.elapsed();
 
-        match proof {
-            TokenProof::Inconclusive(reason) => {
-                assert!(
+            match proof {
+                TokenProof::Inconclusive(reason) => assert!(
                     reason.contains("300ms"),
-                    "the bound must be named: {reason}"
-                )
+                    "{what}: the bound must be named: {reason}"
+                ),
+                other => panic!("{what}: expected the deadline to end this, got {other:?}"),
             }
-            other => panic!("expected the deadline to end this, got {other:?}"),
+            assert!(
+                elapsed < budget * 6,
+                "{what}: the exchange ran {elapsed:?}, which is not bounded by {budget:?}"
+            );
         }
-        assert!(
-            elapsed < budget * 6,
-            "the exchange ran {elapsed:?}, which is not bounded by {budget:?}"
-        );
     }
 
     /// A stale process that accepts a control socket and never answers must
@@ -2442,7 +2517,7 @@ mod tests {
             ConfigReload::NoAnswer {
                 tried: vec![ControlSocketAttempt {
                     socket: socket_path.clone(),
-                    outcome: ControlSocketOutcome::Unanswered,
+                    outcome: ControlSocketOutcome::Unfinished,
                 }]
             }
         );
@@ -2560,34 +2635,56 @@ mod tests {
         FakePeer { addr, presented }
     }
 
-    /// A websocket service that upgrades and then keeps the connection busy
-    /// forever without ever answering: every read succeeds, so nothing but an
-    /// absolute deadline ends the exchange.
-    fn start_websocket_service_that_drips() -> FakePeer {
+    /// A service that starts an http response and never finishes it, one
+    /// byte at a time. The client is left assembling headers, which is
+    /// several reads inside one handshake call.
+    fn start_service_that_drips_a_handshake() -> SocketAddr {
+        drip(|stream| {
+            let _ = stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\n");
+            drip_bytes(stream, b"Upgrade: websocket\r\nConnection: Upgrade\r\n");
+        })
+    }
+
+    /// A service that completes the handshake and then starts a frame it
+    /// never finishes: a text-frame header promising 125 bytes, followed by a
+    /// trickle that never reaches them. The client is left assembling one
+    /// frame, which is several reads inside one `read()`.
+    fn start_service_that_drips_a_frame() -> SocketAddr {
+        drip(|stream| {
+            #[allow(clippy::result_large_err)]
+            let accepted = tungstenite::accept(stream.try_clone().expect("clone"));
+            let Ok(mut websocket) = accepted else { return };
+            let raw = websocket.get_mut();
+            let _ = raw.write_all(&[0x81, 125]);
+            drip_bytes(raw, b"a herdr pong would go here, byte by byte, forever");
+        })
+    }
+
+    /// Write one byte at a time, slower than a whole exchange would take but
+    /// faster than any single read would wait — the interval a silence timer
+    /// can never fire under. Bounded so a bug ends the test with a failure
+    /// rather than a hang.
+    fn drip_bytes(stream: &mut std::net::TcpStream, bytes: &[u8]) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+        for byte in bytes.iter().cycle() {
+            if std::time::Instant::now() >= deadline || stream.write_all(&[*byte]).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+
+    fn drip(serve: fn(&mut std::net::TcpStream)) -> SocketAddr {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("bound address");
-        let presented = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(stream) = stream else { break };
-                #[allow(clippy::result_large_err)]
-                let accepted = tungstenite::accept(stream);
-                if let Ok(mut websocket) = accepted {
-                    // One frame per interval, indefinitely. Slower than the
-                    // frame budget could consume, so the deadline is what has
-                    // to stop this and not the frame count.
-                    while websocket
-                        .send(tungstenite::Message::Ping(Vec::new().into()))
-                        .is_ok()
-                    {
-                        std::thread::sleep(Duration::from_millis(60));
-                    }
-                }
+                let Ok(mut stream) = stream else { break };
+                serve(&mut stream);
             }
         });
-
-        FakePeer { addr, presented }
+        addr
     }
 
     /// Every outcome, whole-message. The wording is the deliverable here: an
@@ -2635,21 +2732,22 @@ mod tests {
                 },
                 ControlSocketAttempt {
                     socket: PathBuf::from("/home/u/.config/herdr/herdr.sock"),
-                    outcome: ControlSocketOutcome::Unanswered,
+                    outcome: ControlSocketOutcome::Unfinished,
                 },
             ],
         };
-        let no_answer_clause = "No running herdr server answered a control socket (/home/u/.config/herdr-second/herdr.sock (not running), /home/u/.config/herdr/herdr.sock (accepted the connection but did not answer within 2s))";
-        let failed = ConfigReload::Failed {
+        let no_answer_clause = "No running herdr server answered a control socket (/home/u/.config/herdr-second/herdr.sock (not running), /home/u/.config/herdr/herdr.sock (the reload request did not finish within 2s))";
+        let failed = ConfigReload::RequestFailed {
+            socket: PathBuf::from("/home/u/.config/herdr/herdr.sock"),
             reason: "boom".to_string(),
         };
-        let failed_clause = "Asking a herdr server to reload its config failed: boom";
-        let refusal_warning = |dialed: &str, once_applied: &str| {
+        let failed_clause =
+            "A reload request to /home/u/.config/herdr/herdr.sock did not come back readable: boom";
+        let refusal_warning = |dialed: &str| {
             format!(
-            "warning: the printed token did not get in, and the refusal names no one: herdr answers an unknown token with the same opaque refusal any other service would, so whether a herdr listener judged this token is not established. If a herdr server does serve {dialed}, it has not applied /home/u/.config/herdr/config.toml: find it with `herdr session list --json`, then reload it with `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or restart it, and {once_applied}. Otherwise check what holds that url."
+            "warning: the printed token did not get in, and the refusal names no one: herdr answers an unknown token with the same opaque refusal any other service would, and whatever answered may be something in front of the listener rather than a herdr server at all. Which process refused, and which config it holds, are not established. Find out what serves {dialed} — `herdr session list --json` names each running server and its socket path — and if that turns out to be a herdr server, `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or a restart is what makes it read /home/u/.config/herdr/config.toml."
         )
         };
-
         let rows = vec![
             (
                 TokenActivation::LiveNow {
@@ -2725,7 +2823,7 @@ mod tests {
                 },
                 true,
                 &local,
-                format!("{rotated}. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr, and one presenting the previous token was refused.\nwarning: asking a herdr server to reload its config failed: boom. The token is live at ws://100.64.0.5:4433 regardless, but that server is not reading its config."),
+                format!("{rotated}. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr, and one presenting the previous token was refused.\nnote: the reload request to /home/u/.config/herdr/herdr.sock did not come back readable: boom. That describes the request, not what that server did with its config."),
                 0,
             ),
             (
@@ -2786,7 +2884,7 @@ mod tests {
                 },
                 true,
                 &local,
-                format!("{rotated}. {reloaded_clause}, and a handshake on ws://100.64.0.5:4433 presenting the new token was refused with http 401.\n{}", refusal_warning("ws://100.64.0.5:4433", "the printed payload works once it does")),
+                format!("{rotated}. {reloaded_clause}, and a handshake on ws://100.64.0.5:4433 presenting the new token was refused with http 401.\n{}", refusal_warning("ws://100.64.0.5:4433")),
                 1,
             ),
             // Nothing answered a control socket and the peer refused: the
@@ -2798,7 +2896,7 @@ mod tests {
                 },
                 true,
                 &local,
-                format!("{rotated}. {no_answer_clause}, and a handshake on ws://100.64.0.5:4433 presenting the new token was refused with http 403.\n{}", refusal_warning("ws://100.64.0.5:4433", "the printed payload works once it does")),
+                format!("{rotated}. {no_answer_clause}, and a handshake on ws://100.64.0.5:4433 presenting the new token was refused with http 403.\n{}", refusal_warning("ws://100.64.0.5:4433")),
                 1,
             ),
             // Behind TLS a reload can only promise the listener, never the
@@ -2810,7 +2908,7 @@ mod tests {
                 },
                 true,
                 &behind_tls,
-                format!("{rotated}. {reloaded_clause}, and a handshake on ws://127.0.0.1:4433 presenting the new token was refused with http 401.\n{}{tls_note}", refusal_warning("ws://127.0.0.1:4433", "the listener will accept the printed token once it does")),
+                format!("{rotated}. {reloaded_clause}, and a handshake on ws://127.0.0.1:4433 presenting the new token was refused with http 401.\n{}{tls_note}", refusal_warning("ws://127.0.0.1:4433")),
                 1,
             ),
             (
