@@ -18,7 +18,6 @@ use std::time::Duration;
 use base64::Engine;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
-use tungstenite::http::StatusCode;
 
 use crate::api::client::{ApiClient, ApiClientError, ConnectionTarget};
 use crate::api::schema::{
@@ -36,6 +35,11 @@ const TOKEN_BYTES: usize = 32;
 /// all, which is worse than a named unproven one. Each step is capped, so the
 /// whole proof ends in a sentence.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long one control socket gets to answer a reload before pairing moves
+/// on to the next candidate. A stale process that accepts and never answers
+/// is a real shape, and waiting on it forever would keep the proof — the part
+/// the report rests on — from ever running.
+const CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -428,10 +432,6 @@ impl ControlSockets {
             .chain(std::iter::once(&self.ambient))
             .collect()
     }
-
-    fn to_paths(&self) -> Vec<PathBuf> {
-        self.in_order().into_iter().cloned().collect()
-    }
 }
 
 /// Order the control sockets to try for the config at `config_path`.
@@ -467,57 +467,104 @@ fn control_sockets_to_try(
 
 /// What came back from asking a server to reload the config. Context for the
 /// report, never the report's verdict.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfigReload {
     /// A server answered on this control socket and reloaded its config.
     /// Which config that server holds is not knowable from here.
     Reloaded { socket: PathBuf },
-    /// No server answered any of the sockets tried.
-    NoServer { tried: Vec<PathBuf> },
+    /// No candidate produced a reload, and this is what each one did.
+    NoAnswer { tried: Vec<ControlSocketAttempt> },
     /// A server answered and the reload failed.
-    Failed(String),
+    Failed { reason: String },
+}
+
+/// What one control socket did when asked to reload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlSocketAttempt {
+    socket: PathBuf,
+    outcome: ControlSocketOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlSocketOutcome {
+    /// Nothing is listening on the socket.
+    NotRunning,
+    /// Something accepted the connection and did not answer in time.
+    Unanswered,
+}
+
+impl ControlSocketAttempt {
+    fn describe(&self) -> String {
+        match self.outcome {
+            ControlSocketOutcome::NotRunning => format!("{} (not running)", self.socket.display()),
+            ControlSocketOutcome::Unanswered => format!(
+                "{} (accepted the connection but did not answer within {}s)",
+                self.socket.display(),
+                CONTROL_SOCKET_TIMEOUT.as_secs()
+            ),
+        }
+    }
 }
 
 /// Ask the first server that answers to reload its config. A socket nothing
 /// is listening on is not a failure — it only means that server is not
-/// running — so the next candidate is tried.
+/// running — and neither is one that accepts and then says nothing, which is
+/// what a stale process looks like. Both move on to the next candidate,
+/// carrying what they did into the report.
 fn reload_config_of_owning_server(sockets: &ControlSockets) -> ConfigReload {
+    let mut tried = Vec::new();
     for socket in sockets.in_order() {
-        match reload_config_at(socket) {
-            ConfigReload::NoServer { .. } => continue,
+        match reload_config_at(socket, CONTROL_SOCKET_TIMEOUT) {
+            ConfigReload::NoAnswer { tried: attempts } => tried.extend(attempts),
             answered => return answered,
         }
     }
-    ConfigReload::NoServer {
-        tried: sockets.to_paths(),
-    }
+    ConfigReload::NoAnswer { tried }
 }
 
-fn reload_config_at(socket: &Path) -> ConfigReload {
-    let response = ApiClient::for_target(ConnectionTarget::SocketPath(socket.to_path_buf()))
-        .request_value(&Request {
+/// Ask one server to reload, bounded by an absolute deadline.
+///
+/// The request runs on a thread this can stop waiting on rather than on a
+/// socket timeout, because a socket timeout measures silence between bytes: a
+/// stale peer that accepts and then trickles would reset it forever, and one
+/// that accepts and says nothing at all would hold pairing open before the
+/// bounded proof ever ran. The abandoned thread ends with the process.
+fn reload_config_at(socket: &Path, timeout: Duration) -> ConfigReload {
+    let client = ApiClient::for_target(ConnectionTarget::SocketPath(socket.to_path_buf()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(client.request_value(&Request {
             id: "cli:pair:reload-config".into(),
             method: Method::ServerReloadConfig(EmptyParams::default()),
-        });
+        }));
+    });
 
-    match response {
-        Ok(_) => ConfigReload::Reloaded {
+    let unanswered = |outcome| ConfigReload::NoAnswer {
+        tried: vec![ControlSocketAttempt {
+            socket: socket.to_path_buf(),
+            outcome,
+        }],
+    };
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(_)) => ConfigReload::Reloaded {
             socket: socket.to_path_buf(),
         },
-        Err(ApiClientError::ErrorResponse(response)) => {
-            ConfigReload::Failed(response.error.message)
-        }
-        Err(ApiClientError::Io(err))
+        Ok(Err(ApiClientError::ErrorResponse(response))) => ConfigReload::Failed {
+            reason: response.error.message,
+        },
+        Ok(Err(ApiClientError::Io(err)))
             if matches!(
                 err.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) =>
         {
-            ConfigReload::NoServer {
-                tried: vec![socket.to_path_buf()],
-            }
+            unanswered(ControlSocketOutcome::NotRunning)
         }
-        Err(err) => ConfigReload::Failed(err.to_string()),
+        Ok(Err(err)) => ConfigReload::Failed {
+            reason: err.to_string(),
+        },
+        Err(_) => unanswered(ControlSocketOutcome::Unanswered),
     }
 }
 
@@ -636,8 +683,10 @@ fn dial_target_for(endpoint: &str) -> Option<DialTarget> {
 enum TokenProof {
     /// A herdr server completed the handshake and answered a request.
     Accepted,
-    /// The peer answered the handshake by refusing the token.
-    Refused,
+    /// The handshake was refused with this status, by a peer that never
+    /// identified itself. It says the connection did not get in; it does not
+    /// say a herdr listener judged this token.
+    RefusedWithoutIdentifying { status: u16 },
     /// Nothing accepted a connection.
     NoListener,
     /// The handshake completed, but the peer never answered as herdr, so
@@ -729,14 +778,25 @@ fn connect_to_target(dial: &DialTarget) -> Result<std::net::TcpStream, TokenProo
 /// that deserializes as this protocol's pong under the id we sent is an
 /// answer only a herdr server gives.
 fn probe_token(dial: &DialTarget, token: &str) -> TokenProof {
+    probe_token_within(dial, token, EXCHANGE_TIMEOUT)
+}
+
+/// The same, with the exchange budget spelled out so a test can watch the
+/// deadline fire instead of taking the production one on faith.
+fn probe_token_within(dial: &DialTarget, token: &str, budget: Duration) -> TokenProof {
     let stream = match connect_to_target(dial) {
         Ok(stream) => stream,
         Err(proof) => return proof,
     };
-    if let Err(err) = stream
-        .set_read_timeout(Some(EXCHANGE_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(EXCHANGE_TIMEOUT)))
-    {
+    // One deadline for the handshake and the identifying exchange together.
+    // A per-read timeout is a silence timer: a peer trickling a byte just
+    // under it keeps every read successful and the command open forever, and
+    // a frame budget that only counts whole frames never trips either.
+    let deadline = std::time::Instant::now() + budget;
+    if let Err(proof) = bound_reads_by(&stream, deadline, budget) {
+        return proof;
+    }
+    if let Err(err) = stream.set_write_timeout(Some(budget)) {
         return TokenProof::Inconclusive(format!("could not bound the handshake: {err}"));
     }
 
@@ -755,27 +815,51 @@ fn probe_token(dial: &DialTarget, token: &str) -> TokenProof {
     };
 
     match tungstenite::client::client(request, stream) {
-        Ok((websocket, _response)) => identify_herdr_peer(websocket),
+        Ok((websocket, _response)) => identify_herdr_peer(websocket, deadline, budget),
+        // A refusal is a status and nothing else. Herdr answers an unknown
+        // token with a deliberately opaque 401, which is exactly what an
+        // unrelated backend or a proxy in front of one answers with, so a
+        // status alone cannot say the herdr listener rejected this token —
+        // only that whatever holds the url did not let this connection in.
         Err(HandshakeError::Failure(tungstenite::Error::Http(response))) => {
-            if matches!(
-                response.status(),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            ) {
-                TokenProof::Refused
-            } else {
-                TokenProof::Inconclusive(format!(
-                    "the peer answered the handshake with http {}",
-                    response.status()
-                ))
+            TokenProof::RefusedWithoutIdentifying {
+                status: response.status().as_u16(),
             }
         }
         Err(err) => TokenProof::Inconclusive(format!("the handshake did not complete: {err}")),
     }
 }
 
-/// Ask the connected peer to identify itself as herdr, then close.
-fn identify_herdr_peer<Stream: std::io::Read + std::io::Write>(
-    mut websocket: tungstenite::WebSocket<Stream>,
+/// Point the socket's read timeout at the shared deadline. Reads are bounded
+/// by what is left of the budget, so activity cannot extend it.
+fn bound_reads_by(
+    stream: &std::net::TcpStream,
+    deadline: std::time::Instant,
+    budget: Duration,
+) -> Result<(), TokenProof> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(TokenProof::Inconclusive(format!(
+            "the exchange did not finish within {}",
+            format_budget(budget)
+        )));
+    }
+    stream
+        .set_read_timeout(Some(remaining))
+        .map_err(|err| TokenProof::Inconclusive(format!("could not bound the exchange: {err}")))
+}
+
+fn format_budget(budget: Duration) -> String {
+    format!("{}ms", budget.as_millis())
+}
+
+/// Ask the connected peer to identify itself as herdr, then close. Bounded by
+/// the same deadline the handshake ran under: what is being bounded is the
+/// whole exchange, not each read within it.
+fn identify_herdr_peer(
+    mut websocket: tungstenite::WebSocket<std::net::TcpStream>,
+    deadline: std::time::Instant,
+    budget: Duration,
 ) -> TokenProof {
     const PROBE_ID: &str = "cli:pair:verify-token";
 
@@ -791,10 +875,14 @@ fn identify_herdr_peer<Stream: std::io::Read + std::io::Write>(
     }
 
     // Control frames and any traffic that is not this answer are skipped
-    // rather than read as one; a bounded number of them keeps a chatty peer
-    // from holding the command open.
+    // rather than read as one; the frame budget bounds a peer that answers
+    // quickly and endlessly, the deadline one that answers slowly.
     let mut proof = TokenProof::NotHerdr("it answered nothing".to_string());
     for _ in 0..PING_FRAME_BUDGET {
+        if let Err(expired) = bound_reads_by(websocket.get_ref(), deadline, budget) {
+            proof = expired;
+            break;
+        }
         match websocket.read() {
             Ok(tungstenite::Message::Text(text)) => {
                 proof = match serde_json::from_str::<SuccessResponse>(&text) {
@@ -812,7 +900,16 @@ fn identify_herdr_peer<Stream: std::io::Read + std::io::Write>(
             }
             Ok(_) => continue,
             Err(err) => {
-                proof = TokenProof::NotHerdr(format!("it answered no ping: {err}"));
+                // A read that ended because the budget ran out is the
+                // deadline speaking, not the peer.
+                proof = if std::time::Instant::now() >= deadline {
+                    TokenProof::Inconclusive(format!(
+                        "it did not answer within {}",
+                        format_budget(budget)
+                    ))
+                } else {
+                    TokenProof::NotHerdr(format!("it answered no ping: {err}"))
+                };
                 break;
             }
         }
@@ -854,32 +951,38 @@ enum PreviousTokenProof {
     StillAccepted,
 }
 
-/// What the command established about the freshly stored token. Every
-/// variant names an observation, and the handshake is the only thing that can
-/// produce the live one: the reload is an attempt this command makes, not
-/// evidence about what any peer accepts.
+/// What the command established about the freshly stored token.
+///
+/// The handshake decides which variant this is; the reload rides along inside
+/// it, because the two are separate observations and a report that keeps only
+/// one of them says something false about the other. Every variant except the
+/// live one therefore carries what the reload attempt did, and every message
+/// states both.
 #[derive(Debug, PartialEq, Eq)]
 enum TokenActivation {
     /// A peer that answered as herdr accepted a handshake presenting the new
     /// token. `previous_token` carries what presenting the previous one to
-    /// that same peer proved.
-    LiveNow { previous_token: PreviousTokenProof },
-    /// No server answered a control socket and nothing is listening where the
-    /// payload points; the stored token applies at next start.
-    NoServer { tried: Vec<PathBuf> },
-    /// A server reloaded its config, but nothing is listening where the
-    /// payload points.
-    NeedsListener,
-    /// The peer refused the new token, so whatever serves that url is not
-    /// running the config just written.
-    NotAccepted,
+    /// that same peer proved, and `reload` is only mentioned when it failed —
+    /// the claim rests on the handshake, but a broken control socket is still
+    /// a fact the operator owns.
+    LiveNow {
+        previous_token: PreviousTokenProof,
+        reload: ConfigReload,
+    },
+    /// Nothing is listening where the payload points.
+    NothingListening { reload: ConfigReload },
+    /// The handshake was refused, by a peer that never identified itself.
+    RefusedWithoutIdentifying { status: u16, reload: ConfigReload },
     /// A websocket service answered, but never as herdr.
-    NotHerdr { reason: String },
+    NotHerdr {
+        reason: String,
+        reload: ConfigReload,
+    },
     /// Neither accepted nor refused.
-    Unverified { reason: String },
-    /// The reload attempt came back an error, and nothing proved the token
-    /// live; the previous token may still authenticate.
-    Failed(String),
+    Unverified {
+        reason: String,
+        reload: ConfigReload,
+    },
 }
 
 fn apply_token_to_running_server(
@@ -902,32 +1005,31 @@ fn apply_token_to_running_server(
 /// Turn the reload attempt and the handshakes into the one state they
 /// support.
 ///
-/// The handshake outranks the reload in both directions. A peer that accepted
-/// the token makes the payload live whichever process this command managed to
-/// reach — that is the point of proving it against the url — and a reload
-/// that succeeded proves nothing on its own, so it can only ever refine what
-/// the handshake found.
+/// The handshake decides, in both directions. A peer that accepted the token
+/// makes the payload live whichever process this command managed to reach —
+/// that is the point of proving it against the url — and a reload that
+/// succeeded proves nothing on its own. Neither observation replaces the
+/// other: the reload travels with the outcome so the report can state both.
 fn decide_activation(
     reload: ConfigReload,
     new_token: TokenProof,
     previous_token: Option<TokenProof>,
 ) -> TokenActivation {
-    match (new_token, reload) {
-        (TokenProof::Accepted, _) => TokenActivation::LiveNow {
+    match new_token {
+        TokenProof::Accepted => TokenActivation::LiveNow {
             previous_token: match previous_token {
-                Some(TokenProof::Refused) => PreviousTokenProof::Refused,
+                Some(TokenProof::RefusedWithoutIdentifying { .. }) => PreviousTokenProof::Refused,
                 Some(TokenProof::Accepted) => PreviousTokenProof::StillAccepted,
                 _ => PreviousTokenProof::Unproven,
             },
+            reload,
         },
-        (_, ConfigReload::Failed(reason)) => TokenActivation::Failed(reason),
-        (TokenProof::NoListener, ConfigReload::Reloaded { .. }) => TokenActivation::NeedsListener,
-        (TokenProof::NoListener, ConfigReload::NoServer { tried }) => {
-            TokenActivation::NoServer { tried }
+        TokenProof::NoListener => TokenActivation::NothingListening { reload },
+        TokenProof::RefusedWithoutIdentifying { status } => {
+            TokenActivation::RefusedWithoutIdentifying { status, reload }
         }
-        (TokenProof::Refused, _) => TokenActivation::NotAccepted,
-        (TokenProof::NotHerdr(reason), _) => TokenActivation::NotHerdr { reason },
-        (TokenProof::Inconclusive(reason), _) => TokenActivation::Unverified { reason },
+        TokenProof::NotHerdr(reason) => TokenActivation::NotHerdr { reason, reload },
+        TokenProof::Inconclusive(reason) => TokenActivation::Unverified { reason, reload },
     }
 }
 
@@ -961,13 +1063,16 @@ fn activation_report(
     );
     // What the proof could not reach. Stated in every outcome it applies to,
     // because "the printed url was never dialed" is a fact about the payload
-    // in the operator's hand whatever else happened.
+    // in the operator's hand whatever else happened — and phrased as the
+    // attempt it is, so it cannot contradict an outcome where the fallback
+    // reached nothing either.
     let unexercised = match &scope.unexercised_printed_url {
         None => String::new(),
         Some(url) => format!(
-            "\nThe printed url {url} was not dialed: this build has no TLS client, so only the \
-             listener behind it was reached. Connect to {url} with the printed token to check \
-             whatever fronts it."
+            "\nThe printed url {url} was not dialed: this build has no TLS client, so the proof \
+             was attempted against the listener behind it instead. Nothing here says whether \
+             {url} carries a connection to that listener; connect to it with the printed token \
+             to find out."
         ),
     };
     let start_remedy = if scope.dialed_is_local_listener {
@@ -978,96 +1083,133 @@ fn activation_report(
              — then scan."
         )
     };
+    // A remedy may only promise as far as the proof reached: when the printed
+    // url was never dialed, applying the config makes the listener accept the
+    // token and says nothing about the path in front of it.
+    let once_applied = if scope.unexercised_printed_url.is_some() {
+        "the listener will accept the printed token once it does"
+    } else {
+        "the printed payload works once it does"
+    };
 
     match activation {
-        TokenActivation::LiveNow { previous_token } => match previous_token {
-            PreviousTokenProof::Refused => (
+        TokenActivation::LiveNow {
+            previous_token,
+            reload,
+        } => {
+            // The live claim rests on the handshake alone, so the reload is
+            // mentioned only where it is news: a control socket that errored
+            // is a separate fault the operator still owns.
+            let reload_fault = match reload {
+                ConfigReload::Failed { reason } => format!(
+                    "\nwarning: asking a herdr server to reload its config failed: {reason}. The \
+                     token is live at {dialed} regardless, but that server is not reading its \
+                     config."
+                ),
+                _ => String::new(),
+            };
+            match previous_token {
+                PreviousTokenProof::Refused => (
+                    format!(
+                        "{rotation}. {accepted}, and one presenting the previous token was refused.{reload_fault}{unexercised}"
+                    ),
+                    0,
+                ),
+                PreviousTokenProof::StillAccepted => (
+                    format!(
+                        "{rotation}. {accepted}, but one presenting the previous token was accepted too.\n\
+                         warning: the previous token has not stopped authenticating. Restart the herdr \
+                         server serving {dialed} before treating it as revoked.{reload_fault}{unexercised}"
+                    ),
+                    1,
+                ),
+                PreviousTokenProof::Unproven if previous_token_existed => (
+                    format!(
+                        "{rotation}. {accepted}.\n\
+                         Whether the previous token still authenticates was not established.{reload_fault}{unexercised}"
+                    ),
+                    0,
+                ),
+                PreviousTokenProof::Unproven => (
+                    format!("{rotation}. {accepted}.{reload_fault}{unexercised}"),
+                    0,
+                ),
+            }
+        }
+        TokenActivation::NothingListening { reload } => {
+            let remedy = match reload {
+                ConfigReload::NoAnswer { .. } if scope.dialed_is_local_listener => {
+                    "The token takes effect when the herdr server starts.".to_string()
+                }
+                _ => start_remedy,
+            };
+            (
                 format!(
-                    "{rotation}. {accepted}, and one presenting the previous token was refused.{unexercised}"
+                    "{rotation}. {}, and nothing is listening on {dialed}.\n\
+                     {remedy}{unexercised}",
+                    reload_clause(reload)
                 ),
                 0,
-            ),
-            PreviousTokenProof::StillAccepted => (
-                format!(
-                    "{rotation}. {accepted}, but one presenting the previous token was accepted too.\n\
-                     warning: the previous token has not stopped authenticating. Restart the herdr \
-                     server serving {dialed} before treating it as revoked.{unexercised}"
-                ),
-                1,
-            ),
-            PreviousTokenProof::Unproven if previous_token_existed => (
-                format!(
-                    "{rotation}. {accepted}.\n\
-                     Whether the previous token still authenticates was not established.{unexercised}"
-                ),
-                0,
-            ),
-            PreviousTokenProof::Unproven => (format!("{rotation}. {accepted}.{unexercised}"), 0),
-        },
-        TokenActivation::NoServer { tried } => (
+            )
+        }
+        TokenActivation::RefusedWithoutIdentifying { status, reload } => (
             format!(
-                "{rotation}. No running herdr server answered a control socket ({}), and nothing is \
-                 listening on {dialed}; the token takes effect when the server starts.{unexercised}",
-                display_paths(tried)
-            ),
-            0,
-        ),
-        TokenActivation::NeedsListener => (
-            format!(
-                "{rotation}. A herdr server reloaded its config, but nothing is listening on {dialed}, \
-                 so nothing has accepted the new token yet.\n\
-                 {start_remedy}{unexercised}"
-            ),
-            0,
-        ),
-        TokenActivation::NotAccepted => (
-            format!(
-                "{rotation}. A handshake on {dialed} presenting the new token was refused.\n\
-                 warning: the printed token does not authenticate. Whatever serves {dialed} has not \
-                 applied {}; the reload this command asked for went to a server that answered a \
-                 control socket, which is not evidence about the peer serving that url. Find the \
-                 server serving it with `herdr session list --json`, then reload it with \
-                 `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or restart it; \
-                 the printed payload works once it does.{unexercised}",
+                "{rotation}. {}, and a handshake on {dialed} presenting the new token was refused \
+                 with http {status}.\n\
+                 warning: the printed token did not get in, and the refusal names no one: herdr \
+                 answers an unknown token with the same opaque refusal any other service would, so \
+                 whether a herdr listener judged this token is not established. If a herdr server \
+                 does serve {dialed}, it has not applied {}: find it with `herdr session list \
+                 --json`, then reload it with `HERDR_SOCKET_PATH=<its socket_path> herdr server \
+                 reload-config` or restart it, and {once_applied}. Otherwise check what holds that \
+                 url.{unexercised}",
+                reload_clause(reload),
                 config_path.display()
             ),
             1,
         ),
-        TokenActivation::NotHerdr { reason } => (
+        TokenActivation::NotHerdr { reason, reload } => (
             format!(
-                "{rotation}. Something on {dialed} completed a websocket handshake but did not answer \
-                 as herdr: {reason}.\n\
+                "{rotation}. {}, and something on {dialed} completed a websocket handshake but did \
+                 not answer as herdr: {reason}.\n\
                  warning: nothing about the printed token was established, and the previous token was \
-                 not presented to that peer. Check what is serving {dialed} before scanning.{unexercised}"
+                 not presented to that peer. Check what is serving {dialed} before scanning.{unexercised}",
+                reload_clause(reload)
             ),
             1,
         ),
-        TokenActivation::Unverified { reason } => (
+        TokenActivation::Unverified { reason, reload } => (
             format!(
-                "{rotation}. Whether {dialed} accepts the new token could not be established: {reason}.\n\
+                "{rotation}. {}, and whether {dialed} accepts the new token could not be established: \
+                 {reason}.\n\
                  warning: nothing has connected with the printed token. Restart the herdr server \
-                 serving {dialed}, or connect with the token yourself, before relying on it.{unexercised}"
-            ),
-            1,
-        ),
-        TokenActivation::Failed(reason) => (
-            format!(
-                "{rotation}. Asking a running herdr server to reload its config failed: {reason}.\n\
-                 warning: nothing has connected with the printed token, and the previous token may \
-                 still be accepted until `herdr server reload-config` succeeds or the server \
-                 restarts.{unexercised}"
+                 serving {dialed}, or connect with the token yourself, before relying on it.{unexercised}",
+                reload_clause(reload)
             ),
             1,
         ),
     }
 }
 
-fn display_paths(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+/// The reload attempt as one clause, so every outcome states it alongside
+/// what the handshake found instead of one standing in for the other.
+fn reload_clause(reload: &ConfigReload) -> String {
+    match reload {
+        ConfigReload::Reloaded { socket } => {
+            format!("A herdr server at {} reloaded its config", socket.display())
+        }
+        ConfigReload::NoAnswer { tried } => format!(
+            "No running herdr server answered a control socket ({})",
+            tried
+                .iter()
+                .map(ControlSocketAttempt::describe)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        ConfigReload::Failed { reason } => {
+            format!("Asking a herdr server to reload its config failed: {reason}")
+        }
+    }
 }
 
 fn print_pair_help() {
@@ -1993,19 +2135,25 @@ mod tests {
         let reloaded = || ConfigReload::Reloaded {
             socket: socket.clone(),
         };
-        let no_server = || ConfigReload::NoServer {
-            tried: vec![socket.clone()],
+        let no_answer = || ConfigReload::NoAnswer {
+            tried: vec![ControlSocketAttempt {
+                socket: socket.clone(),
+                outcome: ControlSocketOutcome::NotRunning,
+            }],
         };
+        let failed = || ConfigReload::Failed {
+            reason: "boom".to_string(),
+        };
+        let refused = || TokenProof::RefusedWithoutIdentifying { status: 401 };
 
         // A reloaded server plus a refused handshake is the shape that used
         // to print "the listener accepts the new token now".
         assert_eq!(
-            decide_activation(reloaded(), TokenProof::Refused, None),
-            TokenActivation::NotAccepted
-        );
-        assert_eq!(
-            decide_activation(no_server(), TokenProof::Refused, None),
-            TokenActivation::NotAccepted
+            decide_activation(reloaded(), refused(), None),
+            TokenActivation::RefusedWithoutIdentifying {
+                status: 401,
+                reload: reloaded()
+            }
         );
 
         // A websocket service that never answered as herdr is not a listener
@@ -2017,28 +2165,32 @@ mod tests {
                 None
             ),
             TokenActivation::NotHerdr {
-                reason: "it answered nothing".to_string()
+                reason: "it answered nothing".to_string(),
+                reload: reloaded()
             }
         );
 
         // Live means observed live, and the previous token's fate is a
         // separate observation rather than something the first one implies.
         assert_eq!(
-            decide_activation(reloaded(), TokenProof::Accepted, Some(TokenProof::Refused)),
+            decide_activation(reloaded(), TokenProof::Accepted, Some(refused())),
             TokenActivation::LiveNow {
-                previous_token: PreviousTokenProof::Refused
+                previous_token: PreviousTokenProof::Refused,
+                reload: reloaded()
             }
         );
         assert_eq!(
             decide_activation(reloaded(), TokenProof::Accepted, Some(TokenProof::Accepted)),
             TokenActivation::LiveNow {
-                previous_token: PreviousTokenProof::StillAccepted
+                previous_token: PreviousTokenProof::StillAccepted,
+                reload: reloaded()
             }
         );
         assert_eq!(
             decide_activation(reloaded(), TokenProof::Accepted, None),
             TokenActivation::LiveNow {
-                previous_token: PreviousTokenProof::Unproven
+                previous_token: PreviousTokenProof::Unproven,
+                reload: reloaded()
             }
         );
         assert_eq!(
@@ -2048,38 +2200,38 @@ mod tests {
                 Some(TokenProof::Inconclusive("eof".to_string()))
             ),
             TokenActivation::LiveNow {
-                previous_token: PreviousTokenProof::Unproven
+                previous_token: PreviousTokenProof::Unproven,
+                reload: reloaded()
             }
         );
 
-        // The handshake outranks the reload in both directions: a peer that
-        // accepted the token makes the payload live whichever process this
-        // command reached, or failed to reach.
+        // The handshake decides in both directions, and the reload rides
+        // along rather than being replaced by it: a peer that accepted the
+        // token makes the payload live whichever process this command
+        // reached, or failed to reach.
         assert_eq!(
-            decide_activation(no_server(), TokenProof::Accepted, Some(TokenProof::Refused)),
+            decide_activation(no_answer(), TokenProof::Accepted, Some(refused())),
             TokenActivation::LiveNow {
-                previous_token: PreviousTokenProof::Refused
+                previous_token: PreviousTokenProof::Refused,
+                reload: no_answer()
             }
         );
         assert_eq!(
-            decide_activation(
-                ConfigReload::Failed("boom".to_string()),
-                TokenProof::Accepted,
-                None
-            ),
+            decide_activation(failed(), TokenProof::Accepted, None),
             TokenActivation::LiveNow {
-                previous_token: PreviousTokenProof::Unproven
+                previous_token: PreviousTokenProof::Unproven,
+                reload: failed()
             }
         );
 
         assert_eq!(
             decide_activation(reloaded(), TokenProof::NoListener, None),
-            TokenActivation::NeedsListener
+            TokenActivation::NothingListening { reload: reloaded() }
         );
         assert_eq!(
-            decide_activation(no_server(), TokenProof::NoListener, None),
-            TokenActivation::NoServer {
-                tried: vec![socket.clone()]
+            decide_activation(no_answer(), TokenProof::NoListener, None),
+            TokenActivation::NothingListening {
+                reload: no_answer()
             }
         );
         assert_eq!(
@@ -2089,18 +2241,35 @@ mod tests {
                 None
             ),
             TokenActivation::Unverified {
-                reason: "http 502".to_string()
+                reason: "http 502".to_string(),
+                reload: reloaded()
             }
         );
-        // A reload that errored is reported as that, unless the token was
-        // proved live anyway.
+
+        // Neither observation may swallow the other. A failed reload with a
+        // peer that never identified itself is both of those things, and a
+        // refusal after nothing answered a control socket is too.
         assert_eq!(
             decide_activation(
-                ConfigReload::Failed("boom".to_string()),
-                TokenProof::NoListener,
+                failed(),
+                TokenProof::NotHerdr("it went quiet".to_string()),
                 None
             ),
-            TokenActivation::Failed("boom".to_string())
+            TokenActivation::NotHerdr {
+                reason: "it went quiet".to_string(),
+                reload: failed()
+            }
+        );
+        assert_eq!(
+            decide_activation(no_answer(), refused(), None),
+            TokenActivation::RefusedWithoutIdentifying {
+                status: 401,
+                reload: no_answer()
+            }
+        );
+        assert_eq!(
+            decide_activation(failed(), TokenProof::NoListener, None),
+            TokenActivation::NothingListening { reload: failed() }
         );
     }
 
@@ -2116,9 +2285,11 @@ mod tests {
             probe_token(&local_dial(endpoint), "the-new-token"),
             TokenProof::Accepted
         );
+        // The listener's refusal is a bare 401 by design, so this says the
+        // connection did not get in and stops there: it names no peer.
         assert_eq!(
             probe_token(&local_dial(endpoint), "the-previous-token"),
-            TokenProof::Refused
+            TokenProof::RefusedWithoutIdentifying { status: 401 }
         );
 
         // A payload whose url carries a path dials that path, and the token
@@ -2215,6 +2386,87 @@ mod tests {
         }
     }
 
+    /// A peer that keeps the exchange alive without ever answering must end
+    /// in a named outcome, and the deadline is what has to end it: the peer
+    /// here sends a frame every 60ms forever, so every read succeeds, no
+    /// silence timer would ever fire, and the frame budget alone would take
+    /// longer than the budget allows. Watching it fire is the point — a
+    /// timeout nobody has seen trip is a claim, not a bound.
+    #[test]
+    fn a_peer_that_answers_forever_without_answering_hits_the_deadline() {
+        let peer = start_websocket_service_that_drips();
+        let budget = Duration::from_millis(300);
+
+        let started = std::time::Instant::now();
+        let proof = probe_token_within(&local_dial(peer.addr), "a-token", budget);
+        let elapsed = started.elapsed();
+
+        match proof {
+            TokenProof::Inconclusive(reason) => {
+                assert!(
+                    reason.contains("300ms"),
+                    "the bound must be named: {reason}"
+                )
+            }
+            other => panic!("expected the deadline to end this, got {other:?}"),
+        }
+        assert!(
+            elapsed < budget * 6,
+            "the exchange ran {elapsed:?}, which is not bounded by {budget:?}"
+        );
+    }
+
+    /// A stale process that accepts a control socket and never answers must
+    /// not hold pairing open: the attempt is bounded, recorded for the
+    /// report, and the next candidate is still tried.
+    #[cfg(unix)]
+    #[test]
+    fn a_control_socket_that_never_answers_is_bounded_and_moves_on() {
+        let socket_path = test_socket_path("stale");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind a unix socket");
+        let accepted = std::thread::spawn(move || {
+            // Accept and hold: never write a byte back.
+            let held = listener.accept();
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(held);
+        });
+
+        let timeout = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let reload = reload_config_at(&socket_path, timeout);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            reload,
+            ConfigReload::NoAnswer {
+                tried: vec![ControlSocketAttempt {
+                    socket: socket_path.clone(),
+                    outcome: ControlSocketOutcome::Unanswered,
+                }]
+            }
+        );
+        assert!(
+            elapsed < timeout * 6,
+            "the control socket attempt ran {elapsed:?}, which is not bounded by {timeout:?}"
+        );
+
+        accepted.join().expect("accepter thread");
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[cfg(unix)]
+    fn test_socket_path(name: &str) -> PathBuf {
+        // Under the crate's own target directory, because a unix socket path
+        // has to stay inside sun_path and another test in this binary
+        // redirects and deletes the process temp dir.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-sockets");
+        std::fs::create_dir_all(&dir).expect("socket directory");
+        dir.join(format!("{name}-{}.sock", std::process::id()))
+    }
+
     fn local_dial(addr: SocketAddr) -> DialTarget {
         plan_token_check(&format!("ws://{addr}"), false, addr).dial
     }
@@ -2308,13 +2560,47 @@ mod tests {
         FakePeer { addr, presented }
     }
 
+    /// A websocket service that upgrades and then keeps the connection busy
+    /// forever without ever answering: every read succeeds, so nothing but an
+    /// absolute deadline ends the exchange.
+    fn start_websocket_service_that_drips() -> FakePeer {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("bound address");
+        let presented = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                #[allow(clippy::result_large_err)]
+                let accepted = tungstenite::accept(stream);
+                if let Ok(mut websocket) = accepted {
+                    // One frame per interval, indefinitely. Slower than the
+                    // frame budget could consume, so the deadline is what has
+                    // to stop this and not the frame count.
+                    while websocket
+                        .send(tungstenite::Message::Ping(Vec::new().into()))
+                        .is_ok()
+                    {
+                        std::thread::sleep(Duration::from_millis(60));
+                    }
+                }
+            }
+        });
+
+        FakePeer { addr, presented }
+    }
+
     /// Every outcome, whole-message. The wording is the deliverable here: an
     /// operator who reads "applied and live" and finds it false stops
     /// believing anything else this command prints, so each message is
-    /// asserted by equality rather than by substring, and each one names the
-    /// url it was proved against — and, when that is not the url in the
-    /// payload, what went unexercised. A row per outcome, plus a row per
-    /// scope wherever the scope changes what an operator should do.
+    /// asserted by equality rather than by substring.
+    ///
+    /// Each row states two observations that must not stand in for each
+    /// other — what the reload attempt did, and what the handshake found —
+    /// and names the url it was proved against. Every outcome is covered at
+    /// the TLS scope too, because that is where a suffix can contradict the
+    /// sentence it follows, and a combination no human reads is a combination
+    /// nothing checks.
     #[test]
     fn activation_report_spells_out_each_outcome() {
         let config_path = Path::new("/home/u/.config/herdr/config.toml");
@@ -2333,15 +2619,46 @@ mod tests {
             dialed_is_local_listener: true,
             unexercised_printed_url: Some("wss://a-host.example.net/herdr-ws".to_string()),
         };
+        let tls_note = "\nThe printed url wss://a-host.example.net/herdr-ws was not dialed: this build has no TLS client, so the proof was attempted against the listener behind it instead. Nothing here says whether wss://a-host.example.net/herdr-ws carries a connection to that listener; connect to it with the printed token to find out.";
+        let rotated = "Rotated: the previous token was replaced in config.toml";
+
+        let reloaded = ConfigReload::Reloaded {
+            socket: PathBuf::from("/home/u/.config/herdr/herdr.sock"),
+        };
+        let reloaded_clause =
+            "A herdr server at /home/u/.config/herdr/herdr.sock reloaded its config";
+        let no_answer = ConfigReload::NoAnswer {
+            tried: vec![
+                ControlSocketAttempt {
+                    socket: PathBuf::from("/home/u/.config/herdr-second/herdr.sock"),
+                    outcome: ControlSocketOutcome::NotRunning,
+                },
+                ControlSocketAttempt {
+                    socket: PathBuf::from("/home/u/.config/herdr/herdr.sock"),
+                    outcome: ControlSocketOutcome::Unanswered,
+                },
+            ],
+        };
+        let no_answer_clause = "No running herdr server answered a control socket (/home/u/.config/herdr-second/herdr.sock (not running), /home/u/.config/herdr/herdr.sock (accepted the connection but did not answer within 2s))";
+        let failed = ConfigReload::Failed {
+            reason: "boom".to_string(),
+        };
+        let failed_clause = "Asking a herdr server to reload its config failed: boom";
+        let refusal_warning = |dialed: &str, once_applied: &str| {
+            format!(
+            "warning: the printed token did not get in, and the refusal names no one: herdr answers an unknown token with the same opaque refusal any other service would, so whether a herdr listener judged this token is not established. If a herdr server does serve {dialed}, it has not applied /home/u/.config/herdr/config.toml: find it with `herdr session list --json`, then reload it with `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or restart it, and {once_applied}. Otherwise check what holds that url."
+        )
+        };
 
         let rows = vec![
             (
                 TokenActivation::LiveNow {
                     previous_token: PreviousTokenProof::Refused,
+                    reload: reloaded.clone(),
                 },
                 true,
                 &local,
-                "Rotated: the previous token was replaced in config.toml. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr, and one presenting the previous token was refused.",
+                format!("{rotated}. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr, and one presenting the previous token was refused."),
                 0,
             ),
             // The proxy deployment: the token is proved against the listener,
@@ -2349,10 +2666,11 @@ mod tests {
             (
                 TokenActivation::LiveNow {
                     previous_token: PreviousTokenProof::Refused,
+                    reload: reloaded.clone(),
                 },
                 true,
                 &behind_tls,
-                "Rotated: the previous token was replaced in config.toml. A handshake on ws://127.0.0.1:4433 presenting the new token was accepted by a peer that answered as herdr, and one presenting the previous token was refused.\nThe printed url wss://a-host.example.net/herdr-ws was not dialed: this build has no TLS client, so only the listener behind it was reached. Connect to wss://a-host.example.net/herdr-ws with the printed token to check whatever fronts it.",
+                format!("{rotated}. A handshake on ws://127.0.0.1:4433 presenting the new token was accepted by a peer that answered as herdr, and one presenting the previous token was refused.{tls_note}"),
                 0,
             ),
             // A ws:// proxy url is dialed as printed, so the proof is about
@@ -2360,97 +2678,180 @@ mod tests {
             (
                 TokenActivation::LiveNow {
                     previous_token: PreviousTokenProof::Refused,
+                    reload: reloaded.clone(),
                 },
                 true,
                 &advertised,
-                "Rotated: the previous token was replaced in config.toml. A handshake on ws://a-host.example.net:8443/herdr-ws presenting the new token was accepted by a peer that answered as herdr, and one presenting the previous token was refused.",
+                format!("{rotated}. A handshake on ws://a-host.example.net:8443/herdr-ws presenting the new token was accepted by a peer that answered as herdr, and one presenting the previous token was refused."),
                 0,
             ),
             (
                 TokenActivation::LiveNow {
                     previous_token: PreviousTokenProof::Unproven,
+                    reload: reloaded.clone(),
                 },
                 true,
                 &local,
-                "Rotated: the previous token was replaced in config.toml. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr.\nWhether the previous token still authenticates was not established.",
+                format!("{rotated}. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr.\nWhether the previous token still authenticates was not established."),
                 0,
             ),
             (
                 TokenActivation::LiveNow {
                     previous_token: PreviousTokenProof::StillAccepted,
+                    reload: reloaded.clone(),
                 },
                 true,
                 &local,
-                "Rotated: the previous token was replaced in config.toml. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr, but one presenting the previous token was accepted too.\nwarning: the previous token has not stopped authenticating. Restart the herdr server serving ws://100.64.0.5:4433 before treating it as revoked.",
+                format!("{rotated}. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr, but one presenting the previous token was accepted too.\nwarning: the previous token has not stopped authenticating. Restart the herdr server serving ws://100.64.0.5:4433 before treating it as revoked."),
                 1,
             ),
             (
                 TokenActivation::LiveNow {
                     previous_token: PreviousTokenProof::Unproven,
+                    reload: reloaded.clone(),
                 },
                 false,
                 &local,
-                "Stored the first token in config.toml. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr.",
+                format!("{rotated_first}. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr.", rotated_first = "Stored the first token in config.toml"),
                 0,
             ),
+            // The live claim rests on the handshake, and a control socket
+            // that errored is still a fault of its own: two facts, two
+            // sentences.
             (
-                TokenActivation::NoServer {
-                    tried: vec![
-                        PathBuf::from("/home/u/.config/herdr-second/herdr.sock"),
-                        PathBuf::from("/home/u/.config/herdr/herdr.sock"),
-                    ],
+                TokenActivation::LiveNow {
+                    previous_token: PreviousTokenProof::Refused,
+                    reload: failed.clone(),
                 },
                 true,
                 &local,
-                "Rotated: the previous token was replaced in config.toml. No running herdr server answered a control socket (/home/u/.config/herdr-second/herdr.sock, /home/u/.config/herdr/herdr.sock), and nothing is listening on ws://100.64.0.5:4433; the token takes effect when the server starts.",
+                format!("{rotated}. A handshake on ws://100.64.0.5:4433 presenting the new token was accepted by a peer that answered as herdr, and one presenting the previous token was refused.\nwarning: asking a herdr server to reload its config failed: boom. The token is live at ws://100.64.0.5:4433 regardless, but that server is not reading its config."),
                 0,
             ),
             (
-                TokenActivation::NeedsListener,
+                TokenActivation::NothingListening {
+                    reload: no_answer.clone(),
+                },
                 true,
                 &local,
-                "Rotated: the previous token was replaced in config.toml. A herdr server reloaded its config, but nothing is listening on ws://100.64.0.5:4433, so nothing has accepted the new token yet.\nRestart the herdr server so it binds the websocket listener, then scan.",
+                format!("{rotated}. {no_answer_clause}, and nothing is listening on ws://100.64.0.5:4433.\nThe token takes effect when the herdr server starts."),
+                0,
+            ),
+            (
+                TokenActivation::NothingListening {
+                    reload: reloaded.clone(),
+                },
+                true,
+                &local,
+                format!("{rotated}. {reloaded_clause}, and nothing is listening on ws://100.64.0.5:4433.\nRestart the herdr server so it binds the websocket listener, then scan."),
                 0,
             ),
             // Nothing answering an advertised url is not a reason to restart
             // a herdr server that may be running perfectly.
             (
-                TokenActivation::NeedsListener,
+                TokenActivation::NothingListening {
+                    reload: reloaded.clone(),
+                },
                 true,
                 &advertised,
-                "Rotated: the previous token was replaced in config.toml. A herdr server reloaded its config, but nothing is listening on ws://a-host.example.net:8443/herdr-ws, so nothing has accepted the new token yet.\nStart whatever serves ws://a-host.example.net:8443/herdr-ws — the proxy in front, or the herdr listener behind it — then scan.",
+                format!("{rotated}. {reloaded_clause}, and nothing is listening on ws://a-host.example.net:8443/herdr-ws.\nStart whatever serves ws://a-host.example.net:8443/herdr-ws — the proxy in front, or the herdr listener behind it — then scan."),
+                0,
+            ),
+            // Behind TLS the fallback reached nothing either, and the note
+            // says the printed url was only attempted — never that it was
+            // reached.
+            (
+                TokenActivation::NothingListening {
+                    reload: no_answer.clone(),
+                },
+                true,
+                &behind_tls,
+                format!("{rotated}. {no_answer_clause}, and nothing is listening on ws://127.0.0.1:4433.\nThe token takes effect when the herdr server starts.{tls_note}"),
+                0,
+            ),
+            // A reload that errored, with nothing listening: both stated.
+            (
+                TokenActivation::NothingListening {
+                    reload: failed.clone(),
+                },
+                true,
+                &local,
+                format!("{rotated}. {failed_clause}, and nothing is listening on ws://100.64.0.5:4433.\nRestart the herdr server so it binds the websocket listener, then scan."),
                 0,
             ),
             (
-                TokenActivation::NotAccepted,
+                TokenActivation::RefusedWithoutIdentifying {
+                    status: 401,
+                    reload: reloaded.clone(),
+                },
                 true,
                 &local,
-                "Rotated: the previous token was replaced in config.toml. A handshake on ws://100.64.0.5:4433 presenting the new token was refused.\nwarning: the printed token does not authenticate. Whatever serves ws://100.64.0.5:4433 has not applied /home/u/.config/herdr/config.toml; the reload this command asked for went to a server that answered a control socket, which is not evidence about the peer serving that url. Find the server serving it with `herdr session list --json`, then reload it with `HERDR_SOCKET_PATH=<its socket_path> herdr server reload-config` or restart it; the printed payload works once it does.",
+                format!("{rotated}. {reloaded_clause}, and a handshake on ws://100.64.0.5:4433 presenting the new token was refused with http 401.\n{}", refusal_warning("ws://100.64.0.5:4433", "the printed payload works once it does")),
+                1,
+            ),
+            // Nothing answered a control socket and the peer refused: the
+            // report may not say a server answered one.
+            (
+                TokenActivation::RefusedWithoutIdentifying {
+                    status: 403,
+                    reload: no_answer.clone(),
+                },
+                true,
+                &local,
+                format!("{rotated}. {no_answer_clause}, and a handshake on ws://100.64.0.5:4433 presenting the new token was refused with http 403.\n{}", refusal_warning("ws://100.64.0.5:4433", "the printed payload works once it does")),
+                1,
+            ),
+            // Behind TLS a reload can only promise the listener, never the
+            // path in front of it.
+            (
+                TokenActivation::RefusedWithoutIdentifying {
+                    status: 401,
+                    reload: reloaded.clone(),
+                },
+                true,
+                &behind_tls,
+                format!("{rotated}. {reloaded_clause}, and a handshake on ws://127.0.0.1:4433 presenting the new token was refused with http 401.\n{}{tls_note}", refusal_warning("ws://127.0.0.1:4433", "the listener will accept the printed token once it does")),
                 1,
             ),
             (
                 TokenActivation::NotHerdr {
                     reason: "it answered nothing".to_string(),
+                    reload: reloaded.clone(),
                 },
                 true,
                 &local,
-                "Rotated: the previous token was replaced in config.toml. Something on ws://100.64.0.5:4433 completed a websocket handshake but did not answer as herdr: it answered nothing.\nwarning: nothing about the printed token was established, and the previous token was not presented to that peer. Check what is serving ws://100.64.0.5:4433 before scanning.",
+                format!("{rotated}. {reloaded_clause}, and something on ws://100.64.0.5:4433 completed a websocket handshake but did not answer as herdr: it answered nothing.\nwarning: nothing about the printed token was established, and the previous token was not presented to that peer. Check what is serving ws://100.64.0.5:4433 before scanning."),
+                1,
+            ),
+            // A failed reload and an unidentified peer are two facts.
+            (
+                TokenActivation::NotHerdr {
+                    reason: "it answered nothing".to_string(),
+                    reload: failed.clone(),
+                },
+                true,
+                &behind_tls,
+                format!("{rotated}. {failed_clause}, and something on ws://127.0.0.1:4433 completed a websocket handshake but did not answer as herdr: it answered nothing.\nwarning: nothing about the printed token was established, and the previous token was not presented to that peer. Check what is serving ws://127.0.0.1:4433 before scanning.{tls_note}"),
                 1,
             ),
             (
                 TokenActivation::Unverified {
-                    reason: "nothing answered at 100.64.0.5:4433 within 2s".to_string(),
+                    reason: "it did not answer within 3000ms".to_string(),
+                    reload: reloaded.clone(),
                 },
                 true,
                 &local,
-                "Rotated: the previous token was replaced in config.toml. Whether ws://100.64.0.5:4433 accepts the new token could not be established: nothing answered at 100.64.0.5:4433 within 2s.\nwarning: nothing has connected with the printed token. Restart the herdr server serving ws://100.64.0.5:4433, or connect with the token yourself, before relying on it.",
+                format!("{rotated}. {reloaded_clause}, and whether ws://100.64.0.5:4433 accepts the new token could not be established: it did not answer within 3000ms.\nwarning: nothing has connected with the printed token. Restart the herdr server serving ws://100.64.0.5:4433, or connect with the token yourself, before relying on it."),
                 1,
             ),
             (
-                TokenActivation::Failed("boom".to_string()),
+                TokenActivation::Unverified {
+                    reason: "it did not answer within 3000ms".to_string(),
+                    reload: no_answer.clone(),
+                },
                 true,
-                &local,
-                "Rotated: the previous token was replaced in config.toml. Asking a running herdr server to reload its config failed: boom.\nwarning: nothing has connected with the printed token, and the previous token may still be accepted until `herdr server reload-config` succeeds or the server restarts.",
+                &behind_tls,
+                format!("{rotated}. {no_answer_clause}, and whether ws://127.0.0.1:4433 accepts the new token could not be established: it did not answer within 3000ms.\nwarning: nothing has connected with the printed token. Restart the herdr server serving ws://127.0.0.1:4433, or connect with the token yourself, before relying on it.{tls_note}"),
                 1,
             ),
         ];
@@ -2469,15 +2870,41 @@ mod tests {
                 matches!(activation, TokenActivation::LiveNow { .. }),
                 "only an observed handshake may claim the token was accepted: {report}"
             );
-            // And whenever the printed url was not the url dialed, every
-            // outcome says so — an unexercised proxy path is a fact about
-            // the payload in the operator's hand, not a detail of the happy
-            // path.
+            // Whenever the printed url was not the url dialed, every outcome
+            // says so — an unexercised proxy path is a fact about the payload
+            // in the operator's hand, not a detail of the happy path — and no
+            // message may promise that payload works.
             assert_eq!(
                 report.contains("was not dialed"),
                 scope.unexercised_printed_url.is_some(),
                 "the unexercised printed url must be named in every outcome: {report}"
             );
+            if scope.unexercised_printed_url.is_some() {
+                assert!(
+                    !report.contains("the printed payload works"),
+                    "a url that was never dialed may not be promised: {report}"
+                );
+            }
+            // The reload attempt is stated in every outcome that carries one,
+            // rather than being replaced by what the handshake found.
+            if let Some(reload) = activation_reload(&activation) {
+                assert!(
+                    report.contains(&reload_clause(reload))
+                        || matches!(activation, TokenActivation::LiveNow { .. }),
+                    "the reload attempt must be stated alongside the proof: {report}"
+                );
+            }
+        }
+    }
+
+    /// The reload an outcome carries, for the invariant above.
+    fn activation_reload(activation: &TokenActivation) -> Option<&ConfigReload> {
+        match activation {
+            TokenActivation::LiveNow { reload, .. }
+            | TokenActivation::NothingListening { reload }
+            | TokenActivation::RefusedWithoutIdentifying { reload, .. }
+            | TokenActivation::NotHerdr { reload, .. }
+            | TokenActivation::Unverified { reload, .. } => Some(reload),
         }
     }
 }
