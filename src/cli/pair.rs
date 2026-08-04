@@ -261,15 +261,19 @@ fn advertised_endpoint(advertised: Option<&str>) -> Result<Option<String>, Pairi
 /// Validate a declared endpoint and return its canonical form: a lowercase
 /// `ws`/`wss` scheme, the host as configured, and the optional port.
 ///
-/// The judge of this value is not this function but the URL parser in
-/// whatever client scans the QR, and minting a payload costs a token
-/// rotation. So the rules here track what a WHATWG URL parser does with the
-/// authority of a `ws`/`wss` url, using only what std offers: a host is
-/// either an IPv4 literal, a bracketed IPv6 literal, or a DNS name, and
-/// anything a client would parse differently — a path hiding behind a
-/// backslash, brackets around something that is not an address, a dotted
-/// number that is not a valid IPv4 — is refused with the reason instead of
-/// encoded into a QR that fails after the credential has already rotated.
+/// This validator is deliberately a STRICT SUBSET of what a client can dial.
+/// The invariant is one-directional: **every value it accepts must parse, in
+/// a client, to exactly the host and port configured.** Refusing something a
+/// client could have dialled is acceptable and must state the canonical form
+/// to use instead. Accepting something a client rejects — or dials as
+/// something else — is the only defect.
+///
+/// Judge every future question about this function by that invariant. It is
+/// what lets the rules below stay small: they do not reimplement WHATWG URL
+/// parsing (which no hand-written Rust can track, and no URL crate is worth
+/// adding here), they only carve out a region where this function and a
+/// client provably agree. Minting a payload costs a token rotation, so a
+/// value we misjudge is a QR that fails after the credential has moved.
 fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
     let (scheme, authority) = advertised
         .split_once("://")
@@ -306,14 +310,7 @@ fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
     let (host, port) = split_host_and_port(authority)?;
     validate_host(host)?;
     if let Some(port) = port {
-        match port.parse::<u16>() {
-            Ok(0) | Err(_) => {
-                return Err(format!(
-                    "{port:?} is not a port a client could dial; use 1-65535"
-                ))
-            }
-            Ok(_) => {}
-        }
+        validate_port(port)?;
     }
 
     Ok(format!("{scheme}://{authority}"))
@@ -374,8 +371,24 @@ fn validate_host(host: HostForm<'_>) -> Result<(), String> {
     if host.is_empty() {
         return Err("no host to dial".to_string());
     }
-    if host.parse::<std::net::Ipv4Addr>().is_ok() {
-        return Ok(());
+
+    // A client reads a host whose last label looks like a number — in any
+    // base — as an IPv4 address rather than a name, and then either throws
+    // or dials an address that shares no text with what was configured
+    // ("0x7f000001" becomes 127.0.0.1 silently, "010.0.0.1" becomes 8.0.0.1).
+    // Both break the invariant, so the whole number-shaped region is narrowed
+    // to the one form this function and a client provably agree on.
+    if last_label_looks_numeric(host) {
+        return if is_canonical_dotted_quad(host) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{host:?} is read as an ipv4 address, not a name, because it ends in a number, \
+                 and a client would refuse it or dial a different address than it spells; \
+                 write it as four plain decimal octets 0-255 with no leading zeros \
+                 and no trailing dot, e.g. 100.64.0.5"
+            ))
+        };
     }
 
     // A trailing dot is the DNS root and names an absolute host; the empty
@@ -415,20 +428,70 @@ fn validate_host(host: HostForm<'_>) -> Result<(), String> {
         }
     }
 
-    // A URL parser reads a host whose last label is all digits as an IPv4
-    // address, and rejects it when the digits are not one — so a name like
-    // "10.0.0.999" is not a name to fall back on, it is a broken address.
-    if labels
-        .last()
-        .is_some_and(|label| label.chars().all(|c| c.is_ascii_digit()))
-    {
+    Ok(())
+}
+
+/// Whether a client will read this host as an IPv4 number rather than a
+/// name: its last label (a single trailing dot is the DNS root, not a label)
+/// is decimal digits, hex with an `0x` prefix, or a leading-zero octal.
+/// Deliberately a shape test, not a parse — the point is to spot the region
+/// where a client switches interpretations, not to reimplement it.
+fn last_label_looks_numeric(host: &str) -> bool {
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let Some(last) = name.rsplit('.').next() else {
+        return false;
+    };
+    if last.is_empty() {
+        return false;
+    }
+    let hex_prefixed = last.starts_with("0x") || last.starts_with("0X");
+    hex_prefixed || last.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The one IPv4 spelling this function and a client agree on exactly: four
+/// plain decimal octets, no leading zeros (which a client reads as octal),
+/// no trailing dot (which a client drops from the host it dials).
+fn is_canonical_dotted_quad(host: &str) -> bool {
+    let mut octets = 0;
+    for part in host.split('.') {
+        octets += 1;
+        if octets > 4 {
+            return false;
+        }
+        let is_plain_decimal = !part.is_empty()
+            && part.len() <= 3
+            && part.chars().all(|c| c.is_ascii_digit())
+            && (part.len() == 1 || !part.starts_with('0'));
+        if !is_plain_decimal || part.parse::<u16>().is_ok_and(|octet| octet > 255) {
+            return false;
+        }
+    }
+    octets == 4
+}
+
+/// Accept only ports a client dials as the digits configured. `parse::<u16>`
+/// is not that test on its own: it accepts a leading `+`, which a client
+/// refuses outright, and a leading zero, which a client silently normalizes
+/// away — so the payload text would stop matching the port dialled.
+fn validate_port(port: &str) -> Result<(), String> {
+    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
         return Err(format!(
-            "{host:?} ends in a number, so a client reads it as an ipv4 address, \
-             but it is not a valid one; use a dotted quad such as 100.64.0.5"
+            "{port:?} is not a port a client could dial; write plain digits, e.g. 8443"
         ));
     }
-
-    Ok(())
+    if port.len() > 1 && port.starts_with('0') {
+        return Err(format!(
+            "{port:?} has a leading zero, which a client strips before dialling; \
+             write the port plainly, e.g. {}",
+            port.trim_start_matches('0')
+        ));
+    }
+    match port.parse::<u16>() {
+        Ok(0) | Err(_) => Err(format!(
+            "{port:?} is not a port a client could dial; use 1-65535"
+        )),
+        Ok(_) => Ok(()),
+    }
 }
 
 /// Resolve the configured bind address into the listener this command works
@@ -868,9 +931,9 @@ mod tests {
         );
     }
 
-    /// Every host shape a client's URL parser accepts must survive with the
-    /// exact bytes it was configured with — the payload is only useful if it
-    /// still names the same server after canonicalization.
+    /// Half of the invariant: an accepted value is carried into the payload
+    /// as exactly the host and port configured, because that is the only
+    /// promise this function makes to whatever client parses it back out.
     #[test]
     fn an_advertised_endpoint_keeps_the_configured_scheme_host_and_port() {
         for (configured, expected) in [
@@ -889,11 +952,21 @@ mod tests {
                 "wss://an_internal.host.local",
                 "wss://an_internal.host.local",
             ),
-            // A trailing dot is the dns root, and names the same host.
+            // A trailing dot is the dns root, and a client keeps it on a
+            // name — so the payload keeps it too.
             ("wss://a-host.example.net.", "wss://a-host.example.net."),
-            // Ipv4 literals, with and without a port.
+            // A punycode name is already the ascii form a client resolves a
+            // non-ascii name to, so it rides through untouched.
+            (
+                "wss://xn--nave-6pa.example.net",
+                "wss://xn--nave-6pa.example.net",
+            ),
+            // The one ipv4 spelling this function and a client agree on,
+            // with and without a port.
             ("wss://100.64.0.5", "wss://100.64.0.5"),
             ("wss://100.64.0.5:8443", "wss://100.64.0.5:8443"),
+            ("wss://0.0.0.0", "wss://0.0.0.0"),
+            ("wss://255.255.255.255:1", "wss://255.255.255.255:1"),
             // Bracketed ipv6 literals, with and without a port.
             ("wss://[fd7a::1]", "wss://[fd7a::1]"),
             ("wss://[fd7a::1]:8443", "wss://[fd7a::1]:8443"),
@@ -918,56 +991,89 @@ mod tests {
         }
     }
 
-    /// The real judge of this value is the URL parser in whatever client
-    /// scans the QR, and minting costs a token rotation — so anything a
-    /// client would parse differently, or refuse, must be refused here first.
+    /// The other half: this validator is a strict subset of what a client can
+    /// dial, so a refusal is allowed to be stricter than a client — but it
+    /// owes the operator the canonical form to write instead. Every refusal
+    /// below is checked for both the reason and that remedy.
     #[test]
     fn a_malformed_advertised_endpoint_refuses_to_print_a_payload() {
-        for (configured, expected_reason) in [
+        for (configured, expected_reason, expected_remedy) in [
             // No scheme at all: nothing says how to dial it.
-            ("a-host.example.ts.net", "ws:// or wss://"),
+            ("a-host.example.ts.net", "ws:// or wss://", "wss://"),
             // A scheme no websocket client can dial.
-            ("https://a-host.example.ts.net", "ws:// or wss://"),
+            ("https://a-host.example.ts.net", "cannot dial", "wss://"),
             // Scheme but no host.
-            ("wss://", "no host"),
+            ("wss://", "no host", ""),
             // Anything past the authority would be dropped or mangled.
-            ("wss://a-host.example.ts.net/api", "path"),
-            ("wss://a-host.example.ts.net/?token=x", "path"),
+            (
+                "wss://a-host.example.ts.net/api",
+                "path",
+                "host, and optional port only",
+            ),
+            (
+                "wss://a-host.example.ts.net/?token=x",
+                "path",
+                "host, and optional port only",
+            ),
             // A backslash is a path separator for ws/wss, so this is the
             // same hazard as "/api" wearing a different costume: a client
             // reads the host as "a-host" and the rest as a path.
-            ("wss://a-host\\api", "path"),
-            ("wss://user@a-host.example.ts.net", "credentials"),
-            ("wss://a host.example.ts.net", "whitespace"),
-            // Ports must be dialable.
-            ("wss://a-host.example.ts.net:0", "port"),
-            ("wss://a-host.example.ts.net:99999", "port"),
-            ("wss://a-host.example.ts.net:https", "port"),
+            ("wss://a-host\\api", "path", "host, and optional port only"),
+            ("wss://user@a-host.example.ts.net", "credentials", ""),
+            ("wss://a host.example.ts.net", "whitespace", ""),
+            // Ports must be dialled as the digits written.
+            ("wss://a-host.example.ts.net:0", "1-65535", ""),
+            ("wss://a-host.example.ts.net:99999", "1-65535", ""),
+            ("wss://a-host.example.ts.net:https", "plain digits", "8443"),
+            // A signed port parses in rust but throws in a client.
+            ("wss://a-host.example.ts.net:+443", "plain digits", "8443"),
+            // A leading-zero port is stripped by a client, so the payload
+            // text would stop naming the port actually dialled.
+            ("wss://a-host.example.ts.net:0443", "leading zero", "443"),
             // An unbracketed ipv6 literal is ambiguous with host:port.
-            ("wss://fd7a::1", "brackets"),
-            ("wss://[fd7a::1", "brackets"),
+            ("wss://fd7a::1", "brackets", "[fd7a::1]:8443"),
+            ("wss://[fd7a::1", "brackets", ""),
             // Brackets promise an ipv6 address; a client throws when the
             // contents are not one, rather than reading them as a name.
-            ("wss://[not-an-ip]", "not an ipv6 address"),
-            ("wss://[not-an-ip]:8443", "not an ipv6 address"),
-            ("wss://[]", "not an ipv6 address"),
-            // A host ending in a number is read as ipv4, so it must be one.
-            ("wss://10.0.0.999", "ipv4"),
-            ("wss://1.2.3.4.5", "ipv4"),
+            ("wss://[not-an-ip]", "not an ipv6 address", ""),
+            ("wss://[not-an-ip]:8443", "not an ipv6 address", ""),
+            ("wss://[]", "not an ipv6 address", ""),
+            // Number-shaped hosts: a client either throws (proxy.0x10,
+            // 10.0.0.999, 1.2.3.4.5) or dials an address that shares no text
+            // with what was written (0x7f000001 and 0177.0.0.1 become
+            // 127.0.0.1, 010.0.0.1 becomes 8.0.0.1, 127.1 becomes 127.0.0.1,
+            // and the trailing dot of 192.0.2.1. is dropped). All refused by
+            // one rule, all pointed at the dotted quad.
+            ("wss://0x7f000001", "ipv4", "100.64.0.5"),
+            ("wss://proxy.0x10", "ipv4", "100.64.0.5"),
+            ("wss://127.1", "ipv4", "100.64.0.5"),
+            ("wss://192.0.2.1.", "ipv4", "100.64.0.5"),
+            ("wss://010.0.0.1", "ipv4", "no leading zeros"),
+            ("wss://10.0.0.05", "ipv4", "no leading zeros"),
+            ("wss://0177.0.0.1", "ipv4", "no leading zeros"),
+            ("wss://10.0.0.999", "ipv4", "0-255"),
+            ("wss://1.2.3.4.5", "ipv4", "100.64.0.5"),
             // Empty labels are not names.
-            ("wss://a-host..example.net", "empty label"),
-            ("wss://.example.net", "empty label"),
+            ("wss://a-host..example.net", "empty label", ""),
+            ("wss://.example.net", "empty label", ""),
             // Hyphen-edged labels are not resolvable names.
-            ("wss://-a-host.example.net", "hyphen"),
-            ("wss://a-host-.example.net", "hyphen"),
-            // Non-ascii needs punycode before it can ride a payload.
-            ("wss://naïve.example.net", "ascii"),
+            ("wss://-a-host.example.net", "hyphen", ""),
+            ("wss://a-host-.example.net", "hyphen", ""),
+            // Non-ascii is refused rather than converted: applying idna by
+            // hand is the class this validator refuses to enter, so the
+            // refusal owes the operator the punycode form instead.
+            ("wss://naïve.example.net", "ascii", "punycode (xn--)"),
         ] {
             let reason = declared(configured)
                 .expect_err(&format!("{configured:?} must be refused, not encoded"));
             assert!(
                 reason.contains(expected_reason),
                 "{configured:?}: expected {expected_reason:?} in {reason:?}"
+            );
+            assert!(
+                reason.contains(expected_remedy),
+                "{configured:?}: refusal must name the canonical form \
+                 {expected_remedy:?}, got {reason:?}"
             );
         }
     }
