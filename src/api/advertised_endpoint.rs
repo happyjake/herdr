@@ -10,6 +10,13 @@
 //! the endpoint without scanning anything again. Both read it through this
 //! module, so a value either reaches both or neither: the pong never
 //! publishes a url `herdr pair` would refuse to encode.
+//!
+//! The two surfaces must also name the same server. A client keys a server by
+//! what it parses out of the url it dialled — scheme, host, port, and path —
+//! so the pong value and the pairing url have to parse to the same key, and
+//! the pairing url is composed with that in mind (see `query_prefix` beside
+//! the payload). A path that reached only one of them would be a client
+//! holding one server twice.
 
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -45,14 +52,15 @@ pub(crate) fn declared_advertised_endpoint(configured: Option<&str>) -> Option<&
 /// client provably agree. Minting a payload costs a token rotation, so a
 /// value we misjudge is a QR that fails after the credential has moved.
 ///
-/// A path is inside that region because the payload appends its query to the
-/// declared url whole — `{endpoint}/?token=…` — so `wss://a-host/herdr-ws` is
-/// dialled as `wss://a-host/herdr-ws/?token=…`, which a client reads back as
-/// the host `a-host` and the path `/herdr-ws/`. What the path is appended to
-/// still has to be text a client dials unchanged, so the path rules below are
-/// narrow for the same reason the host rules are. A query, a fragment, and
-/// credentials stay refused: those collide with what the payload appends
-/// rather than surviving in front of it.
+/// A path is inside that region because the pairing payload puts its query on
+/// after the declared url rather than into it: `wss://a-host/herdr-ws` is
+/// dialled as `wss://a-host/herdr-ws?token=…`, which a client reads back as
+/// the host `a-host` and the path `/herdr-ws` — the same path this function
+/// returned and the pong publishes. What the query goes on after still has to
+/// be text a client dials unchanged, so the path rules below are narrow for
+/// the same reason the host rules are. A query, a fragment, and credentials
+/// stay refused: those collide with what the payload appends rather than
+/// surviving in front of it.
 pub(crate) fn normalize_advertised_endpoint(advertised: &str) -> Result<String, String> {
     let (scheme, rest) = advertised
         .split_once("://")

@@ -149,7 +149,8 @@ pub(super) fn run_pair_command(args: &[String]) -> std::io::Result<i32> {
 /// the scannable URL: the endpoint stays bare, so pasting it never leaks a
 /// credential and renaming never changes a server's identity.
 struct PairingPayload {
-    /// Base URL without a trailing slash, e.g. `ws://100.64.0.5:4433`.
+    /// Base URL without a trailing slash, e.g. `ws://100.64.0.5:4433` or
+    /// `wss://a-host.example.net/herdr-ws`.
     endpoint: String,
     token: String,
     name: String,
@@ -160,11 +161,36 @@ impl PairingPayload {
         // The token charset is URL-unreserved by construction, so the query
         // form needs no percent-encoding; the free-form name does.
         format!(
-            "{}/?token={}&name={}",
+            "{}{}token={}&name={}",
             self.endpoint,
+            query_prefix(&self.endpoint),
             self.token,
             percent_encode_query_value(&self.name)
         )
+    }
+}
+
+/// What goes between an endpoint and the pairing query, so the url a client
+/// dials carries exactly the path the endpoint declares.
+///
+/// A server is named by two surfaces — this url and the `advertised_endpoint`
+/// in its pong — and a client keys it by what it parses out of them, path
+/// included. They have to agree.
+///
+/// An endpoint that is only scheme and authority declares no path, and a
+/// client fills the path in as `/` whichever way this is written; the `/` is
+/// written out, which is the form that has shipped and keeps every paired
+/// server keyed as it already is. An endpoint that declares a path is already
+/// complete: another `/` would dial `/herdr-ws/` while the pong advertises
+/// `/herdr-ws`, and to a client those are two different servers.
+fn query_prefix(endpoint: &str) -> &'static str {
+    let declares_a_path = endpoint
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.contains('/'));
+    if declares_a_path {
+        "?"
+    } else {
+        "/?"
     }
 }
 
@@ -700,10 +726,10 @@ mod tests {
         );
     }
 
-    /// What accepting a path rests on: the payload appends its query to the
-    /// declared url whole, so the path is still there in front of the token,
-    /// and a client that strips the token and name is left with exactly the
-    /// host and path that were declared.
+    /// What accepting a path rests on: the query goes on after the declared
+    /// url, so the path is still there in front of the token, and a client
+    /// that strips the token and name is left with exactly the host and path
+    /// that were declared — the same ones the pong publishes.
     #[test]
     fn an_advertised_path_survives_the_appended_token() {
         let endpoint = declared("wss://a-host.example.ts.net/herdr-ws").unwrap();
@@ -716,11 +742,11 @@ mod tests {
         };
         assert_eq!(
             payload.url(),
-            "wss://a-host.example.ts.net/herdr-ws/?token=abcDEF123-_&name=the%20mini"
+            "wss://a-host.example.ts.net/herdr-ws?token=abcDEF123-_&name=the%20mini"
         );
 
         // A declared trailing slash lands on the same url, because the
-        // canonical form drops it and the payload appends one.
+        // canonical form drops it and nothing puts it back.
         let with_slash = PairingPayload {
             endpoint: declared("wss://a-host.example.ts.net/herdr-ws/").unwrap(),
             token: "abcDEF123-_".to_string(),
@@ -729,12 +755,72 @@ mod tests {
         assert_eq!(with_slash.url(), payload.url());
     }
 
-    /// Half of the invariant: an accepted value is carried into the payload
-    /// as exactly the host, port, and path configured, because that is the
-    /// only promise this function makes to whatever client parses it back out.
+    /// A path of exactly `/` is the same url as no path at all, so it has to
+    /// reach a client as the same server: same canonical form, same pairing
+    /// url, byte for byte.
     #[test]
-    fn an_advertised_endpoint_keeps_the_configured_scheme_host_port_and_path() {
-        for (configured, expected) in [
+    fn a_path_of_only_a_slash_is_the_same_url_as_no_path() {
+        for (with_slash, without) in [
+            (
+                "wss://a-host.example.ts.net/",
+                "wss://a-host.example.ts.net",
+            ),
+            (
+                "wss://a-host.example.ts.net:8443/",
+                "wss://a-host.example.ts.net:8443",
+            ),
+            ("wss://[fd7a::1]:8443/", "wss://[fd7a::1]:8443"),
+        ] {
+            assert_eq!(declared(with_slash), declared(without), "{with_slash:?}");
+
+            let payload = |endpoint: String| PairingPayload {
+                endpoint,
+                token: "tok".to_string(),
+                name: "the-mini".to_string(),
+            };
+            assert_eq!(
+                payload(declared(with_slash).unwrap()).url(),
+                payload(declared(without).unwrap()).url(),
+                "{with_slash:?}"
+            );
+        }
+    }
+
+    /// The root case is what has already shipped and what every paired server
+    /// is keyed by, so its pairing url is pinned byte for byte — an endpoint
+    /// that declares no path still gets the `/` written out, whether it came
+    /// from the bind address or from a declaration.
+    #[test]
+    fn an_endpoint_without_a_path_keeps_the_pairing_url_it_has_always_had() {
+        let payload = |endpoint: &str| {
+            PairingPayload {
+                endpoint: endpoint.to_string(),
+                token: "abcDEF123-_".to_string(),
+                name: "the-mini".to_string(),
+            }
+            .url()
+        };
+
+        assert_eq!(
+            payload("ws://100.64.0.5:4433"),
+            "ws://100.64.0.5:4433/?token=abcDEF123-_&name=the-mini"
+        );
+        assert_eq!(
+            payload("wss://a-host.example.ts.net:8443"),
+            "wss://a-host.example.ts.net:8443/?token=abcDEF123-_&name=the-mini"
+        );
+        assert_eq!(
+            payload("ws://[fd7a::1]:4433"),
+            "ws://[fd7a::1]:4433/?token=abcDEF123-_&name=the-mini"
+        );
+    }
+
+    /// Every value the endpoint validator accepts, with the canonical form it
+    /// is accepted as. Shared by the test that pins those forms and the one
+    /// that pins the pong and the pairing url against each other, so a value
+    /// added here is judged by both rather than by whichever it was added to.
+    fn accepted_endpoints() -> Vec<(&'static str, &'static str)> {
+        vec![
             // A plain single-label host.
             ("wss://a-host", "wss://a-host"),
             ("wss://a-host.example.ts.net", "wss://a-host.example.ts.net"),
@@ -781,9 +867,10 @@ mod tests {
             // Schemes are case-insensitive; the payload carries the canonical form.
             ("WSS://a-host.example.ts.net", "wss://a-host.example.ts.net"),
             // A path survives the appended token rather than being lost to
-            // it: the payload composes "{endpoint}/?token=…", so this is
-            // dialled as wss://a-host.example.ts.net/herdr-ws/?token=…, which
-            // a client reads back as this host and this path.
+            // it: the query goes on after the declared url, so this is dialled
+            // as wss://a-host.example.ts.net/herdr-ws?token=…, which a client
+            // reads back as this host and this path — the pair of them the
+            // pong publishes.
             (
                 "wss://a-host.example.ts.net/herdr-ws",
                 "wss://a-host.example.ts.net/herdr-ws",
@@ -795,7 +882,7 @@ mod tests {
                 "wss://a-host-2.tailnet-name.ts.net/herdr-ws",
             ),
             // A trailing slash is the same url as none, and the canonical
-            // form drops it — the payload appends its own.
+            // form drops it, so both spellings pair as the same server.
             (
                 "wss://a-host.example.ts.net/herdr-ws/",
                 "wss://a-host.example.ts.net/herdr-ws",
@@ -833,11 +920,83 @@ mod tests {
                 "  WSS://a-host.example.ts.net/herdr-ws/  ",
                 "wss://a-host.example.ts.net/herdr-ws",
             ),
-        ] {
+        ]
+    }
+
+    /// Half of the invariant: an accepted value is carried into the payload
+    /// as exactly the host, port, and path configured, because that is the
+    /// only promise this function makes to whatever client parses it back out.
+    #[test]
+    fn an_advertised_endpoint_keeps_the_configured_scheme_host_port_and_path() {
+        for (configured, expected) in accepted_endpoints() {
             assert_eq!(
                 declared(configured),
                 Ok(expected.to_string()),
                 "{configured:?}"
+            );
+        }
+    }
+
+    /// What a client is left holding after it parses one of these urls: the
+    /// scheme, the authority as written, and the path, with the pairing query
+    /// dropped — which is the whole query, because the payload puts nothing
+    /// else there. A split is a faithful stand-in for a url parser over the
+    /// accepted set on purpose: that set is exactly the text this crate
+    /// promises a client dials without rewriting any of it.
+    fn client_server_key(url: &str) -> (String, String, String) {
+        let (scheme, rest) = url.split_once("://").expect("a scheme");
+        let rest = rest.split_once('?').map_or(rest, |(before, _)| before);
+        match rest.split_once('/') {
+            Some((authority, path)) => (
+                scheme.to_string(),
+                authority.to_string(),
+                format!("/{path}"),
+            ),
+            // A url with no path is dialled at the root; a client fills that
+            // in rather than leaving the path empty.
+            None => (scheme.to_string(), rest.to_string(), "/".to_string()),
+        }
+    }
+
+    /// The property the two surfaces owe a client together: the endpoint a
+    /// server publishes in its pong and the endpoint its pairing url carries
+    /// name the same server. A client keys a server by what it parses out of
+    /// the url it dialled, so this compares parsed keys rather than strings —
+    /// which is what catches a normalization that moves one surface and not
+    /// the other, whatever the spelling of it.
+    #[test]
+    fn the_pong_and_the_pairing_url_name_the_same_server() {
+        for (configured, canonical) in accepted_endpoints() {
+            // The pong's value, taken from the slot that publishes it rather
+            // than re-derived here, so this compares the two real surfaces.
+            let published = crate::api::SharedAdvertisedEndpoint::from_config(
+                &crate::config::WebSocketApiConfig {
+                    advertised_endpoint: Some(configured.to_string()),
+                    ..crate::config::WebSocketApiConfig::default()
+                },
+            )
+            .current()
+            .unwrap_or_else(|| panic!("{configured:?} must be published in the pong"));
+            assert_eq!(published, canonical, "{configured:?}");
+
+            let payload = PairingPayload {
+                endpoint: declared(configured).expect("an accepted endpoint"),
+                token: "abcDEF123-_".to_string(),
+                name: "Can's Mini (büro)".to_string(),
+            };
+            let dialled = payload.url();
+
+            assert_eq!(
+                client_server_key(&dialled),
+                client_server_key(&published),
+                "{configured:?}: the pong publishes {published}, the qr dials {dialled}"
+            );
+            // The name and token are the only query there is, so removing
+            // them leaves the endpoint whole — a percent-encoded name with
+            // spaces and parentheses does not reach the path.
+            assert!(
+                dialled.starts_with(&published),
+                "{configured:?}: {dialled} must begin with the published endpoint"
             );
         }
     }
