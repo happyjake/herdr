@@ -355,6 +355,64 @@ pub(crate) fn is_pane_shell_process_name(name: &str) -> bool {
     )
 }
 
+/// Cwd of the pane's effective shell: the direct child, or the shell the
+/// user is actually driving when shells nest under it. A `cd` typed in a
+/// nested shell never moves the direct child, so probing only `child_pid`
+/// would serve the spawn directory forever.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn pane_shell_cwd(child_pid: u32) -> Option<std::path::PathBuf> {
+    let tip = innermost_nested_shell(child_pid);
+    if tip != child_pid {
+        if let Some(cwd) = process_cwd(tip) {
+            return Some(cwd);
+        }
+    }
+    process_cwd(child_pid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn pane_shell_cwd(child_pid: u32) -> Option<std::path::PathBuf> {
+    process_cwd(child_pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_NESTED_SHELL_DEPTH: usize = 8;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn innermost_nested_shell(child_pid: u32) -> u32 {
+    if child_pid == 0 {
+        return child_pid;
+    }
+    let mut shell_children: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    for pid in session_processes(child_pid) {
+        if pid == child_pid {
+            continue;
+        }
+        let Some((ppid, name)) = process_parent_and_name(pid) else {
+            continue;
+        };
+        if is_pane_shell_process_name(&name) {
+            shell_children.entry(ppid).or_default().push(pid);
+        }
+    }
+    let mut tip = child_pid;
+    for _ in 0..MAX_NESTED_SHELL_DEPTH {
+        // Agents and their tool shells never join the chain: the walk only
+        // descends through shells parented by the current tip, and an agent
+        // in between is not a shell. Newest shell wins if several hang off
+        // the same parent.
+        let Some(next) = shell_children
+            .get(&tip)
+            .and_then(|kids| kids.iter().max().copied())
+        else {
+            break;
+        };
+        tip = next;
+    }
+    tip
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_agent_hint(_pid: u32) -> Option<crate::detect::Agent> {
     None
@@ -445,6 +503,72 @@ mod tests {
         for program in ["vim", "nvim", "cargo", "test-runner", "opencode"] {
             assert!(!is_pane_shell_process_name(program), "{program}");
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn unique_cd_target(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-pane-shell-cwd-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn poll_pane_shell_cwd_until(pid: u32, expect: &std::path::Path) -> Option<std::path::PathBuf> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut last = None;
+        while std::time::Instant::now() < deadline {
+            last = pane_shell_cwd(pid);
+            if last.as_deref() == Some(expect) {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        last
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pane_shell_cwd_follows_a_cd_in_the_direct_child_shell() {
+        let target = unique_cd_target("direct");
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("cd \"{}\" && sleep 30; :", target.display()))
+            .spawn()
+            .unwrap();
+        let seen = poll_pane_shell_cwd_until(child.id(), &target);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&target);
+        assert_eq!(seen.as_deref(), Some(target.as_path()));
+    }
+
+    // The live shape behind stale pane cwds: the pane's direct child stays
+    // where it spawned while the user cd's inside a nested shell they
+    // launched from it (pane zsh -> zsh -> agent).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pane_shell_cwd_follows_a_cd_in_a_nested_shell() {
+        let target = unique_cd_target("nested");
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "/bin/sh -c 'cd \"{}\" && sleep 30; :'; :",
+                target.display()
+            ))
+            .spawn()
+            .unwrap();
+        let seen = poll_pane_shell_cwd_until(child.id(), &target);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&target);
+        assert_eq!(seen.as_deref(), Some(target.as_path()));
     }
 
     #[test]

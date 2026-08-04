@@ -385,6 +385,19 @@ fn process_pgrp_and_comm_from_stat(stat: &str) -> Option<(i32, String)> {
     Some((pgrp, comm))
 }
 
+pub(crate) fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_ppid_and_comm_from_stat(&stat)
+}
+
+fn process_ppid_and_comm_from_stat(stat: &str) -> Option<(u32, String)> {
+    let close = stat.rfind(')')?;
+    let comm = stat.get(1 + stat.find('(')?..close)?.to_string();
+    let rest = stat.get(close + 2..)?;
+    let ppid: i32 = rest.split_whitespace().nth(1)?.parse().ok()?;
+    u32::try_from(ppid).ok().map(|ppid| (ppid, comm))
+}
+
 fn process_argv(pid: u32) -> Option<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     if bytes.is_empty() {
