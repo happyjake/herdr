@@ -1033,136 +1033,117 @@ mod tests {
         }
     }
 
-    /// The other half: this validator is a strict subset of what a client can
-    /// dial, so a refusal is allowed to be stricter than a client — but it
-    /// owes the operator the canonical form to write instead. Every refusal
-    /// below is checked for both the reason and that remedy.
+    /// The other half of the invariant. A refusal may be stricter than a
+    /// client, but it owes the operator a message they can act on — so the
+    /// whole message is asserted by equality, not by substring. A substring
+    /// check cannot close this: three rounds of review found fragments that
+    /// were satisfied incidentally, first by the empty string and then by
+    /// text already present elsewhere in the same message. Equality cannot
+    /// be satisfied by accident, and it puts the operator-facing wording in
+    /// the table where it can be read and reviewed.
+    ///
+    /// Every refusal branch in the endpoint path has a row here. Deleting a
+    /// remedy clause from any of them fails this test.
     #[test]
     fn a_malformed_advertised_endpoint_refuses_to_print_a_payload() {
-        for (configured, expected_reason, expected_remedy) in [
+        fn row(configured: &str, refusal: &str) -> (String, String) {
+            (configured.to_string(), refusal.to_string())
+        }
+
+        // Long enough to exceed the 253-character name limit while every
+        // label stays legal, so the name-length branch is what refuses it.
+        let long_label = "a".repeat(63);
+        let over_long_name = [long_label.as_str(); 4].join(".");
+        // One label over the 63-character limit, inside a legal-length name.
+        let over_long_label = "a".repeat(64);
+
+        let mut rows = vec![
             // No scheme at all: nothing says how to dial it.
-            ("a-host.example.ts.net", "ws:// or wss://", "wss://"),
+            row("a-host.example.ts.net", "expected a ws:// or wss:// url"),
             // A scheme no websocket client can dial.
-            ("https://a-host.example.ts.net", "cannot dial", "wss://"),
-            // Scheme but no host.
-            ("wss://", "no host", "wss://a-host.example.net:8443"),
-            // Anything past the authority would be dropped or mangled.
-            (
-                "wss://a-host.example.ts.net/api",
-                "path",
-                "host, and optional port only",
-            ),
-            (
-                "wss://a-host.example.ts.net/?token=x",
-                "path",
-                "host, and optional port only",
-            ),
-            // A backslash is a path separator for ws/wss, so this is the
-            // same hazard as "/api" wearing a different costume: a client
-            // reads the host as "a-host" and the rest as a path.
-            ("wss://a-host\\api", "path", "host, and optional port only"),
-            (
-                "wss://user@a-host.example.ts.net",
-                "credentials",
-                "wss://a-host.example.net:8443",
-            ),
-            (
-                "wss://a host.example.ts.net",
-                "whitespace",
-                "wss://a-host.example.net:8443",
-            ),
-            // Ports must be dialled as the digits written.
-            ("wss://a-host.example.ts.net:0", "1-65535", "e.g. 8443"),
-            ("wss://a-host.example.ts.net:99999", "1-65535", "e.g. 8443"),
-            ("wss://a-host.example.ts.net:https", "plain digits", "8443"),
-            // A signed port parses in rust but throws in a client.
-            ("wss://a-host.example.ts.net:+443", "plain digits", "8443"),
-            // A leading-zero port is stripped by a client, so the payload
-            // text would stop naming the port actually dialled.
-            ("wss://a-host.example.ts.net:0443", "leading zero", "443"),
-            // An all-zero port strips to nothing and a leading-zero port
-            // over the range strips to a value this function would refuse
-            // anyway, so neither may be echoed back as the remedy.
-            ("wss://a-host.example.ts.net:00", "1-65535", "e.g. 8443"),
-            ("wss://a-host.example.ts.net:099999", "1-65535", "e.g. 8443"),
+            row("https://a-host.example.ts.net", "a websocket client cannot dial https://; use ws:// or wss://"),
+            // Scheme but no authority.
+            row("wss://", "no host to dial; declare scheme, host, and optional port, e.g. wss://a-host.example.net:8443"),
+            // Whitespace inside the authority.
+            row("wss://a host.example.ts.net", "a host cannot contain whitespace; declare it as one unbroken url, e.g. wss://a-host.example.net:8443"),
+            // Userinfo.
+            row("wss://user@a-host.example.ts.net", "credentials do not belong in a pairing endpoint; declare the host alone and let the token carry authorization, e.g. wss://a-host.example.net:8443"),
+            // A path, a query, and a backslash, which is a path separator for
+            // ws/wss and so the same hazard in a different costume.
+            row("wss://a-host.example.ts.net/api", "a path, query, or fragment would be lost when the token is appended; declare scheme, host, and optional port only, e.g. wss://a-host.example.net:8443"),
+            row("wss://a-host.example.ts.net/?token=x", "a path, query, or fragment would be lost when the token is appended; declare scheme, host, and optional port only, e.g. wss://a-host.example.net:8443"),
+            row("wss://a-host\\api", "a path, query, or fragment would be lost when the token is appended; declare scheme, host, and optional port only, e.g. wss://a-host.example.net:8443"),
+            // Bracket opened and never closed.
+            row("wss://[fd7a::1", "unterminated ipv6 literal; brackets must be closed, e.g. wss://[fd7a::1]:8443"),
+            // Something other than a port after the closing bracket.
+            row("wss://[fd7a::1]x", "expected a port after the ipv6 literal, found \"x\"; write it as wss://[fd7a::1]:8443"),
             // An unbracketed ipv6 literal is ambiguous with host:port.
-            ("wss://fd7a::1", "brackets", "[fd7a::1]:8443"),
-            ("wss://[fd7a::1", "brackets", "wss://[fd7a::1]:8443"),
+            row("wss://fd7a::1", "an ipv6 literal must be wrapped in brackets, e.g. wss://[fd7a::1]:8443"),
             // Brackets promise an ipv6 address; a client throws when the
             // contents are not one, rather than reading them as a name.
-            (
-                "wss://[not-an-ip]",
-                "not an ipv6 address",
-                "without brackets",
-            ),
-            (
-                "wss://[not-an-ip]:8443",
-                "not an ipv6 address",
-                "wss://[fd7a::1]:8443",
-            ),
-            ("wss://[]", "not an ipv6 address", "wss://[fd7a::1]:8443"),
+            row("wss://[not-an-ip]", "\"not-an-ip\" is bracketed but is not an ipv6 address, and brackets are only for ipv6 literals; write an address as wss://[fd7a::1]:8443 or a name without brackets as wss://a-host.example.net:8443"),
+            row("wss://[not-an-ip]:8443", "\"not-an-ip\" is bracketed but is not an ipv6 address, and brackets are only for ipv6 literals; write an address as wss://[fd7a::1]:8443 or a name without brackets as wss://a-host.example.net:8443"),
+            row("wss://[]", "\"\" is bracketed but is not an ipv6 address, and brackets are only for ipv6 literals; write an address as wss://[fd7a::1]:8443 or a name without brackets as wss://a-host.example.net:8443"),
+            // A port with no host in front of it.
+            row("wss://:8443", "no host to dial; declare scheme, host, and optional port, e.g. wss://a-host.example.net:8443"),
             // Number-shaped hosts: a client either throws (proxy.0x10,
-            // 10.0.0.999, 1.2.3.4.5) or dials an address that shares no text
-            // with what was written (0x7f000001 and 0177.0.0.1 become
-            // 127.0.0.1, 010.0.0.1 becomes 8.0.0.1, 127.1 becomes 127.0.0.1,
-            // and the trailing dot of 192.0.2.1. is dropped). All refused by
-            // one rule, all pointed at the dotted quad.
-            ("wss://0x7f000001", "ipv4", "100.64.0.5"),
-            ("wss://proxy.0x10", "ipv4", "100.64.0.5"),
-            ("wss://127.1", "ipv4", "100.64.0.5"),
-            ("wss://192.0.2.1.", "ipv4", "100.64.0.5"),
-            ("wss://010.0.0.1", "ipv4", "no leading zeros"),
-            ("wss://10.0.0.05", "ipv4", "no leading zeros"),
-            ("wss://0177.0.0.1", "ipv4", "no leading zeros"),
-            ("wss://10.0.0.999", "ipv4", "0-255"),
-            ("wss://1.2.3.4.5", "ipv4", "100.64.0.5"),
+            // 10.0.0.999, 1.2.3.4.5) or dials an address sharing no text with
+            // what was written (0x7f000001 and 0177.0.0.1 become 127.0.0.1,
+            // 010.0.0.1 becomes 8.0.0.1, 127.1 becomes 127.0.0.1, and the
+            // trailing dot of 192.0.2.1. is dropped).
+            row("wss://0x7f000001", "\"0x7f000001\" is read as an ipv4 address, not a name, because it ends in a number, and a client would refuse it or dial a different address than it spells; write it as four plain decimal octets 0-255 with no leading zeros and no trailing dot, e.g. 100.64.0.5"),
+            row("wss://proxy.0x10", "\"proxy.0x10\" is read as an ipv4 address, not a name, because it ends in a number, and a client would refuse it or dial a different address than it spells; write it as four plain decimal octets 0-255 with no leading zeros and no trailing dot, e.g. 100.64.0.5"),
+            row("wss://127.1", "\"127.1\" is read as an ipv4 address, not a name, because it ends in a number, and a client would refuse it or dial a different address than it spells; write it as four plain decimal octets 0-255 with no leading zeros and no trailing dot, e.g. 100.64.0.5"),
+            row("wss://192.0.2.1.", "\"192.0.2.1.\" is read as an ipv4 address, not a name, because it ends in a number, and a client would refuse it or dial a different address than it spells; write it as four plain decimal octets 0-255 with no leading zeros and no trailing dot, e.g. 100.64.0.5"),
+            row("wss://010.0.0.1", "\"010.0.0.1\" is read as an ipv4 address, not a name, because it ends in a number, and a client would refuse it or dial a different address than it spells; write it as four plain decimal octets 0-255 with no leading zeros and no trailing dot, e.g. 100.64.0.5"),
+            row("wss://10.0.0.05", "\"10.0.0.05\" is read as an ipv4 address, not a name, because it ends in a number, and a client would refuse it or dial a different address than it spells; write it as four plain decimal octets 0-255 with no leading zeros and no trailing dot, e.g. 100.64.0.5"),
+            row("wss://0177.0.0.1", "\"0177.0.0.1\" is read as an ipv4 address, not a name, because it ends in a number, and a client would refuse it or dial a different address than it spells; write it as four plain decimal octets 0-255 with no leading zeros and no trailing dot, e.g. 100.64.0.5"),
+            row("wss://10.0.0.999", "\"10.0.0.999\" is read as an ipv4 address, not a name, because it ends in a number, and a client would refuse it or dial a different address than it spells; write it as four plain decimal octets 0-255 with no leading zeros and no trailing dot, e.g. 100.64.0.5"),
+            row("wss://1.2.3.4.5", "\"1.2.3.4.5\" is read as an ipv4 address, not a name, because it ends in a number, and a client would refuse it or dial a different address than it spells; write it as four plain decimal octets 0-255 with no leading zeros and no trailing dot, e.g. 100.64.0.5"),
             // Empty labels are not names.
-            (
-                "wss://a-host..example.net",
-                "empty label",
-                "wss://a-host.example.net:8443",
-            ),
-            (
-                "wss://.example.net",
-                "empty label",
-                "wss://a-host.example.net:8443",
-            ),
+            row("wss://a-host..example.net", "\"a-host..example.net\" has an empty label, and a host name cannot contain \"..\" or start with a dot; write the labels out, e.g. wss://a-host.example.net:8443"),
+            row("wss://.example.net", "\".example.net\" has an empty label, and a host name cannot contain \"..\" or start with a dot; write the labels out, e.g. wss://a-host.example.net:8443"),
             // Hyphen-edged labels are not resolvable names.
-            (
-                "wss://-a-host.example.net",
-                "hyphen",
-                "only sit inside a label",
+            row("wss://-a-host.example.net", "\"-a-host.example.net\" has a label starting or ending with a hyphen, which is not a resolvable name; hyphens may only sit inside a label, e.g. wss://a-host.example.net:8443"),
+            row("wss://a-host-.example.net", "\"a-host-.example.net\" has a label starting or ending with a hyphen, which is not a resolvable name; hyphens may only sit inside a label, e.g. wss://a-host.example.net:8443"),
+            // Non-ascii is refused rather than converted, and a stray ascii
+            // symbol lands in the same branch.
+            row("wss://naïve.example.net", "\"naïve.example.net\" is not an ipv4 literal, a bracketed ipv6 literal, or a host name; a name may hold only ascii letters, digits, hyphens, and underscores. A non-ascii name has to be declared in its punycode (xn--) form, which is what a client resolves it to anyway"),
+            row("wss://a$host.example.net", "\"a$host.example.net\" is not an ipv4 literal, a bracketed ipv6 literal, or a host name; a name may hold only ascii letters, digits, hyphens, and underscores. A non-ascii name has to be declared in its punycode (xn--) form, which is what a client resolves it to anyway"),
+            // A port must be plain digits: a signed port parses in rust but
+            // throws in a client, and an empty one is not a port at all.
+            row("wss://a-host.example.ts.net:https", "\"https\" is not a port a client could dial; write plain digits, e.g. 8443"),
+            row("wss://a-host.example.ts.net:+443", "\"+443\" is not a port a client could dial; write plain digits, e.g. 8443"),
+            row("wss://a-host.example.ts.net:", "\"\" is not a port a client could dial; write plain digits, e.g. 8443"),
+            // A leading zero is stripped by a client, so the payload text would
+            // stop naming the port dialled; the remedy names the plain form.
+            row("wss://a-host.example.ts.net:0443", "\"0443\" has a leading zero, which a client strips before dialling; write the port plainly, e.g. 443"),
+            // An all-zero port strips to nothing and a leading-zero port over the
+            // range strips to a value refused anyway, so neither may be echoed
+            // back as the remedy: both fall through to the range message.
+            row("wss://a-host.example.ts.net:00", "\"00\" is not a port a client could dial; use a port in 1-65535, e.g. 8443"),
+            row("wss://a-host.example.ts.net:099999", "\"099999\" is not a port a client could dial; use a port in 1-65535, e.g. 8443"),
+            // Out of range, with and without a leading zero.
+            row("wss://a-host.example.ts.net:0", "\"0\" is not a port a client could dial; use a port in 1-65535, e.g. 8443"),
+            row("wss://a-host.example.ts.net:99999", "\"99999\" is not a port a client could dial; use a port in 1-65535, e.g. 8443"),
+        ];
+        rows.push(row(
+            &format!("wss://{over_long_name}"),
+            "a host name cannot exceed 253 characters; declare the name the proxy actually serves, e.g. wss://a-host.example.net:8443",
+        ));
+        rows.push(row(
+            &format!("wss://{over_long_label}"),
+            &format!(
+                "{over_long_label:?} has a label longer than 63 characters, which no \
+                 resolver accepts; keep each label at 63 or fewer, \
+                 e.g. wss://a-host.example.net:8443"
             ),
-            (
-                "wss://a-host-.example.net",
-                "hyphen",
-                "wss://a-host.example.net:8443",
-            ),
-            // Non-ascii is refused rather than converted: applying idna by
-            // hand is the class this validator refuses to enter, so the
-            // refusal owes the operator the punycode form instead.
-            ("wss://naïve.example.net", "ascii", "punycode (xn--)"),
-        ] {
-            // `contains("")` is true of every string, so an empty expectation
-            // would assert nothing while reading like a check. Fail the row
-            // outright rather than let it pass vacuously.
-            assert!(
-                !expected_reason.is_empty() && !expected_remedy.is_empty(),
-                "{configured:?}: both expectations must be substantive; \
-                 an empty one asserts nothing"
-            );
+        ));
 
-            let reason = declared(configured)
+        for (configured, expected) in rows {
+            let refusal = declared(&configured)
                 .expect_err(&format!("{configured:?} must be refused, not encoded"));
-            assert!(
-                reason.contains(expected_reason),
-                "{configured:?}: expected {expected_reason:?} in {reason:?}"
-            );
-            assert!(
-                reason.contains(expected_remedy),
-                "{configured:?}: refusal must name the canonical form \
-                 {expected_remedy:?}, got {reason:?}"
-            );
+            assert_eq!(refusal, expected, "refusal text for {configured:?}");
         }
     }
 
