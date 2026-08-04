@@ -1004,7 +1004,8 @@ pub struct WebSocketApiConfig {
     /// listener — a TLS terminating proxy, for instance — so the pairing
     /// payload names the reachable url instead of the bind address, which
     /// only describes the local socket. Must be a `ws://` or `wss://` url
-    /// carrying scheme, host, and optional port and nothing else; `herdr
+    /// carrying scheme, host, optional port, and optional path and nothing
+    /// else — a path is how one proxy fronts several servers; `herdr
     /// pair` refuses to print a payload it cannot make connectable, and the
     /// `ping` pong publishes nothing rather than a url no client could dial.
     /// Unset or empty (the default) keeps the bind-derived `ws://<bind>` url.

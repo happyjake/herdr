@@ -230,7 +230,7 @@ impl PairingUnavailable {
             ),
             Self::InvalidAdvertisedEndpoint { advertised, reason } => format!(
                 "error: websocket_api.advertised_endpoint {advertised:?} in {} is not a url a client could dial: {reason}.\n\
-                 Declare the url something else serves this listener at, e.g. \"wss://a-host.example.net\" — scheme, host, and optional port only.\n\
+                 Declare the url something else serves this listener at, e.g. \"wss://a-host.example.net/herdr-ws\" — scheme, host, optional port, and optional path only.\n\
                  Remove it to pair against the bind address instead.\n",
                 config_path.display()
             ),
@@ -454,8 +454,10 @@ fn print_pair_help() {
     eprintln!();
     eprintln!("When something else fronts the listener (a TLS terminating proxy,");
     eprintln!("for instance), set [websocket_api].advertised_endpoint to the url");
-    eprintln!("clients should dial, e.g. \"wss://a-host.example.net\"; the payload");
-    eprintln!("names that instead of the bind address. Unset pairs against bind.");
+    eprintln!("clients should dial, e.g. \"wss://a-host.example.net\", or with a");
+    eprintln!("path when one proxy fronts several servers, e.g.");
+    eprintln!("\"wss://a-host.example.net/herdr-ws\"; the payload names that instead");
+    eprintln!("of the bind address. Unset pairs against bind.");
     eprintln!();
     eprintln!("The scannable URL also carries the server's display name so clients");
     eprintln!("can label the server before first connect: [websocket_api].name,");
@@ -698,11 +700,40 @@ mod tests {
         );
     }
 
-    /// Half of the invariant: an accepted value is carried into the payload
-    /// as exactly the host and port configured, because that is the only
-    /// promise this function makes to whatever client parses it back out.
+    /// What accepting a path rests on: the payload appends its query to the
+    /// declared url whole, so the path is still there in front of the token,
+    /// and a client that strips the token and name is left with exactly the
+    /// host and path that were declared.
     #[test]
-    fn an_advertised_endpoint_keeps_the_configured_scheme_host_and_port() {
+    fn an_advertised_path_survives_the_appended_token() {
+        let endpoint = declared("wss://a-host.example.ts.net/herdr-ws").unwrap();
+        assert_eq!(endpoint, "wss://a-host.example.ts.net/herdr-ws");
+
+        let payload = PairingPayload {
+            endpoint,
+            token: "abcDEF123-_".to_string(),
+            name: "the mini".to_string(),
+        };
+        assert_eq!(
+            payload.url(),
+            "wss://a-host.example.ts.net/herdr-ws/?token=abcDEF123-_&name=the%20mini"
+        );
+
+        // A declared trailing slash lands on the same url, because the
+        // canonical form drops it and the payload appends one.
+        let with_slash = PairingPayload {
+            endpoint: declared("wss://a-host.example.ts.net/herdr-ws/").unwrap(),
+            token: "abcDEF123-_".to_string(),
+            name: "the mini".to_string(),
+        };
+        assert_eq!(with_slash.url(), payload.url());
+    }
+
+    /// Half of the invariant: an accepted value is carried into the payload
+    /// as exactly the host, port, and path configured, because that is the
+    /// only promise this function makes to whatever client parses it back out.
+    #[test]
+    fn an_advertised_endpoint_keeps_the_configured_scheme_host_port_and_path() {
         for (configured, expected) in [
             // A plain single-label host.
             ("wss://a-host", "wss://a-host"),
@@ -749,6 +780,59 @@ mod tests {
             ),
             // Schemes are case-insensitive; the payload carries the canonical form.
             ("WSS://a-host.example.ts.net", "wss://a-host.example.ts.net"),
+            // A path survives the appended token rather than being lost to
+            // it: the payload composes "{endpoint}/?token=…", so this is
+            // dialled as wss://a-host.example.ts.net/herdr-ws/?token=…, which
+            // a client reads back as this host and this path.
+            (
+                "wss://a-host.example.ts.net/herdr-ws",
+                "wss://a-host.example.ts.net/herdr-ws",
+            ),
+            // The path form this ships against: one path per host, so every
+            // node can answer on the same port behind one proxy.
+            (
+                "wss://a-host-2.tailnet-name.ts.net/herdr-ws",
+                "wss://a-host-2.tailnet-name.ts.net/herdr-ws",
+            ),
+            // A trailing slash is the same url as none, and the canonical
+            // form drops it — the payload appends its own.
+            (
+                "wss://a-host.example.ts.net/herdr-ws/",
+                "wss://a-host.example.ts.net/herdr-ws",
+            ),
+            // A path rides alongside a port, an ipv4 literal, and a
+            // bracketed ipv6 literal without changing any of them.
+            (
+                "wss://a-host.example.ts.net:8443/herdr-ws",
+                "wss://a-host.example.ts.net:8443/herdr-ws",
+            ),
+            ("wss://100.64.0.5/herdr-ws", "wss://100.64.0.5/herdr-ws"),
+            (
+                "wss://[fd7a::1]:8443/herdr-ws",
+                "wss://[fd7a::1]:8443/herdr-ws",
+            ),
+            // Several segments are one path, not several.
+            (
+                "wss://a-host.example.ts.net/api/v1/herdr-ws",
+                "wss://a-host.example.ts.net/api/v1/herdr-ws",
+            ),
+            // Every character a client dials unchanged, including case: a
+            // path is case-sensitive where a host is not.
+            (
+                "wss://a-host.example.ts.net/Herdr_ws-2.0~x",
+                "wss://a-host.example.ts.net/Herdr_ws-2.0~x",
+            ),
+            // Dots inside a segment are ordinary text; only a segment that
+            // is exactly "." or ".." is resolved away.
+            (
+                "wss://a-host.example.ts.net/...",
+                "wss://a-host.example.ts.net/...",
+            ),
+            // Config noise around a url that carries a path is still noise.
+            (
+                "  WSS://a-host.example.ts.net/herdr-ws/  ",
+                "wss://a-host.example.ts.net/herdr-ws",
+            ),
         ] {
             assert_eq!(
                 declared(configured),
@@ -789,15 +873,44 @@ mod tests {
             row("https://a-host.example.ts.net", "a websocket client cannot dial https://; use ws:// or wss://"),
             // Scheme but no authority.
             row("wss://", "no host to dial; declare scheme, host, and optional port, e.g. wss://a-host.example.net:8443"),
-            // Whitespace inside the authority.
-            row("wss://a host.example.ts.net", "a host cannot contain whitespace; declare it as one unbroken url, e.g. wss://a-host.example.net:8443"),
-            // Userinfo.
+            // Whitespace anywhere in the url, host or path.
+            row("wss://a host.example.ts.net", "a url cannot contain whitespace; declare it as one unbroken url, e.g. wss://a-host.example.net:8443"),
+            row("wss://a-host.example.ts.net/herdr ws", "a url cannot contain whitespace; declare it as one unbroken url, e.g. wss://a-host.example.net:8443"),
+            // Userinfo, with and without a path behind it.
             row("wss://user@a-host.example.ts.net", "credentials do not belong in a pairing endpoint; declare the host alone and let the token carry authorization, e.g. wss://a-host.example.net:8443"),
-            // A path, a query, and a backslash, which is a path separator for
-            // ws/wss and so the same hazard in a different costume.
-            row("wss://a-host.example.ts.net/api", "a path, query, or fragment would be lost when the token is appended; declare scheme, host, and optional port only, e.g. wss://a-host.example.net:8443"),
-            row("wss://a-host.example.ts.net/?token=x", "a path, query, or fragment would be lost when the token is appended; declare scheme, host, and optional port only, e.g. wss://a-host.example.net:8443"),
-            row("wss://a-host\\api", "a path, query, or fragment would be lost when the token is appended; declare scheme, host, and optional port only, e.g. wss://a-host.example.net:8443"),
+            row("wss://user@a-host.example.ts.net/herdr-ws", "credentials do not belong in a pairing endpoint; declare the host alone and let the token carry authorization, e.g. wss://a-host.example.net:8443"),
+            // A query collides with the token the payload appends; a fragment
+            // never reaches the server at all.
+            row("wss://a-host.example.ts.net/?token=x", "a query would collide with the token the pairing payload appends; declare scheme, host, optional port, and optional path only, e.g. wss://a-host.example.net/herdr-ws"),
+            row("wss://a-host.example.ts.net/herdr-ws?x=1", "a query would collide with the token the pairing payload appends; declare scheme, host, optional port, and optional path only, e.g. wss://a-host.example.net/herdr-ws"),
+            row("wss://a-host.example.ts.net/herdr-ws#frag", "a fragment is never sent to a server, so it cannot be part of the url a client dials; declare scheme, host, optional port, and optional path only, e.g. wss://a-host.example.net/herdr-ws"),
+            // Both at once is refused by whichever the url reaches first, so
+            // the message names the delimiter that is actually in front.
+            row("wss://a-host.example.ts.net/herdr-ws?x=1#frag", "a query would collide with the token the pairing payload appends; declare scheme, host, optional port, and optional path only, e.g. wss://a-host.example.net/herdr-ws"),
+            row("wss://a-host.example.ts.net/herdr-ws#frag?x=1", "a fragment is never sent to a server, so it cannot be part of the url a client dials; declare scheme, host, optional port, and optional path only, e.g. wss://a-host.example.net/herdr-ws"),
+            // A backslash is a path separator for ws/wss, so a client dials a
+            // url spelled differently than the one declared.
+            row("wss://a-host\\api", "a backslash is read as a path separator, so a client would dial a url spelled differently than the one declared; write path separators as forward slashes, e.g. wss://a-host.example.net/herdr-ws"),
+            row("wss://a-host.example.ts.net/herdr\\ws", "a backslash is read as a path separator, so a client would dial a url spelled differently than the one declared; write path separators as forward slashes, e.g. wss://a-host.example.net/herdr-ws"),
+            // A path with no host in front of it.
+            row("wss:///herdr-ws", "no host to dial; declare scheme, host, and optional port, e.g. wss://a-host.example.net:8443"),
+            // Dot segments are resolved away before a client dials, so the
+            // path dialled is not the path declared.
+            row("wss://a-host.example.ts.net/api/../herdr-ws", "\"..\" is resolved away before a client dials, so it would dial a different path than the one declared; write the path out, e.g. wss://a-host.example.net/herdr-ws"),
+            row("wss://a-host.example.ts.net/./herdr-ws", "\".\" is resolved away before a client dials, so it would dial a different path than the one declared; write the path out, e.g. wss://a-host.example.net/herdr-ws"),
+            row("wss://a-host.example.ts.net/herdr-ws/..", "\"..\" is resolved away before a client dials, so it would dial a different path than the one declared; write the path out, e.g. wss://a-host.example.net/herdr-ws"),
+            // An empty segment: a doubled slash inside the path, and the one
+            // a second trailing slash leaves behind.
+            row("wss://a-host.example.ts.net/api//herdr-ws", "a path segment cannot be empty; write single slashes between the segments, e.g. wss://a-host.example.net/herdr-ws"),
+            row("wss://a-host.example.ts.net//", "a path segment cannot be empty; write single slashes between the segments, e.g. wss://a-host.example.net/herdr-ws"),
+            row("wss://a-host.example.ts.net/herdr-ws//", "a path segment cannot be empty; write single slashes between the segments, e.g. wss://a-host.example.net/herdr-ws"),
+            // A percent escape is preserved by some parsers and decoded by
+            // others, so the path this server answers at would depend on
+            // which client dialled it.
+            row("wss://a-host.example.ts.net/herdr%2Fws", "a percent escape is not preserved identically by every client and proxy, so the path dialled would not reliably be the one declared; write the path in plain characters, e.g. wss://a-host.example.net/herdr-ws"),
+            // Everything else outside the set that provably round-trips.
+            row("wss://a-host.example.ts.net/herdr@ws", "\"herdr@ws\" is not a path segment this endpoint can promise to round-trip; a path may hold only ascii letters, digits, hyphens, dots, underscores, and tildes, which every client dials unchanged, e.g. wss://a-host.example.net/herdr-ws"),
+            row("wss://a-host.example.ts.net/naïve", "\"naïve\" is not a path segment this endpoint can promise to round-trip; a path may hold only ascii letters, digits, hyphens, dots, underscores, and tildes, which every client dials unchanged, e.g. wss://a-host.example.net/herdr-ws"),
             // Bracket opened and never closed.
             row("wss://[fd7a::1", "unterminated ipv6 literal; brackets must be closed, e.g. wss://[fd7a::1]:8443"),
             // Something other than a port after the closing bracket.
