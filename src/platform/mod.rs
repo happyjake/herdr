@@ -355,63 +355,68 @@ pub(crate) fn is_pane_shell_process_name(name: &str) -> bool {
     )
 }
 
-/// Cwd of the pane's effective shell: the direct child, or the shell the
-/// user is actually driving when shells nest under it. A `cd` typed in a
-/// nested shell never moves the direct child, so probing only `child_pid`
-/// would serve the spawn directory forever.
+/// Cwd of the pane's effective shell: the direct child, or the nested
+/// shell the user is actually driving. A `cd` typed in a nested shell
+/// never moves the direct child, so probing only `child_pid` would serve
+/// the spawn directory forever. The driven shell is found on the
+/// foreground ancestry — the ppid chain from the PTY's foreground
+/// process-group leader up to the child — never by scanning the process
+/// table: background jobs and an agent's own tool shells sit outside
+/// that chain, and the bounded climb stays cheap on hot paths (snapshot
+/// assembly and label rendering call this per pane).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub fn pane_shell_cwd(child_pid: u32) -> Option<std::path::PathBuf> {
-    let tip = innermost_nested_shell(child_pid);
-    if tip != child_pid {
-        if let Some(cwd) = process_cwd(tip) {
-            return Some(cwd);
+pub fn pane_shell_cwd(
+    child_pid: u32,
+    foreground_process_group: Option<u32>,
+) -> Option<std::path::PathBuf> {
+    if child_pid == 0 {
+        return process_cwd(child_pid);
+    }
+    // A pane whose direct child is not a shell (an agent launched as the
+    // pane command) keeps plain child probing — its tool shells must not
+    // be mistaken for a user-driven shell.
+    let Some((_, child_name)) = process_parent_and_name(child_pid) else {
+        return process_cwd(child_pid);
+    };
+    if !is_pane_shell_process_name(&child_name) {
+        return process_cwd(child_pid);
+    }
+    let Some(mut current) = foreground_process_group else {
+        return process_cwd(child_pid);
+    };
+    for _ in 0..MAX_FOREGROUND_ANCESTRY {
+        if current == child_pid {
+            break;
         }
+        let Some((ppid, name)) = process_parent_and_name(current) else {
+            break;
+        };
+        if is_pane_shell_process_name(&name) {
+            // First shell met climbing from the foreground is the one the
+            // user is driving.
+            if let Some(cwd) = process_cwd(current) {
+                return Some(cwd);
+            }
+            break;
+        }
+        if ppid <= 1 {
+            break;
+        }
+        current = ppid;
     }
     process_cwd(child_pid)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn pane_shell_cwd(child_pid: u32) -> Option<std::path::PathBuf> {
+pub fn pane_shell_cwd(
+    child_pid: u32,
+    _foreground_process_group: Option<u32>,
+) -> Option<std::path::PathBuf> {
     process_cwd(child_pid)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const MAX_NESTED_SHELL_DEPTH: usize = 8;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn innermost_nested_shell(child_pid: u32) -> u32 {
-    if child_pid == 0 {
-        return child_pid;
-    }
-    let mut shell_children: std::collections::HashMap<u32, Vec<u32>> =
-        std::collections::HashMap::new();
-    for pid in session_processes(child_pid) {
-        if pid == child_pid {
-            continue;
-        }
-        let Some((ppid, name)) = process_parent_and_name(pid) else {
-            continue;
-        };
-        if is_pane_shell_process_name(&name) {
-            shell_children.entry(ppid).or_default().push(pid);
-        }
-    }
-    let mut tip = child_pid;
-    for _ in 0..MAX_NESTED_SHELL_DEPTH {
-        // Agents and their tool shells never join the chain: the walk only
-        // descends through shells parented by the current tip, and an agent
-        // in between is not a shell. Newest shell wins if several hang off
-        // the same parent.
-        let Some(next) = shell_children
-            .get(&tip)
-            .and_then(|kids| kids.iter().max().copied())
-        else {
-            break;
-        };
-        tip = next;
-    }
-    tip
-}
+const MAX_FOREGROUND_ANCESTRY: usize = 16;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_agent_hint(_pid: u32) -> Option<crate::detect::Agent> {
@@ -519,12 +524,63 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
+    // Fixtures get their own process group so cleanup can kill the whole
+    // tree — Child::kill alone would leave nested shells and sleeps alive,
+    // which nextest reports as leaky tests.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn poll_pane_shell_cwd_until(pid: u32, expect: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn spawn_fixture(
+        program: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+    ) -> std::process::Child {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args).process_group(0);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.spawn().unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn kill_fixture(mut child: std::process::Child) {
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+
+    // Matcher-based on purpose: macOS /bin/sh reports kernel comm "bash",
+    // so exact-name matching never finds it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn wait_for_descendant(parent: u32, matches: fn(&str) -> bool) -> Option<u32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            for pid in session_processes(parent) {
+                if pid == parent {
+                    continue;
+                }
+                if let Some((ppid, comm)) = process_parent_and_name(pid) {
+                    if ppid == parent && matches(&comm) {
+                        return Some(pid);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        None
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn poll_pane_shell_cwd_until(
+        pid: u32,
+        foreground: Option<u32>,
+        expect: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         let mut last = None;
         while std::time::Instant::now() < deadline {
-            last = pane_shell_cwd(pid);
+            last = pane_shell_cwd(pid, foreground);
             if last.as_deref() == Some(expect) {
                 return last;
             }
@@ -537,38 +593,100 @@ mod tests {
     #[test]
     fn pane_shell_cwd_follows_a_cd_in_the_direct_child_shell() {
         let target = unique_cd_target("direct");
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("cd \"{}\" && sleep 30; :", target.display()))
-            .spawn()
-            .unwrap();
-        let seen = poll_pane_shell_cwd_until(child.id(), &target);
-        let _ = child.kill();
-        let _ = child.wait();
+        let child = spawn_fixture(
+            "/bin/sh",
+            &["-c", &format!("cd \"{}\" && sleep 30; :", target.display())],
+            None,
+        );
+        let seen = poll_pane_shell_cwd_until(child.id(), Some(child.id()), &target);
+        kill_fixture(child);
         let _ = std::fs::remove_dir_all(&target);
         assert_eq!(seen.as_deref(), Some(target.as_path()));
     }
 
-    // The live shape behind stale pane cwds: the pane's direct child stays
-    // where it spawned while the user cd's inside a nested shell they
-    // launched from it (pane zsh -> zsh -> agent).
+    // The shape behind stale pane cwds: the pane's direct child stays where
+    // it spawned while the user cd's inside a nested shell launched from it
+    // and then runs a program there. The foreground process is that
+    // program; the driven shell is its parent.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn pane_shell_cwd_follows_a_cd_in_a_nested_shell() {
         let target = unique_cd_target("nested");
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!(
-                "/bin/sh -c 'cd \"{}\" && sleep 30; :'; :",
-                target.display()
-            ))
-            .spawn()
-            .unwrap();
-        let seen = poll_pane_shell_cwd_until(child.id(), &target);
-        let _ = child.kill();
-        let _ = child.wait();
+        let child = spawn_fixture(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!("/bin/sh -c 'cd \"{}\" && sleep 30; :'; :", target.display()),
+            ],
+            None,
+        );
+        let inner = wait_for_descendant(child.id(), is_pane_shell_process_name).expect("nested shell appears");
+        let foreground = wait_for_descendant(inner, |comm| comm == "sleep").expect("program appears");
+        let seen = poll_pane_shell_cwd_until(child.id(), Some(foreground), &target);
+        kill_fixture(child);
         let _ = std::fs::remove_dir_all(&target);
         assert_eq!(seen.as_deref(), Some(target.as_path()));
+    }
+
+    // A pane whose direct child is not a shell (an agent launched as the
+    // pane command) must keep plain child probing: the agent's own tool
+    // shell working elsewhere is not a user-driven shell.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pane_shell_cwd_ignores_tool_shells_under_a_non_shell_child() {
+        let target = unique_cd_target("toolshell");
+        let child = spawn_fixture(
+            "/usr/bin/find",
+            &[
+                ".",
+                "-maxdepth",
+                "0",
+                "-exec",
+                "/bin/sh",
+                "-c",
+                &format!("cd \"{}\" && sleep 30; :", target.display()),
+                ";",
+            ],
+            None,
+        );
+        let tool_shell = wait_for_descendant(child.id(), is_pane_shell_process_name).expect("tool shell appears");
+        // Give the tool shell time to reach the target before asserting the
+        // guard holds anyway.
+        let _ = poll_pane_shell_cwd_until(tool_shell, Some(tool_shell), &target);
+        let seen = pane_shell_cwd(child.id(), Some(tool_shell));
+        let direct = process_cwd(child.id());
+        kill_fixture(child);
+        let _ = std::fs::remove_dir_all(&target);
+        assert_ne!(seen.as_deref(), Some(target.as_path()));
+        assert_eq!(seen, direct);
+    }
+
+    // A backgrounded shell job is not the driven shell: while the user sits
+    // at the pane shell's prompt, a `(cd elsewhere; ...) &` child must not
+    // hijack the served cwd.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pane_shell_cwd_ignores_background_shell_jobs() {
+        let home = unique_cd_target("bgjob-home");
+        let target = unique_cd_target("bgjob-target");
+        let child = spawn_fixture(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!(
+                    "/bin/sh -c 'cd \"{}\" && sleep 30; :' & sleep 30; :",
+                    target.display()
+                ),
+            ],
+            Some(&home),
+        );
+        let background = wait_for_descendant(child.id(), is_pane_shell_process_name).expect("background job appears");
+        let _ = poll_pane_shell_cwd_until(background, Some(background), &target);
+        let seen = pane_shell_cwd(child.id(), Some(child.id()));
+        kill_fixture(child);
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(seen.as_deref(), Some(home.as_path()));
     }
 
     #[test]

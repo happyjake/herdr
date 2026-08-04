@@ -3293,7 +3293,14 @@ impl PaneRuntime {
         }
 
         let pid = self.child_pid.load(Ordering::Relaxed);
-        crate::platform::pane_shell_cwd(pid)
+        #[cfg(unix)]
+        let foreground = self
+            .io
+            .foreground_process_group_id()
+            .or_else(|| crate::platform::foreground_process_group_id(pid));
+        #[cfg(not(unix))]
+        let foreground = None;
+        crate::platform::pane_shell_cwd(pid, foreground)
     }
 
     pub fn child_pid(&self) -> Option<u32> {
