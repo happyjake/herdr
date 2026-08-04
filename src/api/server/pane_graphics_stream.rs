@@ -663,6 +663,9 @@ mod tests {
                 &crate::api::SharedServerReach::from_config(
                     &crate::config::WebSocketApiConfig::default(),
                 ),
+                &crate::api::SharedAdvertisedEndpoint::from_config(
+                    &crate::config::WebSocketApiConfig::default(),
+                ),
                 &test_credentials(),
             )
         });
@@ -770,6 +773,9 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &crate::api::SharedServerReach::from_config(
+                    &crate::config::WebSocketApiConfig::default(),
+                ),
+                &crate::api::SharedAdvertisedEndpoint::from_config(
                     &crate::config::WebSocketApiConfig::default(),
                 ),
                 &test_credentials(),
@@ -910,6 +916,9 @@ mod tests {
                 None,
                 &crate::api::SharedServerName::new("test".to_string()),
                 &crate::api::SharedServerReach::from_config(
+                    &crate::config::WebSocketApiConfig::default(),
+                ),
+                &crate::api::SharedAdvertisedEndpoint::from_config(
                     &crate::config::WebSocketApiConfig::default(),
                 ),
                 &test_credentials(),

@@ -1406,11 +1406,15 @@ impl HeadlessServer {
             .server_reach
             .clone()
             .unwrap_or_else(|| api::SharedServerReach::from_config(&self.websocket_api_config));
+        let advertised_endpoint = self.app.advertised_endpoint.clone().unwrap_or_else(|| {
+            api::SharedAdvertisedEndpoint::from_config(&self.websocket_api_config)
+        });
         let api_server = api::start_server(
             api_tx.clone(),
             self.app.event_hub.clone(),
             server_name.clone(),
             server_reach.clone(),
+            advertised_endpoint.clone(),
         )?;
         let websocket_server = api::start_websocket_server(
             &self.websocket_api_config,
@@ -1418,6 +1422,7 @@ impl HeadlessServer {
             self.app.event_hub.clone(),
             server_name,
             server_reach,
+            advertised_endpoint,
         )?;
 
         let client_path = client_socket_path();
@@ -4454,6 +4459,8 @@ pub fn run_server() -> io::Result<()> {
     // pongs match, and by the app so config reloads update the live server.
     let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
     let server_reach = api::SharedServerReach::from_config(&loaded_config.config.websocket_api);
+    let advertised_endpoint =
+        api::SharedAdvertisedEndpoint::from_config(&loaded_config.config.websocket_api);
 
     // Start the JSON API socket server.
     let _api_server = match api::start_server(
@@ -4461,6 +4468,7 @@ pub fn run_server() -> io::Result<()> {
         event_hub.clone(),
         server_name.clone(),
         server_reach.clone(),
+        advertised_endpoint.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -4479,6 +4487,7 @@ pub fn run_server() -> io::Result<()> {
         event_hub.clone(),
         server_name.clone(),
         server_reach.clone(),
+        advertised_endpoint.clone(),
     ) {
         Ok(server) => server,
         Err(err) => {
@@ -4505,6 +4514,7 @@ pub fn run_server() -> io::Result<()> {
         );
         app.set_server_name(Some(server_name));
         app.set_server_reach(Some(server_reach));
+        app.set_advertised_endpoint(Some(advertised_endpoint));
         seed_startup_workspace_if_empty(&mut app);
 
         // The server runs headless — disable local notification side effects.
@@ -4628,13 +4638,17 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
 
         let server_name = api::SharedServerName::from_config(&loaded_config.config.websocket_api);
         let server_reach = api::SharedServerReach::from_config(&loaded_config.config.websocket_api);
+        let advertised_endpoint =
+            api::SharedAdvertisedEndpoint::from_config(&loaded_config.config.websocket_api);
         app.set_server_name(Some(server_name.clone()));
         app.set_server_reach(Some(server_reach.clone()));
+        app.set_advertised_endpoint(Some(advertised_endpoint.clone()));
         let api_server = api::start_server(
             api_tx.clone(),
             event_hub.clone(),
             server_name.clone(),
             server_reach.clone(),
+            advertised_endpoint.clone(),
         )?;
         // The old server released the websocket port with its socket files;
         // bind it here so a committed handoff keeps the listener alive.
@@ -4645,6 +4659,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             event_hub.clone(),
             server_name,
             server_reach,
+            advertised_endpoint,
         )?;
         let mut server = HeadlessServer::new(
             app,
