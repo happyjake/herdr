@@ -706,6 +706,37 @@ fn process_allows_remote_memory_read(state: char, comm: &str, running_inside_wsl
         && (!running_inside_wsl || crate::detect::identify_agent(comm).is_none())
 }
 
+pub(crate) fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_ppid_and_comm_from_stat(&stat)
+}
+
+pub(crate) fn process_group_member_pids(process_group_id: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .filter(|name| name.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if process_pgrp_and_comm(pid).is_some_and(|(pgrp, _)| pgrp == process_group_id as i32) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+fn process_ppid_and_comm_from_stat(stat: &str) -> Option<(u32, String)> {
+    let close = stat.rfind(')')?;
+    let comm = stat.get(1 + stat.find('(')?..close)?.to_string();
+    let rest = stat.get(close + 2..)?;
+    let ppid: i32 = rest.split_whitespace().nth(1)?.parse().ok()?;
+    u32::try_from(ppid).ok().map(|ppid| (ppid, comm))
+}
+
 fn process_argv(pid: u32) -> Option<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     if bytes.is_empty() {

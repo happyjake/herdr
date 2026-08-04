@@ -495,6 +495,121 @@ pub(crate) fn is_pane_shell_process_name(name: &str) -> bool {
     )
 }
 
+/// Cwd of the pane's effective shell: the direct child, or the nested
+/// shell the user is actually driving. A `cd` typed in a nested shell
+/// never moves the direct child, so probing only `child_pid` would serve
+/// the spawn directory forever. The driven shell is found on the
+/// foreground ancestry — the ppid chain from the PTY's foreground
+/// process-group leader up to the child — never by scanning the process
+/// table: background jobs and an agent's own tool shells sit outside
+/// that chain, and the bounded climb stays cheap on hot paths (snapshot
+/// assembly and label rendering call this per pane).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn pane_shell_cwd(
+    child_pid: u32,
+    foreground_process_group: Option<u32>,
+) -> Option<std::path::PathBuf> {
+    if child_pid == 0 {
+        return process_cwd(child_pid);
+    }
+    // A pane whose direct child is not a shell (an agent launched as the
+    // pane command) keeps plain child probing — its tool shells must not
+    // be mistaken for a user-driven shell.
+    let Some((_, child_name)) = process_parent_and_name(child_pid) else {
+        return process_cwd(child_pid);
+    };
+    if !is_pane_shell_process_name(&child_name) {
+        return process_cwd(child_pid);
+    }
+    let Some(mut current) = foreground_process_group.and_then(live_foreground_group_member)
+    else {
+        return process_cwd(child_pid);
+    };
+    for _ in 0..MAX_FOREGROUND_ANCESTRY {
+        if current == child_pid {
+            break;
+        }
+        let Some((ppid, name)) = process_parent_and_name(current) else {
+            break;
+        };
+        if is_pane_shell_process_name(&name) {
+            // First shell met climbing from the foreground is the one the
+            // user is driving.
+            if let Some(cwd) = process_cwd(current) {
+                return Some(cwd);
+            }
+            break;
+        }
+        if ppid <= 1 {
+            break;
+        }
+        current = ppid;
+    }
+    process_cwd(child_pid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn pane_shell_cwd(
+    child_pid: u32,
+    _foreground_process_group: Option<u32>,
+) -> Option<std::path::PathBuf> {
+    process_cwd(child_pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_FOREGROUND_ANCESTRY: usize = 16;
+
+/// A process group outlives its leader (a pipeline whose first command
+/// exited still holds the terminal), so the group id is not always a live
+/// pid. Leader first — the cheap, common case — then any live member.
+/// Member enumeration scans the machine, and a dead-leader pipeline can
+/// hold the terminal for hours of repeated cwd calls, so the member that
+/// answered is remembered per group and revalidated with one getpgid per
+/// call — membership is checked, never trusted, so a died member costs
+/// exactly one fresh enumeration. (A recycled pid landing in the same
+/// group could fool the check; that coincidence only risks reading a
+/// wrong cwd until the next call.)
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn live_foreground_group_member(foreground_process_group: u32) -> Option<u32> {
+    if process_parent_and_name(foreground_process_group).is_some() {
+        return Some(foreground_process_group);
+    }
+    let cache = dead_leader_member_cache();
+    if let Ok(mut members) = cache.lock() {
+        if let Some(&member) = members.get(&foreground_process_group) {
+            let pgid = unsafe { libc::getpgid(member as libc::pid_t) };
+            if pgid == foreground_process_group as libc::pid_t {
+                return Some(member);
+            }
+            members.remove(&foreground_process_group);
+        }
+    }
+    let found = process_group_member_pids(foreground_process_group)
+        .into_iter()
+        .find(|pid| process_parent_and_name(*pid).is_some());
+    if let Ok(mut members) = cache.lock() {
+        if members.len() > 64 {
+            members.clear();
+        }
+        match found {
+            Some(member) => {
+                members.insert(foreground_process_group, member);
+            }
+            None => {
+                members.remove(&foreground_process_group);
+            }
+        }
+    }
+    found
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn dead_leader_member_cache() -> &'static std::sync::Mutex<std::collections::HashMap<u32, u32>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_agent_hint(_pid: u32) -> Option<crate::detect::Agent> {
     None
@@ -604,6 +719,250 @@ mod tests {
         for program in ["vim", "nvim", "cargo", "test-runner", "opencode"] {
             assert!(!is_pane_shell_process_name(program), "{program}");
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn unique_cd_target(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-pane-shell-cwd-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    // Fixtures run in their own process group and group-kill it on Drop,
+    // so a panicking assertion cannot leak nested shells or sleeps
+    // (nextest reports leaked descendants as leaky tests).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct Fixture {
+        child: Option<std::process::Child>,
+        pid: u32,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Fixture {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        /// Reap the root process (the group leader) while keeping the
+        /// group-kill on Drop — for tests that need a dead leader.
+        fn reap_root(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-(self.pid as i32), libc::SIGKILL);
+            }
+            if let Some(mut child) = self.child.take() {
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_fixture(program: &str, args: &[&str], cwd: Option<&std::path::Path>) -> Fixture {
+        use std::os::unix::process::CommandExt as _;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args).process_group(0);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        let spawned = cmd.spawn().unwrap();
+        let pid = spawned.id();
+        Fixture {
+            child: Some(spawned),
+            pid,
+        }
+    }
+
+    // Matcher-based on purpose: macOS /bin/sh reports kernel comm "bash",
+    // so exact-name matching never finds it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn wait_for_descendant(parent: u32, matches: fn(&str) -> bool) -> Option<u32> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            for pid in session_processes(parent) {
+                if pid == parent {
+                    continue;
+                }
+                if let Some((ppid, comm)) = process_parent_and_name(pid) {
+                    if ppid == parent && matches(&comm) {
+                        return Some(pid);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        None
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn poll_pane_shell_cwd_until(
+        pid: u32,
+        foreground: Option<u32>,
+        expect: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let mut last = None;
+        while std::time::Instant::now() < deadline {
+            last = pane_shell_cwd(pid, foreground);
+            if last.as_deref() == Some(expect) {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        last
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pane_shell_cwd_follows_a_cd_in_the_direct_child_shell() {
+        let target = unique_cd_target("direct");
+        let child = spawn_fixture(
+            "/bin/sh",
+            &["-c", &format!("cd \"{}\" && sleep 30; :", target.display())],
+            None,
+        );
+        let seen = poll_pane_shell_cwd_until(child.pid(), Some(child.pid()), &target);
+        drop(child);
+        let _ = std::fs::remove_dir_all(&target);
+        assert_eq!(seen.as_deref(), Some(target.as_path()));
+    }
+
+    // The shape behind stale pane cwds: the pane's direct child stays where
+    // it spawned while the user cd's inside a nested shell launched from it
+    // and then runs a program there. The foreground process is that
+    // program; the driven shell is its parent.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pane_shell_cwd_follows_a_cd_in_a_nested_shell() {
+        let target = unique_cd_target("nested");
+        let child = spawn_fixture(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!("/bin/sh -c 'cd \"{}\" && sleep 30; :'; :", target.display()),
+            ],
+            None,
+        );
+        let inner = wait_for_descendant(child.pid(), is_pane_shell_process_name).expect("nested shell appears");
+        let foreground = wait_for_descendant(inner, |comm| comm == "sleep").expect("program appears");
+        let seen = poll_pane_shell_cwd_until(child.pid(), Some(foreground), &target);
+        drop(child);
+        let _ = std::fs::remove_dir_all(&target);
+        assert_eq!(seen.as_deref(), Some(target.as_path()));
+    }
+
+    // A pane whose direct child is not a shell (an agent launched as the
+    // pane command) must keep plain child probing: the agent's own tool
+    // shell working elsewhere is not a user-driven shell.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pane_shell_cwd_ignores_tool_shells_under_a_non_shell_child() {
+        let target = unique_cd_target("toolshell");
+        let child = spawn_fixture(
+            "/usr/bin/find",
+            &[
+                ".",
+                "-maxdepth",
+                "0",
+                "-exec",
+                "/bin/sh",
+                "-c",
+                &format!("cd \"{}\" && sleep 30; :", target.display()),
+                ";",
+            ],
+            None,
+        );
+        let tool_shell = wait_for_descendant(child.pid(), is_pane_shell_process_name).expect("tool shell appears");
+        // Give the tool shell time to reach the target before asserting the
+        // guard holds anyway.
+        let _ = poll_pane_shell_cwd_until(tool_shell, Some(tool_shell), &target);
+        let seen = pane_shell_cwd(child.pid(), Some(tool_shell));
+        let direct = process_cwd(child.pid());
+        drop(child);
+        let _ = std::fs::remove_dir_all(&target);
+        assert_ne!(seen.as_deref(), Some(target.as_path()));
+        assert_eq!(seen, direct);
+    }
+
+    // A backgrounded shell job is not the driven shell: while the user sits
+    // at the pane shell's prompt, a `(cd elsewhere; ...) &` child must not
+    // hijack the served cwd.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pane_shell_cwd_ignores_background_shell_jobs() {
+        let home = unique_cd_target("bgjob-home");
+        let target = unique_cd_target("bgjob-target");
+        let child = spawn_fixture(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!(
+                    "/bin/sh -c 'cd \"{}\" && sleep 30; :' & sleep 30; :",
+                    target.display()
+                ),
+            ],
+            Some(&home),
+        );
+        let background = wait_for_descendant(child.pid(), is_pane_shell_process_name).expect("background job appears");
+        let _ = poll_pane_shell_cwd_until(background, Some(background), &target);
+        let seen = pane_shell_cwd(child.pid(), Some(child.pid()));
+        drop(child);
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(seen.as_deref(), Some(home.as_path()));
+    }
+
+    // A pipeline whose first command exited leaves a foreground group
+    // whose leader pid is gone while members still hold the terminal.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_foreground_group_member_survives_a_dead_leader() {
+        let mut fixture = spawn_fixture("/bin/sh", &["-c", "sleep 30 & :"], None);
+        let leader = fixture.pid();
+        fixture.reap_root();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while process_parent_and_name(leader).is_some() && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            process_parent_and_name(leader).is_none(),
+            "group leader must be gone"
+        );
+        let member = live_foreground_group_member(leader).expect("a live member is found");
+        assert_ne!(member, leader);
+        assert_eq!(
+            unsafe { libc::getpgid(member as libc::pid_t) },
+            leader as libc::pid_t
+        );
+        // The remembered member is revalidated, never trusted: once it dies
+        // the resolver must not serve it again.
+        unsafe {
+            libc::kill(member as libc::pid_t, libc::SIGKILL);
+        }
+        let gone = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while process_parent_and_name(member).is_some() && std::time::Instant::now() < gone {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            process_parent_and_name(member).is_none(),
+            "member must be gone"
+        );
+        assert_ne!(live_foreground_group_member(leader), Some(member));
     }
 
     #[test]
