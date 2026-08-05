@@ -57,6 +57,10 @@ Agent commands accept either a unique live agent name or the pane ID currently h
 
 `idle` means the agent is ready for input and its tab has been seen in the focused Herdr UI. `done` is the same underlying idle state after unseen background work finishes. Focusing the tab or targeting the pane or agent with a focus command marks it seen. CLI reads do not mark it seen. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify it confidently; it does not prove completion.
 
+Lifecycle state, not a pane read, is the oracle for whether input landed. A pane hosting an idle agent may not repaint for a long time, so a read can return a frame that predates everything you just sent — keys reported as delivered while the captured screen is unchanged. When a send appears to do nothing, compare the agent's state before and after rather than the frame: a status moving to `working` is proof the input arrived, and an unchanged frame is not proof it did not.
+
+A pane's composer may already hold text a person typed and never submitted. Submitting text to that pane appends to what is there rather than replacing it, so an unsent line and yours arrive as one message. Read the composer before sending into a pane you do not own, and treat anything you find as the pane owner's intent — preserve it, or say plainly that you cleared it and what it said. Pressing Enter on someone else's draft submits their instruction, which is theirs to send, not yours.
+
 ## Use IDs and caller context
 
 Public IDs are opaque stable handles:
