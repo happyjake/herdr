@@ -11,7 +11,7 @@ pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
 #[cfg(test)]
 pub(crate) use api::test_support::exiting_test_command;
-mod api_helpers;
+pub(crate) mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod creation;
 mod custom_commands;
@@ -3432,6 +3432,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         assert_eq!(
             app.state.terminals.get(&terminal_id).unwrap().state,
@@ -3456,6 +3457,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         tokio::pin!(send);
 

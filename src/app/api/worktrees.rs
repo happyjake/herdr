@@ -2454,6 +2454,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         assert!(app.state.pending_agent_notifications.contains_key(&pane_id));
         let (runtime, _input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);

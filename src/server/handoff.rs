@@ -360,10 +360,7 @@ pub(crate) fn honor_legacy_alternate_screen_panes(manifest: &mut HandoffManifest
         .collect();
 
     for pane in manifest.panes.iter_mut() {
-        let carried_alternate = pane
-            .input_state
-            .as_ref()
-            .is_some_and(|input_state| input_state.alternate_screen);
+        let carried_alternate = pane.carries_alternate_screen();
         let stream_sets_mode = pane
             .initial_history_ansi
             .as_deref()
@@ -630,7 +627,6 @@ mod tests {
         assert!(older.api_window_title.is_none());
     }
 
-
     fn manifest_pane(
         pane_id: u32,
         alternate_screen: bool,
@@ -680,6 +676,10 @@ mod tests {
                             value: "session-1".into(),
                         }),
                         launch_argv: None,
+                        agent_status: None,
+                        agent_status_changed_at: None,
+                        agent_status_resolve_by: None,
+                        agent_status_saw_other: false,
                     },
                 )
             })

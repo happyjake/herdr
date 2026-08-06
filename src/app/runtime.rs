@@ -40,6 +40,26 @@ impl App {
         }
     }
 
+    /// Classify every pane whose restored status claim has run out, dating
+    /// each at its own deadline. Returns whether any pane changed.
+    pub(crate) fn resolve_due_agent_status_windows(&mut self, now: Instant) -> bool {
+        if self
+            .state
+            .next_agent_status_resolution_deadline(now)
+            .is_none_or(|deadline| now < deadline)
+        {
+            return false;
+        }
+        let resolved = self
+            .state
+            .resolve_due_agent_status_windows_at(crate::pane::unix_now_secs());
+        let changed = !resolved.is_empty();
+        for (ws_idx, pane_id) in resolved {
+            self.emit_pane_updated(ws_idx, pane_id);
+        }
+        changed
+    }
+
     pub(crate) fn sync_agent_metadata_deadline(&mut self) {
         self.agent_metadata_deadline = self.state.next_agent_metadata_expiry();
     }
@@ -151,6 +171,7 @@ impl App {
             self.toast_deadline,
             self.state.next_pending_agent_notification_deadline(),
             self.state.next_managed_agent_deadline(),
+            self.state.next_agent_status_resolution_deadline(now),
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
                 .flatten(),

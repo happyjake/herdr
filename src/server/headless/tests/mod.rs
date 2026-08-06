@@ -778,6 +778,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
                 visible_working: state == crate::detect::AgentState::Working,
                 process_exited: false,
                 observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             });
         }
         server.render_and_stream();
@@ -2684,6 +2685,7 @@ async fn public_agent_focus_replaces_a_diverged_client_shell_projection() {
             pane_id: first_pane,
             agent: crate::detect::Agent::Claude,
             observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
         })
         .unwrap();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
@@ -7285,6 +7287,7 @@ fn completion_guard_api_startup_blocker_respects_suppression() {
         pane_id,
         agent: crate::detect::Agent::Pi,
         observed_at: Instant::now(),
+        reading: crate::events::StatusReading::Provisional,
     });
     let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
     for (seq, state) in [
@@ -7444,6 +7447,7 @@ fn startup_idle_does_not_forward_completion() {
             pane_id,
             agent: crate::detect::Agent::Pi,
             observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
         })
     );
 
@@ -7474,6 +7478,7 @@ fn startup_idle_does_not_forward_completion() {
             visible_working: false,
             process_exited: false,
             observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         })
     );
     assert!(

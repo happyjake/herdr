@@ -983,6 +983,7 @@ fn worktree_request_and_response_round_trip() {
                 scroll: None,
                 mouse_tracking: false,
                 alternate_screen: false,
+                agent_status_changed_at: Some(1_700_000_000),
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1416,6 +1417,7 @@ fn create_response_round_trips_with_root_pane() {
                 scroll: None,
                 mouse_tracking: false,
                 alternate_screen: false,
+                agent_status_changed_at: None,
                 revision: 0,
             },
         },

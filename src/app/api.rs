@@ -646,9 +646,7 @@ impl App {
         };
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
-        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.clear_agent_runtime_identity_after_respawn();
-        }
+        self.state.clear_agent_identity_after_respawn(&terminal_id);
         if focus_pane {
             self.state.focus_pane_in_workspace(ws_idx, pane_id);
         }
@@ -813,6 +811,7 @@ impl App {
     }
 
     pub(crate) fn emit_pane_updated(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
+        self.state.sync_agent_status_clocks();
         if let Some(pane) = self.pane_info(ws_idx, pane_id) {
             self.emit_event(crate::api::schema::EventEnvelope {
                 event: crate::api::schema::EventKind::PaneUpdated,
@@ -949,6 +948,9 @@ impl App {
         request: crate::api::schema::Request,
     ) -> String {
         self.sync_pending_terminal_titles();
+        // Catch any status move that reached a pane through a path with no
+        // event of its own, so a snapshot never reports a stale transition.
+        self.state.sync_agent_status_clocks();
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
@@ -1900,6 +1902,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         app.handle_internal_event(AppEvent::StateChanged {
             pane_id: root,
@@ -1909,6 +1912,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert_eq!(
@@ -1993,6 +1997,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         app.handle_internal_event(AppEvent::StateChanged {
             pane_id: root,
@@ -2002,6 +2007,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let notification_deadline = app
@@ -2118,6 +2124,7 @@ mod tests {
                 visible_working: false,
                 process_exited: true,
                 observed_at: std::time::Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             });
 
             // The release event is this test's subject; the name outliving the
@@ -2178,6 +2185,7 @@ mod tests {
             visible_working: false,
             process_exited: true,
             observed_at,
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let terminal = &app.state.terminals[&terminal_id];
@@ -2360,6 +2368,7 @@ mod tests {
             visible_working: false,
             process_exited: true,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert_eq!(
@@ -2484,6 +2493,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         app.state.toast = Some(crate::app::state::ToastNotification {
             kind: ToastKind::Finished,
@@ -2504,6 +2514,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert_eq!(

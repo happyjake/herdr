@@ -514,11 +514,13 @@ mod tests {
             visible_working: false,
             process_exited: true,
             observed_at,
+            reading: crate::events::StatusReading::Verdict,
         });
         app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
             pane_id,
             agent: Agent::Pi,
             observed_at: observed_at + std::time::Duration::from_secs(1),
+            reading: crate::events::StatusReading::Provisional,
         });
 
         let terminal = &app.state.terminals[&terminal_id];
