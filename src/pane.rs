@@ -41,13 +41,15 @@ use self::agent_detection::{
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
+#[cfg(test)]
+pub(crate) use self::state::RESTORE_DEADLINE_PROBE_SECS;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
     TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalTextMatch,
     TerminalTextPoint, TerminalWordMotion,
 };
 pub use self::{
-    state::PaneState,
+    state::{unix_now_secs, AgentStatusClaim, PaneState},
     terminal::{
         InputState, RecentReadRequest, RecentReadWindow, ScrollMetrics, TerminalCursorState,
     },
@@ -183,6 +185,7 @@ async fn publish_state_changed_event(
     visible_working: bool,
     process_exited: bool,
     observed_at: std::time::Instant,
+    reading: crate::events::StatusReading,
 ) {
     // This runs on the async detector task, not the PTY reader thread.
     // Waiting for queue space here preserves correctness-critical state transitions
@@ -196,6 +199,7 @@ async fn publish_state_changed_event(
             visible_working,
             process_exited,
             observed_at,
+            reading,
         })
         .await
     {
@@ -250,6 +254,8 @@ async fn apply_agent_detection_publish_update(
         update.visible_working,
         update.process_exited,
         observed_at,
+        // Past the startup grace window, this is the detector's verdict.
+        crate::events::StatusReading::Verdict,
     )
     .await;
 }
@@ -783,6 +789,7 @@ fn spawn_basic_detection_task(
                                 false,
                                 false,
                                 now,
+                                crate::events::StatusReading::Provisional,
                             )
                             .await;
                         } else {
@@ -2492,6 +2499,7 @@ impl PaneRuntime {
                                             false,
                                             false,
                                             now,
+                                            crate::events::StatusReading::Provisional,
                                         )
                                         .await;
                                     } else {
@@ -4498,6 +4506,7 @@ mod tests {
             false,
             false,
             std::time::Instant::now(),
+            crate::events::StatusReading::Verdict,
         );
         tokio::pin!(publish);
 
@@ -4536,6 +4545,7 @@ mod tests {
                 visible_working: false,
                 process_exited: false,
                 observed_at: _,
+                reading: crate::events::StatusReading::Verdict,
             } if delivered_pane == pane_id
         ));
     }

@@ -51,6 +51,34 @@ pub struct WorktreeRemoveResult {
     pub result: Result<(), String>,
 }
 
+/// What a change to a pane says about that pane's agent status.
+///
+/// This is a claim about status, not a description of the plumbing that
+/// carried it. A change can travel the same code path as a status change and
+/// still say nothing about status — a title update is the clearest case — and
+/// only what it claims decides whether it can settle what a session recorded
+/// about the pane before a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusReading {
+    /// A statement about the pane's status from a source entitled to make
+    /// one: the detector past its startup grace, an accepted hook report, a
+    /// process exit. Confirming what a pane is doing is as much a statement as
+    /// contradicting it, so this counts whether or not the value moves.
+    Verdict,
+    /// A change entitled to move the status but not itself a statement about
+    /// it, such as an agent being released or reported metadata expiring. It
+    /// counts only when the status value actually moves.
+    Incidental,
+    /// A reading the source may still revise. The detector announces a pane as
+    /// Idle the moment it recognises an agent and only classifies it once its
+    /// startup grace has passed; treating that placeholder as a statement
+    /// would throw away an age the pane is about to get back.
+    Provisional,
+    /// Says nothing about status: a title, a display label, a session
+    /// identity. It can never settle anything, whatever else it changes.
+    DisplayOnly,
+}
+
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
@@ -65,6 +93,7 @@ pub enum AppEvent {
         visible_working: bool,
         process_exited: bool,
         observed_at: Instant,
+        reading: StatusReading,
     },
     /// Hook-authoritative agent state was reported for a pane.
     HookStateReported {

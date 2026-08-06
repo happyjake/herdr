@@ -5,6 +5,7 @@ use ratatui::layout::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::layout::Node;
+use crate::pane::PaneState;
 use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
@@ -107,6 +108,63 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// Effective agent status the pane was reporting when this was captured,
+    /// under the same name the socket API uses.
+    ///
+    /// Held as a name rather than the wire enum so a snapshot written by a
+    /// build that knows a status this one does not still restores; the
+    /// unreadable name is dropped instead of failing the whole session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<String>,
+    /// Unix seconds at which that status began. Restored together with
+    /// `agent_status` so pane ages survive a restart or a live handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status_changed_at: Option<u64>,
+    /// Unix second past which this claim is no longer worth honouring,
+    /// present only while the pane it came from was still waiting to be
+    /// classified.
+    ///
+    /// The deadline travels with the claim so every reader can check it
+    /// against its own clock. A manifest that takes half a minute to reach the
+    /// process that reads it cannot renew a claim by being slow, and no future
+    /// reader has to remember to re-check anything the writer thought it knew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status_resolve_by: Option<u64>,
+    /// Whether the pane had reported some other known status while this claim
+    /// was outstanding.
+    ///
+    /// Travels with the claim because it is part of what the claim asserts: a
+    /// claim that saw an interlude before a handoff is still a claim that saw
+    /// one after it, and a reader that reset this would let the next process
+    /// inherit an age across a status the previous one already reported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_status_saw_other: bool,
+}
+
+/// The socket API's name for a status, as stored in a snapshot.
+pub fn agent_status_snapshot_name(status: crate::api::schema::AgentStatus) -> &'static str {
+    use crate::api::schema::AgentStatus;
+    match status {
+        AgentStatus::Idle => "idle",
+        AgentStatus::Working => "working",
+        AgentStatus::Blocked => "blocked",
+        AgentStatus::Done => "done",
+        AgentStatus::Unknown => "unknown",
+    }
+}
+
+/// Read back a name written by [`agent_status_snapshot_name`], or `None` when
+/// the snapshot names a status this build does not know.
+pub fn agent_status_from_snapshot_name(name: &str) -> Option<crate::api::schema::AgentStatus> {
+    use crate::api::schema::AgentStatus;
+    match name {
+        "idle" => Some(AgentStatus::Idle),
+        "working" => Some(AgentStatus::Working),
+        "blocked" => Some(AgentStatus::Blocked),
+        "done" => Some(AgentStatus::Done),
+        "unknown" => Some(AgentStatus::Unknown),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,10 +379,15 @@ fn capture_tab(
         let cwd = tab
             .cwd_for_pane(*id, terminals, terminal_runtimes)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
-        let terminal = tab
-            .panes
-            .get(id)
-            .and_then(|pane| terminals.get(&pane.attached_terminal_id));
+        let pane_state = tab.panes.get(id);
+        let terminal = pane_state.and_then(|pane| terminals.get(&pane.attached_terminal_id));
+        let durable_agent_status = pane_state.map(PaneState::durable_agent_status);
+        let agent_status =
+            durable_agent_status.map(|claim| agent_status_snapshot_name(claim.status).to_string());
+        let agent_status_changed_at = durable_agent_status.map(|claim| claim.changed_at);
+        let agent_status_resolve_by = durable_agent_status.and_then(|claim| claim.resolve_by);
+        let agent_status_saw_other =
+            durable_agent_status.is_some_and(|claim| claim.saw_other_status);
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
@@ -368,6 +431,10 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                agent_status,
+                agent_status_changed_at,
+                agent_status_resolve_by,
+                agent_status_saw_other,
             },
         );
     }
@@ -615,6 +682,137 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_snapshot_names_match_the_socket_api_names() {
+        use crate::api::schema::AgentStatus;
+
+        for status in [
+            AgentStatus::Idle,
+            AgentStatus::Working,
+            AgentStatus::Blocked,
+            AgentStatus::Done,
+            AgentStatus::Unknown,
+        ] {
+            let wire = serde_json::to_value(status).unwrap();
+            assert_eq!(
+                wire.as_str(),
+                Some(agent_status_snapshot_name(status)),
+                "snapshot name must not drift from the wire name"
+            );
+            assert_eq!(
+                agent_status_from_snapshot_name(agent_status_snapshot_name(status)),
+                Some(status)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_status_name_is_dropped_rather_than_guessed() {
+        assert_eq!(agent_status_from_snapshot_name("supervising"), None);
+    }
+
+    #[test]
+    fn a_captured_pane_carries_the_status_clock_a_handoff_has_to_preserve() {
+        let mut workspace = Workspace::test_new("one");
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace
+            .pane_state(root)
+            .expect("root pane exists")
+            .attached_terminal_id
+            .clone();
+        workspace.tabs[0].panes.insert(
+            root,
+            PaneState::restored(
+                terminal_id,
+                crate::api::schema::AgentStatus::Working,
+                1_700,
+                crate::pane::unix_now_secs(),
+            ),
+        );
+
+        let snapshot = capture(
+            std::slice::from_ref(&workspace),
+            &std::collections::HashMap::new(),
+            &Default::default(),
+            Some(0),
+            0,
+            30,
+            0.5,
+            Default::default(),
+        );
+
+        // Survives the write and the read, which is what a live handoff does.
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        let pane = restored.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("captured pane");
+        assert_eq!(pane.agent_status.as_deref(), Some("working"));
+        assert_eq!(pane.agent_status_changed_at, Some(1_700));
+    }
+
+    #[test]
+    fn a_capture_racing_the_deadline_does_not_carry_a_dead_pair_onward() {
+        let mut workspace = Workspace::test_new("one");
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace
+            .pane_state(root)
+            .expect("root pane exists")
+            .attached_terminal_id
+            .clone();
+        // A handoff started while the window was alive, reaching the capture
+        // just after its deadline. The pane was never classified, so nothing
+        // has closed the window yet.
+        let restored_at = crate::pane::unix_now_secs() - crate::pane::RESTORE_DEADLINE_PROBE_SECS;
+        let mut pane = PaneState::restored(
+            terminal_id,
+            crate::api::schema::AgentStatus::Working,
+            1_700,
+            restored_at,
+        );
+        assert!(pane.awaits_agent_status_resolution());
+        pane.seen = true;
+        workspace.tabs[0].panes.insert(root, pane);
+
+        let snapshot = capture(
+            std::slice::from_ref(&workspace),
+            &std::collections::HashMap::new(),
+            &Default::default(),
+            Some(0),
+            0,
+            30,
+            0.5,
+            Default::default(),
+        );
+
+        let pane_snapshot = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("captured pane");
+        assert_eq!(
+            pane_snapshot.agent_status.as_deref(),
+            Some("unknown"),
+            "a dead pair must not reach the replacement process"
+        );
+        assert_ne!(pane_snapshot.agent_status_changed_at, Some(1_700));
+    }
+
+    #[test]
+    fn a_snapshot_written_before_the_status_clock_still_restores() {
+        let json = r#"{
+            "cwd": "/tmp",
+            "label": null
+        }"#;
+
+        let pane: PaneSnapshot = serde_json::from_str(json).expect("older snapshots stay readable");
+
+        assert_eq!(pane.agent_status, None);
+        assert_eq!(pane.agent_status_changed_at, None);
+    }
+
+    #[test]
     fn round_trip_layout_snapshot() {
         let layout = LayoutSnapshot::Split {
             direction: DirectionSnapshot::Horizontal,
@@ -648,6 +846,10 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                agent_status: None,
+                agent_status_changed_at: None,
+                agent_status_resolve_by: None,
+                agent_status_saw_other: false,
             },
         );
         panes.insert(
@@ -659,6 +861,10 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                agent_status: None,
+                agent_status_changed_at: None,
+                agent_status_resolve_by: None,
+                agent_status_saw_other: false,
             },
         );
 
@@ -1207,6 +1413,10 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                agent_status: None,
+                agent_status_changed_at: None,
+                agent_status_resolve_by: None,
+                agent_status_saw_other: false,
             },
         );
         panes.insert(
@@ -1220,6 +1430,10 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                agent_status: None,
+                agent_status_changed_at: None,
+                agent_status_resolve_by: None,
+                agent_status_saw_other: false,
             },
         );
 

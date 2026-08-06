@@ -571,6 +571,10 @@ mod tests {
                             value: "session-1".into(),
                         }),
                         launch_argv: None,
+                        agent_status: None,
+                        agent_status_changed_at: None,
+                        agent_status_resolve_by: None,
+                        agent_status_saw_other: false,
                     },
                 )
             })

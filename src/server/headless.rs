@@ -4127,6 +4127,22 @@ impl HeadlessServer {
         if self
             .app
             .state
+            .next_agent_status_resolution_deadline(now)
+            .is_some_and(|deadline| now >= deadline)
+        {
+            let resolved = self
+                .app
+                .state
+                .resolve_due_agent_status_windows_at(crate::pane::unix_now_secs());
+            for (ws_idx, pane_id) in resolved {
+                self.app.emit_pane_updated(ws_idx, pane_id);
+                changed = true;
+            }
+        }
+
+        if self
+            .app
+            .state
             .next_pending_agent_notification_deadline()
             .is_some_and(|deadline| now >= deadline)
         {
@@ -10113,6 +10129,7 @@ next_tab = ""
             visible_working: false,
             process_exited: false,
             observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert!(changed);
@@ -10202,6 +10219,7 @@ next_tab = ""
                 visible_working: false,
                 process_exited: false,
                 observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             })
         );
         assert!(server.app.state.toast.is_none());

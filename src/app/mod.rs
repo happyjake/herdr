@@ -9,7 +9,7 @@ mod agent_resume;
 pub(crate) mod agent_view;
 mod agents;
 mod api;
-mod api_helpers;
+pub(crate) mod api_helpers;
 mod config_io;
 mod creation;
 mod git_refresh;
@@ -4999,6 +4999,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         assert_eq!(
             app.state.terminals.get(&terminal_id).unwrap().state,
@@ -5023,6 +5024,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         tokio::pin!(send);
 

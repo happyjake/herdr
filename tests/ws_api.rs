@@ -997,6 +997,18 @@ fn pane_list_and_pane_read_are_identical_over_unix_socket_and_websocket() {
     let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
 
     let list_request = r#"{"id":"req_eq_list","method":"pane.list","params":{}}"#;
+    let ws_listed = ws.request(list_request);
+    let ws_pane = ws_listed["result"]["panes"]
+        .as_array()
+        .expect("pane.list returns panes")
+        .iter()
+        .find(|pane| pane["pane_id"] == pane_id.as_str())
+        .unwrap_or_else(|| panic!("the created pane is listed over the websocket: {ws_listed}"));
+    assert!(
+        ws_pane["agent_status_changed_at"].is_u64(),
+        "the websocket transport carries agent_status_changed_at too: {ws_pane}"
+    );
+
     assert_eventually_identical(
         "pane.list",
         || unix_request(&server.socket_path, list_request),
