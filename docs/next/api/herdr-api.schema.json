@@ -701,8 +701,21 @@
                     "null"
                   ]
                 },
+                "label": {
+                  "default": null,
+                  "description": "The pane's manual label, always serialized and `null` when unset, so\na subscriber can tell a cleared label from a server that predates\nthe field.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
+                },
+                "pinned": {
+                  "default": false,
+                  "description": "Whether the user has pinned the pane, always serialized for the same\nreason the label is.",
+                  "type": "boolean"
                 },
                 "state_labels": {
                   "additionalProperties": {
@@ -802,6 +815,15 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "agent_status_changed_at": {
+              "description": "Unix seconds at which `agent_status` last changed for this pane.\n\nThis server always sends it, so a client that has just connected can\ndate a status it never watched change. Additive and optional rather\nthan a plain integer: payloads from older servers omit it, and absent\nhas to stay distinguishable from a real timestamp so a client renders\nno age instead of an age measured from the unix epoch.\n\nThis always dates exactly the `agent_status` in the same payload, never\nsome other status the pane held earlier.\n\nThe date is captured with the session, so it survives a server restart\nand a live handoff. Until the new server has classified a pane, though,\nwhat it reports is dated to the restart; a pane then found doing what\nthe session recorded gets its older date back, provided it reported no\nother KNOWN status in between; Unknown does not count, being the\nabsence of a reading rather than a competing one, so a client may see\nUnknown give way to a status dated before the restart. A pane found\ndoing anything else is dated at the classification. The guarantee is\nprecise: an age never spans an observed transition between known\nstatuses. A change that says nothing about status, such as a title,\nnever moves this at all.\n\nEvery change of the reported status restamps this, including a Done to\nIdle change caused by the pane being seen at the desk rather than by\nthe agent. A client that folds read-driven transitions without ageing\nits own rows should expect an age seeded from here to be at most as old\nas the last desk read of that pane, not to match its own stamp.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "alternate_screen": {
               "default": false,
               "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
@@ -841,6 +863,11 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "pinned": {
+              "default": false,
+              "description": "Whether the user has pinned this pane, as `pane.set_pinned` and\n`herdr pane pin` set it.\n\nAlways serialized, unlike the optional presentation fields: a client\nreads the absence of this key as a server that predates the pin and\noffers no pinning at all, so `false` has to stay distinguishable from\n\"this server has no such notion\".\n\nThe pin is the user's own mark. It is theirs to set: read it freely,\nand write it only when the user asks for it.",
+              "type": "boolean"
             },
             "restore_error": {
               "type": [
@@ -3376,6 +3403,21 @@
           "required": [
             "pane_id",
             "text"
+          ],
+          "type": "object"
+        },
+        "PaneSetPinnedParams": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "pinned": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "pane_id",
+            "pinned"
           ],
           "type": "object"
         },
@@ -6115,6 +6157,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.set_pinned",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSetPinnedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.send_text",
               "type": "string"
             },
@@ -6617,8 +6675,21 @@
                 "null"
               ]
             },
+            "label": {
+              "default": null,
+              "description": "The pane's manual label, always serialized and `null` when unset, so a\nsubscriber can tell a cleared label from a server that predates the\nfield. The other optional presentation fields stay omitted when unset.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
+            },
+            "pinned": {
+              "default": false,
+              "description": "Whether the user has pinned the pane, always serialized for the same\nreason the label is: a subscriber reads an absent key as a server that\npredates the pin, not as an unpinned pane.",
+              "type": "boolean"
             },
             "state_labels": {
               "additionalProperties": {
@@ -7721,8 +7792,21 @@
                     "null"
                   ]
                 },
+                "label": {
+                  "default": null,
+                  "description": "The pane's manual label, always serialized and `null` when unset, so\na subscriber can tell a cleared label from a server that predates\nthe field.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
+                },
+                "pinned": {
+                  "default": false,
+                  "description": "Whether the user has pinned the pane, always serialized for the same\nreason the label is.",
+                  "type": "boolean"
                 },
                 "state_labels": {
                   "additionalProperties": {
@@ -8217,6 +8301,15 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "agent_status_changed_at": {
+              "description": "Unix seconds at which `agent_status` last changed for this pane.\n\nThis server always sends it, so a client that has just connected can\ndate a status it never watched change. Additive and optional rather\nthan a plain integer: payloads from older servers omit it, and absent\nhas to stay distinguishable from a real timestamp so a client renders\nno age instead of an age measured from the unix epoch.\n\nThis always dates exactly the `agent_status` in the same payload, never\nsome other status the pane held earlier.\n\nThe date is captured with the session, so it survives a server restart\nand a live handoff. Until the new server has classified a pane, though,\nwhat it reports is dated to the restart; a pane then found doing what\nthe session recorded gets its older date back, provided it reported no\nother KNOWN status in between; Unknown does not count, being the\nabsence of a reading rather than a competing one, so a client may see\nUnknown give way to a status dated before the restart. A pane found\ndoing anything else is dated at the classification. The guarantee is\nprecise: an age never spans an observed transition between known\nstatuses. A change that says nothing about status, such as a title,\nnever moves this at all.\n\nEvery change of the reported status restamps this, including a Done to\nIdle change caused by the pane being seen at the desk rather than by\nthe agent. A client that folds read-driven transitions without ageing\nits own rows should expect an age seeded from here to be at most as old\nas the last desk read of that pane, not to match its own stamp.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "alternate_screen": {
               "default": false,
               "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
@@ -8256,6 +8349,11 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "pinned": {
+              "default": false,
+              "description": "Whether the user has pinned this pane, as `pane.set_pinned` and\n`herdr pane pin` set it.\n\nAlways serialized, unlike the optional presentation fields: a client\nreads the absence of this key as a server that predates the pin and\noffers no pinning at all, so `false` has to stay distinguishable from\n\"this server has no such notion\".\n\nThe pin is the user's own mark. It is theirs to set: read it freely,\nand write it only when the user asks for it.",
+              "type": "boolean"
             },
             "restore_error": {
               "type": [

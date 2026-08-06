@@ -201,6 +201,8 @@ fn pane_scroll_result(
             }),
             mouse_tracking: false,
             alternate_screen: false,
+            agent_status_changed_at: None,
+            pinned: false,
             revision: 0,
         },
     }

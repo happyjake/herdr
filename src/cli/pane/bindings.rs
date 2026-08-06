@@ -596,6 +596,26 @@ pub(super) const LEAVES: &[Leaf] = &[
         PaneRename
     ),
     Leaf {
+        name: "pin",
+        about: "Pin a pane at the user's request",
+        id: "cli:pane:set_pinned",
+        output: Output::Json,
+        arguments: PaneSetPinnedProjection::arguments,
+        method: |matches| {
+            let mut params = PaneSetPinnedProjection::from_matches(matches)?;
+            params.pinned = true;
+            Ok(Method::PaneSetPinned(params))
+        },
+    },
+    leaf!(
+        "unpin",
+        "Unpin a pane at the user's request",
+        "cli:pane:set_pinned",
+        Json,
+        PaneSetPinnedProjection,
+        PaneSetPinned
+    ),
+    Leaf {
         name: "input",
         about: "Set pane input routing",
         id: "cli:pane:input:set",

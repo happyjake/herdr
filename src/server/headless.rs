@@ -3310,6 +3310,8 @@ impl HeadlessServer {
             changed = true;
         }
 
+        changed |= self.app.resolve_due_agent_status_windows(now);
+
         if self
             .app
             .state

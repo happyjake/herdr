@@ -25,7 +25,7 @@ fn normalize_api_key_alias(key: &str) -> &str {
 const IMAGE_PATH_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
 
 /// A whitespace-delimited token that is one absolute path to an image file —
-/// the shape attachments take inside ordinary pane input (ADR-0004 mints
+/// the shape attachments take inside ordinary pane input (attachments get
 /// space-free server-side names precisely so a path never needs quoting).
 fn is_image_path_token(token: &str) -> bool {
     if !token.starts_with('/') {
@@ -178,7 +178,7 @@ pub(super) fn detect_state_from_api(
     }
 }
 
-pub(super) fn pane_agent_status(
+pub(crate) fn pane_agent_status(
     state: crate::detect::AgentState,
     seen: bool,
 ) -> crate::api::schema::AgentStatus {

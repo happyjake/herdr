@@ -193,9 +193,8 @@ fn start_server_inner(
                 let advertised_endpoint = advertised_endpoint.clone();
                 // Local socket ownership grants managing authority unless the
                 // request explicitly selects a registry credential.
-                let credentials = crate::api::credentials::CredentialContext::local_socket(
-                    credentials.clone(),
-                );
+                let credentials =
+                    crate::api::credentials::CredentialContext::local_socket(credentials.clone());
                 let connection_running = Arc::clone(&listener_running);
                 #[cfg(unix)]
                 let ssh_agents = ssh_agents.clone();
@@ -1557,6 +1556,8 @@ mod tests {
             scroll: None,
             mouse_tracking: false,
             alternate_screen: false,
+            agent_status_changed_at: Some(1_700_000_000),
+            pinned: false,
             revision: 0,
         }
     }

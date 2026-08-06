@@ -13,7 +13,7 @@ pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
 #[cfg(test)]
 pub(crate) use api::test_support::exiting_test_command;
-mod api_helpers;
+pub(crate) mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod creation;
 mod custom_commands;
@@ -2473,6 +2473,16 @@ mod tests {
             ),
         };
 
+        let pane_set_pinned = crate::api::schema::Request {
+            id: "req_11".into(),
+            method: crate::api::schema::Method::PaneSetPinned(
+                crate::api::schema::PaneSetPinnedParams {
+                    pane_id: "w1:p1".into(),
+                    pinned: true,
+                },
+            ),
+        };
+
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
         assert!(crate::api::request_changes_ui(&mutating));
@@ -2486,6 +2496,11 @@ mod tests {
         assert!(crate::api::request_changes_ui(&announcement_dismiss));
         assert!(crate::api::request_changes_ui(&release_notes_dismiss));
         assert!(crate::api::request_changes_ui(&pane_send_mouse));
+        assert!(
+            !crate::api::request_changes_ui(&pane_set_pinned),
+            "the pin is published to clients and draws nothing here, so it must not \
+             cost the desk a redraw"
+        );
     }
 
     #[test]
@@ -2712,6 +2727,480 @@ mod tests {
             .unwrap()
             .manual_label
             .is_none());
+    }
+
+    #[test]
+    fn pane_set_pinned_request_sets_and_clears_the_pin() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-pin");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        assert!(!app.state.terminals.get(&terminal_id).unwrap().pinned);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_pin".into(),
+            method: crate::api::schema::Method::PaneSetPinned(
+                crate::api::schema::PaneSetPinnedParams {
+                    pane_id: pane_id.clone(),
+                    pinned: true,
+                },
+            ),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "pane_info");
+        assert_eq!(response["result"]["pane"]["pinned"], true);
+        assert!(app.state.terminals.get(&terminal_id).unwrap().pinned);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_unpin".into(),
+            method: crate::api::schema::Method::PaneSetPinned(
+                crate::api::schema::PaneSetPinnedParams {
+                    pane_id,
+                    pinned: false,
+                },
+            ),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["result"]["type"], "pane_info");
+        assert_eq!(
+            response["result"]["pane"]["pinned"], false,
+            "an unpinned pane still carries the key, so a client can tell it \
+             from a server that has no pin at all: {response}"
+        );
+        assert!(!app.state.terminals.get(&terminal_id).unwrap().pinned);
+    }
+
+    fn agent_status_event_pins_after(app: &App, sequence: u64) -> Vec<bool> {
+        app.event_hub
+            .events_after(sequence)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                crate::api::schema::EventData::PaneAgentStatusChanged { pinned, .. } => {
+                    Some(pinned)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pane_set_pinned_publishes_one_agent_status_event_carrying_the_new_pin() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-pin-event");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let status_before = app.pane_info(0, pane).unwrap().agent_status;
+        let sequence = app.event_hub.current_sequence();
+
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_pin_event".into(),
+            method: crate::api::schema::Method::PaneSetPinned(
+                crate::api::schema::PaneSetPinnedParams {
+                    pane_id: pane_id.clone(),
+                    pinned: true,
+                },
+            ),
+        });
+
+        let events = app.event_hub.events_after(sequence);
+        let pinned: Vec<_> = events
+            .iter()
+            .filter(|(_, event)| {
+                event.event == crate::api::schema::EventKind::PaneAgentStatusChanged
+            })
+            .collect();
+        assert_eq!(
+            pinned.len(),
+            1,
+            "one pin change publishes one status event: {events:?}"
+        );
+        let payload = serde_json::to_value(&pinned[0].1.data).unwrap();
+        assert_eq!(payload["pinned"], true);
+        assert_eq!(
+            payload["agent_status"],
+            serde_json::to_value(status_before).unwrap(),
+            "a pin change leaves the reported agent status untouched"
+        );
+        assert_eq!(app.pane_info(0, pane).unwrap().agent_status, status_before);
+
+        let sequence = app.event_hub.current_sequence();
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_unpin_event".into(),
+            method: crate::api::schema::Method::PaneSetPinned(
+                crate::api::schema::PaneSetPinnedParams {
+                    pane_id,
+                    pinned: false,
+                },
+            ),
+        });
+
+        assert_eq!(agent_status_event_pins_after(&app, sequence), vec![false]);
+        let cleared = app.event_hub.events_after(sequence);
+        let payload = serde_json::to_value(&cleared[0].1.data).unwrap();
+        assert_eq!(
+            payload["pinned"], false,
+            "a cleared pin stays present and false: {payload}"
+        );
+    }
+
+    #[test]
+    fn pane_set_pinned_to_the_pin_the_pane_already_holds_publishes_nothing() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-pin-noop");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_pin_first".into(),
+            method: crate::api::schema::Method::PaneSetPinned(
+                crate::api::schema::PaneSetPinnedParams {
+                    pane_id: pane_id.clone(),
+                    pinned: true,
+                },
+            ),
+        });
+
+        let sequence = app.event_hub.current_sequence();
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_pin_again".into(),
+            method: crate::api::schema::Method::PaneSetPinned(
+                crate::api::schema::PaneSetPinnedParams {
+                    pane_id,
+                    pinned: true,
+                },
+            ),
+        });
+
+        assert!(agent_status_event_pins_after(&app, sequence).is_empty());
+    }
+
+    #[test]
+    fn a_pin_and_a_label_are_published_together_and_neither_clears_the_other() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pin-and-label");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pin_before_rename".into(),
+            method: crate::api::schema::Method::PaneSetPinned(
+                crate::api::schema::PaneSetPinnedParams {
+                    pane_id: pane_id.clone(),
+                    pinned: true,
+                },
+            ),
+        });
+
+        let sequence = app.event_hub.current_sequence();
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_rename_while_pinned".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: Some("reviewer".into()),
+            }),
+        });
+        let renamed = app.event_hub.events_after(sequence);
+        let payload = serde_json::to_value(&renamed[0].1.data).unwrap();
+        assert_eq!(payload["label"], "reviewer");
+        assert_eq!(
+            payload["pinned"], true,
+            "a rename repeats the standing pin instead of reading as an unpin: {payload}"
+        );
+
+        let sequence = app.event_hub.current_sequence();
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_clear_label_while_pinned".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: None,
+            }),
+        });
+        let cleared = app.event_hub.events_after(sequence);
+        let payload = serde_json::to_value(&cleared[0].1.data).unwrap();
+        assert!(payload.get("label").is_some_and(serde_json::Value::is_null));
+        assert_eq!(
+            payload["pinned"], true,
+            "clearing a label leaves the pin standing: {payload}"
+        );
+        assert!(app.pane_info(0, pane).unwrap().pinned);
+    }
+
+    #[test]
+    fn an_agent_status_change_reports_the_pin_the_pane_already_holds() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-status-carries-pin");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let empty_presentation = crate::terminal::EffectivePresentation {
+            title: None,
+            display_agent: None,
+            state_labels: std::collections::HashMap::new(),
+        };
+        let update = crate::app::actions::PaneStateUpdate {
+            pane_id: pane,
+            ws_idx: 0,
+            previous_agent_label: None,
+            previous_known_agent: None,
+            previous_state: AgentState::Idle,
+            previous_seen: true,
+            previous_presentation: empty_presentation.clone(),
+            agent_label: None,
+            known_agent: None,
+            state: AgentState::Working,
+            seen: true,
+            presentation: empty_presentation,
+            agent_name_changed: false,
+            agent_released: false,
+            agent_release_status: None,
+            suppress_completion: false,
+        };
+
+        let sequence = app.event_hub.current_sequence();
+        app.emit_pane_state_update(&update);
+        assert_eq!(
+            agent_status_event_pins_after(&app, sequence),
+            vec![false],
+            "an unpinned pane reports an unset pin"
+        );
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_status_pin".into(),
+            method: crate::api::schema::Method::PaneSetPinned(
+                crate::api::schema::PaneSetPinnedParams {
+                    pane_id,
+                    pinned: true,
+                },
+            ),
+        });
+
+        let sequence = app.event_hub.current_sequence();
+        app.emit_pane_state_update(&update);
+        assert_eq!(
+            agent_status_event_pins_after(&app, sequence),
+            vec![true],
+            "a status change repeats the standing pin instead of reading as an unpin"
+        );
+    }
+
+    fn agent_status_event_labels_after(app: &App, sequence: u64) -> Vec<Option<String>> {
+        app.event_hub
+            .events_after(sequence)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                crate::api::schema::EventData::PaneAgentStatusChanged { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pane_rename_publishes_one_agent_status_event_carrying_the_new_label() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-rename-event");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let status_before = app.pane_info(0, pane).unwrap().agent_status;
+        let sequence = app.event_hub.current_sequence();
+
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_event".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: Some("reviewer".into()),
+            }),
+        });
+
+        let events = app.event_hub.events_after(sequence);
+        let renamed: Vec<_> = events
+            .iter()
+            .filter(|(_, event)| {
+                event.event == crate::api::schema::EventKind::PaneAgentStatusChanged
+            })
+            .collect();
+        assert_eq!(
+            renamed.len(),
+            1,
+            "one label change publishes one status event: {events:?}"
+        );
+        let payload = serde_json::to_value(&renamed[0].1.data).unwrap();
+        assert_eq!(payload["label"], "reviewer");
+        assert_eq!(
+            payload["agent_status"],
+            serde_json::to_value(status_before).unwrap(),
+            "a label change leaves the reported agent status untouched"
+        );
+        assert_eq!(app.pane_info(0, pane).unwrap().agent_status, status_before);
+
+        let sequence = app.event_hub.current_sequence();
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_event_clear".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: None,
+            }),
+        });
+
+        assert_eq!(agent_status_event_labels_after(&app, sequence), vec![None]);
+        let cleared = app.event_hub.events_after(sequence);
+        let payload = serde_json::to_value(&cleared[0].1.data).unwrap();
+        assert!(
+            payload.get("label").is_some_and(serde_json::Value::is_null),
+            "a cleared label stays present and null so it reads as cleared, not missing: {payload}"
+        );
+    }
+
+    #[test]
+    fn pane_rename_to_the_same_label_publishes_nothing() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-rename-noop");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_first".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: Some("reviewer".into()),
+            }),
+        });
+
+        let sequence = app.event_hub.current_sequence();
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_again".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id,
+                label: Some("  reviewer  ".into()),
+            }),
+        });
+
+        assert!(agent_status_event_labels_after(&app, sequence).is_empty());
+    }
+
+    #[test]
+    fn an_agent_status_change_reports_the_label_the_pane_already_holds() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-status-carries-label");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let empty_presentation = crate::terminal::EffectivePresentation {
+            title: None,
+            display_agent: None,
+            state_labels: std::collections::HashMap::new(),
+        };
+        let update = crate::app::actions::PaneStateUpdate {
+            pane_id: pane,
+            ws_idx: 0,
+            previous_agent_label: None,
+            previous_known_agent: None,
+            previous_state: AgentState::Idle,
+            previous_seen: true,
+            previous_presentation: empty_presentation.clone(),
+            agent_label: None,
+            known_agent: None,
+            state: AgentState::Working,
+            seen: true,
+            presentation: empty_presentation,
+            agent_name_changed: false,
+            agent_released: false,
+            agent_release_status: None,
+            suppress_completion: false,
+        };
+
+        let sequence = app.event_hub.current_sequence();
+        app.emit_pane_state_update(&update);
+        assert_eq!(
+            agent_status_event_labels_after(&app, sequence),
+            vec![None],
+            "an unlabelled pane reports no label"
+        );
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_status_label_rename".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id,
+                label: Some("reviewer".into()),
+            }),
+        });
+
+        let sequence = app.event_hub.current_sequence();
+        app.emit_pane_state_update(&update);
+        assert_eq!(
+            agent_status_event_labels_after(&app, sequence),
+            vec![Some("reviewer".to_string())],
+            "a status change repeats the standing label instead of reading as a clear"
+        );
+    }
+
+    #[test]
+    fn desk_pane_rename_publishes_the_new_label_on_the_agent_status_event() {
+        // The desk's own rename reaches the server as a plain pane.rename.
+        let mut app = test_app();
+        let workspace = Workspace::test_new("desk-pane-rename-event");
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app
+            .public_pane_id(0, app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap();
+        let sequence = app.event_hub.current_sequence();
+
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_desk_rename".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id,
+                label: Some("reviewer".into()),
+            }),
+        });
+
+        assert_eq!(
+            agent_status_event_labels_after(&app, sequence),
+            vec![Some("reviewer".to_string())]
+        );
     }
 
     #[test]
@@ -3572,6 +4061,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         assert_eq!(
             app.state.terminals.get(&terminal_id).unwrap().state,
@@ -3596,6 +4086,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         tokio::pin!(send);
 

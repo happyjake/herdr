@@ -533,11 +533,67 @@ fn restore_tab(
         }
 
         let saved_label = saved_pane.and_then(|p| p.label.clone());
+        // A snapshot written before the pin existed leaves this absent, and the
+        // pane restores unpinned.
+        let saved_pinned = saved_pane.is_some_and(|p| p.pinned);
         let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
         let saved_managed_agent = saved_pane
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+        // Restores the pane's age along with the pane. A snapshot written
+        // before this field existed leaves it absent, and the pane falls back
+        // to dating itself to the restore, as it always did.
+        // Read the claim; do not judge it. Whether it is still worth honouring
+        // is decided where it is adopted, against the clock at that moment,
+        // because a pane's terminal is spawned or imported between here and
+        // there and a claim can die in that interval.
+        let saved_agent_status_claim = saved_pane.and_then(|p| {
+            let status =
+                super::snapshot::agent_status_from_snapshot_name(p.agent_status.as_ref()?)?;
+            Some(crate::pane::AgentStatusClaim {
+                status,
+                changed_at: p.agent_status_changed_at?,
+                resolve_by: p.agent_status_resolve_by,
+                saw_other_status: p.agent_status_saw_other,
+            })
+        });
+        // Whether a pane has something to wait for is decided by what the
+        // session captured, not by whether detection ever minted a name or a
+        // session for it. A pane recorded as anything other than Unknown had
+        // something running, however little was known about it, and gets a
+        // window that a classification or the deadline will close. Only a pane
+        // recorded as Unknown, or one from a session with no record at all, is
+        // classified where it is rebuilt.
+        let awaits_agent_resolution = saved_agent_status_claim
+            .is_some_and(|claim| claim.status != crate::api::schema::AgentStatus::Unknown);
+        // The restore builds a pane and its terminal together, so whatever the
+        // pane ends up reporting, it has reported it since the restore. That
+        // includes a status the restore itself produced, such as the Idle
+        // pre-seeded for an agent about to be resumed: it is dated here, not
+        // left for whichever request first notices it.
+        let restored_pane_state = |terminal: &TerminalState| {
+            let now_unix = crate::pane::unix_now_secs();
+            let mut pane = match saved_agent_status_claim {
+                Some(claim) => PaneState::restored_from(terminal.id.clone(), claim, now_unix),
+                None => PaneState::new_at(terminal.id.clone(), now_unix),
+            };
+            let restored_status =
+                crate::app::api_helpers::pane_agent_status(terminal.state, pane.seen);
+            if awaits_agent_resolution {
+                // The restore placing a pane's starting status is not this
+                // process watching the pane move, so it dates from the restore
+                // and leaves the window open for whatever classifies it.
+                pane.record_agent_status_at(
+                    restored_status,
+                    now_unix,
+                    crate::events::StatusReading::Provisional,
+                );
+            } else {
+                pane.resolve_agent_status_at(restored_status, now_unix);
+            }
+            pane
+        };
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
         let saved_history =
@@ -596,6 +652,7 @@ fn restore_tab(
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
+            terminal.set_pinned(saved_pinned);
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
             }
@@ -620,7 +677,7 @@ fn restore_tab(
                     std::time::Instant::now(),
                 );
             }
-            panes.insert(*id, PaneState::new(terminal_id));
+            panes.insert(*id, restored_pane_state(&terminal));
             terminals.push(terminal);
             continue;
         }
@@ -696,6 +753,7 @@ fn restore_tab(
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
                 }
+                terminal.set_pinned(saved_pinned);
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
@@ -726,7 +784,7 @@ fn restore_tab(
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
                 }
-                panes.insert(*id, PaneState::new(terminal_id.clone()));
+                panes.insert(*id, restored_pane_state(&terminal));
                 terminal_runtimes.insert(terminal_id, runtime);
                 terminals.push(terminal);
             }
@@ -1554,6 +1612,11 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            agent_status: None,
+                            agent_status_changed_at: None,
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -1603,6 +1666,919 @@ mod tests {
         assert_eq!(session.session_ref.value, "opencode-session");
     }
 
+    /// The pin survives a restart, and a session written before the pin
+    /// existed restores every pane unpinned rather than failing to load.
+    #[tokio::test]
+    async fn restore_carries_the_pin_and_defaults_an_older_session_unpinned() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: None,
+                            agent_status_changed_at: None,
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: true,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+
+        let restore_once = |snapshot: &SessionSnapshot| {
+            let (events, event_rx) = mpsc::channel(4);
+            let (_workspaces, terminals, _runtimes) = restore(
+                snapshot,
+                None,
+                24,
+                80,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let pinned = terminals
+                .values()
+                .next()
+                .expect("restored terminal should exist")
+                .pinned;
+            drop(event_rx);
+            pinned
+        };
+
+        assert!(
+            restore_once(&snapshot),
+            "a pinned pane comes back pinned after a restart"
+        );
+
+        // The same session as written by a build that had no pin: every
+        // `pinned` key stripped from the stored JSON.
+        let mut stored = serde_json::to_value(&snapshot).expect("serialize session");
+        assert!(
+            stored["workspaces"][0]["tabs"][0]["panes"]["0"]
+                .get("pinned")
+                .is_some(),
+            "the captured session states the pin: {stored}"
+        );
+        strip_key(&mut stored, "pinned");
+        assert!(
+            stored["workspaces"][0]["tabs"][0]["panes"]["0"]
+                .get("pinned")
+                .is_none(),
+            "the older session says nothing about a pin: {stored}"
+        );
+        let older: SessionSnapshot =
+            serde_json::from_value(stored).expect("an older session still loads");
+
+        assert!(
+            !restore_once(&older),
+            "a session written before the pin restores every pane unpinned"
+        );
+    }
+
+    fn strip_key(value: &mut serde_json::Value, key: &str) {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.remove(key);
+                for child in object.values_mut() {
+                    strip_key(child, key);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    strip_key(item, key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_carries_the_status_clock_a_handoff_captured() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: Some("reviewer".into()),
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: Some("working".into()),
+                            agent_status_changed_at: Some(1_000),
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let before = crate::pane::unix_now_secs();
+        let (workspaces, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("restored workspace");
+        let pane_id = workspace.tabs[0].root_pane;
+        let pane = workspace.pane_state(pane_id).expect("restored pane");
+
+        // The pane reports what it can actually see, dated to the restore, so
+        // the pair a client receives never dates one status with another's.
+        assert_eq!(
+            pane.agent_status(),
+            crate::api::schema::AgentStatus::Unknown
+        );
+        assert!(pane.agent_status_changed_at() >= before);
+        assert_eq!(
+            pane.agent_status_changed_at_for(crate::api::schema::AgentStatus::Idle),
+            pane.agent_status_changed_at(),
+            "every status reported inside the window dates from the restart"
+        );
+        // An agent to find means something will classify this pane.
+        assert!(pane.awaits_agent_status_resolution());
+        // The captured pair is held for that classification, and would be
+        // handed on unchanged if this process were handed off again first.
+        assert_eq!(
+            pane.durable_agent_status().status,
+            crate::api::schema::AgentStatus::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_opens_a_window_for_an_agent_the_session_never_named() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            // A detected agent nothing ever minted a name or a
+                            // session for. The captured status is the only
+                            // record that something was running here.
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: Some("working".into()),
+                            agent_status_changed_at: Some(1_000),
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("restored workspace");
+        let pane_id = workspace.tabs[0].root_pane;
+        let mut pane_state = workspace
+            .pane_state(pane_id)
+            .expect("restored pane")
+            .durable_agent_status();
+        assert_eq!(
+            (pane_state.status, pane_state.changed_at),
+            (crate::api::schema::AgentStatus::Working, 1_000),
+            "a markerless agent's age must not be thrown away at the restore"
+        );
+        assert!(workspace
+            .pane_state(pane_id)
+            .expect("restored pane")
+            .awaits_agent_status_resolution());
+
+        // And the age comes back when the detector confirms the pane.
+        let mut workspaces = workspaces;
+        let pane = workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .expect("restored pane");
+        pane.resolve_agent_status_at(
+            crate::api::schema::AgentStatus::Working,
+            crate::pane::unix_now_secs(),
+        );
+        pane_state = pane.durable_agent_status();
+        assert_eq!(
+            (pane_state.status, pane_state.changed_at),
+            (crate::api::schema::AgentStatus::Working, 1_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_window_stops_a_snapshot_carrying_the_captured_pair_further() {
+        let terminal_id = TerminalId::alloc();
+        let mut pane = PaneState::restored(
+            terminal_id,
+            crate::api::schema::AgentStatus::Working,
+            1_000,
+            5_000,
+        );
+        let due_at = pane
+            .agent_status_resolution_due_at()
+            .expect("an unresolved pane has a deadline");
+
+        // Nothing ever classified it, so the deadline does.
+        pane.resolve_agent_status_at(crate::api::schema::AgentStatus::Unknown, due_at);
+
+        assert!(!pane.awaits_agent_status_resolution());
+        assert_eq!(
+            (
+                pane.durable_agent_status().status,
+                pane.durable_agent_status().changed_at
+            ),
+            (crate::api::schema::AgentStatus::Unknown, due_at),
+            "an expired window must not hand the captured pair to the next restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manifest_read_after_its_claim_expired_is_dead_on_restore() {
+        let cwd = std::env::current_dir().unwrap();
+        let now = crate::pane::unix_now_secs();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: Some("reviewer".into()),
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: Some("working".into()),
+                            agent_status_changed_at: Some(1_000),
+                            // Captured while alive, serialized slowly enough
+                            // that the deadline passed on the way here.
+                            agent_status_resolve_by: Some(now - 5),
+                            agent_status_saw_other: false,
+                            pinned: false,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("restored workspace");
+        let pane_id = workspace.tabs[0].root_pane;
+        let pane = workspace.pane_state(pane_id).expect("restored pane");
+
+        // The reader checked the deadline against its own clock, so the claim
+        // never took effect: no window, no inherited date, and nothing handed
+        // on that could be given a fresh lease by the next restore.
+        assert!(
+            !pane.awaits_agent_status_resolution(),
+            "a claim that expired in transit must not open a window here"
+        );
+        assert_eq!(
+            pane.agent_status(),
+            crate::api::schema::AgentStatus::Unknown
+        );
+        assert!(
+            pane.agent_status_changed_at() >= now,
+            "the pane dates from this restore, not from the dead claim"
+        );
+        let durable = pane.durable_agent_status();
+        let (durable_status, durable_resolve_by) = (durable.status, durable.resolve_by);
+        assert_eq!(durable_status, crate::api::schema::AgentStatus::Unknown);
+        assert_eq!(
+            durable_resolve_by, None,
+            "an expired claim must not be handed on with a new deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_saw_an_interlude_does_not_inherit_after_a_handoff() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: Some("reviewer".into()),
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: Some("working".into()),
+                            agent_status_changed_at: Some(1_000),
+                            agent_status_resolve_by: Some(crate::pane::unix_now_secs() + 60),
+                            agent_status_saw_other: true,
+                            pinned: false,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("restored workspace");
+        let pane_id = workspace.tabs[0].root_pane;
+        let mut workspaces = workspaces;
+        let pane = workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .expect("restored pane");
+        assert!(pane.awaits_agent_status_resolution());
+
+        // The interlude travelled with the claim, so confirming working here
+        // still cannot claim the pane has been working since the session said.
+        let resolved_at = crate::pane::unix_now_secs();
+        pane.resolve_agent_status_at(crate::api::schema::AgentStatus::Working, resolved_at);
+
+        assert_eq!(
+            pane.agent_status_changed_at(),
+            resolved_at,
+            "an interlude seen before the handoff still counts after it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_claim_does_not_survive_by_matching_the_resume_pre_seed() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: Some("reviewer".into()),
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:opencode".into(),
+                                agent: "opencode".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "opencode-session".into(),
+                            }),
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: Some("idle".into()),
+                            agent_status_changed_at: Some(1_000),
+                            agent_status_resolve_by: Some(crate::pane::unix_now_secs() - 5),
+                            agent_status_saw_other: false,
+                            pinned: false,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let before = crate::pane::unix_now_secs();
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("restored workspace");
+        let pane_id = workspace.tabs[0].root_pane;
+        let pane = workspace.pane_state(pane_id).expect("restored pane");
+
+        // The pre-seeded Idle matches what the dead claim recorded, but the
+        // claim was checked for life before that question was ever asked.
+        assert!(
+            !pane.awaits_agent_status_resolution(),
+            "an expired claim must not open a window"
+        );
+        assert!(
+            pane.agent_status_changed_at() >= before,
+            "a matching pre-seed must not resurrect an expired claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_classifies_a_bare_shell_immediately() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: Some("unknown".into()),
+                            agent_status_changed_at: Some(1_000),
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("restored workspace");
+        let pane_id = workspace.tabs[0].root_pane;
+        let pane = workspace.pane_state(pane_id).expect("restored pane");
+
+        // No agent to find and no resume to run, so nothing would ever
+        // classify this pane. It is classified at the restore instead, which
+        // confirms the snapshot and keeps its age rather than pinning it.
+        assert!(!pane.awaits_agent_status_resolution());
+        assert_eq!(pane.agent_status_changed_at(), 1_000);
+    }
+
+    #[tokio::test]
+    async fn restore_dates_a_pane_awaiting_agent_resume_to_the_restore() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: Some("reviewer".into()),
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:opencode".into(),
+                                agent: "opencode".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "opencode-session".into(),
+                            }),
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: Some("working".into()),
+                            agent_status_changed_at: Some(1_000),
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let before = crate::pane::unix_now_secs();
+        // Resume enabled, so this pane is pre-seeded Idle for an agent that is
+        // about to be relaunched.
+        let (workspaces, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("restored workspace");
+        let pane_id = workspace.tabs[0].root_pane;
+        let pane = workspace.pane_state(pane_id).expect("restored pane");
+
+        // The pre-seed is dated at the restore, not deferred to whenever the
+        // first client request happens to arrive.
+        assert!(pane.awaits_agent_status_resolution());
+        assert!(pane.agent_status_changed_at() >= before);
+        assert_eq!(
+            pane.agent_status_changed_at_for(crate::api::schema::AgentStatus::Idle),
+            pane.agent_status_changed_at()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_taken_mid_window_hands_the_captured_pair_to_the_next_restore() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: Some("reviewer".into()),
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: Some("working".into()),
+                            agent_status_changed_at: Some(1_000),
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        // Hand off again before anything classified the pane.
+        let recaptured = super::super::snapshot::capture(
+            &workspaces,
+            &terminals,
+            &Default::default(),
+            Some(0),
+            0,
+        );
+        let pane_snapshot = recaptured.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("recaptured pane");
+
+        assert_eq!(pane_snapshot.agent_status.as_deref(), Some("working"));
+        assert_eq!(
+            pane_snapshot.agent_status_changed_at,
+            Some(1_000),
+            "a second handoff must not reset an age the first one was still holding"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_without_a_captured_status_clock_dates_the_pane_to_the_restore() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: None,
+                            agent_status_changed_at: None,
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let before = crate::pane::unix_now_secs();
+        let (workspaces, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("restored workspace");
+        let pane_id = workspace.tabs[0].root_pane;
+        let pane = workspace.pane_state(pane_id).expect("restored pane");
+
+        assert_eq!(
+            pane.agent_status(),
+            crate::api::schema::AgentStatus::Unknown
+        );
+        assert!(pane.agent_status_changed_at() >= before);
+        assert_eq!(
+            pane.durable_agent_status().status,
+            crate::api::schema::AgentStatus::Unknown
+        );
+    }
+
     #[tokio::test]
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();
@@ -1636,6 +2612,11 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                agent_status: None,
+                                agent_status_changed_at: None,
+                                agent_status_resolve_by: None,
+                                agent_status_saw_other: false,
+                                pinned: false,
                             },
                         ),
                         (
@@ -1648,6 +2629,11 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                agent_status: None,
+                                agent_status_changed_at: None,
+                                agent_status_resolve_by: None,
+                                agent_status_saw_other: false,
+                                pinned: false,
                             },
                         ),
                     ]),
@@ -1702,6 +2688,11 @@ mod tests {
                     agent_session: None,
                     agent_resume: None,
                     launch_argv: None,
+                    agent_status: None,
+                    agent_status_changed_at: None,
+                    agent_status_resolve_by: None,
+                    agent_status_saw_other: false,
+                    pinned: false,
                 },
             )
         };
@@ -1718,6 +2709,11 @@ mod tests {
             }),
             agent_resume: None,
             launch_argv: None,
+            agent_status: None,
+            agent_status_changed_at: None,
+            agent_status_resolve_by: None,
+            agent_status_saw_other: false,
+            pinned: false,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1870,6 +2866,11 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            agent_status: None,
+                            agent_status_changed_at: None,
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -2176,6 +3177,11 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                agent_status: None,
+                agent_status_changed_at: None,
+                agent_status_resolve_by: None,
+                agent_status_saw_other: false,
+                pinned: false,
             },
         );
         let mut history = SessionHistorySnapshot {

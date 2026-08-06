@@ -38,6 +38,7 @@ fn detect(app: &mut AppState, pane_id: PaneId, agent: Agent, at: Instant) {
         pane_id,
         agent,
         observed_at: at,
+        reading: crate::events::StatusReading::Provisional,
     });
 }
 
@@ -56,6 +57,7 @@ fn detection_state(
         visible_working: false,
         process_exited,
         observed_at: at,
+        reading: crate::events::StatusReading::Verdict,
     });
 }
 

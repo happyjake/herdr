@@ -358,6 +358,14 @@ crate::cli::projection::cli_params! {
 
 crate::cli::projection::cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct PaneSetPinnedParams => PaneSetPinnedProjection {
+        pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
+        pub pinned: bool => Field::new(false),
+    }
+}
+
+crate::cli::projection::cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
     pub struct PaneSendTextParams => PaneSendTextProjection {
         pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
         pub text: String => Field::new(String::new()).input(binding::joined("text", "TEXT")),
@@ -580,6 +588,48 @@ pub struct PaneInfo {
     /// Additive: payloads from older servers omit this and deserialize false.
     #[serde(default)]
     pub alternate_screen: bool,
+    /// Unix seconds at which `agent_status` last changed for this pane.
+    ///
+    /// This server always sends it, so a client that has just connected can
+    /// date a status it never watched change. Additive and optional rather
+    /// than a plain integer: payloads from older servers omit it, and absent
+    /// has to stay distinguishable from a real timestamp so a client renders
+    /// no age instead of an age measured from the unix epoch.
+    ///
+    /// This always dates exactly the `agent_status` in the same payload, never
+    /// some other status the pane held earlier.
+    ///
+    /// The date is captured with the session, so it survives a server restart
+    /// and a live handoff. Until the new server has classified a pane, though,
+    /// what it reports is dated to the restart; a pane then found doing what
+    /// the session recorded gets its older date back, provided it reported no
+    /// other KNOWN status in between; Unknown does not count, being the
+    /// absence of a reading rather than a competing one, so a client may see
+    /// Unknown give way to a status dated before the restart. A pane found
+    /// doing anything else is dated at the classification. The guarantee is
+    /// precise: an age never spans an observed transition between known
+    /// statuses. A change that says nothing about status, such as a title,
+    /// never moves this at all.
+    ///
+    /// Every change of the reported status restamps this, including a Done to
+    /// Idle change caused by the pane being seen at the desk rather than by
+    /// the agent. A client that folds read-driven transitions without ageing
+    /// its own rows should expect an age seeded from here to be at most as old
+    /// as the last desk read of that pane, not to match its own stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status_changed_at: Option<u64>,
+    /// Whether the user has pinned this pane, as `pane.set_pinned` and
+    /// `herdr pane pin` set it.
+    ///
+    /// Always serialized, unlike the optional presentation fields: a client
+    /// reads the absence of this key as a server that predates the pin and
+    /// offers no pinning at all, so `false` has to stay distinguishable from
+    /// "this server has no such notion".
+    ///
+    /// The pin is the user's own mark. It is theirs to set: read it freely,
+    /// and write it only when the user asks for it.
+    #[serde(default)]
+    pub pinned: bool,
     pub revision: u64,
 }
 

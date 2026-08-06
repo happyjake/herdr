@@ -16,6 +16,33 @@ mod worktrees;
 use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
 use crate::events::AppEvent;
 
+/// The one place a `pane.agent_status_changed` payload is built, so every
+/// publisher reports the pane's manual label alongside its status.
+fn pane_agent_status_changed_event(
+    pane_id: String,
+    workspace_id: String,
+    agent_status: crate::api::schema::AgentStatus,
+    agent: Option<String>,
+    presentation: crate::terminal::EffectivePresentation,
+    label: Option<String>,
+    pinned: bool,
+) -> crate::api::schema::EventEnvelope {
+    crate::api::schema::EventEnvelope {
+        event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+        data: crate::api::schema::EventData::PaneAgentStatusChanged {
+            pane_id,
+            workspace_id,
+            agent_status,
+            agent,
+            title: presentation.title,
+            display_agent: presentation.display_agent,
+            state_labels: presentation.state_labels,
+            label,
+            pinned,
+        },
+    }
+}
+
 const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const WINDOWS_POWERSHELL_AGENT_EXIT_RESPAWN_GRACE: Duration = Duration::from_secs(2);
@@ -681,9 +708,7 @@ impl App {
         };
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
-        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.clear_agent_runtime_identity_after_respawn();
-        }
+        self.state.clear_agent_identity_after_respawn(&terminal_id);
         if focus_pane {
             self.state.focus_pane_in_workspace(ws_idx, pane_id);
         }
@@ -771,20 +796,73 @@ impl App {
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
         {
-            let presentation = update.presentation.clone();
-            self.emit_event(crate::api::schema::EventEnvelope {
-                event: crate::api::schema::EventKind::PaneAgentStatusChanged,
-                data: crate::api::schema::EventData::PaneAgentStatusChanged {
-                    pane_id,
-                    workspace_id,
-                    agent_status,
-                    agent: update.agent_label.clone(),
-                    title: presentation.title,
-                    display_agent: presentation.display_agent,
-                    state_labels: presentation.state_labels,
-                },
-            });
+            let (label, pinned) = self.pane_kept_presentation(update.ws_idx, update.pane_id);
+            let event = pane_agent_status_changed_event(
+                pane_id,
+                workspace_id,
+                agent_status,
+                update.agent_label.clone(),
+                update.presentation.clone(),
+                label,
+                pinned,
+            );
+            self.emit_event(event);
         }
+    }
+
+    /// Publish the pane's presentation because a field the pane keeps rather
+    /// than derives changed: its manual label, or its pin. The agent status is
+    /// reported exactly as the pane holds it; only the kept field moved.
+    ///
+    /// Every writer of either field publishes through here, so a subscriber
+    /// hears them the same way and neither can go out on its own path.
+    pub(crate) fn emit_pane_kept_presentation_changed(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) {
+        let Some(event) = self.pane_kept_presentation_event(ws_idx, pane_id) else {
+            return;
+        };
+        self.emit_event(event);
+    }
+
+    fn pane_kept_presentation_event(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::EventEnvelope> {
+        let public_pane_id = self.public_pane_id(ws_idx, pane_id)?;
+        let pane = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        Some(pane_agent_status_changed_event(
+            public_pane_id,
+            self.public_workspace_id(ws_idx),
+            pane_agent_status(terminal.state, pane.seen),
+            terminal.effective_agent_label().map(str::to_string),
+            terminal.effective_presentation(),
+            terminal.manual_label.clone(),
+            terminal.pinned,
+        ))
+    }
+
+    /// The kept presentation fields of a pane's terminal, read together so a
+    /// published event cannot report one of them and forget the other.
+    fn pane_kept_presentation(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> (Option<String>, bool) {
+        let Some(terminal) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+        else {
+            return (None, false);
+        };
+        (terminal.manual_label.clone(), terminal.pinned)
     }
 
     pub(crate) fn sync_toast_deadline(
@@ -848,6 +926,7 @@ impl App {
     }
 
     pub(crate) fn emit_pane_updated(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
+        self.state.sync_agent_status_clocks();
         if let Some(pane) = self.pane_info(ws_idx, pane_id) {
             self.emit_event(crate::api::schema::EventEnvelope {
                 event: crate::api::schema::EventKind::PaneUpdated,
@@ -984,6 +1063,9 @@ impl App {
         request: crate::api::schema::Request,
     ) -> String {
         self.sync_pending_terminal_titles();
+        // Catch any status move that reached a pane through a path with no
+        // event of its own, so a snapshot never reports a stale transition.
+        self.state.sync_agent_status_clocks();
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
@@ -1235,6 +1317,9 @@ impl App {
                 return self.handle_pane_link_activate(request.id, params);
             }
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
+            Method::PaneSetPinned(params) => {
+                return self.handle_pane_set_pinned(request.id, params)
+            }
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
@@ -1951,6 +2036,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         app.handle_internal_event(AppEvent::StateChanged {
             pane_id: root,
@@ -1960,6 +2046,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert_eq!(
@@ -2044,6 +2131,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         app.handle_internal_event(AppEvent::StateChanged {
             pane_id: root,
@@ -2053,6 +2141,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let notification_deadline = app
@@ -2169,6 +2258,7 @@ mod tests {
                 visible_working: false,
                 process_exited: true,
                 observed_at: std::time::Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             });
 
             // The release event is this test's subject; the name outliving the
@@ -2229,6 +2319,7 @@ mod tests {
             visible_working: false,
             process_exited: true,
             observed_at,
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let terminal = &app.state.terminals[&terminal_id];
@@ -2411,6 +2502,7 @@ mod tests {
             visible_working: false,
             process_exited: true,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert_eq!(
@@ -2535,6 +2627,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         app.state.toast = Some(crate::app::state::ToastNotification {
             kind: ToastKind::Finished,
@@ -2555,6 +2648,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert_eq!(

@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -203,6 +203,63 @@ responses from older servers can treat an absent field as `false`.
 `PaneInfo.alternate_screen` reports whether the live terminal currently uses
 its alternate screen. Supporting servers always include this boolean. Clients
 reading responses from older servers can treat an absent field as `false`.
+
+`PaneInfo.agent_status_changed_at` reports the unix second at which the pane's
+`agent_status` last changed, so a client that has just connected can show how
+long a pane has held its status without having watched it change. A pane with
+no detected agent reports `unknown` and dates it to the pane's own creation.
+Supporting servers always include this field; clients reading responses from
+older servers must treat an absent field as "age unknown" rather than as a
+timestamp, and show no age at all.
+
+The date is captured with the session, so it survives a server restart and a
+live handoff: a pane that has been working for an hour still reads as an hour
+old to a client that connects to the new process.
+
+Getting that date back takes a moment. Until the new server has classified a
+pane, what the pane reports is dated to the restart. A pane is classified by
+the first of: the detector finishing its startup grace and saying what the
+pane is doing, an agent reporting for itself — including a report that
+confirms what the pane already showed — a deferred agent resume finishing or
+failing, or any other change that moves what the pane reports. Changes that
+say nothing about status, such as a title or a display label, never classify
+a pane and never move its date. Once classified, a pane found doing what the session recorded gets
+that older date back — but only if it reported no other known status in the
+meantime. `unknown` does not count, because it is the absence of a reading
+rather than a competing one: a client may well watch a pane go from `unknown`
+to `working` and see the `working` dated to before the restart, and that is
+correct, since the server never claimed the pane was doing something else. A
+pane found doing anything else, or one that reported some other known status
+on the way, is dated at the classification, because as far as this server
+witnessed, that is when it started. A pane whose session recorded nothing running is classified the
+moment it is rebuilt, and one that nothing classifies is classified on a
+timer, so no pane stays undated. A session captured before this field existed
+has no date to restore, and those panes date themselves to the restart.
+
+A status the server watches change is always dated at the change, never back
+at the restart. The guarantee this gives a client is precise: an age never
+spans an observed transition between known statuses. Leaving `unknown` is not
+such a transition.
+
+The practical consequence for a client: for a few seconds after a server
+restart, ages are short and then some of them jump back to their true values.
+Ages during that window are never older than the restart, so a client that
+sorts or filters on age will under-state rather than invent.
+
+The two values are always read together, so the date describes exactly the
+`agent_status` in the same payload and never some other status the pane held
+earlier. A client can rely on that: if `agent_status` is `unknown`, the date
+is when the pane started reporting `unknown`.
+
+Every change of the reported status restamps the field, including a `done` to
+`idle` change caused by the pane being seen at the desk rather than by the
+agent doing anything. A client that deliberately folds read-driven transitions
+without ageing its own rows will therefore disagree with a freshly seeded one:
+an age seeded from `agent_status_changed_at` is at most as old as the last desk
+read of that pane, while a client that watched the same transition still holds
+the older stamp. Both are honest about what they witnessed, so a client that
+folds read-transitions should expect the seeded age to be the shorter of the
+two and not treat the difference as drift.
 
 ### Pane graphics
 
@@ -780,6 +837,25 @@ If no native session reference is stored, the field is omitted.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
+`pane.set_pinned` sets or clears a pane's pin and answers `pane_info`, the way
+`pane.rename` does, so the client that toggled it can fold the answer instead
+of waiting for its next snapshot:
+
+```json
+{"id":"req_pin","method":"pane.set_pinned","params":{"pane_id":"w1:p1","pinned":true}}
+```
+
+The pin is a durable per-pane mark. It is kept, never derived: it is set only
+by this method or by `herdr pane pin` / `herdr pane unpin`, it persists with the
+session across a restart, and it says nothing about the pane's label, agent, or
+status. `PaneInfo.pinned` is always present and `true` or `false`, unlike the
+optional presentation fields, so a client can read an absent `pinned` key as a
+server that predates the pin and offer no pinning at all.
+
+The pin is the user's own mark. Agents may read `pinned` freely and should set
+it only when the user explicitly asks for it, never on their own initiative.
+This is a convention where agents are taught, not a rule the server enforces.
+
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
 
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
@@ -886,6 +962,27 @@ Pane event subscriptions include `pane.created`, `pane.updated`, `pane.closed`, 
 to this server. It does not move other clients' views, and its payload does not
 identify the client. Selecting an already-selected pane does not emit it again.
 Terminal-title changes can emit `pane.updated`, but spinner-only raw-title changes do not emit it when `terminal_title_stripped` is unchanged.
+`pane.agent_status_changed` is scoped to one `pane_id` and emits `pane_id`,
+`workspace_id`, `agent_status`, and the pane's presentation: optional `agent`,
+`title`, `display_agent`, `state_labels`, and `label`. `label` is the pane's
+manual label, the one `pane.rename` sets and the pane menu edits. Changing it
+publishes the event on its own, with `agent_status` reporting whatever the pane
+already held, so a subscribed client sees a rename as it happens rather than at
+its next snapshot.
+
+The payload also carries `pinned`, the pane's pin. Changing it publishes the
+event on its own in the same way a label change does, with `agent_status`
+reporting whatever the pane already held.
+
+`label` and `pinned` are the presentation fields always present in this
+payload: `label` is `null` when the pane has no manual label and `pinned` is
+`true` or `false`, where the others are omitted when unset. That is deliberate.
+A client must be able to tell a cleared label (`"label": null`) or an unpinned
+pane (`"pinned": false`) from a server that predates the field (no key at all),
+and keep what it already learned in the second case. `PaneInfo.label` in
+`pane.get`, `session.snapshot`, and the `pane.rename` response is unchanged and
+stays omitted when unset; `PaneInfo.pinned` is always present there too.
+
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a
 changed scroll snapshot.

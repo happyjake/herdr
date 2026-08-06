@@ -414,6 +414,16 @@ pub struct PaneAgentStatusChangedEvent {
     pub display_agent: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
+    /// The pane's manual label, always serialized and `null` when unset, so a
+    /// subscriber can tell a cleared label from a server that predates the
+    /// field. The other optional presentation fields stay omitted when unset.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Whether the user has pinned the pane, always serialized for the same
+    /// reason the label is: a subscriber reads an absent key as a server that
+    /// predates the pin, not as an unpinned pane.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -555,6 +565,15 @@ pub enum EventData {
         display_agent: Option<String>,
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         state_labels: HashMap<String, String>,
+        /// The pane's manual label, always serialized and `null` when unset, so
+        /// a subscriber can tell a cleared label from a server that predates
+        /// the field.
+        #[serde(default)]
+        label: Option<String>,
+        /// Whether the user has pinned the pane, always serialized for the same
+        /// reason the label is.
+        #[serde(default)]
+        pinned: bool,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

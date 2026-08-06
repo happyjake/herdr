@@ -217,6 +217,23 @@ mod tests {
             .request(&args(values))
     }
 
+    #[test]
+    fn pin_commands_preserve_request_identity_and_require_one_target() {
+        for (command, pinned) in [("pin", true), ("unpin", false)] {
+            let actual = request(command, &["opaque"]).unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::json!({
+                    "id": "cli:pane:set_pinned",
+                    "method": "pane.set_pinned",
+                    "params": {"pane_id": "opaque", "pinned": pinned}
+                })
+            );
+            assert!(request(command, &[]).is_err());
+            assert!(request(command, &["opaque", "extra"]).is_err());
+        }
+    }
+
     fn parse_pane_split_args(
         values: &[&str],
         caller: Option<&str>,
@@ -487,6 +504,17 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn pane_pin_and_unpin_require_exactly_one_pane_id() {
+        assert_eq!(run_pane_command(&args(&["pin"])).unwrap(), 2);
+        assert_eq!(run_pane_command(&args(&["unpin"])).unwrap(), 2);
+        assert_eq!(
+            run_pane_command(&args(&["pin", "w1:p1", "please"])).unwrap(),
+            2,
+            "the pin takes no value of its own: pin and unpin say which way it goes"
+        );
     }
 
     #[test]

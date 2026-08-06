@@ -153,6 +153,7 @@ operations::define_operations! {
     CredentialList(CredentialActorParams) => "credential.list", false, false;
     CredentialRevoke(CredentialRevokeParams) => "credential.revoke", false, false;
     CredentialRevokeAll(CredentialActorParams) => "credential.revoke_all", false, false;
+    PaneSetPinned(PaneSetPinnedParams) => "pane.set_pinned", false, false;
 }
 
 #[cfg(test)]
