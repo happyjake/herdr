@@ -35,6 +35,15 @@ impl HandoffRuntimeState {
         self.pane_id = pane_id.raw();
         self
     }
+
+    /// Whether the exporting server recorded this pane on the alternate
+    /// screen. Answered here on the carried manifest data — importers must
+    /// not re-query a terminal that does not exist yet on their side.
+    pub fn carries_alternate_screen(&self) -> bool {
+        self.input_state
+            .as_ref()
+            .is_some_and(|input_state| input_state.alternate_screen)
+    }
 }
 
 #[derive(Debug)]

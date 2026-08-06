@@ -136,6 +136,7 @@ pub fn start_server_with_capabilities(
         None,
         server_name,
         server_reach,
+        advertised_endpoint,
     )
 }
 
@@ -147,6 +148,7 @@ fn start_server_inner(
     server_stop: Option<Arc<AtomicBool>>,
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
+    advertised_endpoint: crate::api::SharedAdvertisedEndpoint,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -225,14 +227,30 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
+    server_name: &crate::api::SharedServerName,
+    server_reach: &crate::api::SharedServerReach,
+    advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
+    credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
-    handle_connection_with_stop(stream, api_tx, event_hub, running, capabilities, None)
+    handle_connection_with_stop(
+        stream,
+        api_tx,
+        event_hub,
+        running,
+        capabilities,
+        None,
+        server_name,
+        server_reach,
+        advertised_endpoint,
+        credentials,
+    )
 }
 
 fn handle_connection_with_stop(
@@ -1346,6 +1364,7 @@ mod tests {
             scroll: None,
             mouse_tracking: false,
             alternate_screen: false,
+            agent_status_changed_at: Some(1_700_000_000),
             revision: 0,
         }
     }

@@ -41,6 +41,8 @@ use self::agent_detection::{
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
+#[cfg(test)]
+pub(crate) use self::state::RESTORE_DEADLINE_PROBE_SECS;
 #[cfg(any(unix, test))]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
@@ -49,10 +51,8 @@ pub(crate) use self::terminal::{
     TerminalTextPoint, TerminalWordMotion,
 };
 pub use self::{
-    state::PaneState,
-    terminal::{
-        InputState, RecentReadRequest, RecentReadWindow, ScrollMetrics, TerminalCursorState,
-    },
+    state::{unix_now_secs, AgentStatusClaim, PaneState},
+    terminal::{RecentReadRequest, RecentReadWindow, ScrollMetrics, TerminalCursorState},
 };
 
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
@@ -202,6 +202,7 @@ async fn publish_state_changed_event(
     visible_working: bool,
     process_exited: bool,
     observed_at: std::time::Instant,
+    reading: crate::events::StatusReading,
 ) {
     // This runs on the async detector task, not the PTY reader thread.
     // Waiting for queue space here preserves correctness-critical state transitions
@@ -215,6 +216,7 @@ async fn publish_state_changed_event(
             visible_working,
             process_exited,
             observed_at,
+            reading,
         })
         .await
     {
@@ -231,12 +233,14 @@ async fn publish_agent_process_detected_event(
     pane_id: PaneId,
     agent: Agent,
     observed_at: std::time::Instant,
+    reading: crate::events::StatusReading,
 ) {
     if let Err(e) = state_events
         .send(AppEvent::AgentProcessDetected {
             pane_id,
             agent,
             observed_at,
+            reading,
         })
         .await
     {
@@ -291,6 +295,8 @@ async fn apply_agent_detection_publish_update(
         update.visible_working,
         update.process_exited,
         observed_at,
+        // Past the startup grace window, this is the detector's verdict.
+        crate::events::StatusReading::Verdict,
     )
     .await;
 }
@@ -863,6 +869,7 @@ fn spawn_basic_detection_task(
                                 pane_id,
                                 agent,
                                 now,
+                                crate::events::StatusReading::Provisional,
                             )
                             .await;
                         } else {
@@ -2669,6 +2676,7 @@ impl PaneRuntime {
                                             pane_id,
                                             agent,
                                             now,
+                                            crate::events::StatusReading::Provisional,
                                         )
                                         .await;
                                     } else {
@@ -3201,7 +3209,7 @@ impl PaneRuntime {
     }
 
     pub fn encode_mouse_click(&self, column: u16, row: u16) -> Option<Vec<u8>> {
-        if !self.input_state()?.mouse_protocol_mode.reporting_enabled() {
+        if !self.mouse_reporting_enabled() {
             return None;
         }
         self.terminal.encode_mouse_click(column, row)
@@ -3252,7 +3260,11 @@ impl PaneRuntime {
             WheelRouting::HostScroll => None,
             WheelRouting::MouseReport => {
                 self.scroll_reset();
-                self.encode_mouse_wheel(kind, column, row, modifiers)
+                self.encode_mouse_wheel(
+                    kind,
+                    crate::input::mouse::Position::Cell { column, row },
+                    modifiers,
+                )
             }
             WheelRouting::AlternateScroll => {
                 self.scroll_reset();
@@ -4931,6 +4943,7 @@ mod tests {
             false,
             false,
             std::time::Instant::now(),
+            crate::events::StatusReading::Verdict,
         );
         tokio::pin!(publish);
 
@@ -4969,6 +4982,7 @@ mod tests {
                 visible_working: false,
                 process_exited: false,
                 observed_at: _,
+                reading: crate::events::StatusReading::Verdict,
             } if delivered_pane == pane_id
         ));
     }

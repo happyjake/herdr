@@ -363,10 +363,7 @@ pub(crate) fn honor_legacy_alternate_screen_panes(manifest: &mut HandoffManifest
         .collect();
 
     for pane in manifest.panes.iter_mut() {
-        let carried_alternate = pane
-            .input_state
-            .as_ref()
-            .is_some_and(|input_state| input_state.alternate_screen);
+        let carried_alternate = pane.carries_alternate_screen();
         let stream_sets_mode = pane
             .initial_history_ansi
             .as_deref()
@@ -577,7 +574,6 @@ mod tests {
         assert!(older.api_window_title.is_none());
     }
 
-
     fn manifest_pane(
         pane_id: u32,
         alternate_screen: bool,
@@ -602,6 +598,7 @@ mod tests {
                 mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
                 mouse_alternate_scroll: false,
                 modify_other_keys: false,
+                color_scheme_reporting: false,
             }),
             initial_history_ansi: initial_history_ansi.map(str::to_string),
         }
@@ -625,6 +622,10 @@ mod tests {
                             value: "session-1".into(),
                         }),
                         launch_argv: None,
+                        agent_status: None,
+                        agent_status_changed_at: None,
+                        agent_status_resolve_by: None,
+                        agent_status_saw_other: false,
                     },
                 )
             })
@@ -675,6 +676,7 @@ mod tests {
             ],
             None,
             None,
+            None,
         );
 
         honor_legacy_alternate_screen_panes(&mut manifest);
@@ -708,6 +710,7 @@ mod tests {
         let mut manifest = manifest_for(
             snapshot_with_agent_flags(&[(1, false)]),
             vec![manifest_pane(1, true, None)],
+            None,
             None,
             None,
         );

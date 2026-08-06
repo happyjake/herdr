@@ -401,13 +401,6 @@ pub(crate) fn should_query_host_terminal_palette() -> bool {
     false
 }
 
-/// The machine's node name, as shown by tmux's `#h`.
-pub(crate) fn hostname() -> Option<String> {
-    std::env::var("COMPUTERNAME")
-        .ok()
-        .filter(|name| !name.is_empty())
-}
-
 pub(crate) fn local_datetime() -> Option<time::PrimitiveDateTime> {
     let mut timestamp: libc::time_t = 0;
     if unsafe { libc::time(&mut timestamp) } == -1 {

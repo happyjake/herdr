@@ -6,9 +6,9 @@ use crate::api::schema::{
     PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
     PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
     PaneListParams, PaneMouseRouting, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
-    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo,
-    PaneProcessInfoParams, PaneProcessInfoProcess, PaneReadParams, PaneReadResult,
-    PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
+    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
+    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneSendInputParams, PaneSendKeysParams, PaneSendMouseParams, PaneSendTextParams,
     PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode,
@@ -2169,6 +2169,7 @@ mod tests {
             format: ReadFormat::Text,
             strip_ansi: true,
             offset_from_bottom,
+            intent: crate::api::schema::ReadIntent::Interactive,
         }
     }
 
@@ -2460,6 +2461,494 @@ mod tests {
             assert_eq!(rx.try_recv().unwrap().as_ref(), expected);
             assert!(rx.try_recv().is_err());
         }
+    }
+
+    /// An app whose one pane was rebuilt from a snapshot that recorded it
+    /// working since `SNAPSHOT_AT`, with its terminal not yet re-read.
+    fn app_with_restored_pane(restored_at: u64) -> (App, String, PaneId) {
+        let (mut app, public_pane_id, _rx) = app_with_mouse_runtime(b"", 1);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("root pane exists")
+            .attached_terminal_id
+            .clone();
+        app.state.workspaces[0].tabs[0].panes.insert(
+            pane_id,
+            crate::pane::PaneState::restored(
+                terminal_id,
+                crate::api::schema::AgentStatus::Working,
+                SNAPSHOT_AT,
+                restored_at,
+            ),
+        );
+        (app, public_pane_id, pane_id)
+    }
+
+    const SNAPSHOT_AT: u64 = 1_000;
+
+    /// Ask for the pane the way a client does, through the request entry point
+    /// rather than the inner handler, so the reconciliation runs too.
+    fn requested_pane_info(app: &mut App, public_pane_id: &str) -> serde_json::Value {
+        let request = crate::api::schema::Request {
+            id: "req_restored".into(),
+            method: crate::api::schema::Method::PaneGet(PaneTarget {
+                pane_id: public_pane_id.to_string(),
+            }),
+        };
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        response["result"]["pane"].clone()
+    }
+
+    fn publish_agent_state(
+        app: &mut App,
+        pane_id: PaneId,
+        state: crate::detect::AgentState,
+        reading: crate::events::StatusReading,
+    ) {
+        app.state
+            .handle_app_event(crate::events::AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::Pi),
+                state,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+                reading,
+            });
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_dates_a_restored_pane_to_the_restore_until_it_is_read_again() {
+        let restored_at = crate::pane::unix_now_secs();
+        let (mut app, public_pane_id, _pane_id) = app_with_restored_pane(restored_at);
+
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+
+        // The snapshot said working, but the pane cannot see that yet, so it
+        // must not wear working's date while reporting something else.
+        assert_eq!(pane["agent_status"], "unknown");
+        assert_eq!(
+            pane["agent_status_changed_at"].as_u64(),
+            Some(restored_at),
+            "the reported date must date the reported status: {pane}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_inherits_the_snapshot_date_when_detection_confirms_it() {
+        let (mut app, public_pane_id, pane_id) =
+            app_with_restored_pane(crate::pane::unix_now_secs());
+        requested_pane_info(&mut app, &public_pane_id);
+
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Verdict,
+        );
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+
+        assert_eq!(pane["agent_status"], "working");
+        assert_eq!(
+            pane["agent_status_changed_at"].as_u64(),
+            Some(SNAPSHOT_AT),
+            "a confirmed pane has been working since before the restart: {pane}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_dates_a_restored_pane_now_when_detection_disagrees() {
+        let (mut app, public_pane_id, pane_id) =
+            app_with_restored_pane(crate::pane::unix_now_secs());
+        requested_pane_info(&mut app, &public_pane_id);
+
+        let before = crate::pane::unix_now_secs();
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Blocked,
+            crate::events::StatusReading::Verdict,
+        );
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+
+        assert_eq!(pane["agent_status"], "blocked");
+        assert!(
+            pane["agent_status_changed_at"].as_u64().unwrap() >= before,
+            "a pane doing something else changed, and changed now: {pane}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_holds_a_matching_status_at_the_restore_until_it_is_classified() {
+        let restored_at = crate::pane::unix_now_secs();
+        let (mut app, public_pane_id, pane_id) = app_with_restored_pane(restored_at);
+
+        // The pane already reads as working, matching the snapshot, but
+        // nothing has classified it, so it cannot claim the older date yet.
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Provisional,
+        );
+        let during = requested_pane_info(&mut app, &public_pane_id);
+        assert_eq!(during["agent_status"], "working");
+        assert_eq!(
+            during["agent_status_changed_at"].as_u64(),
+            Some(restored_at),
+            "an unclassified pane dates from the restart: {during}"
+        );
+
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Verdict,
+        );
+        let after = requested_pane_info(&mut app, &public_pane_id);
+
+        assert_eq!(after["agent_status"], "working");
+        assert_eq!(
+            after["agent_status_changed_at"].as_u64(),
+            Some(SNAPSHOT_AT),
+            "classified as working, the pane has been working since the snapshot: {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_will_not_claim_an_age_across_a_placeholder_a_client_could_have_seen() {
+        let (mut app, public_pane_id, pane_id) =
+            app_with_restored_pane(crate::pane::unix_now_secs());
+
+        // The detector announces a newly recognised agent as Idle before it
+        // has classified it. A placeholder settles nothing on its own...
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Idle,
+            crate::events::StatusReading::Provisional,
+        );
+        let placeholder = requested_pane_info(&mut app, &public_pane_id);
+        assert_eq!(placeholder["agent_status"], "idle");
+        assert!(app.state.workspaces[0]
+            .pane_state(app.state.workspaces[0].tabs[0].root_pane)
+            .expect("root pane exists")
+            .awaits_agent_status_resolution());
+
+        // ...but the pane reported idle, and a client could have read that, so
+        // claiming it has been working without interruption since the snapshot
+        // would span an interlude that was on the wire.
+        let before = crate::pane::unix_now_secs();
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Verdict,
+        );
+
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+        assert_eq!(pane["agent_status"], "working");
+        assert!(
+            pane["agent_status_changed_at"].as_u64().unwrap() >= before,
+            "an age must not span a status the pane already reported: {pane}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_does_not_reuse_a_spent_snapshot_date_after_a_differing_verdict() {
+        let (mut app, public_pane_id, pane_id) =
+            app_with_restored_pane(crate::pane::unix_now_secs());
+
+        // Classified as idle, which differs from the snapshot's working, so
+        // the snapshot's claim is settled and spent even though the pane is
+        // reporting what it was already reporting.
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Idle,
+            crate::events::StatusReading::Verdict,
+        );
+        requested_pane_info(&mut app, &public_pane_id);
+
+        let before = crate::pane::unix_now_secs();
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Verdict,
+        );
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+
+        assert_eq!(pane["agent_status"], "working");
+        assert!(
+            pane["agent_status_changed_at"].as_u64().unwrap() >= before,
+            "a spent snapshot date must not be minted onto a later transition: {pane}"
+        );
+    }
+
+    fn report_hook_state(app: &mut App, pane_id: PaneId, state: crate::detect::AgentState) {
+        app.state
+            .handle_app_event(crate::events::AppEvent::HookStateReported {
+                pane_id,
+                source: "custom:pi".into(),
+                agent_label: "pi".into(),
+                state,
+                message: None,
+                seq: None,
+                session_ref: None,
+            });
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_dates_a_mid_window_hook_transition_at_the_transition() {
+        let restored_at = crate::pane::unix_now_secs();
+        let (mut app, public_pane_id, pane_id) = app_with_restored_pane(restored_at);
+
+        // An agent reporting for itself is authoritative, so this is a real
+        // move and not the pane settling after a restart.
+        let before = crate::pane::unix_now_secs();
+        report_hook_state(&mut app, pane_id, crate::detect::AgentState::Blocked);
+        let blocked = requested_pane_info(&mut app, &public_pane_id);
+
+        assert_eq!(blocked["agent_status"], "blocked");
+        assert!(
+            blocked["agent_status_changed_at"].as_u64().unwrap() >= before,
+            "a real move dates at the move, never back at the restart: {blocked}"
+        );
+
+        // And the snapshot's claim is spent, so working cannot come back
+        // wearing a date from before a blocked the client already saw.
+        let before_working = crate::pane::unix_now_secs();
+        report_hook_state(&mut app, pane_id, crate::detect::AgentState::Working);
+        let working = requested_pane_info(&mut app, &public_pane_id);
+
+        assert_eq!(working["agent_status"], "working");
+        assert!(
+            working["agent_status_changed_at"].as_u64().unwrap() >= before_working,
+            "a status seen to change cannot inherit an age from across that change: {working}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_lets_a_confirming_hook_report_settle_the_window() {
+        let restored_at = crate::pane::unix_now_secs();
+        let (mut app, public_pane_id, pane_id) = app_with_restored_pane(restored_at);
+        // The pane already reads as idle, and the agent reports idle. Nothing
+        // moves, but the agent has spoken about its own status, and that is a
+        // statement about the pane whether or not it changes the value.
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Idle,
+            crate::events::StatusReading::Provisional,
+        );
+        requested_pane_info(&mut app, &public_pane_id);
+
+        report_hook_state(&mut app, pane_id, crate::detect::AgentState::Idle);
+        let idle = requested_pane_info(&mut app, &public_pane_id);
+        assert_eq!(idle["agent_status"], "idle");
+
+        // Idle is not what the session recorded, so the claim is spent and a
+        // later working cannot reach back across the idle the client just saw.
+        let before = crate::pane::unix_now_secs();
+        report_hook_state(&mut app, pane_id, crate::detect::AgentState::Working);
+        let working = requested_pane_info(&mut app, &public_pane_id);
+
+        assert_eq!(working["agent_status"], "working");
+        assert!(
+            working["agent_status_changed_at"].as_u64().unwrap() >= before,
+            "a confirming report is still a verdict and must spend the claim: {working}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_survives_a_title_update_with_its_age_intact() {
+        let restored_at = crate::pane::unix_now_secs();
+        let (mut app, public_pane_id, pane_id) = app_with_restored_pane(restored_at);
+
+        // Give the pane an agent without settling anything and without
+        // reporting a status other than the one the session recorded, so this
+        // stays a test about the title.
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Provisional,
+        );
+
+        // A title says nothing about status. It must not settle the window,
+        // and it must not move the date either.
+        app.state
+            .handle_app_event(crate::events::AppEvent::HookMetadataReported {
+                pane_id,
+                source: "custom:pi".into(),
+                agent_label: Some("pi".into()),
+                applies_to_source: None,
+                title: Some("Refactor auth".into()),
+                display_agent: None,
+                state_labels: Default::default(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_state_labels: false,
+                seq: None,
+                ttl: None,
+            });
+        let titled = requested_pane_info(&mut app, &public_pane_id);
+        assert_eq!(titled["title"], "Refactor auth");
+        assert_eq!(
+            titled["agent_status_changed_at"].as_u64(),
+            Some(restored_at),
+            "a title update must not stamp the status clock: {titled}"
+        );
+
+        // And the age is still there to be recovered when the pane is really
+        // classified.
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Verdict,
+        );
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+
+        assert_eq!(pane["agent_status"], "working");
+        assert_eq!(
+            pane["agent_status_changed_at"].as_u64(),
+            Some(SNAPSHOT_AT),
+            "a title update must not cost the pane its age: {pane}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_will_not_claim_an_age_across_an_authority_clear_fallback() {
+        let (mut app, public_pane_id, pane_id) =
+            app_with_restored_pane(crate::pane::unix_now_secs());
+
+        // A hook takes authority and says working, then hands it back. The
+        // pane falls back to idle, which happens to be what the session
+        // recorded — but working was on the wire in between.
+        report_hook_state(&mut app, pane_id, crate::detect::AgentState::Working);
+        let working = requested_pane_info(&mut app, &public_pane_id);
+        assert_eq!(working["agent_status"], "working");
+
+        let before = crate::pane::unix_now_secs();
+        app.state
+            .handle_app_event(crate::events::AppEvent::HookAuthorityCleared {
+                pane_id,
+                source: Some("custom:pi".into()),
+                seq: None,
+            });
+
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+        assert!(
+            pane["agent_status_changed_at"].as_u64().unwrap() >= before,
+            "a fallback cannot claim an age reaching back across the working \
+             the client just read: {pane}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_dates_a_seen_driven_move_at_the_moment_it_happens() {
+        let restored_at = crate::pane::unix_now_secs();
+        let (mut app, public_pane_id, pane_id) = app_with_restored_pane(restored_at);
+        // Put the pane in a background workspace so a completion lands unseen.
+        app.state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        app.state.active = Some(0);
+        app.state.outer_terminal_focus = Some(false);
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Provisional,
+        );
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Idle,
+            crate::events::StatusReading::Provisional,
+        );
+        let done = requested_pane_info(&mut app, &public_pane_id);
+        assert_eq!(done["agent_status"], "done");
+
+        // Being seen at the desk turns Done into Idle. That is not a statement
+        // about the agent, but it is the pane moving.
+        let before = crate::pane::unix_now_secs();
+        assert!(app.state.mark_active_tab_seen());
+
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+        assert_eq!(pane["agent_status"], "idle");
+        assert!(
+            pane["agent_status_changed_at"].as_u64().unwrap() >= before,
+            "a seen-driven move dates at the move, not at the restart: {pane}"
+        );
+        assert!(
+            !app.state.workspaces[0]
+                .pane_state(app.state.workspaces[0].tabs[0].root_pane)
+                .expect("root pane exists")
+                .awaits_agent_status_resolution(),
+            "movement settles the window like any other movement"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_resolves_a_silent_pane_when_its_window_runs_out() {
+        // Restored far enough in the past that the window is already due, as
+        // it would be for a hook-driven agent that never reports and that the
+        // detector never classifies.
+        let restored_at = crate::pane::unix_now_secs() - 600;
+        let (mut app, public_pane_id, _pane_id) = app_with_restored_pane(restored_at);
+        let due_at = app.state.workspaces[0]
+            .pane_state(app.state.workspaces[0].tabs[0].root_pane)
+            .expect("root pane exists")
+            .agent_status_resolution_due_at()
+            .expect("an unresolved pane has a deadline");
+
+        // The scheduled work the event loops run, not a client request.
+        app.handle_scheduled_tasks(std::time::Instant::now(), false);
+
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+        assert_eq!(pane["agent_status"], "unknown");
+        assert_eq!(
+            pane["agent_status_changed_at"].as_u64(),
+            Some(due_at),
+            "an expired window dates at its deadline, not at whoever noticed: {pane}"
+        );
+        assert!(!app.state.workspaces[0]
+            .pane_state(app.state.workspaces[0].tabs[0].root_pane)
+            .expect("root pane exists")
+            .awaits_agent_status_resolution());
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_does_not_reuse_the_snapshot_date_after_a_failed_resume() {
+        let (mut app, public_pane_id, pane_id) =
+            app_with_restored_pane(crate::pane::unix_now_secs());
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("root pane exists")
+            .attached_terminal_id
+            .clone();
+
+        // A deferred resume that fails to start a shell drops the pane's agent
+        // identity, which is the same path a respawn takes.
+        app.state.clear_agent_identity_after_respawn(&terminal_id);
+        let before = crate::pane::unix_now_secs();
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Verdict,
+        );
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+
+        assert_eq!(pane["agent_status"], "working");
+        assert!(
+            pane["agent_status_changed_at"].as_u64().unwrap() >= before,
+            "the agent that snapshot belonged to never came back: {pane}"
+        );
     }
 
     #[tokio::test]
@@ -2990,8 +3479,14 @@ mod tests {
             }),
         };
 
-        assert_ok_response(&app.handle_api_request(request("req_a", Some("id-1"))), "req_a");
-        assert_ok_response(&app.handle_api_request(request("req_b", Some("id-2"))), "req_b");
+        assert_ok_response(
+            &app.handle_api_request(request("req_a", Some("id-1"))),
+            "req_a",
+        );
+        assert_ok_response(
+            &app.handle_api_request(request("req_b", Some("id-2"))),
+            "req_b",
+        );
         assert_ok_response(&app.handle_api_request(request("req_c", None)), "req_c");
         assert_ok_response(&app.handle_api_request(request("req_d", None)), "req_d");
 

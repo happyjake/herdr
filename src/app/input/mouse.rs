@@ -3329,6 +3329,7 @@ mod tests {
                 visible_working: false,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             });
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 

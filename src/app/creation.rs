@@ -437,16 +437,17 @@ impl App {
                 max_offset_from_bottom: metrics.max_offset_from_bottom as u64,
                 viewport_rows: metrics.viewport_rows as u64,
             });
-        let input_state = runtime.and_then(crate::terminal::TerminalRuntime::input_state);
-        let mouse_tracking =
-            input_state.is_some_and(crate::pane::InputState::mouse_reporting_enabled);
-        let alternate_screen = input_state.is_some_and(|state| state.alternate_screen);
+        let mouse_tracking = runtime.is_some_and(|runtime| runtime.mouse_reporting_enabled());
+        let alternate_screen = runtime.is_some_and(|runtime| runtime.alternate_screen_active());
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
             && ws
                 .focused_pane_id()
                 .is_some_and(|focused| focused == pane_id);
         let presentation = terminal.effective_presentation();
+        // Read the status and its date together so the reported pair can never
+        // date one status with another one's time.
+        let agent_status = pane_agent_status(terminal.state, pane.seen);
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
             terminal_id: terminal.id.to_string(),
@@ -465,13 +466,14 @@ impl App {
             terminal_title: terminal.terminal_title.clone(),
             terminal_title_stripped: terminal.terminal_title_stripped(),
             display_agent: presentation.display_agent,
-            agent_status: pane_agent_status(terminal.state, pane.seen),
+            agent_status,
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
             scroll,
             mouse_tracking,
             alternate_screen,
+            agent_status_changed_at: Some(pane.agent_status_changed_at_for(agent_status)),
             revision: terminal.revision,
         })
     }

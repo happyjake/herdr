@@ -203,6 +203,63 @@ responses from older servers can treat an absent field as `false`.
 its alternate screen. Supporting servers always include this boolean. Clients
 reading responses from older servers can treat an absent field as `false`.
 
+`PaneInfo.agent_status_changed_at` reports the unix second at which the pane's
+`agent_status` last changed, so a client that has just connected can show how
+long a pane has held its status without having watched it change. A pane with
+no detected agent reports `unknown` and dates it to the pane's own creation.
+Supporting servers always include this field; clients reading responses from
+older servers must treat an absent field as "age unknown" rather than as a
+timestamp, and show no age at all.
+
+The date is captured with the session, so it survives a server restart and a
+live handoff: a pane that has been working for an hour still reads as an hour
+old to a client that connects to the new process.
+
+Getting that date back takes a moment. Until the new server has classified a
+pane, what the pane reports is dated to the restart. A pane is classified by
+the first of: the detector finishing its startup grace and saying what the
+pane is doing, an agent reporting for itself — including a report that
+confirms what the pane already showed — a deferred agent resume finishing or
+failing, or any other change that moves what the pane reports. Changes that
+say nothing about status, such as a title or a display label, never classify
+a pane and never move its date. Once classified, a pane found doing what the session recorded gets
+that older date back — but only if it reported no other known status in the
+meantime. `unknown` does not count, because it is the absence of a reading
+rather than a competing one: a client may well watch a pane go from `unknown`
+to `working` and see the `working` dated to before the restart, and that is
+correct, since the server never claimed the pane was doing something else. A
+pane found doing anything else, or one that reported some other known status
+on the way, is dated at the classification, because as far as this server
+witnessed, that is when it started. A pane whose session recorded nothing running is classified the
+moment it is rebuilt, and one that nothing classifies is classified on a
+timer, so no pane stays undated. A session captured before this field existed
+has no date to restore, and those panes date themselves to the restart.
+
+A status the server watches change is always dated at the change, never back
+at the restart. The guarantee this gives a client is precise: an age never
+spans an observed transition between known statuses. Leaving `unknown` is not
+such a transition.
+
+The practical consequence for a client: for a few seconds after a server
+restart, ages are short and then some of them jump back to their true values.
+Ages during that window are never older than the restart, so a client that
+sorts or filters on age will under-state rather than invent.
+
+The two values are always read together, so the date describes exactly the
+`agent_status` in the same payload and never some other status the pane held
+earlier. A client can rely on that: if `agent_status` is `unknown`, the date
+is when the pane started reporting `unknown`.
+
+Every change of the reported status restamps the field, including a `done` to
+`idle` change caused by the pane being seen at the desk rather than by the
+agent doing anything. A client that deliberately folds read-driven transitions
+without ageing its own rows will therefore disagree with a freshly seeded one:
+an age seeded from `agent_status_changed_at` is at most as old as the last desk
+read of that pane, while a client that watched the same transition still holds
+the older stamp. Both are honest about what they witnessed, so a client that
+folds read-transitions should expect the seeded age to be the shorter of the
+two and not treat the difference as drift.
+
 ### Experimental pane graphics
 
 Pane graphics let a plugin place image data over a pane. They are available

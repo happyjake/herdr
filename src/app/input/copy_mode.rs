@@ -1187,7 +1187,8 @@ mod tests {
             .state
             .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
             .expect("pane runtime")
-            .recent_text(usize::MAX);
+            .recent_unwrapped_text_snapshot(usize::MAX)
+            .text;
 
         let copy_anchor = app.scrollback_editor_anchor_line(0, pane_id, &dump);
         let copy = app.state.copy_mode.as_ref().expect("copy mode");

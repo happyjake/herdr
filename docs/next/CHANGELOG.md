@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Added `PaneInfo.agent_status_changed_at`, the unix second at which a pane's `agent_status` last changed, so a client that connects after the fact can still show how long a pane has held its status. The date is captured with the session and survives a server restart or live handoff. The field is additive and the protocol version is unchanged; clients reading older servers must treat an absent field as "age unknown" rather than as a timestamp.
 - The websocket API now keeps a credential registry per server: the pairing's managing credential plus limited credentials minted through `credential.mint`, listed with `credential.list`, and ended with `credential.revoke` / `credential.revoke_all`. Limited credentials drive the whole API but cannot manage the registry, and may revoke only themselves. Servers declare `credential_registry` in their `ping` capabilities; the protocol version is unchanged. Revocation is reported to the affected client as a terminal `credential_revoked` error on an established connection, so a browser can tell revocation from transient trouble.
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)
 

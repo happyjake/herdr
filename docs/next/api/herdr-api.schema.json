@@ -802,6 +802,20 @@
             "agent_status": {
               "$ref": "#/schemas/event/$defs/AgentStatus"
             },
+            "agent_status_changed_at": {
+              "description": "Unix seconds at which `agent_status` last changed for this pane.\n\nThis server always sends it, so a client that has just connected can\ndate a status it never watched change. Additive and optional rather\nthan a plain integer: payloads from older servers omit it, and absent\nhas to stay distinguishable from a real timestamp so a client renders\nno age instead of an age measured from the unix epoch.\n\nThis always dates exactly the `agent_status` in the same payload, never\nsome other status the pane held earlier.\n\nThe date is captured with the session, so it survives a server restart\nand a live handoff. Until the new server has classified a pane, though,\nwhat it reports is dated to the restart; a pane then found doing what\nthe session recorded gets its older date back, provided it reported no\nother KNOWN status in between; Unknown does not count, being the\nabsence of a reading rather than a competing one, so a client may see\nUnknown give way to a status dated before the restart. A pane found\ndoing anything else is dated at the classification. The guarantee is\nprecise: an age never spans an observed transition between known\nstatuses. A change that says nothing about status, such as a title,\nnever moves this at all.\n\nEvery change of the reported status restamps this, including a Done to\nIdle change caused by the pane being seen at the desk rather than by\nthe agent. A client that folds read-driven transitions without ageing\nits own rows should expect an age seeded from here to be at most as old\nas the last desk read of that pane, not to match its own stamp.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "alternate_screen": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
+            },
             "cwd": {
               "type": [
                 "string",
@@ -828,6 +842,11 @@
                 "string",
                 "null"
               ]
+            },
+            "mouse_tracking": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently reports mouse input.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
             },
             "pane_id": {
               "type": "string"
@@ -1722,6 +1741,18 @@
           ],
           "type": "object"
         },
+        "AttachmentCreateParams": {
+          "properties": {
+            "bytes_b64": {
+              "description": "Image bytes encoded as standard base64 (RFC 4648, padding accepted).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "bytes_b64"
+          ],
+          "type": "object"
+        },
         "ClientWindowTitleSetParams": {
           "properties": {
             "title": {
@@ -1731,6 +1762,54 @@
           "required": [
             "title"
           ],
+          "type": "object"
+        },
+        "CredentialActorParams": {
+          "description": "The credential a local-socket caller acts as.\n\nAuthenticated transports carry the acting credential themselves — a\nWebSocket connection acts as the credential it presented at the\nhandshake, and sending this field there is refused. The Unix socket has\nno handshake: owning the socket file is already full authority over the\nserver, so a caller there may act as the managing credential (the\ndefault) or name one of the registry's credentials explicitly.",
+          "properties": {
+            "acting_token": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "CredentialMintParams": {
+          "properties": {
+            "acting_token": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "description": "Display label for the holder, e.g. the linked browser's device name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "CredentialRevokeParams": {
+          "properties": {
+            "acting_token": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "credential_id": {
+              "description": "The credential to end. Absent means the caller's own credential —\nhow a limited credential logs itself out.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
           "type": "object"
         },
         "EmptyParams": {
@@ -2628,6 +2707,14 @@
           },
           "type": "object"
         },
+        "PaneMouseAction": {
+          "enum": [
+            "click",
+            "scroll_up",
+            "scroll_down"
+          ],
+          "type": "string"
+        },
         "PaneMoveDestination": {
           "oneOf": [
             {
@@ -3098,6 +3185,43 @@
           "required": [
             "pane_id",
             "keys"
+          ],
+          "type": "object"
+        },
+        "PaneSendMouseParams": {
+          "description": "Mouse input addressed in zero-based terminal cells. Coordinates outside\nthe live pane grid are clamped to its last row or column before encoding.",
+          "properties": {
+            "action": {
+              "$ref": "#/schemas/request/$defs/PaneMouseAction"
+            },
+            "col": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "lines": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "row": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "action",
+            "row",
+            "col"
           ],
           "type": "object"
         },
@@ -4604,6 +4728,86 @@
         {
           "properties": {
             "method": {
+              "const": "attachment.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttachmentCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.mint",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialMintParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialActorParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.revoke",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialRevokeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.revoke_all",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialActorParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "notification.show",
               "type": "string"
             },
@@ -5532,6 +5736,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.send_mouse",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendMouseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.read",
               "type": "string"
             },
@@ -6446,6 +6666,58 @@
             "failed"
           ],
           "type": "string"
+        },
+        "CredentialInfo": {
+          "description": "One credential as the registry reports it. Never carries a token: a\nminted token is returned once, at mint time, and stored only as a\nfingerprint afterwards.",
+          "properties": {
+            "created_at_unix": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "credential_id": {
+              "type": "string"
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_seen_unix": {
+              "description": "Unix seconds of the last request this credential made, absent until\nit has been used. Server-observed, which is what makes the phone's\nlinked-browsers panel a report rather than local bookkeeping.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "tier": {
+              "$ref": "#/schemas/success_response/$defs/CredentialTier"
+            }
+          },
+          "required": [
+            "credential_id",
+            "tier",
+            "created_at_unix"
+          ],
+          "type": "object"
+        },
+        "CredentialTier": {
+          "description": "What a credential is allowed to do (ADR-0026).\n\nA server honors one managing credential — the pairing's token — and any\nnumber of limited credentials it has minted. Both drive the whole pane\nAPI; the tier decides only who may manage the registry itself.",
+          "oneOf": [
+            {
+              "const": "managing",
+              "description": "The pairing's credential: mints, lists, and revokes. Rotated by\nre-running `herdr pair`, never revoked through the API.",
+              "type": "string"
+            },
+            {
+              "const": "limited",
+              "description": "A minted credential: full pane access, and may revoke only itself.",
+              "type": "string"
+            }
+          ]
         },
         "EventData": {
           "oneOf": [
@@ -7506,6 +7778,20 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "agent_status_changed_at": {
+              "description": "Unix seconds at which `agent_status` last changed for this pane.\n\nThis server always sends it, so a client that has just connected can\ndate a status it never watched change. Additive and optional rather\nthan a plain integer: payloads from older servers omit it, and absent\nhas to stay distinguishable from a real timestamp so a client renders\nno age instead of an age measured from the unix epoch.\n\nThis always dates exactly the `agent_status` in the same payload, never\nsome other status the pane held earlier.\n\nThe date is captured with the session, so it survives a server restart\nand a live handoff. Until the new server has classified a pane, though,\nwhat it reports is dated to the restart; a pane then found doing what\nthe session recorded gets its older date back, provided it reported no\nother KNOWN status in between; Unknown does not count, being the\nabsence of a reading rather than a competing one, so a client may see\nUnknown give way to a status dated before the restart. A pane found\ndoing anything else is dated at the classification. The guarantee is\nprecise: an age never spans an observed transition between known\nstatuses. A change that says nothing about status, such as a title,\nnever moves this at all.\n\nEvery change of the reported status restamps this, including a Done to\nIdle change caused by the pane being seen at the desk rather than by\nthe agent. A client that folds read-driven transitions without ageing\nits own rows should expect an age seeded from here to be at most as old\nas the last desk read of that pane, not to match its own stamp.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "alternate_screen": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
+            },
             "cwd": {
               "type": [
                 "string",
@@ -7532,6 +7818,11 @@
                 "string",
                 "null"
               ]
+            },
+            "mouse_tracking": {
+              "default": false,
+              "description": "Whether the pane's live terminal state currently reports mouse input.\nAdditive: payloads from older servers omit this and deserialize false.",
+              "type": "boolean"
             },
             "pane_id": {
               "type": "string"
@@ -7724,6 +8015,14 @@
             "rect"
           ],
           "type": "object"
+        },
+        "PaneMouseRouting": {
+          "enum": [
+            "mouse_report",
+            "alternate_scroll",
+            "host_scroll"
+          ],
+          "type": "string"
         },
         "PaneMoveReason": {
           "enum": [
@@ -8819,6 +9118,30 @@
             },
             {
               "properties": {
+                "expires_at": {
+                  "description": "Unix seconds after which the TTL sweep may remove the file.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "path": {
+                  "description": "Absolute, space-free path of the fully written attachment file.\nThe success response is encoded only after the file is renamed\ninto place, so this path always names a complete, readable file.",
+                  "type": "string"
+                },
+                "type": {
+                  "const": "attachment_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "path",
+                "expires_at"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "type": {
                   "const": "workspace_info",
                   "type": "string"
@@ -9503,6 +9826,26 @@
             },
             {
               "properties": {
+                "delivered": {
+                  "type": "boolean"
+                },
+                "routing": {
+                  "$ref": "#/schemas/success_response/$defs/PaneMouseRouting"
+                },
+                "type": {
+                  "const": "pane_send_mouse",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "delivered",
+                "routing"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "explain": true,
                 "type": {
                   "const": "agent_explain",
@@ -9906,6 +10249,66 @@
             },
             {
               "properties": {
+                "credential": {
+                  "$ref": "#/schemas/success_response/$defs/CredentialInfo"
+                },
+                "token": {
+                  "description": "The minted credential's token, returned exactly once — the\nregistry stores only its fingerprint, so it cannot be re-read.",
+                  "type": "string"
+                },
+                "type": {
+                  "const": "credential_minted",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "credential",
+                "token"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "credentials": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/CredentialInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "credential_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "credentials"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The credentials this request ended: one for `credential.revoke`,\nevery limited credential for `credential.revoke_all`.",
+              "properties": {
+                "revoked": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "credential_revoked",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "revoked"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "diagnostics": {
                   "items": {
                     "type": "string"
@@ -9943,6 +10346,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "credential_registry": {
+              "default": false,
+              "description": "Whether this server keeps a credential registry (ADR-0026): the\npairing's managing credential plus any minted limited credentials,\nwith `credential.mint`, `credential.list`, `credential.revoke`, and\n`credential.revoke_all`. Additive: absent (false) in pongs of servers\nthat predate it, which refuse the verbs as unparseable methods.",
+              "type": "boolean"
+            },
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"

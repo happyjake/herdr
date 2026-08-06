@@ -256,9 +256,7 @@ impl App {
                     err = %err,
                     "failed to start shell for deferred agent resume"
                 );
-                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.clear_agent_runtime_identity_after_respawn();
-                }
+                self.state.clear_agent_identity_after_respawn(&terminal_id);
                 return false;
             }
         };
@@ -274,6 +272,9 @@ impl App {
                 "failed to send deferred agent resume command to shell"
             );
             runtime.shutdown();
+            // The resume is over and it failed, which classifies the pane just
+            // as completing it would.
+            self.state.clear_agent_identity_after_respawn(&terminal_id);
             return false;
         }
 
@@ -282,6 +283,10 @@ impl App {
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;
         }
+        // The resume finished. Whatever the snapshot said this pane was doing,
+        // it was a different agent process; this one starts now.
+        self.state
+            .resolve_agent_status_for_terminal_at(&terminal_id, crate::pane::unix_now_secs());
         true
     }
 }

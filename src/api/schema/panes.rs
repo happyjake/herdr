@@ -326,18 +326,6 @@ pub struct PaneReadParams {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) intent: super::common::ReadIntent,
-    /// Shift the recent-source window up from the bottom anchor: physical
-    /// rows for `recent`, logical lines for `recent_unwrapped`. Inside a
-    /// logical line taller than the window, one step degrades to one
-    /// window of physical rows so every prefix row stays reachable; page
-    /// by the echoed `effective_offset` rather than assuming fixed units.
-    /// Panes whose only history lives in the Windows console fallback echo
-    /// `has_more: false` at offset zero and reject nonzero offsets.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset_from_bottom: Option<u64>,
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub(crate) intent: super::common::ReadIntent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -538,6 +526,36 @@ pub struct PaneInfo {
     /// Additive: payloads from older servers omit this and deserialize false.
     #[serde(default)]
     pub alternate_screen: bool,
+    /// Unix seconds at which `agent_status` last changed for this pane.
+    ///
+    /// This server always sends it, so a client that has just connected can
+    /// date a status it never watched change. Additive and optional rather
+    /// than a plain integer: payloads from older servers omit it, and absent
+    /// has to stay distinguishable from a real timestamp so a client renders
+    /// no age instead of an age measured from the unix epoch.
+    ///
+    /// This always dates exactly the `agent_status` in the same payload, never
+    /// some other status the pane held earlier.
+    ///
+    /// The date is captured with the session, so it survives a server restart
+    /// and a live handoff. Until the new server has classified a pane, though,
+    /// what it reports is dated to the restart; a pane then found doing what
+    /// the session recorded gets its older date back, provided it reported no
+    /// other KNOWN status in between; Unknown does not count, being the
+    /// absence of a reading rather than a competing one, so a client may see
+    /// Unknown give way to a status dated before the restart. A pane found
+    /// doing anything else is dated at the classification. The guarantee is
+    /// precise: an age never spans an observed transition between known
+    /// statuses. A change that says nothing about status, such as a title,
+    /// never moves this at all.
+    ///
+    /// Every change of the reported status restamps this, including a Done to
+    /// Idle change caused by the pane being seen at the desk rather than by
+    /// the agent. A client that folds read-driven transitions without ageing
+    /// its own rows should expect an age seeded from here to be at most as old
+    /// as the last desk read of that pane, not to match its own stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status_changed_at: Option<u64>,
     pub revision: u64,
 }
 

@@ -178,7 +178,7 @@ pub(super) fn detect_state_from_api(
     }
 }
 
-pub(super) fn pane_agent_status(
+pub(crate) fn pane_agent_status(
     state: crate::detect::AgentState,
     seen: bool,
 ) -> crate::api::schema::AgentStatus {

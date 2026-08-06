@@ -187,7 +187,6 @@ impl PtyIoActorHandle {
         self.data_tx.capacity()
     }
 
-
     pub(crate) fn resize(
         &self,
         rows: u16,

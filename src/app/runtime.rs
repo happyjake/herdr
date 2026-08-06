@@ -329,6 +329,20 @@ impl App {
 
         if self
             .state
+            .next_agent_status_resolution_deadline(now)
+            .is_some_and(|deadline| now >= deadline)
+        {
+            let resolved = self
+                .state
+                .resolve_due_agent_status_windows_at(crate::pane::unix_now_secs());
+            for (ws_idx, pane_id) in resolved {
+                self.emit_pane_updated(ws_idx, pane_id);
+                changed = true;
+            }
+        }
+
+        if self
+            .state
             .next_managed_agent_deadline()
             .is_some_and(|deadline| now >= deadline)
         {
@@ -616,6 +630,7 @@ impl App {
             self.toast_deadline,
             self.state.next_pending_agent_notification_deadline(),
             self.state.next_managed_agent_deadline(),
+            self.state.next_agent_status_resolution_deadline(now),
             self.copy_feedback_deadline,
             include_git_refresh
                 .then(|| self.git_refresh_deadline())

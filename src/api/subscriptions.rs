@@ -634,6 +634,7 @@ mod tests {
             scroll,
             mouse_tracking: false,
             alternate_screen: false,
+            agent_status_changed_at: Some(1_700_000_000),
             revision: 0,
         }
     }

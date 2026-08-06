@@ -1888,6 +1888,172 @@ fn pane_report_agent_accepts_unknown_agent_labels() {
     cleanup_spawned_herdr(child, base);
 }
 
+fn status_changed_at(pane: &serde_json::Value) -> u64 {
+    pane["agent_status_changed_at"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("pane carries agent_status_changed_at: {pane}"))
+}
+
+#[test]
+fn pane_info_dates_the_agent_status_it_reports() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let before_create = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after the unix epoch")
+        .as_secs();
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_changed_1","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A pane nobody has watched still dates its status: it has reported
+    // whatever it reports since the moment it was created.
+    let created_at = status_changed_at(&created["result"]["root_pane"]);
+    assert!(
+        created_at >= before_create,
+        "a fresh pane reads as changed now, not at some earlier time: \
+         {created_at} < {before_create}"
+    );
+
+    let listed = send_request(
+        &socket_path,
+        r#"{"id":"req_changed_2","method":"pane.list","params":{}}"#,
+    );
+    let listed_pane = listed["result"]["panes"]
+        .as_array()
+        .expect("pane.list returns panes")
+        .iter()
+        .find(|pane| pane["pane_id"] == pane_id.as_str())
+        .expect("the created pane is listed")
+        .clone();
+    assert_eq!(status_changed_at(&listed_pane), created_at);
+
+    let mut reader = open_subscription(
+        &socket_path,
+        r#"{"id":"sub_changed","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"}]}}"#,
+    );
+    let ack = reader.read_json_line(Duration::from_secs(2));
+    assert_eq!(ack["result"]["type"], "subscription_started");
+
+    let hook = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_changed_3","method":"pane.report_agent","params":{{"pane_id":"{}","source":"custom:hermes","agent":"hermes","state":"working"}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(hook["result"]["type"], "ok");
+
+    let working = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_changed_4","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(working["result"]["pane"]["agent_status"], "working");
+    let working_at = status_changed_at(&working["result"]["pane"]);
+    assert!(
+        working_at >= created_at,
+        "detecting an agent is itself a transition: {working_at} < {created_at}"
+    );
+
+    // A status that has not moved keeps dating the transition that produced it,
+    // even a second later, so a client can render a growing age.
+    thread::sleep(Duration::from_millis(1_200));
+    let restated = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_changed_5","method":"pane.report_agent","params":{{"pane_id":"{}","source":"custom:hermes","agent":"hermes","state":"working"}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(restated["result"]["type"], "ok");
+    let still_working = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_changed_6","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(still_working["result"]["pane"]["agent_status"], "working");
+    assert_eq!(
+        status_changed_at(&still_working["result"]["pane"]),
+        working_at
+    );
+
+    // A real transition restamps.
+    let blocked_report = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_changed_7","method":"pane.report_agent","params":{{"pane_id":"{}","source":"custom:hermes","agent":"hermes","state":"blocked"}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(blocked_report["result"]["type"], "ok");
+    let blocked = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_changed_8","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ),
+    );
+    assert_eq!(blocked["result"]["pane"]["agent_status"], "blocked");
+    assert!(
+        status_changed_at(&blocked["result"]["pane"]) > working_at,
+        "a transition a second later must read later than the status it replaced: {blocked}"
+    );
+
+    // A pane created later dates itself later, so the stamp is per pane.
+    let split = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"req_changed_9","method":"pane.split","params":{{"target_pane_id":"{}","direction":"right","focus":true}}}}"#,
+            pane_id
+        ),
+    );
+    let split_pane_id = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(split_pane_id, pane_id);
+    let split_at = status_changed_at(&split["result"]["pane"]);
+    assert!(
+        split_at > created_at,
+        "the split pane dates itself to its own creation: {split}"
+    );
+
+    // Pane lifecycle events carry the same stamp the creation response does.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let created_event = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "no pane_created event for the split");
+        let value = reader.read_json_line(remaining);
+        if value["event"] == "pane_created"
+            && value["data"]["pane"]["pane_id"] == split_pane_id.as_str()
+        {
+            break value;
+        }
+    };
+    assert_eq!(status_changed_at(&created_event["data"]["pane"]), split_at);
+
+    cleanup_spawned_herdr(child, base);
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn official_release_waits_for_confirmed_process_exit() {

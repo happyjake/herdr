@@ -381,8 +381,7 @@ pub fn pane_shell_cwd(
     if !is_pane_shell_process_name(&child_name) {
         return process_cwd(child_pid);
     }
-    let Some(mut current) = foreground_process_group.and_then(live_foreground_group_member)
-    else {
+    let Some(mut current) = foreground_process_group.and_then(live_foreground_group_member) else {
         return process_cwd(child_pid);
     };
     for _ in 0..MAX_FOREGROUND_ANCESTRY {
@@ -698,8 +697,10 @@ mod tests {
             ],
             None,
         );
-        let inner = wait_for_descendant(child.pid(), is_pane_shell_process_name).expect("nested shell appears");
-        let foreground = wait_for_descendant(inner, |comm| comm == "sleep").expect("program appears");
+        let inner = wait_for_descendant(child.pid(), is_pane_shell_process_name)
+            .expect("nested shell appears");
+        let foreground =
+            wait_for_descendant(inner, |comm| comm == "sleep").expect("program appears");
         let seen = poll_pane_shell_cwd_until(child.pid(), Some(foreground), &target);
         drop(child);
         let _ = std::fs::remove_dir_all(&target);
@@ -727,7 +728,8 @@ mod tests {
             ],
             None,
         );
-        let tool_shell = wait_for_descendant(child.pid(), is_pane_shell_process_name).expect("tool shell appears");
+        let tool_shell = wait_for_descendant(child.pid(), is_pane_shell_process_name)
+            .expect("tool shell appears");
         // Give the tool shell time to reach the target before asserting the
         // guard holds anyway.
         let _ = poll_pane_shell_cwd_until(tool_shell, Some(tool_shell), &target);
@@ -758,7 +760,8 @@ mod tests {
             ],
             Some(&home),
         );
-        let background = wait_for_descendant(child.pid(), is_pane_shell_process_name).expect("background job appears");
+        let background = wait_for_descendant(child.pid(), is_pane_shell_process_name)
+            .expect("background job appears");
         let _ = poll_pane_shell_cwd_until(background, Some(background), &target);
         let seen = pane_shell_cwd(child.pid(), Some(child.pid()));
         drop(child);
@@ -776,8 +779,7 @@ mod tests {
         let leader = fixture.pid();
         fixture.reap_root();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-        while process_parent_and_name(leader).is_some() && std::time::Instant::now() < deadline
-        {
+        while process_parent_and_name(leader).is_some() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         assert!(

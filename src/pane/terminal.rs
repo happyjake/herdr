@@ -1963,7 +1963,10 @@ impl GhosttyPaneTerminal {
         let Ok(core) = self.core.lock() else {
             return None;
         };
-        let mut encoder = ghostty_mouse_encoder_for_terminal(&core.terminal)?;
+        let mut encoder = ghostty_mouse_encoder_for_terminal(
+            &core.terminal,
+            crate::input::mouse::Position::Cell { column, row },
+        )?;
         let press = ghostty_mouse_event_from_button_kind(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column,
@@ -4788,6 +4791,7 @@ mod tests {
             mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Default,
             mouse_alternate_scroll: false,
             modify_other_keys: false,
+            color_scheme_reporting: false,
         });
         pane.seed_history_ansi("\x1b[Htranscript tail line\r\n");
 

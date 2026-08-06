@@ -268,6 +268,33 @@ fn headless_size_floor(state: &crate::app::AppState) -> (u16, u16) {
     (cols.max(MIN_COLS), rows.max(MIN_ROWS))
 }
 
+/// The size headless panes lay out at while no client is attached.
+///
+/// An explicitly configured `[server] headless_cols/rows` is authoritative:
+/// exactly what the operator asked for, attached history notwithstanding
+/// (upstream semantics, pinned by the detach_reattach suite). On the default
+/// size the fork's protection applies instead: the last foreground client's
+/// size is retained across detach, and the `[advanced] headless_min_cols/rows`
+/// floor keeps API readers (the mobile client) from ever seeing panes
+/// collapse below phone-readable width.
+fn detached_headless_size(
+    configured: (u16, u16),
+    retained: Option<(u16, u16)>,
+    state: &crate::app::AppState,
+) -> (u16, u16) {
+    if configured
+        != (
+            crate::config::DEFAULT_HEADLESS_COLS,
+            crate::config::DEFAULT_HEADLESS_ROWS,
+        )
+    {
+        return configured;
+    }
+    let floor = headless_size_floor(state);
+    let retained = retained.unwrap_or(configured);
+    (retained.0.max(floor.0), retained.1.max(floor.1))
+}
+
 /// Timeout for in-flight API requests during shutdown.
 #[allow(dead_code)]
 const SHUTDOWN_API_TIMEOUT: Duration = Duration::from_secs(5);
@@ -524,9 +551,9 @@ impl HeadlessServer {
         #[cfg(windows)]
         spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
 
-        let headless_floor = headless_size_floor(&app.state);
         let server_keybindings = app_keybindings(&app);
         let headless_size = app.state.headless_size;
+        let effective_size = detached_headless_size(headless_size, None, &app.state);
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
         #[cfg(not(unix))]
@@ -556,10 +583,7 @@ impl HeadlessServer {
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
             headless_size,
-            effective_size: (
-                headless_size.0.max(headless_floor.0),
-                headless_size.1.max(headless_floor.1),
-            ),
+            effective_size,
             last_foreground_terminal_size: None,
             shutting_down: false,
             handoff_in_progress: false,
@@ -1144,7 +1168,20 @@ impl HeadlessServer {
         // With no foreground client the panes still have to follow
         // `effective_size`: detaching the last client can raise the
         // headless size to the configured floor, and only this relayout
-        // makes API readers actually see floor-sized panes.
+        // makes API readers actually see floor-sized panes. An explicitly
+        // configured `[server] headless_cols/rows` opts out of the fork's
+        // protection entirely (see detached_headless_size): upstream
+        // preserves existing panes across detach, and the explicit size
+        // already governs every pane created headless.
+        if self.foreground_client_id.is_none()
+            && self.headless_size
+                != (
+                    crate::config::DEFAULT_HEADLESS_COLS,
+                    crate::config::DEFAULT_HEADLESS_ROWS,
+                )
+        {
+            return;
+        }
         let foreground_cell_size = self
             .foreground_client_id
             .and_then(|client_id| self.clients.get(&client_id))
@@ -1209,11 +1246,11 @@ impl HeadlessServer {
         if !self.app.direct_graphics_available {
             self.retire_all_direct_graphics();
         }
-        let floor = headless_size_floor(&self.app.state);
-        let retained = self
-            .last_foreground_terminal_size
-            .unwrap_or(self.headless_size);
-        let headless_size = (retained.0.max(floor.0), retained.1.max(floor.1));
+        let headless_size = detached_headless_size(
+            self.headless_size,
+            self.last_foreground_terminal_size,
+            &self.app.state,
+        );
         let Some(client_id) = self.foreground_client_id else {
             self.effective_size = headless_size;
             self.app.state.outer_terminal_focus = None;
@@ -4820,6 +4857,22 @@ impl HeadlessServer {
         if self
             .app
             .state
+            .next_agent_status_resolution_deadline(now)
+            .is_some_and(|deadline| now >= deadline)
+        {
+            let resolved = self
+                .app
+                .state
+                .resolve_due_agent_status_windows_at(crate::pane::unix_now_secs());
+            for (ws_idx, pane_id) in resolved {
+                self.app.emit_pane_updated(ws_idx, pane_id);
+                changed = true;
+            }
+        }
+
+        if self
+            .app
+            .state
             .next_pending_agent_notification_deadline()
             .is_some_and(|deadline| now >= deadline)
         {
@@ -5511,8 +5564,8 @@ mod tests {
         spawn_windows_client_accept_thread(listener, should_quit.clone(), server_event_tx.clone());
         let server_keybindings = app_keybindings(&app);
         let headless_size = app.state.headless_size;
+        let effective_size = detached_headless_size(headless_size, None, &app.state);
 
-        let headless_floor = headless_size_floor(&app.state);
         HeadlessServer {
             app,
             #[cfg(unix)]
@@ -5538,10 +5591,7 @@ mod tests {
             deferred_alt_screen_reads: Vec::new(),
             next_activity_stamp: 1,
             headless_size,
-            effective_size: (
-                headless_size.0.max(headless_floor.0),
-                headless_size.1.max(headless_floor.1),
-            ),
+            effective_size,
             last_foreground_terminal_size: None,
             shutting_down: false,
             handoff_in_progress: false,
@@ -5602,7 +5652,17 @@ mod tests {
                 crate::config::DEFAULT_HEADLESS_ROWS
             )
         );
-        assert_eq!(server.effective_size, server.headless_size);
+        // Fork semantics: on the DEFAULT base size the configured floor
+        // applies, so a fresh headless server is phone-ready. An explicit
+        // `[server] headless_cols/rows` stays authoritative (the
+        // detach_reattach suite pins that side).
+        assert_eq!(
+            server.effective_size,
+            (
+                crate::config::DEFAULT_HEADLESS_MIN_COLS,
+                crate::config::DEFAULT_HEADLESS_MIN_ROWS
+            )
+        );
     }
 
     #[tokio::test]
@@ -6716,6 +6776,7 @@ next_tab = ""
                         lines: Some(200),
                         format: api::schema::ReadFormat::Text,
                         strip_ansi: true,
+                        offset_from_bottom: None,
                     }),
                 };
 
@@ -6860,6 +6921,8 @@ next_tab = ""
                         text: String::new(),
                         revision: 0,
                         truncated: false,
+                        effective_offset: None,
+                        has_more: None,
                     },
                     120,
                     false,
@@ -11619,6 +11682,7 @@ next_tab = ""
                 pane_id,
                 agent: crate::detect::Agent::Pi,
                 observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Provisional,
             })
         );
 
@@ -11651,6 +11715,7 @@ next_tab = ""
                 visible_working: false,
                 process_exited: false,
                 observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             })
         );
         assert!(
@@ -11699,6 +11764,7 @@ next_tab = ""
             visible_working: false,
             process_exited: false,
             observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert!(changed);
@@ -11788,6 +11854,7 @@ next_tab = ""
                 visible_working: false,
                 process_exited: false,
                 observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             })
         );
         assert!(server.app.state.toast.is_none());

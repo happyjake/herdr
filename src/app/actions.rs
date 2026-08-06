@@ -1040,7 +1040,13 @@ impl AppState {
                     .get_mut(&terminal_id)?
                     .expire_agent_metadata_at(scheduled_deadline, now)?;
                 let change = mutation.effective_state_change?;
-                let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, false)?;
+                let seen = self.apply_pane_state_change(
+                    ws_idx,
+                    pane_id,
+                    &change,
+                    false,
+                    crate::events::StatusReading::Incidental,
+                )?;
                 let update = PaneStateUpdate {
                     pane_id,
                     ws_idx,
@@ -1134,6 +1140,7 @@ impl AppState {
                     public_tab_id_for_index(ws, active_tab).unwrap_or_else(|| workspace_id.clone());
                 crate::logging::tab_focused(&workspace_id, &tab_id);
             }
+            self.sync_agent_status_clocks();
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
             self.record_pane_focus_after_navigation(previous_focus);
@@ -1169,6 +1176,7 @@ impl AppState {
                 public_tab_id_for_index(ws, tab_idx).unwrap_or_else(|| workspace_id.clone());
             crate::logging::tab_focused(&workspace_id, &tab_id);
         }
+        self.sync_agent_status_clocks();
         self.tab_scroll_follow_active = true;
         self.refresh_tab_bar_view();
         self.record_pane_focus_after_navigation(previous_focus);
@@ -1266,6 +1274,7 @@ impl AppState {
             let workspace_id = ws.id.clone();
             let tab_id = public_tab_id_for_index(ws, idx).unwrap_or_else(|| workspace_id.clone());
             crate::logging::tab_focused(&workspace_id, &tab_id);
+            self.sync_agent_status_clocks();
             self.mark_session_dirty();
             self.tab_scroll_follow_active = true;
             self.refresh_tab_bar_view();
@@ -1291,6 +1300,203 @@ impl AppState {
             if !pane.seen {
                 pane.seen = true;
                 changed = true;
+            }
+        }
+        if changed {
+            self.sync_agent_status_clocks();
+        }
+        changed
+    }
+
+    /// Re-derive every pane's effective agent status and date the ones that
+    /// moved, using the current wall clock.
+    ///
+    /// This takes no reading and never will: it visits every pane, and a
+    /// caller here has no evidence about any of them in particular. Every pane
+    /// is reconciled as `Incidental`, which leaves movement to decide — a
+    /// value that moved is dated and settles the pane, and one that did not is
+    /// left alone. That is deliberately not opt-out, so a status written by a
+    /// path nobody classified still gets movement semantics rather than
+    /// slipping through as a free observation. A caller that does have
+    /// evidence about one pane names it through
+    /// [`AppState::sync_agent_status_clocks_about_at`].
+    pub(crate) fn sync_agent_status_clocks(&mut self) -> bool {
+        self.sync_agent_status_clocks_at(crate::pane::unix_now_secs())
+    }
+
+    /// Reconcile every pane against its terminal, carrying `reading` only to
+    /// the pane it is evidence about.
+    ///
+    /// A reading's strength names what the caller knows, and what is known
+    /// about one pane says nothing about another: a verdict classifying pane A
+    /// must not settle pane B's window and cost B an age it was entitled to
+    /// keep. Every other pane is reconciled as if nobody had claimed anything,
+    /// which leaves movement to decide.
+    pub(crate) fn sync_agent_status_clocks_about_at(
+        &mut self,
+        now_unix: u64,
+        subject: PaneId,
+        reading: crate::events::StatusReading,
+    ) -> bool {
+        self.reconcile_agent_status_clocks_at(now_unix, Some((subject, reading)))
+    }
+
+    /// When the soonest unresolved restore window ends.
+    ///
+    /// Returned against the monotonic clock the event loops schedule on, from
+    /// the wall clock the window is held in. The two advance together, so
+    /// converting at query time is enough.
+    pub(crate) fn next_agent_status_resolution_deadline(&self, now: Instant) -> Option<Instant> {
+        let due = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| tab.panes.values())
+            .filter_map(crate::pane::PaneState::agent_status_resolution_due_at)
+            .min()?;
+        Some(now + std::time::Duration::from_secs(due.saturating_sub(crate::pane::unix_now_secs())))
+    }
+
+    /// Classify every pane whose restore window has run out, dating each at
+    /// the deadline rather than at whatever moment noticed it.
+    ///
+    /// Returns the panes that resolved, so the caller can tell clients.
+    pub(crate) fn resolve_due_agent_status_windows_at(
+        &mut self,
+        now_unix: u64,
+    ) -> Vec<(usize, PaneId)> {
+        let due: Vec<(usize, PaneId, u64)> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(ws_idx, ws)| {
+                ws.tabs.iter().flat_map(move |tab| {
+                    tab.panes.iter().filter_map(move |(pane_id, pane)| {
+                        pane.agent_status_resolution_due_at()
+                            .filter(|resolve_by| now_unix >= *resolve_by)
+                            .map(|resolve_by| (ws_idx, *pane_id, resolve_by))
+                    })
+                })
+            })
+            .collect();
+        for (_, pane_id, resolve_by) in &due {
+            self.resolve_agent_status_for_pane_at(*pane_id, *resolve_by);
+        }
+        due.into_iter()
+            .map(|(ws_idx, pane_id, _)| (ws_idx, pane_id))
+            .collect()
+    }
+
+    /// Classify one pane, ending the window a restore opened for it.
+    ///
+    /// The only callers are the events that count as a classification: the
+    /// detector's verdict once its startup grace has passed, a deferred agent
+    /// resume completing, and a deferred agent resume failing. Everything else
+    /// that touches a pane's status goes through the reconciliation, which
+    /// settles nothing.
+    pub(crate) fn resolve_agent_status_for_pane(&mut self, pane_id: PaneId) {
+        self.resolve_agent_status_for_pane_at(pane_id, crate::pane::unix_now_secs());
+    }
+
+    /// Same as [`AppState::resolve_agent_status_for_pane`] with an explicit
+    /// clock.
+    pub(crate) fn resolve_agent_status_for_pane_at(&mut self, pane_id: PaneId, now_unix: u64) {
+        let terminals = &self.terminals;
+        for ws in &mut self.workspaces {
+            for tab in &mut ws.tabs {
+                let Some(pane) = tab.panes.get_mut(&pane_id) else {
+                    continue;
+                };
+                let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
+                    return;
+                };
+                let status = pane_agent_status(terminal.state, pane.seen);
+                pane.resolve_agent_status_at(status, now_unix);
+                return;
+            }
+        }
+    }
+
+    /// Classify every pane attached to a terminal. Used where the event is
+    /// about the terminal rather than one pane, such as a resume finishing.
+    pub(crate) fn resolve_agent_status_for_terminal_at(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        now_unix: u64,
+    ) {
+        let pane_ids: Vec<PaneId> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| tab.panes.iter())
+            .filter(|(_, pane)| &pane.attached_terminal_id == terminal_id)
+            .map(|(pane_id, _)| *pane_id)
+            .collect();
+        for pane_id in pane_ids {
+            self.resolve_agent_status_for_pane_at(pane_id, now_unix);
+        }
+    }
+
+    /// Drop a respawned terminal's agent identity.
+    ///
+    /// Clearing the identity moves the pane back to Unknown, so the two happen
+    /// together here rather than at each call site: a caller that dropped the
+    /// identity without dating the move would leave the departed agent's stamp
+    /// on a bare shell until some later request re-dated it wrongly.
+    pub(crate) fn clear_agent_identity_after_respawn(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+    ) {
+        self.clear_agent_identity_after_respawn_at(terminal_id, crate::pane::unix_now_secs());
+    }
+
+    /// Same as [`AppState::clear_agent_identity_after_respawn`] with an
+    /// explicit clock.
+    pub(crate) fn clear_agent_identity_after_respawn_at(
+        &mut self,
+        terminal_id: &crate::terminal::TerminalId,
+        now_unix: u64,
+    ) {
+        let Some(terminal) = self.terminals.get_mut(terminal_id) else {
+            return;
+        };
+        terminal.clear_agent_runtime_identity_after_respawn();
+        self.sync_agent_status_clocks_at(now_unix);
+        // A respawn is a classification: whatever the snapshot claimed about
+        // this pane, the agent it claimed it about is gone.
+        self.resolve_agent_status_for_terminal_at(terminal_id, now_unix);
+    }
+
+    /// Same as [`AppState::sync_agent_status_clocks`] with an explicit clock.
+    ///
+    /// A pane's reported status is derived from its terminal's agent state and
+    /// its own seen flag, and both can move independently, so the durable
+    /// timestamp lives on the pane and is reconciled from the derived value
+    /// rather than written at each of the places that touch either input.
+    pub(crate) fn sync_agent_status_clocks_at(&mut self, now_unix: u64) -> bool {
+        self.reconcile_agent_status_clocks_at(now_unix, None)
+    }
+
+    fn reconcile_agent_status_clocks_at(
+        &mut self,
+        now_unix: u64,
+        about: Option<(PaneId, crate::events::StatusReading)>,
+    ) -> bool {
+        let terminals = &self.terminals;
+        let mut changed = false;
+        for ws in &mut self.workspaces {
+            for tab in &mut ws.tabs {
+                for (pane_id, pane) in tab.panes.iter_mut() {
+                    let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
+                        continue;
+                    };
+                    let reading = match about {
+                        Some((subject, reading)) if subject == *pane_id => reading,
+                        _ => crate::events::StatusReading::Incidental,
+                    };
+                    let status = pane_agent_status(terminal.state, pane.seen);
+                    changed |= pane.record_agent_status_at(status, now_unix, reading);
+                }
             }
         }
         changed
@@ -2786,8 +2992,9 @@ impl AppState {
                 pane_id,
                 agent,
                 observed_at,
+                reading,
             } => self
-                .update_terminal_state(pane_id, |terminal| {
+                .update_terminal_state(pane_id, reading, |terminal| {
                     Some(terminal.set_detected_agent_process_at(agent, observed_at))
                 })
                 .into_iter()
@@ -2800,20 +3007,29 @@ impl AppState {
                 visible_working,
                 process_exited,
                 observed_at,
-            } => self
-                .update_terminal_state(pane_id, |terminal| {
-                    Some(terminal.set_detected_state_with_screen_signals_at(
-                        agent,
-                        state,
-                        visible_blocker,
-                        false,
-                        visible_working,
-                        process_exited,
-                        observed_at,
-                    ))
-                })
-                .into_iter()
-                .collect(),
+                reading,
+            } => {
+                let updates: Vec<_> = self
+                    .update_terminal_state(pane_id, reading, |terminal| {
+                        Some(terminal.set_detected_state_with_screen_signals_at(
+                            agent,
+                            state,
+                            visible_blocker,
+                            false,
+                            visible_working,
+                            process_exited,
+                            observed_at,
+                        ))
+                    })
+                    .into_iter()
+                    .collect();
+                if reading == crate::events::StatusReading::Verdict {
+                    // The detector has classified this pane, so a snapshot's
+                    // claim about it can finally be settled either way.
+                    self.resolve_agent_status_for_pane(pane_id);
+                }
+                updates
+            }
             AppEvent::HookStateReported {
                 pane_id,
                 source,
@@ -2824,22 +3040,30 @@ impl AppState {
                 session_ref,
             } => {
                 if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
-                    self.update_terminal_state(pane_id, |terminal| {
-                        terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
-                    })
+                    self.update_terminal_state(
+                        pane_id,
+                        crate::events::StatusReading::DisplayOnly,
+                        |terminal| {
+                            terminal.set_agent_session_ref(source, agent_label, session_ref, seq)
+                        },
+                    )
                     .into_iter()
                     .collect()
                 } else {
-                    self.update_terminal_state(pane_id, |terminal| {
-                        terminal.set_hook_authority_with_session_ref(
-                            source,
-                            agent_label,
-                            state,
-                            message,
-                            session_ref,
-                            seq,
-                        )
-                    })
+                    self.update_terminal_state(
+                        pane_id,
+                        crate::events::StatusReading::Verdict,
+                        |terminal| {
+                            terminal.set_hook_authority_with_session_ref(
+                                source,
+                                agent_label,
+                                state,
+                                message,
+                                session_ref,
+                                seq,
+                            )
+                        },
+                    )
                     .into_iter()
                     .collect()
                 }
@@ -2852,15 +3076,19 @@ impl AppState {
                 session_ref,
                 session_start_source,
             } => self
-                .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
-                        source,
-                        agent_label,
-                        session_ref,
-                        seq,
-                        session_start_source,
-                    )
-                })
+                .update_terminal_state(
+                    pane_id,
+                    crate::events::StatusReading::DisplayOnly,
+                    |terminal| {
+                        terminal.set_agent_session_ref_for_session_start(
+                            source,
+                            agent_label,
+                            session_ref,
+                            seq,
+                            session_start_source,
+                        )
+                    },
+                )
                 .into_iter()
                 .collect(),
             AppEvent::HookMetadataReported {
@@ -2877,21 +3105,25 @@ impl AppState {
                 seq,
                 ttl,
             } => self
-                .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_metadata(crate::terminal::AgentMetadataReport {
-                        source,
-                        agent_label,
-                        applies_to_source,
-                        title,
-                        display_agent,
-                        state_labels,
-                        clear_title,
-                        clear_display_agent,
-                        clear_state_labels,
-                        ttl,
-                        seq,
-                    })
-                })
+                .update_terminal_state(
+                    pane_id,
+                    crate::events::StatusReading::DisplayOnly,
+                    |terminal| {
+                        terminal.set_agent_metadata(crate::terminal::AgentMetadataReport {
+                            source,
+                            agent_label,
+                            applies_to_source,
+                            title,
+                            display_agent,
+                            state_labels,
+                            clear_title,
+                            clear_display_agent,
+                            clear_state_labels,
+                            ttl,
+                            seq,
+                        })
+                    },
+                )
                 .into_iter()
                 .collect(),
             AppEvent::HookAuthorityCleared {
@@ -2899,9 +3131,11 @@ impl AppState {
                 source,
                 seq,
             } => self
-                .update_terminal_state(pane_id, |terminal| {
-                    terminal.clear_hook_authority_with_mutation(source.as_deref(), seq)
-                })
+                .update_terminal_state(
+                    pane_id,
+                    crate::events::StatusReading::Incidental,
+                    |terminal| terminal.clear_hook_authority_with_mutation(source.as_deref(), seq),
+                )
                 .into_iter()
                 .collect(),
             AppEvent::HookAgentReleased {
@@ -2914,9 +3148,11 @@ impl AppState {
                 if crate::agent_resume::is_official_agent_source(&source, &agent_label) {
                     Vec::new()
                 } else {
-                    self.update_terminal_state(pane_id, |terminal| {
-                        terminal.release_agent_with_mutation(&source, &agent_label, seq)
-                    })
+                    self.update_terminal_state(
+                        pane_id,
+                        crate::events::StatusReading::Incidental,
+                        |terminal| terminal.release_agent_with_mutation(&source, &agent_label, seq),
+                    )
                     .into_iter()
                     .collect()
                 }
@@ -2961,7 +3197,19 @@ impl AppState {
         }
     }
 
-    fn update_terminal_state<F>(&mut self, pane_id: PaneId, update: F) -> Option<PaneStateUpdate>
+    /// Apply a change to a pane's terminal agent state.
+    ///
+    /// `reading` says what the change claims about the pane's status. An
+    /// accepted verdict settles what a session recorded about the pane even
+    /// when it produces no change at all, because confirming what a pane is
+    /// doing is as much a statement as contradicting it. A change the source
+    /// declines to make is not accepted and settles nothing.
+    fn update_terminal_state<F>(
+        &mut self,
+        pane_id: PaneId,
+        reading: crate::events::StatusReading,
+        update: F,
+    ) -> Option<PaneStateUpdate>
     where
         F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,
     {
@@ -3005,7 +3253,14 @@ impl AppState {
             self.mark_session_dirty();
         }
         let agent_released = mutation.agent_released;
-        let change = mutation.effective_state_change.or(unchanged_change)?;
+        let Some(change) = mutation.effective_state_change.or(unchanged_change) else {
+            // A verdict that confirms what the pane already reports changes
+            // nothing here, and still settles what a session claimed about it.
+            if reading == crate::events::StatusReading::Verdict {
+                self.resolve_agent_status_for_pane(pane_id);
+            }
+            return None;
+        };
         let suppress_completion = change.state == AgentState::Idle
             && (managed_launch_pending || suppress_acquisition_completion);
         if change.previous_state != change.state {
@@ -3014,7 +3269,8 @@ impl AppState {
                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
             }
         }
-        let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, suppress_completion)?;
+        let seen =
+            self.apply_pane_state_change(ws_idx, pane_id, &change, suppress_completion, reading)?;
         let update = PaneStateUpdate {
             pane_id,
             ws_idx,
@@ -3083,21 +3339,25 @@ impl AppState {
         pane_id: PaneId,
     ) -> Option<PaneStateUpdate> {
         let observed_at = std::time::Instant::now();
-        let update = self.update_terminal_state(pane_id, |terminal| {
-            let agent = terminal.effective_known_agent().or(terminal.detected_agent);
-            if agent.is_none() && !terminal.full_lifecycle_hook_authority_active() {
-                return None;
-            }
-            Some(terminal.set_detected_state_with_screen_signals_at(
-                agent,
-                AgentState::Idle,
-                false,
-                true,
-                false,
-                true,
-                observed_at,
-            ))
-        })?;
+        let update = self.update_terminal_state(
+            pane_id,
+            crate::events::StatusReading::Verdict,
+            |terminal| {
+                let agent = terminal.effective_known_agent().or(terminal.detected_agent);
+                if agent.is_none() && !terminal.full_lifecycle_hook_authority_active() {
+                    return None;
+                }
+                Some(terminal.set_detected_state_with_screen_signals_at(
+                    agent,
+                    AgentState::Idle,
+                    false,
+                    true,
+                    false,
+                    true,
+                    observed_at,
+                ))
+            },
+        )?;
         update.agent_released.then_some(update)
     }
 
@@ -3107,6 +3367,7 @@ impl AppState {
         pane_id: PaneId,
         change: &EffectiveStateChange,
         suppress_completion: bool,
+        reading: crate::events::StatusReading,
     ) -> Option<bool> {
         let is_active_tab = self.pane_is_in_active_tab(ws_idx, pane_id);
         let suppress_active_tab_notifications =
@@ -3122,6 +3383,13 @@ impl AppState {
             pane.seen = suppress_active_tab_notifications;
         }
         let seen = pane.seen;
+
+        // Date the transition where it happens, so the reported age is measured
+        // from the change itself rather than from whenever a client next asks.
+        // What the change claims travels with it: the comparison that decides
+        // movement, and what movement means, both live in the recorder.
+        let now_unix = crate::pane::unix_now_secs();
+        self.sync_agent_status_clocks_about_at(now_unix, pane_id, reading);
 
         if !suppress_completion {
             if let Some(delivery) =
@@ -4244,7 +4512,7 @@ mod tests {
 
     fn transition_agent_state(state: &mut AppState, pane_id: PaneId, agent_state: AgentState) {
         state
-            .update_terminal_state(pane_id, |terminal| {
+            .update_terminal_state(pane_id, crate::events::StatusReading::Verdict, |terminal| {
                 Some(terminal.set_detected_state_with_screen_signals_at(
                     Some(Agent::Pi),
                     agent_state,
@@ -4875,6 +5143,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let terminal_id = state.workspaces[0]
@@ -4913,6 +5182,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
@@ -4946,6 +5216,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let terminal = state.terminals.get(&terminal_id).unwrap();
@@ -4968,6 +5239,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
@@ -4989,6 +5261,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         state.handle_app_event(AppEvent::StateChanged {
             pane_id: bg_pane_id,
@@ -4998,6 +5271,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let pane = state.workspaces[1].panes.get(&bg_pane_id).unwrap();
@@ -5015,6 +5289,7 @@ mod tests {
             pane_id,
             agent: Agent::Pi,
             observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
         });
         let direct_idle = state
             .handle_app_event(AppEvent::StateChanged {
@@ -5025,6 +5300,7 @@ mod tests {
                 visible_working: false,
                 process_exited: false,
                 observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             })
             .pop()
             .expect("direct idle state update");
@@ -5034,6 +5310,7 @@ mod tests {
             pane_id,
             agent: Agent::Pi,
             observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
         });
         for agent_state in [AgentState::Working, AgentState::Blocked] {
             state.handle_app_event(AppEvent::StateChanged {
@@ -5044,6 +5321,7 @@ mod tests {
                 visible_working: agent_state == AgentState::Working,
                 process_exited: false,
                 observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             });
         }
         let update = state
@@ -5055,6 +5333,7 @@ mod tests {
                 visible_working: false,
                 process_exited: false,
                 observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             })
             .pop()
             .expect("idle state update");
@@ -5070,6 +5349,7 @@ mod tests {
             pane_id,
             agent: Agent::Codex,
             observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
         });
         state.handle_app_event(AppEvent::StateChanged {
             pane_id,
@@ -5079,6 +5359,7 @@ mod tests {
             visible_working: true,
             process_exited: false,
             observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         let exit_update = state
             .handle_app_event(AppEvent::StateChanged {
@@ -5089,6 +5370,7 @@ mod tests {
                 visible_working: false,
                 process_exited: true,
                 observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
             })
             .pop()
             .expect("process exit update");
@@ -5134,6 +5416,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let toast = state.toast.as_ref().unwrap();
@@ -5158,6 +5441,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert!(state.toast.is_none());
@@ -5190,6 +5474,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
 
@@ -5201,6 +5486,7 @@ mod tests {
             visible_working: true,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert!(state.pending_agent_notifications.is_empty());
@@ -5224,6 +5510,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
         state.active = Some(1);
@@ -5249,6 +5536,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
@@ -5276,6 +5564,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
         state.handle_app_event(AppEvent::PaneDied {
@@ -5331,6 +5620,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         state.handle_app_event(AppEvent::HookStateReported {
             pane_id: bg_pane_id,
@@ -5349,6 +5639,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let terminal = state.terminals.get(&bg_terminal_id).unwrap();
@@ -5379,6 +5670,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         state.handle_app_event(AppEvent::HookStateReported {
             pane_id,
@@ -5402,6 +5694,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let terminal = state.terminals.get(&terminal_id).unwrap();
@@ -5428,6 +5721,7 @@ mod tests {
             visible_working: true,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         let terminal = state.terminals.get_mut(&terminal_id).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
@@ -5488,6 +5782,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
         state.handle_app_event(AppEvent::HookStateReported {
             pane_id,
@@ -5620,6 +5915,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let toast = state.toast.as_ref().unwrap();
@@ -5649,6 +5945,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let toast = state.toast.as_ref().unwrap();
@@ -5675,6 +5972,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         let toast = state.toast.as_ref().unwrap();
@@ -5698,6 +5996,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert!(state.toast.is_none());
@@ -5719,6 +6018,7 @@ mod tests {
             visible_working: false,
             process_exited: false,
             observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
         });
 
         assert!(state.toast.is_none());
@@ -6151,5 +6451,364 @@ mod tests {
         assert!(!deferred);
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.workspaces[0].display_name(), "notes");
+    }
+
+    fn pane_status_changed_at(state: &AppState, ws_idx: usize, pane_id: PaneId) -> u64 {
+        state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .expect("pane exists")
+            .agent_status_changed_at()
+    }
+
+    fn set_pane_seen(state: &mut AppState, ws_idx: usize, pane_id: PaneId, seen: bool) {
+        state.workspaces[ws_idx].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .expect("pane exists")
+            .seen = seen;
+    }
+
+    fn backdate_pane_status(state: &mut AppState, ws_idx: usize, pane_id: PaneId, at: u64) {
+        state.workspaces[ws_idx].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .expect("pane exists")
+            .backdate_agent_status_for_test(at);
+    }
+
+    fn pane_status(
+        state: &AppState,
+        ws_idx: usize,
+        pane_id: PaneId,
+    ) -> crate::api::schema::AgentStatus {
+        state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .expect("pane exists")
+            .agent_status()
+    }
+
+    /// Drive a pane's agent state through the production detection path so the
+    /// seen flag and the status clock move the way they do at runtime.
+    fn publish_agent_state(state: &mut AppState, pane_id: PaneId, agent_state: AgentState) {
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: agent_state,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Verdict,
+        });
+    }
+
+    fn terminal_id_for(
+        state: &AppState,
+        ws_idx: usize,
+        pane_id: PaneId,
+    ) -> crate::terminal::TerminalId {
+        state.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .expect("pane exists")
+            .attached_terminal_id
+            .clone()
+    }
+
+    #[test]
+    fn agent_status_clock_dates_the_first_detected_status() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        set_agent_state(&mut state, 0, 0, root, AgentState::Working);
+
+        assert!(state.sync_agent_status_clocks_at(500));
+
+        assert_eq!(pane_status_changed_at(&state, 0, root), 500);
+    }
+
+    #[test]
+    fn agent_status_clock_holds_still_while_the_status_holds_still() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        set_agent_state(&mut state, 0, 0, root, AgentState::Working);
+        state.sync_agent_status_clocks_at(500);
+
+        assert!(!state.sync_agent_status_clocks_at(900));
+
+        assert_eq!(pane_status_changed_at(&state, 0, root), 500);
+    }
+
+    #[test]
+    fn agent_status_clock_restamps_on_every_transition() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        set_agent_state(&mut state, 0, 0, root, AgentState::Working);
+        state.sync_agent_status_clocks_at(500);
+
+        set_agent_state(&mut state, 0, 0, root, AgentState::Idle);
+        assert!(state.sync_agent_status_clocks_at(1_200));
+
+        assert_eq!(pane_status_changed_at(&state, 0, root), 1_200);
+    }
+
+    #[test]
+    fn marking_the_active_tab_seen_dates_the_done_to_idle_move() {
+        let mut state = app_with_workspaces(&["one"]);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        // An unfocused outer terminal lets a completion in the active tab land
+        // unseen, which is the only way this pane reaches Done.
+        state.outer_terminal_focus = Some(false);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        publish_agent_state(&mut state, root, AgentState::Working);
+        publish_agent_state(&mut state, root, AgentState::Idle);
+        assert_eq!(
+            pane_status(&state, 0, root),
+            crate::api::schema::AgentStatus::Done
+        );
+        backdate_pane_status(&mut state, 0, root, 1_000);
+
+        let before = crate::pane::unix_now_secs();
+        assert!(state.mark_active_tab_seen());
+
+        assert_eq!(
+            pane_status(&state, 0, root),
+            crate::api::schema::AgentStatus::Idle
+        );
+        assert!(
+            pane_status_changed_at(&state, 0, root) >= before,
+            "being seen at the desk is a transition the production path must date"
+        );
+    }
+
+    #[test]
+    fn switching_to_a_workspace_dates_the_done_to_idle_move() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.active = Some(0);
+        let background = state.workspaces[1].tabs[0].root_pane;
+        publish_agent_state(&mut state, background, AgentState::Working);
+        publish_agent_state(&mut state, background, AgentState::Idle);
+        assert_eq!(
+            pane_status(&state, 1, background),
+            crate::api::schema::AgentStatus::Done
+        );
+        backdate_pane_status(&mut state, 1, background, 1_000);
+
+        let before = crate::pane::unix_now_secs();
+        state.switch_workspace(1);
+
+        assert_eq!(
+            pane_status(&state, 1, background),
+            crate::api::schema::AgentStatus::Idle
+        );
+        assert!(
+            pane_status_changed_at(&state, 1, background) >= before,
+            "switching to the workspace must date the pane it just marked seen"
+        );
+    }
+
+    #[test]
+    fn detection_dates_the_pane_without_waiting_for_a_client_to_ask() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        backdate_pane_status(&mut state, 0, root, 1_000);
+
+        let before = crate::pane::unix_now_secs();
+        publish_agent_state(&mut state, root, AgentState::Working);
+
+        assert_eq!(
+            pane_status(&state, 0, root),
+            crate::api::schema::AgentStatus::Working
+        );
+        assert!(pane_status_changed_at(&state, 0, root) >= before);
+    }
+
+    #[test]
+    fn respawning_a_shell_dates_the_pane_losing_its_agent() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        publish_agent_state(&mut state, root, AgentState::Working);
+        backdate_pane_status(&mut state, 0, root, 1_000);
+        let terminal_id = terminal_id_for(&state, 0, root);
+
+        state.clear_agent_identity_after_respawn_at(&terminal_id, 4_200);
+
+        assert_eq!(
+            pane_status(&state, 0, root),
+            crate::api::schema::AgentStatus::Unknown,
+            "a respawned shell has no agent"
+        );
+        assert_eq!(
+            pane_status_changed_at(&state, 0, root),
+            4_200,
+            "the pane went back to Unknown at the respawn, not whenever a client next asks"
+        );
+    }
+
+    fn insert_restored_pane(state: &mut AppState, ws_idx: usize, pane_id: PaneId, at: u64) {
+        let terminal_id = terminal_id_for(state, ws_idx, pane_id);
+        state.workspaces[ws_idx].tabs[0].panes.insert(
+            pane_id,
+            crate::pane::PaneState::restored(
+                terminal_id,
+                crate::api::schema::AgentStatus::Working,
+                1_000,
+                at,
+            ),
+        );
+    }
+
+    #[test]
+    fn a_restored_pane_reports_a_coherent_pair_before_detection_catches_up() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        insert_restored_pane(&mut state, 0, root, 5_000);
+
+        // The reconciliation the first API request runs must not date the
+        // status the pane actually reports with the snapshot's time.
+        assert!(!state.sync_agent_status_clocks_at(5_002));
+
+        assert_eq!(
+            pane_status(&state, 0, root),
+            crate::api::schema::AgentStatus::Unknown
+        );
+        assert_eq!(pane_status_changed_at(&state, 0, root), 5_000);
+    }
+
+    #[test]
+    fn a_restored_pane_inherits_its_date_when_detection_confirms_it() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let restored_at = crate::pane::unix_now_secs();
+        insert_restored_pane(&mut state, 0, root, restored_at);
+        state.sync_agent_status_clocks_at(restored_at);
+
+        publish_agent_state(&mut state, root, AgentState::Working);
+
+        assert_eq!(
+            pane_status(&state, 0, root),
+            crate::api::schema::AgentStatus::Working
+        );
+        assert_eq!(
+            pane_status_changed_at(&state, 0, root),
+            1_000,
+            "a confirmed pane has been working since before the restart"
+        );
+    }
+
+    #[test]
+    fn one_panes_classification_does_not_settle_another_panes_window() {
+        let mut state = app_with_workspaces(&["one"]);
+        let classified = state.workspaces[0].tabs[0].root_pane;
+        let bystander = state.workspaces[0].test_split(Direction::Horizontal);
+        state.ensure_test_terminals();
+        let restored_at = crate::pane::unix_now_secs();
+        insert_restored_pane(&mut state, 0, classified, restored_at);
+        insert_restored_pane(&mut state, 0, bystander, restored_at);
+
+        // A verdict about one pane is evidence about that pane only.
+        publish_agent_state(&mut state, classified, AgentState::Blocked);
+
+        assert!(
+            state.workspaces[0]
+                .pane_state(bystander)
+                .expect("pane exists")
+                .awaits_agent_status_resolution(),
+            "a verdict about another pane must not settle this one's window"
+        );
+
+        // And the bystander's own confirmation still inherits its age.
+        publish_agent_state(&mut state, bystander, AgentState::Working);
+        assert_eq!(
+            pane_status_changed_at(&state, 0, bystander),
+            1_000,
+            "the bystander kept the age it was entitled to"
+        );
+    }
+
+    #[test]
+    fn a_restored_pane_dates_the_first_change_detection_actually_finds() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let restored_at = crate::pane::unix_now_secs();
+        insert_restored_pane(&mut state, 0, root, restored_at);
+        state.sync_agent_status_clocks_at(restored_at);
+
+        let before = crate::pane::unix_now_secs();
+        publish_agent_state(&mut state, root, AgentState::Blocked);
+
+        assert_eq!(
+            pane_status(&state, 0, root),
+            crate::api::schema::AgentStatus::Blocked
+        );
+        assert!(pane_status_changed_at(&state, 0, root) >= before);
+    }
+
+    #[test]
+    fn a_failed_respawn_stops_a_later_status_inheriting_the_snapshot_date() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let restored_at = crate::pane::unix_now_secs();
+        insert_restored_pane(&mut state, 0, root, restored_at);
+        let terminal_id = terminal_id_for(&state, 0, root);
+
+        state.clear_agent_identity_after_respawn_at(&terminal_id, restored_at);
+        let before = crate::pane::unix_now_secs();
+        publish_agent_state(&mut state, root, AgentState::Working);
+
+        assert_eq!(
+            pane_status(&state, 0, root),
+            crate::api::schema::AgentStatus::Working
+        );
+        assert!(
+            pane_status_changed_at(&state, 0, root) >= before,
+            "the agent that snapshot belonged to is gone, so its date cannot be reused"
+        );
+    }
+
+    #[test]
+    fn a_seen_flip_that_moves_the_reported_status_restamps() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        set_agent_state(&mut state, 0, 0, root, AgentState::Idle);
+        set_pane_seen(&mut state, 0, root, false);
+        state.sync_agent_status_clocks_at(500);
+
+        // Idle-and-unseen reports Done; being seen turns the same agent state
+        // into Idle, which is a transition the client has to be able to date.
+        set_pane_seen(&mut state, 0, root, true);
+        assert!(state.sync_agent_status_clocks_at(900));
+
+        assert_eq!(pane_status_changed_at(&state, 0, root), 900);
+    }
+
+    #[test]
+    fn a_seen_flip_that_leaves_the_reported_status_alone_does_not_restamp() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        set_agent_state(&mut state, 0, 0, root, AgentState::Working);
+        set_pane_seen(&mut state, 0, root, false);
+        state.sync_agent_status_clocks_at(500);
+
+        set_pane_seen(&mut state, 0, root, true);
+        assert!(!state.sync_agent_status_clocks_at(900));
+
+        assert_eq!(pane_status_changed_at(&state, 0, root), 500);
+    }
+
+    #[test]
+    fn each_pane_keeps_its_own_status_clock() {
+        let mut state = app_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let second = state.workspaces[0].test_split(Direction::Horizontal);
+        state.ensure_test_terminals();
+        set_agent_state(&mut state, 0, 0, root, AgentState::Working);
+        set_agent_state(&mut state, 0, 0, second, AgentState::Working);
+        state.sync_agent_status_clocks_at(500);
+
+        set_agent_state(&mut state, 0, 0, second, AgentState::Blocked);
+        state.sync_agent_status_clocks_at(1_100);
+
+        assert_eq!(pane_status_changed_at(&state, 0, root), 500);
+        assert_eq!(pane_status_changed_at(&state, 0, second), 1_100);
     }
 }
