@@ -67,6 +67,7 @@ struct PanePresentationSnapshot {
     title: Option<String>,
     display_agent: Option<String>,
     state_labels: std::collections::HashMap<String, String>,
+    label: Option<String>,
 }
 
 impl PanePresentationSnapshot {
@@ -75,6 +76,7 @@ impl PanePresentationSnapshot {
             title: pane.title.clone(),
             display_agent: pane.display_agent.clone(),
             state_labels: pane.state_labels.clone(),
+            label: pane.label.clone(),
         }
     }
 
@@ -82,11 +84,13 @@ impl PanePresentationSnapshot {
         title: &Option<String>,
         display_agent: &Option<String>,
         state_labels: &std::collections::HashMap<String, String>,
+        label: &Option<String>,
     ) -> Self {
         Self {
             title: title.clone(),
             display_agent: display_agent.clone(),
             state_labels: state_labels.clone(),
+            label: label.clone(),
         }
     }
 }
@@ -220,6 +224,7 @@ impl ActiveSubscription {
                         title: probe.title,
                         display_agent: probe.display_agent,
                         state_labels: probe.state_labels,
+                        label: probe.label,
                     });
 
                 Ok(Self::AgentStatusChanged(Box::new(
@@ -352,6 +357,7 @@ impl ActiveAgentStatusChangedSubscription {
                 title,
                 display_agent,
                 state_labels,
+                label,
             } = event.data
             else {
                 continue;
@@ -365,7 +371,7 @@ impl ActiveAgentStatusChangedSubscription {
             saw_status_event = true;
 
             let current_presentation =
-                PanePresentationSnapshot::from_event(&title, &display_agent, &state_labels);
+                PanePresentationSnapshot::from_event(&title, &display_agent, &state_labels, &label);
             self.last_status = Some(agent_status);
             self.last_presentation = Some(current_presentation);
             if self
@@ -386,6 +392,7 @@ impl ActiveAgentStatusChangedSubscription {
                     title,
                     display_agent,
                     state_labels,
+                    label,
                 }),
             }));
         }
@@ -452,6 +459,7 @@ impl ActiveAgentStatusChangedSubscription {
                 title: pane.title,
                 display_agent: pane.display_agent,
                 state_labels: pane.state_labels,
+                label: pane.label,
             }),
         })
     }
@@ -589,6 +597,10 @@ mod tests {
     use crate::api::schema::{AgentStatus, EventData, EventEnvelope, EventKind, PaneInfo};
 
     fn presentation_event(title: Option<&str>) -> EventEnvelope {
+        labelled_presentation_event(title, None)
+    }
+
+    fn labelled_presentation_event(title: Option<&str>, label: Option<&str>) -> EventEnvelope {
         EventEnvelope {
             event: EventKind::PaneAgentStatusChanged,
             data: EventData::PaneAgentStatusChanged {
@@ -599,6 +611,7 @@ mod tests {
                 title: title.map(str::to_string),
                 display_agent: None,
                 state_labels: HashMap::new(),
+                label: label.map(str::to_string),
             },
         }
     }
@@ -609,6 +622,13 @@ mod tests {
             data: EventData::WorkspaceFocused {
                 workspace_id: workspace_id.into(),
             },
+        }
+    }
+
+    fn pane_info_with_label(label: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            label: label.map(str::to_string),
+            ..pane_info_with_scroll(None)
         }
     }
 
@@ -736,6 +756,7 @@ mod tests {
                 title: None,
                 display_agent: None,
                 state_labels: HashMap::new(),
+                label: None,
             }),
             last_sequence: event_hub.current_sequence(),
             initial_event: None,
@@ -773,6 +794,7 @@ mod tests {
                 title: None,
                 display_agent: None,
                 state_labels: HashMap::new(),
+                label: None,
             }),
             last_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
@@ -783,6 +805,7 @@ mod tests {
                 title: None,
                 display_agent: None,
                 state_labels: HashMap::new(),
+                label: None,
             }),
             request_prefix: "test".into(),
         };
@@ -808,6 +831,128 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_event_always_carries_the_label_while_pane_info_omits_it() {
+        let unset = PaneAgentStatusChangedEvent {
+            pane_id: "pane_1".into(),
+            workspace_id: "workspace_1".into(),
+            agent_status: AgentStatus::Working,
+            agent: Some("pi".into()),
+            title: None,
+            display_agent: None,
+            state_labels: HashMap::new(),
+            label: None,
+        };
+        let json = serde_json::to_value(&unset).expect("serialize event");
+        assert!(
+            json.get("label").is_some_and(serde_json::Value::is_null),
+            "an unset label stays present and null: {json}"
+        );
+        assert!(
+            json.get("title").is_none() && json.get("display_agent").is_none(),
+            "the other optional presentation fields stay omitted when unset: {json}"
+        );
+
+        let set = PaneAgentStatusChangedEvent {
+            label: Some("reviewer".into()),
+            ..unset.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&set).expect("serialize event")["label"],
+            "reviewer"
+        );
+
+        let without_key = serde_json::json!({
+            "pane_id": "pane_1",
+            "workspace_id": "workspace_1",
+            "agent_status": "working",
+        });
+        let decoded: PaneAgentStatusChangedEvent =
+            serde_json::from_value(without_key).expect("decode a payload that predates the field");
+        assert_eq!(decoded.label, None);
+
+        let pane = serde_json::to_value(pane_info_with_label(None)).expect("serialize pane");
+        assert!(
+            pane.get("label").is_none(),
+            "pane_info still omits an unset label: {pane}"
+        );
+        let pane =
+            serde_json::to_value(pane_info_with_label(Some("reviewer"))).expect("serialize pane");
+        assert_eq!(pane["label"], "reviewer");
+    }
+
+    #[test]
+    fn agent_status_subscription_emits_when_only_the_manual_label_changes() {
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: None,
+            last_status: Some(AgentStatus::Unknown),
+            last_presentation: Some(PanePresentationSnapshot::from(&pane_info_with_label(None))),
+            last_sequence: 0,
+            initial_event: None,
+            request_prefix: "test".into(),
+        };
+
+        assert!(subscription
+            .event_from_snapshot(pane_info_with_label(None))
+            .is_none());
+
+        let event = subscription
+            .event_from_snapshot(pane_info_with_label(Some("reviewer")))
+            .expect("label event");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert_eq!(data.label.as_deref(), Some("reviewer"));
+        assert_eq!(data.agent_status, AgentStatus::Unknown);
+
+        assert!(
+            subscription
+                .event_from_snapshot(pane_info_with_label(Some("reviewer")))
+                .is_none(),
+            "the probe remembers the label it just reported"
+        );
+
+        let event = subscription
+            .event_from_snapshot(pane_info_with_label(None))
+            .expect("cleared label event");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert_eq!(data.label, None);
+    }
+
+    #[test]
+    fn agent_status_subscription_forwards_and_remembers_a_published_label() {
+        let event_hub = EventHub::default();
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: None,
+            last_status: Some(AgentStatus::Working),
+            last_presentation: Some(PanePresentationSnapshot::from(&pane_info_with_label(None))),
+            last_sequence: event_hub.current_sequence(),
+            initial_event: None,
+            request_prefix: "test".into(),
+        };
+
+        event_hub.push(labelled_presentation_event(None, Some("reviewer")));
+
+        let event = subscription
+            .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
+            .expect("label event");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert_eq!(data.label.as_deref(), Some("reviewer"));
+
+        let mut same = pane_info_with_label(Some("reviewer"));
+        same.agent_status = AgentStatus::Working;
+        assert!(
+            subscription.event_from_snapshot(same).is_none(),
+            "a forwarded label seeds the snapshot, so the next probe sees no change"
+        );
+    }
+
+    #[test]
     fn agent_status_subscription_emits_setup_window_event_already_reflected_by_probe() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
@@ -818,6 +963,7 @@ mod tests {
                 title: Some("short lived".into()),
                 display_agent: None,
                 state_labels: HashMap::new(),
+                label: None,
             }),
             last_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
@@ -828,6 +974,7 @@ mod tests {
                 title: Some("short lived".into()),
                 display_agent: None,
                 state_labels: HashMap::new(),
+                label: None,
             }),
             request_prefix: "test".into(),
         };

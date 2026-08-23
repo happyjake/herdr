@@ -1191,11 +1191,16 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let previous_label = terminal.manual_label.clone();
         match params.label.map(|label| label.trim().to_string()) {
             Some(label) if !label.is_empty() => terminal.set_manual_label(label),
             _ => terminal.clear_manual_label(),
         }
+        let label_changed = terminal.manual_label != previous_label;
         self.state.mark_session_dirty();
+        if label_changed {
+            self.emit_pane_label_changed(ws_idx, pane_id);
+        }
         let pane = self.pane_info(ws_idx, pane_id).unwrap();
 
         encode_success(id, ResponseResult::PaneInfo { pane })

@@ -17,6 +17,31 @@ mod worktrees;
 use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
 use crate::events::AppEvent;
 
+/// The one place a `pane.agent_status_changed` payload is built, so every
+/// publisher reports the pane's manual label alongside its status.
+fn pane_agent_status_changed_event(
+    pane_id: String,
+    workspace_id: String,
+    agent_status: crate::api::schema::AgentStatus,
+    agent: Option<String>,
+    presentation: crate::terminal::EffectivePresentation,
+    label: Option<String>,
+) -> crate::api::schema::EventEnvelope {
+    crate::api::schema::EventEnvelope {
+        event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+        data: crate::api::schema::EventData::PaneAgentStatusChanged {
+            pane_id,
+            workspace_id,
+            agent_status,
+            agent,
+            title: presentation.title,
+            display_agent: presentation.display_agent,
+            state_labels: presentation.state_labels,
+            label,
+        },
+    }
+}
+
 const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const WINDOWS_POWERSHELL_AGENT_EXIT_RESPAWN_GRACE: Duration = Duration::from_secs(2);
@@ -692,20 +717,57 @@ impl App {
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
         {
-            let presentation = update.presentation.clone();
-            self.emit_event(crate::api::schema::EventEnvelope {
-                event: crate::api::schema::EventKind::PaneAgentStatusChanged,
-                data: crate::api::schema::EventData::PaneAgentStatusChanged {
-                    pane_id,
-                    workspace_id,
-                    agent_status,
-                    agent: update.agent_label.clone(),
-                    title: presentation.title,
-                    display_agent: presentation.display_agent,
-                    state_labels: presentation.state_labels,
-                },
-            });
+            let event = pane_agent_status_changed_event(
+                pane_id,
+                workspace_id,
+                agent_status,
+                update.agent_label.clone(),
+                update.presentation.clone(),
+                self.pane_manual_label(update.ws_idx, update.pane_id),
+            );
+            self.emit_event(event);
         }
+    }
+
+    /// Publish the pane's presentation because its manual label changed. The
+    /// agent status is reported exactly as the pane holds it; only the label
+    /// moved.
+    pub(crate) fn emit_pane_label_changed(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) {
+        let Some(event) = self.pane_label_changed_event(ws_idx, pane_id) else {
+            return;
+        };
+        self.emit_event(event);
+    }
+
+    fn pane_label_changed_event(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::EventEnvelope> {
+        let public_pane_id = self.public_pane_id(ws_idx, pane_id)?;
+        let pane = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        Some(pane_agent_status_changed_event(
+            public_pane_id,
+            self.public_workspace_id(ws_idx),
+            pane_agent_status(terminal.state, pane.seen),
+            terminal.effective_agent_label().map(str::to_string),
+            terminal.effective_presentation(),
+            terminal.manual_label.clone(),
+        ))
+    }
+
+    fn pane_manual_label(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> Option<String> {
+        let pane = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        self.state
+            .terminals
+            .get(&pane.attached_terminal_id)?
+            .manual_label
+            .clone()
     }
 
     fn emit_terminal_or_system_agent_notifications(

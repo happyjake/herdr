@@ -701,6 +701,14 @@
                     "null"
                   ]
                 },
+                "label": {
+                  "default": null,
+                  "description": "The pane's manual label, always serialized and `null` when unset, so\na subscriber can tell a cleared label from a server that predates\nthe field.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -6222,6 +6230,14 @@
                 "null"
               ]
             },
+            "label": {
+              "default": null,
+              "description": "The pane's manual label, always serialized and `null` when unset, so a\nsubscriber can tell a cleared label from a server that predates the\nfield. The other optional presentation fields stay omitted when unset.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
             },
@@ -7312,6 +7328,14 @@
                   "$ref": "#/schemas/success_response/$defs/AgentStatus"
                 },
                 "display_agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "label": {
+                  "default": null,
+                  "description": "The pane's manual label, always serialized and `null` when unset, so\na subscriber can tell a cleared label from a server that predates\nthe field.",
                   "type": [
                     "string",
                     "null"

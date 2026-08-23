@@ -2261,6 +2261,54 @@ mod tests {
     }
 
     #[test]
+    fn context_menu_clear_pane_name_publishes_a_cleared_label_event() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal")
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal")
+            .set_manual_label("reviewer".into());
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id,
+                source_pane_id: None,
+                has_manual_label: true,
+                right_click_passthrough: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Clear pane name")
+            .expect("clear pane name item");
+        let sequence = app.event_hub.current_sequence();
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        let labels: Vec<_> = app
+            .event_hub
+            .events_after(sequence)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                crate::api::schema::EventData::PaneAgentStatusChanged { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec![None]);
+        assert!(app.state.terminals[&terminal_id].manual_label.is_none());
+    }
+
+    #[test]
     fn context_menu_close_pane_last_parent_group_pane_keeps_confirmation_mode() {
         let mut state = state_with_workspaces(&["main", "issue"]);
         state.active = Some(0);

@@ -4535,6 +4535,191 @@ mod tests {
             .is_none());
     }
 
+    fn agent_status_event_labels_after(app: &App, sequence: u64) -> Vec<Option<String>> {
+        app.event_hub
+            .events_after(sequence)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                crate::api::schema::EventData::PaneAgentStatusChanged { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pane_rename_publishes_one_agent_status_event_carrying_the_new_label() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-rename-event");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let status_before = app.pane_info(0, pane).unwrap().agent_status;
+        let sequence = app.event_hub.current_sequence();
+
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_event".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: Some("reviewer".into()),
+            }),
+        });
+
+        let events = app.event_hub.events_after(sequence);
+        let renamed: Vec<_> = events
+            .iter()
+            .filter(|(_, event)| {
+                event.event == crate::api::schema::EventKind::PaneAgentStatusChanged
+            })
+            .collect();
+        assert_eq!(
+            renamed.len(),
+            1,
+            "one label change publishes one status event: {events:?}"
+        );
+        let payload = serde_json::to_value(&renamed[0].1.data).unwrap();
+        assert_eq!(payload["label"], "reviewer");
+        assert_eq!(
+            payload["agent_status"],
+            serde_json::to_value(status_before).unwrap(),
+            "a label change leaves the reported agent status untouched"
+        );
+        assert_eq!(app.pane_info(0, pane).unwrap().agent_status, status_before);
+
+        let sequence = app.event_hub.current_sequence();
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_event_clear".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: None,
+            }),
+        });
+
+        assert_eq!(agent_status_event_labels_after(&app, sequence), vec![None]);
+        let cleared = app.event_hub.events_after(sequence);
+        let payload = serde_json::to_value(&cleared[0].1.data).unwrap();
+        assert!(
+            payload.get("label").is_some_and(serde_json::Value::is_null),
+            "a cleared label stays present and null so it reads as cleared, not missing: {payload}"
+        );
+    }
+
+    #[test]
+    fn pane_rename_to_the_same_label_publishes_nothing() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-rename-noop");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_first".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: Some("reviewer".into()),
+            }),
+        });
+
+        let sequence = app.event_hub.current_sequence();
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_again".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id,
+                label: Some("  reviewer  ".into()),
+            }),
+        });
+
+        assert!(agent_status_event_labels_after(&app, sequence).is_empty());
+    }
+
+    #[test]
+    fn an_agent_status_change_reports_the_label_the_pane_already_holds() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-status-carries-label");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let empty_presentation = crate::terminal::EffectivePresentation {
+            title: None,
+            display_agent: None,
+            state_labels: std::collections::HashMap::new(),
+        };
+        let update = crate::app::actions::PaneStateUpdate {
+            pane_id: pane,
+            ws_idx: 0,
+            previous_agent_label: None,
+            previous_known_agent: None,
+            previous_state: AgentState::Idle,
+            previous_seen: true,
+            previous_presentation: empty_presentation.clone(),
+            agent_label: None,
+            known_agent: None,
+            state: AgentState::Working,
+            seen: true,
+            presentation: empty_presentation,
+            agent_name_changed: false,
+            agent_released: false,
+            agent_release_status: None,
+            suppress_completion: false,
+        };
+
+        let sequence = app.event_hub.current_sequence();
+        app.emit_pane_state_update(&update);
+        assert_eq!(
+            agent_status_event_labels_after(&app, sequence),
+            vec![None],
+            "an unlabelled pane reports no label"
+        );
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_status_label_rename".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id,
+                label: Some("reviewer".into()),
+            }),
+        });
+
+        let sequence = app.event_hub.current_sequence();
+        app.emit_pane_state_update(&update);
+        assert_eq!(
+            agent_status_event_labels_after(&app, sequence),
+            vec![Some("reviewer".to_string())],
+            "a status change repeats the standing label instead of reading as a clear"
+        );
+    }
+
+    #[test]
+    fn tui_pane_rename_publishes_the_new_label_on_the_agent_status_event() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("tui-pane-rename-event");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::RenamePane;
+        app.state.rename_pane_target = Some(pane);
+        app.state.name_input = "reviewer".into();
+        let sequence = app.event_hub.current_sequence();
+
+        app.route_client_input(b"\r".to_vec());
+
+        assert_eq!(
+            agent_status_event_labels_after(&app, sequence),
+            vec![Some("reviewer".to_string())]
+        );
+    }
+
     #[test]
     fn terminal_and_agent_targets_treat_terminal_ids_differently() {
         let mut app = test_app();

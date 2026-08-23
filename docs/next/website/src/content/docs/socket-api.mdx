@@ -936,6 +936,22 @@ Pane event subscriptions include `pane.created`, `pane.updated`, `pane.closed`, 
 `pane.moved`, `pane.exited`, `pane.agent_detected`,
 `pane.output_matched`, `pane.agent_status_changed`, and `pane.scroll_changed`.
 Terminal-title changes can emit `pane.updated`, but spinner-only raw-title changes do not emit it when `terminal_title_stripped` is unchanged.
+`pane.agent_status_changed` is scoped to one `pane_id` and emits `pane_id`,
+`workspace_id`, `agent_status`, and the pane's presentation: optional `agent`,
+`title`, `display_agent`, `state_labels`, and `label`. `label` is the pane's
+manual label, the one `pane.rename` sets and the pane menu edits. Changing it
+publishes the event on its own, with `agent_status` reporting whatever the pane
+already held, so a subscribed client sees a rename as it happens rather than at
+its next snapshot.
+
+`label` is the one presentation field that is always present in this payload:
+it is `null` when the pane has no manual label, where the others are omitted
+when unset. That is deliberate. A client must be able to tell a cleared label
+(`"label": null`) from a server that predates the field (no `label` key at
+all), and keep the label it already learned in the second case. `PaneInfo.label`
+in `pane.get`, `session.snapshot`, and the `pane.rename` response is unchanged
+and stays omitted when unset.
+
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a
 changed scroll snapshot.
