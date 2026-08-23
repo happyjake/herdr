@@ -52,6 +52,10 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     last_status: Option<crate::api::schema::AgentStatus>,
     last_presentation: Option<PanePresentationSnapshot>,
     last_sequence: u64,
+    /// The ring position setup finished at. Entries at or below it landed
+    /// before the seeding probe read the pane, so what they say about the
+    /// manual label is older than what the subscription already knows.
+    probe_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
     request_prefix: String,
 }
@@ -212,6 +216,7 @@ impl ActiveSubscription {
             } => {
                 let last_sequence = event_hub.current_sequence();
                 let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+                let probe_sequence = event_hub.current_sequence();
                 let last_status = probe.agent_status;
                 let last_presentation = PanePresentationSnapshot::from(&probe);
                 let initial_event = agent_status
@@ -234,6 +239,7 @@ impl ActiveSubscription {
                         last_status: Some(last_status),
                         last_presentation: Some(last_presentation),
                         last_sequence,
+                        probe_sequence,
                         initial_event,
                         request_prefix: format!("{request_id}:sub:{index}"),
                     },
@@ -370,6 +376,14 @@ impl ActiveAgentStatusChangedSubscription {
             }
             saw_status_event = true;
 
+            // A setup-window entry landed before the seeding probe read the
+            // pane, so its label is older than the one already known. Report
+            // the known label and leave it standing; the entry still speaks for
+            // every other field it carries.
+            let label = match self.last_presentation.as_ref() {
+                Some(known) if sequence <= self.probe_sequence => known.label.clone(),
+                _ => label,
+            };
             let current_presentation =
                 PanePresentationSnapshot::from_event(&title, &display_agent, &state_labels, &label);
             self.last_status = Some(agent_status);
@@ -748,6 +762,9 @@ mod tests {
     #[test]
     fn agent_status_subscription_replays_queued_metadata_set_and_expiry_events() {
         let event_hub = EventHub::default();
+        let last_sequence = event_hub.current_sequence();
+        event_hub.push(presentation_event(Some("short lived")));
+        event_hub.push(presentation_event(None));
         let mut subscription = ActiveAgentStatusChangedSubscription {
             pane_id: "pane_1".into(),
             status_filter: None,
@@ -758,13 +775,11 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
             }),
-            last_sequence: event_hub.current_sequence(),
+            last_sequence,
+            probe_sequence: event_hub.current_sequence(),
             initial_event: None,
             request_prefix: "test".into(),
         };
-
-        event_hub.push(presentation_event(Some("short lived")));
-        event_hub.push(presentation_event(None));
 
         let set_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
@@ -786,6 +801,9 @@ mod tests {
     #[test]
     fn agent_status_subscription_prefers_setup_window_events_over_initial_snapshot() {
         let event_hub = EventHub::default();
+        let last_sequence = event_hub.current_sequence();
+        event_hub.push(presentation_event(Some("short lived")));
+        event_hub.push(presentation_event(None));
         let mut subscription = ActiveAgentStatusChangedSubscription {
             pane_id: "pane_1".into(),
             status_filter: Some(AgentStatus::Working),
@@ -796,7 +814,8 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
             }),
-            last_sequence: event_hub.current_sequence(),
+            last_sequence,
+            probe_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
@@ -809,9 +828,6 @@ mod tests {
             }),
             request_prefix: "test".into(),
         };
-
-        event_hub.push(presentation_event(Some("short lived")));
-        event_hub.push(presentation_event(None));
 
         let set_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
@@ -888,6 +904,7 @@ mod tests {
             last_status: Some(AgentStatus::Unknown),
             last_presentation: Some(PanePresentationSnapshot::from(&pane_info_with_label(None))),
             last_sequence: 0,
+            probe_sequence: 0,
             initial_event: None,
             request_prefix: "test".into(),
         };
@@ -922,6 +939,67 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_subscription_reports_the_probed_label_on_a_setup_window_entry() {
+        let event_hub = EventHub::default();
+        let last_sequence = event_hub.current_sequence();
+        // Both entries land while the subscription is still being set up: a
+        // status change on a pane that had no manual label, then the rename.
+        event_hub.push(labelled_presentation_event(None, None));
+        event_hub.push(labelled_presentation_event(None, Some("reviewer")));
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: None,
+            last_status: Some(AgentStatus::Working),
+            // The probe ran after both entries, so it already saw the rename.
+            last_presentation: Some(PanePresentationSnapshot::from(&pane_info_with_label(Some(
+                "reviewer",
+            )))),
+            last_sequence,
+            probe_sequence: event_hub.current_sequence(),
+            initial_event: None,
+            request_prefix: "test".into(),
+        };
+
+        for expected in ["reviewer", "reviewer"] {
+            let event = subscription
+                .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
+                .expect("setup-window delivery");
+            let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+                panic!("wrong event data");
+            };
+            assert_eq!(
+                data.label.as_deref(),
+                Some(expected),
+                "a setup-window entry reports the label the probe already found"
+            );
+        }
+
+        let mut probed = pane_info_with_label(Some("reviewer"));
+        probed.agent_status = AgentStatus::Working;
+        assert!(
+            subscription.event_from_snapshot(probed).is_none(),
+            "a setup-window entry does not overwrite the remembered label"
+        );
+
+        // An entry published after the probe speaks for itself.
+        event_hub.push(labelled_presentation_event(None, None));
+        let event = subscription
+            .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
+            .expect("live delivery");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert_eq!(data.label, None);
+
+        let mut cleared = pane_info_with_label(None);
+        cleared.agent_status = AgentStatus::Working;
+        assert!(
+            subscription.event_from_snapshot(cleared).is_none(),
+            "a live entry does update the remembered label"
+        );
+    }
+
+    #[test]
     fn agent_status_subscription_forwards_and_remembers_a_published_label() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
@@ -930,6 +1008,7 @@ mod tests {
             last_status: Some(AgentStatus::Working),
             last_presentation: Some(PanePresentationSnapshot::from(&pane_info_with_label(None))),
             last_sequence: event_hub.current_sequence(),
+            probe_sequence: event_hub.current_sequence(),
             initial_event: None,
             request_prefix: "test".into(),
         };
@@ -955,6 +1034,8 @@ mod tests {
     #[test]
     fn agent_status_subscription_emits_setup_window_event_already_reflected_by_probe() {
         let event_hub = EventHub::default();
+        let last_sequence = event_hub.current_sequence();
+        event_hub.push(presentation_event(Some("short lived")));
         let mut subscription = ActiveAgentStatusChangedSubscription {
             pane_id: "pane_1".into(),
             status_filter: Some(AgentStatus::Working),
@@ -965,7 +1046,8 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
             }),
-            last_sequence: event_hub.current_sequence(),
+            last_sequence,
+            probe_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
@@ -978,8 +1060,6 @@ mod tests {
             }),
             request_prefix: "test".into(),
         };
-
-        event_hub.push(presentation_event(Some("short lived")));
 
         let event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
