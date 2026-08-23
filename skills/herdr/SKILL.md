@@ -93,21 +93,13 @@ Creation responses expose the IDs to use next. `workspace create` returns `.resu
 
 ## Start and coordinate an agent
 
-Default to a sibling pane in the current tab and the current working directory. Do not create a workspace, tab, worktree, or different cwd unless the user explicitly requests that topology or location.
-
-Honor a direction requested by the user. Otherwise inspect the caller pane:
+Give an agent a tab of its own in the current workspace, never a split. An agent renders its interface and its prose at the width of the pane it runs in, and a split column stays narrow for as long as the agent lives: everything it prints is broken at that width, on this screen and for every client that reads the pane from elsewhere. A tab gives it the full width. Keep the caller's working directory and leave the user's focus where it is:
 
 ```bash
-herdr pane layout --pane "$HERDR_PANE_ID"
+herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$PWD" --label <agent-name> --no-focus
 ```
 
-Split a wide pane to the right and a narrow or tall pane down. Avoid repeated same-direction splits that create unusably narrow columns or short rows. Keep the user's focus in the calling pane and explicitly preserve the caller's working directory:
-
-```bash
-herdr pane split --current --direction right --cwd "$PWD" --no-focus
-```
-
-Replace `right` with `down` when appropriate. Read the new pane ID from `.result.pane.pane_id`.
+Read the new pane ID from `.result.root_pane.pane_id`. Do not create a workspace, worktree, or different cwd unless the user explicitly requests that topology or location; a split is for a short ordinary command whose output is read once (see below), not for an agent.
 
 An available shell pane must be at its interactive prompt, with the shell itself in the foreground and no foreground command, editor, or agent running. Start a supported agent in that pane with a useful unique name:
 
@@ -159,7 +151,7 @@ If a wait fails or returns `blocked`, inspect `agent get` and `agent read` befor
 
 ## Run an ordinary command in another pane
 
-Create a sibling pane with the same geometry rule, preserve the caller's working directory, and keep user focus unchanged:
+A short command whose output is read once may take a sibling pane. Honor a direction requested by the user; otherwise inspect the caller pane (`herdr pane layout --pane "$HERDR_PANE_ID"`), split a wide pane to the right and a narrow or tall pane down, and avoid repeated same-direction splits that create unusably narrow columns or short rows. Preserve the caller's working directory and keep user focus unchanged:
 
 ```bash
 herdr pane split --current --direction right --cwd "$PWD" --no-focus
