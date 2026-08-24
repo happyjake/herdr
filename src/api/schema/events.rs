@@ -419,6 +419,11 @@ pub struct PaneAgentStatusChangedEvent {
     /// field. The other optional presentation fields stay omitted when unset.
     #[serde(default)]
     pub label: Option<String>,
+    /// Whether the user has pinned the pane, always serialized for the same
+    /// reason the label is: a subscriber reads an absent key as a server that
+    /// predates the pin, not as an unpinned pane.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -565,6 +570,10 @@ pub enum EventData {
         /// the field.
         #[serde(default)]
         label: Option<String>,
+        /// Whether the user has pinned the pane, always serialized for the same
+        /// reason the label is.
+        #[serde(default)]
+        pinned: bool,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

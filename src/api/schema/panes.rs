@@ -251,6 +251,12 @@ pub struct PaneRenameParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSetPinnedParams {
+    pub pane_id: String,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendTextParams {
     pub pane_id: String,
     pub text: String,
@@ -556,6 +562,18 @@ pub struct PaneInfo {
     /// as the last desk read of that pane, not to match its own stamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status_changed_at: Option<u64>,
+    /// Whether the user has pinned this pane, as `pane.set_pinned` and
+    /// `herdr pane pin` set it.
+    ///
+    /// Always serialized, unlike the optional presentation fields: a client
+    /// reads the absence of this key as a server that predates the pin and
+    /// offers no pinning at all, so `false` has to stay distinguishable from
+    /// "this server has no such notion".
+    ///
+    /// The pin is the user's own mark. It is theirs to set: read it freely,
+    /// and write it only when the user asks for it.
+    #[serde(default)]
+    pub pinned: bool,
     pub revision: u64,
 }
 

@@ -1,9 +1,10 @@
 use crate::api::schema::{
     EmptyParams, Method, PaneFocusDirectionParams, PaneInputSetParams, PaneMoveParams,
-    PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget,
-    PaneZoomParams, Request, TabCreateParams, TabListParams, TabRenameParams, TabTarget,
-    WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
-    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    PaneRenameParams, PaneResizeParams, PaneSetPinnedParams, PaneSplitParams, PaneSwapParams,
+    PaneTarget, PaneZoomParams, Request, TabCreateParams, TabListParams, TabRenameParams,
+    TabTarget, WorkspaceCloseParams, WorkspaceCreateParams, WorkspaceRenameParams,
+    WorkspaceTarget, WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams,
+    WorktreeRemoveParams,
 };
 
 fn print_method_response(id: &'static str, method: Method) -> std::io::Result<i32> {
@@ -100,6 +101,10 @@ pub(super) fn pane_zoom(params: PaneZoomParams) -> std::io::Result<i32> {
 
 pub(super) fn pane_rename(params: PaneRenameParams) -> std::io::Result<i32> {
     print_method_response("cli:pane:rename", Method::PaneRename(params))
+}
+
+pub(super) fn pane_set_pinned(params: PaneSetPinnedParams) -> std::io::Result<i32> {
+    print_method_response("cli:pane:set_pinned", Method::PaneSetPinned(params))
 }
 
 pub(super) fn pane_input_set(params: PaneInputSetParams) -> std::io::Result<i32> {

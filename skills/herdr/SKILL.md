@@ -182,6 +182,7 @@ After that failed read, ask the agent to write its complete response as Markdown
 
 ## Safety and coordination rules
 
+- A pane's `pinned` bit is the user's own mark. Read it freely from `pane list` or `pane get`; set it with `pane pin` or `pane unpin` only when the user explicitly asks, never on your own initiative.
 - Use `--no-focus` for background work unless the user asked to switch context.
 - Use `--current`, an explicit pane ID, or a unique agent name. Do not rely on another client's focused pane.
 - Parse IDs from JSON responses. Do not derive them from sidebar order or examples.

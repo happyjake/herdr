@@ -26,6 +26,7 @@ fn pane_agent_status_changed_event(
     agent: Option<String>,
     presentation: crate::terminal::EffectivePresentation,
     label: Option<String>,
+    pinned: bool,
 ) -> crate::api::schema::EventEnvelope {
     crate::api::schema::EventEnvelope {
         event: crate::api::schema::EventKind::PaneAgentStatusChanged,
@@ -38,6 +39,7 @@ fn pane_agent_status_changed_event(
             display_agent: presentation.display_agent,
             state_labels: presentation.state_labels,
             label,
+            pinned,
         },
     }
 }
@@ -717,33 +719,38 @@ impl App {
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
         {
+            let (label, pinned) = self.pane_kept_presentation(update.ws_idx, update.pane_id);
             let event = pane_agent_status_changed_event(
                 pane_id,
                 workspace_id,
                 agent_status,
                 update.agent_label.clone(),
                 update.presentation.clone(),
-                self.pane_manual_label(update.ws_idx, update.pane_id),
+                label,
+                pinned,
             );
             self.emit_event(event);
         }
     }
 
-    /// Publish the pane's presentation because its manual label changed. The
-    /// agent status is reported exactly as the pane holds it; only the label
-    /// moved.
-    pub(crate) fn emit_pane_label_changed(
+    /// Publish the pane's presentation because a field the pane keeps rather
+    /// than derives changed: its manual label, or its pin. The agent status is
+    /// reported exactly as the pane holds it; only the kept field moved.
+    ///
+    /// Every writer of either field publishes through here, so a subscriber
+    /// hears them the same way and neither can go out on its own path.
+    pub(crate) fn emit_pane_kept_presentation_changed(
         &mut self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) {
-        let Some(event) = self.pane_label_changed_event(ws_idx, pane_id) else {
+        let Some(event) = self.pane_kept_presentation_event(ws_idx, pane_id) else {
             return;
         };
         self.emit_event(event);
     }
 
-    fn pane_label_changed_event(
+    fn pane_kept_presentation_event(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -758,16 +765,27 @@ impl App {
             terminal.effective_agent_label().map(str::to_string),
             terminal.effective_presentation(),
             terminal.manual_label.clone(),
+            terminal.pinned,
         ))
     }
 
-    fn pane_manual_label(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> Option<String> {
-        let pane = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
-        self.state
-            .terminals
-            .get(&pane.attached_terminal_id)?
-            .manual_label
-            .clone()
+    /// The kept presentation fields of a pane's terminal, read together so a
+    /// published event cannot report one of them and forget the other.
+    fn pane_kept_presentation(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> (Option<String>, bool) {
+        let Some(terminal) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+        else {
+            return (None, false);
+        };
+        (terminal.manual_label.clone(), terminal.pinned)
     }
 
     fn emit_terminal_or_system_agent_notifications(
@@ -1219,6 +1237,9 @@ impl App {
             Method::PaneFocus(target) => return self.handle_pane_focus(request.id, target),
             Method::PaneInputSet(params) => return self.handle_pane_input_set(request.id, params),
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
+            Method::PaneSetPinned(params) => {
+                return self.handle_pane_set_pinned(request.id, params)
+            }
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneGraphicsSet(params) => {
                 return self.handle_pane_graphics_set(request.id, params);

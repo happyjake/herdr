@@ -54,7 +54,8 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     last_sequence: u64,
     /// The ring position setup finished at. Entries at or below it landed
     /// before the seeding probe read the pane, so what they say about the
-    /// manual label is older than what the subscription already knows.
+    /// kept presentation fields is older than what the subscription already
+    /// knows.
     probe_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
     request_prefix: String,
@@ -72,6 +73,7 @@ struct PanePresentationSnapshot {
     display_agent: Option<String>,
     state_labels: std::collections::HashMap<String, String>,
     label: Option<String>,
+    pinned: bool,
 }
 
 impl PanePresentationSnapshot {
@@ -81,6 +83,7 @@ impl PanePresentationSnapshot {
             display_agent: pane.display_agent.clone(),
             state_labels: pane.state_labels.clone(),
             label: pane.label.clone(),
+            pinned: pane.pinned,
         }
     }
 
@@ -89,12 +92,14 @@ impl PanePresentationSnapshot {
         display_agent: &Option<String>,
         state_labels: &std::collections::HashMap<String, String>,
         label: &Option<String>,
+        pinned: bool,
     ) -> Self {
         Self {
             title: title.clone(),
             display_agent: display_agent.clone(),
             state_labels: state_labels.clone(),
             label: label.clone(),
+            pinned,
         }
     }
 }
@@ -230,6 +235,7 @@ impl ActiveSubscription {
                         display_agent: probe.display_agent,
                         state_labels: probe.state_labels,
                         label: probe.label,
+                        pinned: probe.pinned,
                     });
 
                 Ok(Self::AgentStatusChanged(Box::new(
@@ -364,6 +370,7 @@ impl ActiveAgentStatusChangedSubscription {
                 display_agent,
                 state_labels,
                 label,
+                pinned,
             } = event.data
             else {
                 continue;
@@ -377,15 +384,29 @@ impl ActiveAgentStatusChangedSubscription {
             saw_status_event = true;
 
             // A setup-window entry landed before the seeding probe read the
-            // pane, so its label is older than the one already known. Report
-            // the known label and leave it standing; the entry still speaks for
-            // every other field it carries.
-            let label = match self.last_presentation.as_ref() {
-                Some(known) if sequence <= self.probe_sequence => known.label.clone(),
-                _ => label,
+            // pane, so what it says about the kept fields is older than what is
+            // already known. Report the known label and pin and leave them
+            // standing; the entry still speaks for every other field it
+            // carries.
+            let replayed = self
+                .last_presentation
+                .as_ref()
+                .filter(|_| sequence <= self.probe_sequence);
+            let label = match replayed {
+                Some(known) => known.label.clone(),
+                None => label,
             };
-            let current_presentation =
-                PanePresentationSnapshot::from_event(&title, &display_agent, &state_labels, &label);
+            let pinned = match replayed {
+                Some(known) => known.pinned,
+                None => pinned,
+            };
+            let current_presentation = PanePresentationSnapshot::from_event(
+                &title,
+                &display_agent,
+                &state_labels,
+                &label,
+                pinned,
+            );
             self.last_status = Some(agent_status);
             self.last_presentation = Some(current_presentation);
             if self
@@ -407,6 +428,7 @@ impl ActiveAgentStatusChangedSubscription {
                     display_agent,
                     state_labels,
                     label,
+                    pinned,
                 }),
             }));
         }
@@ -474,6 +496,7 @@ impl ActiveAgentStatusChangedSubscription {
                 display_agent: pane.display_agent,
                 state_labels: pane.state_labels,
                 label: pane.label,
+                pinned: pane.pinned,
             }),
         })
     }
@@ -615,6 +638,18 @@ mod tests {
     }
 
     fn labelled_presentation_event(title: Option<&str>, label: Option<&str>) -> EventEnvelope {
+        kept_presentation_event(title, label, false)
+    }
+
+    fn pinned_presentation_event(pinned: bool) -> EventEnvelope {
+        kept_presentation_event(None, None, pinned)
+    }
+
+    fn kept_presentation_event(
+        title: Option<&str>,
+        label: Option<&str>,
+        pinned: bool,
+    ) -> EventEnvelope {
         EventEnvelope {
             event: EventKind::PaneAgentStatusChanged,
             data: EventData::PaneAgentStatusChanged {
@@ -626,6 +661,7 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
                 label: label.map(str::to_string),
+                pinned,
             },
         }
     }
@@ -642,6 +678,13 @@ mod tests {
     fn pane_info_with_label(label: Option<&str>) -> PaneInfo {
         PaneInfo {
             label: label.map(str::to_string),
+            ..pane_info_with_scroll(None)
+        }
+    }
+
+    fn pane_info_with_pin(pinned: bool) -> PaneInfo {
+        PaneInfo {
+            pinned,
             ..pane_info_with_scroll(None)
         }
     }
@@ -669,6 +712,7 @@ mod tests {
             mouse_tracking: false,
             alternate_screen: false,
             agent_status_changed_at: Some(1_700_000_000),
+            pinned: false,
             revision: 0,
         }
     }
@@ -774,6 +818,7 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
                 label: None,
+                pinned: false,
             }),
             last_sequence,
             probe_sequence: event_hub.current_sequence(),
@@ -813,6 +858,7 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
                 label: None,
+                pinned: false,
             }),
             last_sequence,
             probe_sequence: event_hub.current_sequence(),
@@ -825,6 +871,7 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
                 label: None,
+                pinned: false,
             }),
             request_prefix: "test".into(),
         };
@@ -857,6 +904,7 @@ mod tests {
             display_agent: None,
             state_labels: HashMap::new(),
             label: None,
+            pinned: false,
         };
         let json = serde_json::to_value(&unset).expect("serialize event");
         assert!(
@@ -1032,6 +1080,208 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_event_and_pane_info_always_carry_the_pin() {
+        let unpinned = PaneAgentStatusChangedEvent {
+            pane_id: "pane_1".into(),
+            workspace_id: "workspace_1".into(),
+            agent_status: AgentStatus::Working,
+            agent: Some("pi".into()),
+            title: None,
+            display_agent: None,
+            state_labels: HashMap::new(),
+            label: None,
+            pinned: false,
+        };
+        let json = serde_json::to_value(&unpinned).expect("serialize event");
+        assert_eq!(
+            json["pinned"], false,
+            "an unpinned pane still says so, so an absent key can only mean a \
+             server that predates the pin: {json}"
+        );
+
+        let pinned = PaneAgentStatusChangedEvent {
+            pinned: true,
+            ..unpinned.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&pinned).expect("serialize event")["pinned"],
+            true
+        );
+
+        let without_key = serde_json::json!({
+            "pane_id": "pane_1",
+            "workspace_id": "workspace_1",
+            "agent_status": "working",
+        });
+        let decoded: PaneAgentStatusChangedEvent =
+            serde_json::from_value(without_key).expect("decode a payload that predates the field");
+        assert!(!decoded.pinned);
+
+        let pane = serde_json::to_value(pane_info_with_pin(false)).expect("serialize pane");
+        assert_eq!(
+            pane["pinned"], false,
+            "pane_info carries the pin whether or not it is set: {pane}"
+        );
+        let pane = serde_json::to_value(pane_info_with_pin(true)).expect("serialize pane");
+        assert_eq!(pane["pinned"], true);
+    }
+
+    #[test]
+    fn agent_status_subscription_emits_when_only_the_pin_changes() {
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: None,
+            last_status: Some(AgentStatus::Unknown),
+            last_presentation: Some(PanePresentationSnapshot::from(&pane_info_with_pin(false))),
+            last_sequence: 0,
+            probe_sequence: 0,
+            initial_event: None,
+            request_prefix: "test".into(),
+        };
+
+        assert!(subscription
+            .event_from_snapshot(pane_info_with_pin(false))
+            .is_none());
+
+        let event = subscription
+            .event_from_snapshot(pane_info_with_pin(true))
+            .expect("pin event");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert!(data.pinned);
+        assert_eq!(data.agent_status, AgentStatus::Unknown);
+
+        assert!(
+            subscription
+                .event_from_snapshot(pane_info_with_pin(true))
+                .is_none(),
+            "the probe remembers the pin it just reported"
+        );
+
+        let event = subscription
+            .event_from_snapshot(pane_info_with_pin(false))
+            .expect("unpin event");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert!(!data.pinned);
+    }
+
+    #[test]
+    fn agent_status_subscription_reports_the_probed_pin_on_a_setup_window_entry() {
+        let event_hub = EventHub::default();
+        let last_sequence = event_hub.current_sequence();
+        // Both entries land while the subscription is still being set up: a
+        // status change on a pane nobody had pinned, then the pin.
+        event_hub.push(pinned_presentation_event(false));
+        event_hub.push(pinned_presentation_event(true));
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: None,
+            last_status: Some(AgentStatus::Working),
+            // The probe ran after both entries, so it already saw the pin.
+            last_presentation: Some(PanePresentationSnapshot::from(&pane_info_with_pin(true))),
+            last_sequence,
+            probe_sequence: event_hub.current_sequence(),
+            initial_event: None,
+            request_prefix: "test".into(),
+        };
+
+        for _ in 0..2 {
+            let event = subscription
+                .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
+                .expect("setup-window delivery");
+            let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+                panic!("wrong event data");
+            };
+            assert!(
+                data.pinned,
+                "a setup-window entry reports the pin the probe already found"
+            );
+        }
+
+        let mut probed = pane_info_with_pin(true);
+        probed.agent_status = AgentStatus::Working;
+        assert!(
+            subscription.event_from_snapshot(probed).is_none(),
+            "a setup-window entry does not overwrite the remembered pin"
+        );
+
+        // An entry published after the probe speaks for itself.
+        event_hub.push(pinned_presentation_event(false));
+        let event = subscription
+            .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
+            .expect("live delivery");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert!(!data.pinned);
+
+        let mut unpinned = pane_info_with_pin(false);
+        unpinned.agent_status = AgentStatus::Working;
+        assert!(
+            subscription.event_from_snapshot(unpinned).is_none(),
+            "a live entry does update the remembered pin"
+        );
+    }
+
+    /// A client that subscribes after the pin was already set learns it from
+    /// the very first delivery, which is built from the setup probe.
+    #[test]
+    fn a_subscription_opened_after_a_pin_reports_it_in_its_first_delivery() {
+        let event_hub = EventHub::default();
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let mut pinned = pane_info_with_pin(true);
+        pinned.agent_status = AgentStatus::Working;
+        let responder = std::thread::spawn(move || loop {
+            match api_rx.try_recv() {
+                Ok(message) => {
+                    let response = serde_json::json!({
+                        "id": message.request.id,
+                        "result": { "type": "pane_info", "pane": pinned },
+                    });
+                    let _ = message.respond_to.send(response.to_string());
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => std::thread::yield_now(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        });
+
+        let subscription = ActiveSubscription::new(
+            Subscription::PaneAgentStatusChanged {
+                pane_id: "pane_1".into(),
+                agent_status: Some(AgentStatus::Working),
+            },
+            "test",
+            0,
+            &api_tx,
+            &event_hub,
+            event_hub.current_sequence(),
+        )
+        .expect("agent status subscription");
+        drop(api_tx);
+        responder.join().expect("responder thread");
+
+        let ActiveSubscription::AgentStatusChanged(subscription) = subscription else {
+            panic!("wrong subscription kind");
+        };
+        let initial = subscription.initial_event.expect("initial delivery");
+        assert!(
+            initial.pinned,
+            "the first delivery carries the pin the probe found"
+        );
+        assert!(
+            subscription
+                .last_presentation
+                .expect("seeded presentation")
+                .pinned,
+            "the seeded presentation carries it too, so an unpin fires as a change"
+        );
+    }
+
+    #[test]
     fn agent_status_subscription_emits_setup_window_event_already_reflected_by_probe() {
         let event_hub = EventHub::default();
         let last_sequence = event_hub.current_sequence();
@@ -1045,6 +1295,7 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
                 label: None,
+                pinned: false,
             }),
             last_sequence,
             probe_sequence: event_hub.current_sequence(),
@@ -1057,6 +1308,7 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
                 label: None,
+                pinned: false,
             }),
             request_prefix: "test".into(),
         };

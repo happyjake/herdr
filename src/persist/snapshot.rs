@@ -139,6 +139,12 @@ pub struct PaneSnapshot {
     /// inherit an age across a status the previous one already reported.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_status_saw_other: bool,
+    /// Whether the user had pinned this pane's terminal.
+    ///
+    /// Defaulted rather than required, so a snapshot written before the pin
+    /// existed restores every pane unpinned instead of failing the session.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// The socket API's name for a status, as stored in a snapshot.
@@ -389,6 +395,7 @@ fn capture_tab(
         let agent_status_saw_other =
             durable_agent_status.is_some_and(|claim| claim.saw_other_status);
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
+        let pinned = terminal.is_some_and(|terminal| terminal.pinned);
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
             .map(|terminal| {
@@ -435,6 +442,7 @@ fn capture_tab(
                 agent_status_changed_at,
                 agent_status_resolve_by,
                 agent_status_saw_other,
+                pinned,
             },
         );
     }
@@ -800,6 +808,48 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_pane_carries_the_pin_its_terminal_holds() {
+        let mut state = state_with_workspaces(&["pinned-capture"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_pinned(true);
+
+        let snapshot = capture_from_state(&state);
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("captured pane");
+        assert!(pane.pinned, "the pin is captured with the session");
+
+        let json = serde_json::to_value(pane).expect("serialize pane");
+        let read_back: PaneSnapshot =
+            serde_json::from_value(json).expect("a captured pane reads back");
+        assert!(read_back.pinned);
+    }
+
+    #[test]
+    fn a_snapshot_written_before_the_pin_restores_every_pane_unpinned() {
+        let json = r#"{
+            "cwd": "/tmp",
+            "label": "reviewer"
+        }"#;
+
+        let pane: PaneSnapshot = serde_json::from_str(json).expect("older snapshots stay readable");
+
+        assert!(
+            !pane.pinned,
+            "a pane written before the pin existed restores unpinned"
+        );
+    }
+
+    #[test]
     fn a_snapshot_written_before_the_status_clock_still_restores() {
         let json = r#"{
             "cwd": "/tmp",
@@ -850,6 +900,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                pinned: false,
             },
         );
         panes.insert(
@@ -865,6 +916,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                pinned: false,
             },
         );
 
@@ -1417,6 +1469,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                pinned: false,
             },
         );
         panes.insert(
@@ -1434,6 +1487,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                pinned: false,
             },
         );
 

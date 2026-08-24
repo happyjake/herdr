@@ -184,6 +184,8 @@ herdr pane focus --direction left|right|up|down [--pane ID|--current]
 herdr pane resize --direction left|right|up|down [--amount FLOAT] [--pane ID|--current]
 herdr pane zoom [<pane_id>|--pane ID|--current] [--toggle|--on|--off]
 herdr pane rename <pane_id> <label>|--clear
+herdr pane pin <pane_id>
+herdr pane unpin <pane_id>
 herdr pane input [<pane_id>|--pane ID|--current] --right-click herdr|pane
 herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--right-click herdr|pane] [--focus] [--no-focus]
 herdr pane swap --direction left|right|up|down [--pane ID|--current]
@@ -199,6 +201,11 @@ For pane commands that accept `--current`, Herdr uses the calling pane's
 an explicit pane id or `--pane ID` splits that pane, `--current` splits the
 calling pane, and an omitted target keeps using the UI-focused pane.
 The split response exposes the new pane ID as `.result.pane.pane_id`.
+
+`pane pin` and `pane unpin` set the pane's pin, the durable mark a user puts
+on a pane. It survives a restart, and `pane list` and `pane get` report it as
+`pinned`. The pin is the user's own mark: read it freely, and set it only when
+the user asks for it.
 
 `pane input --right-click pane` forwards unmodified right-click gestures to a
 mouse-reporting pane application. `herdr` restores the default pane menu.

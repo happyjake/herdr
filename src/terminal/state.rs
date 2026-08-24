@@ -130,6 +130,10 @@ pub struct TerminalState {
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
+    /// Whether the user has pinned this terminal. Kept, never derived: it is
+    /// set only by an explicit request, persists with the session, and says
+    /// nothing about the label, the agent, or anything the terminal does.
+    pub pinned: bool,
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
     managed_agent: Option<ManagedAgent>,
@@ -164,6 +168,7 @@ impl TerminalState {
             persisted_agent_session: None,
             terminal_title: None,
             manual_label: None,
+            pinned: false,
             agent_name: None,
             agent_name_owner: None,
             managed_agent: None,
@@ -1864,6 +1869,10 @@ impl TerminalState {
 
     pub fn clear_manual_label(&mut self) {
         self.manual_label = None;
+    }
+
+    pub fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
     }
 
     pub fn set_agent_name(&mut self, name: String) {

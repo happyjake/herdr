@@ -4,9 +4,9 @@ use crate::api::schema::{
     PaneMoveDestination, PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneRightClickTarget, PaneSendInputParams,
-    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneTarget,
-    PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource, Request,
-    SplitDirection,
+    PaneSendKeysParams, PaneSendTextParams, PaneSetPinnedParams, PaneSplitParams, PaneSwapParams,
+    PaneTarget, PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource,
+    Request, SplitDirection,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -28,6 +28,8 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "zoom" => pane_zoom(&args[1..]),
         "read" => pane_read(&args[1..]),
         "rename" => pane_rename(&args[1..]),
+        "pin" => pane_set_pinned(&args[1..], true),
+        "unpin" => pane_set_pinned(&args[1..], false),
         "input" => pane_input(&args[1..]),
         "split" => pane_split(&args[1..]),
         "swap" => pane_swap(&args[1..]),
@@ -449,6 +451,26 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
     super::runtime::pane_rename(PaneRenameParams {
         pane_id: super::normalize_pane_id(raw_pane_id),
         label,
+    })
+}
+
+/// `herdr pane pin` / `herdr pane unpin`. The pin is the user's own mark on a
+/// pane: read it from `pane list` or `pane get`, and set it only when the user
+/// asks for it.
+fn pane_set_pinned(args: &[String], pinned: bool) -> std::io::Result<i32> {
+    let verb = if pinned { "pin" } else { "unpin" };
+    let Some(raw_pane_id) = args.first() else {
+        eprintln!("usage: herdr pane {verb} <pane_id>");
+        return Ok(2);
+    };
+    if args.len() > 1 {
+        eprintln!("usage: herdr pane {verb} <pane_id>");
+        return Ok(2);
+    }
+
+    super::runtime::pane_set_pinned(PaneSetPinnedParams {
+        pane_id: super::normalize_pane_id(raw_pane_id),
+        pinned,
     })
 }
 
@@ -1683,6 +1705,8 @@ fn print_pane_help() {
     );
     eprintln!("  herdr pane zoom [<pane_id>|--pane ID|--current] [--toggle|--on|--off]");
     eprintln!("  herdr pane rename <pane_id> <label>|--clear");
+    eprintln!("  herdr pane pin <pane_id>");
+    eprintln!("  herdr pane unpin <pane_id>");
     eprintln!("  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr pane input [<pane_id>|--pane ID|--current] --right-click herdr|pane");
     eprintln!(
@@ -1710,6 +1734,17 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn pane_pin_and_unpin_require_exactly_one_pane_id() {
+        assert_eq!(pane_set_pinned(&args(&[]), true).unwrap(), 2);
+        assert_eq!(pane_set_pinned(&args(&[]), false).unwrap(), 2);
+        assert_eq!(
+            pane_set_pinned(&args(&["w1:p1", "please"]), true).unwrap(),
+            2,
+            "the pin takes no value of its own: pin and unpin say which way it goes"
+        );
     }
 
     #[test]

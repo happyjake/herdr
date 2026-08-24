@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -859,6 +859,25 @@ If no native session reference is stored, the field is omitted.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
+`pane.set_pinned` sets or clears a pane's pin and answers `pane_info`, the way
+`pane.rename` does, so the client that toggled it can fold the answer instead
+of waiting for its next snapshot:
+
+```json
+{"id":"req_pin","method":"pane.set_pinned","params":{"pane_id":"w1:p1","pinned":true}}
+```
+
+The pin is a durable per-pane mark. It is kept, never derived: it is set only
+by this method or by `herdr pane pin` / `herdr pane unpin`, it persists with the
+session across a restart, and it says nothing about the pane's label, agent, or
+status. `PaneInfo.pinned` is always present and `true` or `false`, unlike the
+optional presentation fields, so a client can read an absent `pinned` key as a
+server that predates the pin and offer no pinning at all.
+
+The pin is the user's own mark. Agents may read `pinned` freely and should set
+it only when the user explicitly asks for it, never on their own initiative.
+This is a convention where agents are taught, not a rule the server enforces.
+
 `PaneInfo` and `AgentInfo` expose optional `terminal_title` and `terminal_title_stripped` fields. `terminal_title` is the latest OSC 0/2 title after safety normalization. `terminal_title_stripped` removes one recognized leading activity or spinner glyph and following whitespace. These server-owned values are ephemeral across a cold restart and are independent of the metadata `title` and semantic agent state.
 
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Herdr integration.
@@ -944,13 +963,18 @@ publishes the event on its own, with `agent_status` reporting whatever the pane
 already held, so a subscribed client sees a rename as it happens rather than at
 its next snapshot.
 
-`label` is the one presentation field that is always present in this payload:
-it is `null` when the pane has no manual label, where the others are omitted
-when unset. That is deliberate. A client must be able to tell a cleared label
-(`"label": null`) from a server that predates the field (no `label` key at
-all), and keep the label it already learned in the second case. `PaneInfo.label`
-in `pane.get`, `session.snapshot`, and the `pane.rename` response is unchanged
-and stays omitted when unset.
+The payload also carries `pinned`, the pane's pin. Changing it publishes the
+event on its own in the same way a label change does, with `agent_status`
+reporting whatever the pane already held.
+
+`label` and `pinned` are the presentation fields always present in this
+payload: `label` is `null` when the pane has no manual label and `pinned` is
+`true` or `false`, where the others are omitted when unset. That is deliberate.
+A client must be able to tell a cleared label (`"label": null`) or an unpinned
+pane (`"pinned": false`) from a server that predates the field (no key at all),
+and keep what it already learned in the second case. `PaneInfo.label` in
+`pane.get`, `session.snapshot`, and the `pane.rename` response is unchanged and
+stays omitted when unset; `PaneInfo.pinned` is always present there too.
 
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a

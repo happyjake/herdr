@@ -712,6 +712,11 @@
                 "pane_id": {
                   "type": "string"
                 },
+                "pinned": {
+                  "default": false,
+                  "description": "Whether the user has pinned the pane, always serialized for the same\nreason the label is.",
+                  "type": "boolean"
+                },
                 "state_labels": {
                   "additionalProperties": {
                     "type": "string"
@@ -858,6 +863,11 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "pinned": {
+              "default": false,
+              "description": "Whether the user has pinned this pane, as `pane.set_pinned` and\n`herdr pane pin` set it.\n\nAlways serialized, unlike the optional presentation fields: a client\nreads the absence of this key as a server that predates the pin and\noffers no pinning at all, so `false` has to stay distinguishable from\n\"this server has no such notion\".\n\nThe pin is the user's own mark. It is theirs to set: read it freely,\nand write it only when the user asks for it.",
+              "type": "boolean"
             },
             "revision": {
               "format": "uint64",
@@ -3245,6 +3255,21 @@
           "required": [
             "pane_id",
             "text"
+          ],
+          "type": "object"
+        },
+        "PaneSetPinnedParams": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "pinned": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "pane_id",
+            "pinned"
           ],
           "type": "object"
         },
@@ -5696,6 +5721,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.set_pinned",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSetPinnedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.send_text",
               "type": "string"
             },
@@ -6240,6 +6281,11 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "pinned": {
+              "default": false,
+              "description": "Whether the user has pinned the pane, always serialized for the same\nreason the label is: a subscriber reads an absent key as a server that\npredates the pin, not as an unpinned pane.",
+              "type": "boolean"
             },
             "state_labels": {
               "additionalProperties": {
@@ -7344,6 +7390,11 @@
                 "pane_id": {
                   "type": "string"
                 },
+                "pinned": {
+                  "default": false,
+                  "description": "Whether the user has pinned the pane, always serialized for the same\nreason the label is.",
+                  "type": "boolean"
+                },
                 "state_labels": {
                   "additionalProperties": {
                     "type": "string"
@@ -7850,6 +7901,11 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "pinned": {
+              "default": false,
+              "description": "Whether the user has pinned this pane, as `pane.set_pinned` and\n`herdr pane pin` set it.\n\nAlways serialized, unlike the optional presentation fields: a client\nreads the absence of this key as a server that predates the pin and\noffers no pinning at all, so `false` has to stay distinguishable from\n\"this server has no such notion\".\n\nThe pin is the user's own mark. It is theirs to set: read it freely,\nand write it only when the user asks for it.",
+              "type": "boolean"
             },
             "revision": {
               "format": "uint64",

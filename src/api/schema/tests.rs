@@ -91,6 +91,53 @@ fn workspace_close_group_intent_defaults_false_and_round_trips() {
 }
 
 #[test]
+fn pane_set_pinned_request_names_both_directions_with_one_method() {
+    for pinned in [true, false] {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id": "req_pin",
+            "method": "pane.set_pinned",
+            "params": { "pane_id": "w1:p1", "pinned": pinned },
+        }))
+        .unwrap();
+
+        assert_eq!(
+            request.method,
+            Method::PaneSetPinned(PaneSetPinnedParams {
+                pane_id: "w1:p1".into(),
+                pinned,
+            })
+        );
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "pane.set_pinned");
+        assert_eq!(json["params"]["pinned"], pinned);
+    }
+}
+
+#[test]
+fn pane_info_defaults_a_missing_pin_to_unpinned() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "pane_1",
+        "terminal_id": "terminal_1",
+        "workspace_id": "workspace_1",
+        "tab_id": "tab_1",
+        "focused": true,
+        "agent_status": "unknown",
+        "revision": 0
+    }))
+    .unwrap();
+
+    assert!(
+        !pane.pinned,
+        "a pane read from a server that predates the pin is not pinned"
+    );
+    assert_eq!(
+        serde_json::to_value(&pane).unwrap()["pinned"],
+        false,
+        "this server always states it, so a client can tell the two apart"
+    );
+}
+
+#[test]
 fn agent_start_and_prompt_requests_round_trip() {
     let start = Request {
         id: "start".into(),
@@ -924,6 +971,7 @@ fn worktree_request_and_response_round_trip() {
                 mouse_tracking: false,
                 alternate_screen: false,
                 agent_status_changed_at: Some(1_700_000_000),
+                pinned: false,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1357,6 +1405,7 @@ fn create_response_round_trips_with_root_pane() {
                 mouse_tracking: false,
                 alternate_screen: false,
                 agent_status_changed_at: None,
+                pinned: false,
                 revision: 0,
             },
         },
