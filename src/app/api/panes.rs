@@ -12,9 +12,9 @@ use crate::api::schema::{
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendMouseParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason,
-    PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams,
-    PaneZoomReason, PaneZoomResult, ResponseResult,
+    PaneSendMouseParams, PaneSendTextParams, PaneSetPinnedParams, PaneSplitParams,
+    PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange,
+    PaneZoomMode, PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 #[cfg(test)]
 use crate::api::schema::{ReadFormat, ReadSource};
@@ -1594,9 +1594,45 @@ impl App {
         let label_changed = terminal.manual_label != previous_label;
         self.state.mark_session_dirty();
         if label_changed {
-            self.emit_pane_label_changed(ws_idx, pane_id);
+            self.emit_pane_kept_presentation_changed(ws_idx, pane_id);
         }
         let pane = self.pane_info(ws_idx, pane_id).unwrap();
+
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    /// Set or clear the pane's pin. One method for both directions, resolved
+    /// and answered exactly as a rename is, so the client that toggled it can
+    /// fold the answer instead of waiting for its next snapshot.
+    pub(super) fn handle_pane_set_pinned(
+        &mut self,
+        id: String,
+        params: PaneSetPinnedParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id))
+            .cloned()
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let pinned_changed = terminal.pinned != params.pinned;
+        terminal.set_pinned(params.pinned);
+        self.state.mark_session_dirty();
+        if pinned_changed {
+            self.emit_pane_kept_presentation_changed(ws_idx, pane_id);
+        }
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
 
         encode_success(id, ResponseResult::PaneInfo { pane })
     }

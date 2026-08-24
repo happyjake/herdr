@@ -887,6 +887,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneLinkActivate(_) => "pane.link.activate",
         Method::PaneLinkResolve(_) => "pane.link.resolve",
         Method::PaneRename(_) => "pane.rename",
+        Method::PaneSetPinned(_) => "pane.set_pinned",
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendInput(_) => "pane.send_input",
@@ -1544,6 +1545,7 @@ mod tests {
             mouse_tracking: false,
             alternate_screen: false,
             agent_status_changed_at: Some(1_700_000_000),
+            pinned: false,
             revision: 0,
         }
     }

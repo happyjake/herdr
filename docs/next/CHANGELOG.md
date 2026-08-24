@@ -2,12 +2,15 @@
 
 ## Unreleased
 
-## [0.9.1] - 2026-09-16
-
 ### Added
+- A pane can now be pinned: `pane.set_pinned` and `herdr pane pin` / `herdr pane unpin` set a durable per-pane mark that persists with the session, is reported as `PaneInfo.pinned` by `pane.get`, `pane.list`, and `session.snapshot`, and rides `pane.agent_status_changed` so a subscribed client sees a pin as it happens. `pinned` is always present on both, so a client can tell an unpinned pane from a server that predates the field; a session written before the pin restores every pane unpinned. The pin is the user's own mark: agents read it freely and set it only when the user asks. The field is additive and the protocol version is unchanged.
 - `pane.agent_status_changed` now carries the pane's manual `label`, and changing that label publishes the event on its own with `agent_status` untouched, so a subscribed client sees a pane renamed over the socket or from the pane menu as it happens instead of at its next snapshot. `label` is always present on this event and `null` when unset, so a client can tell a cleared label from a server that predates the field; `PaneInfo.label` is unchanged and still omitted when unset. The field is additive and the protocol version is unchanged.
 - Added `PaneInfo.agent_status_changed_at`, the unix second at which a pane's `agent_status` last changed, so a client that connects after the fact can still show how long a pane has held its status. The date is captured with the session and survives a server restart or live handoff. The field is additive and the protocol version is unchanged; clients reading older servers must treat an absent field as "age unknown" rather than as a timestamp.
 - The websocket API now keeps a credential registry per server: the pairing's managing credential plus limited credentials minted through `credential.mint`, listed with `credential.list`, and ended with `credential.revoke` / `credential.revoke_all`. Limited credentials drive the whole API but cannot manage the registry, and may revoke only themselves. Servers declare `credential_registry` in their `ping` capabilities; the protocol version is unchanged. Revocation is reported to the affected client as a terminal `credential_revoked` error on an established connection, so a browser can tell revocation from transient trouble.
+
+## [0.9.1] - 2026-09-16
+
+### Added
 - Control agents, panes, workspaces, and worktrees on saved SSH machines with `herdr --machine <label-or-id>`. Commands use the saved machine's session without needing an open Herdr window. Update Herdr on both machines to use CLI forwarding; failed remote commands never fall back to Local. (#3918)
 - Connect to Windows SSH hosts from Linux, macOS, or Windows. Interactive setup can install or update the complete Windows package after confirmation; background reconnects never install updates. (#3651, #3701, #3661, #3687, thanks @JJLiebig)
 - Edit names, filters, and search text at the cursor instead of only at the end. Herdr inputs now support character and word movement, Home/End, deletion, and familiar Ctrl+A/E/K/U/W/Y shortcuts, including Unicode text. (#1803, #3698, thanks @markjaquith)

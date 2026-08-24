@@ -524,6 +524,9 @@ fn restore_tab(
         }
 
         let saved_label = saved_pane.and_then(|p| p.label.clone());
+        // A snapshot written before the pin existed leaves this absent, and the
+        // pane restores unpinned.
+        let saved_pinned = saved_pane.is_some_and(|p| p.pinned);
         let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
         let saved_managed_agent = saved_pane
             .and_then(|pane| pane.managed_agent_kind.as_deref())
@@ -630,6 +633,7 @@ fn restore_tab(
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
+            terminal.set_pinned(saved_pinned);
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
             }
@@ -727,6 +731,7 @@ fn restore_tab(
                 if let Some(label) = saved_label {
                     terminal.set_manual_label(label);
                 }
+                terminal.set_pinned(saved_pinned);
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
@@ -1390,6 +1395,7 @@ mod tests {
                             agent_status_changed_at: None,
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -1439,6 +1445,125 @@ mod tests {
         assert_eq!(session.session_ref.value, "opencode-session");
     }
 
+    /// The pin survives a restart, and a session written before the pin
+    /// existed restores every pane unpinned rather than failing to load.
+    #[tokio::test]
+    async fn restore_carries_the_pin_and_defaults_an_older_session_unpinned() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            launch_argv: None,
+                            agent_status: None,
+                            agent_status_changed_at: None,
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: true,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+
+        let restore_once = |snapshot: &SessionSnapshot| {
+            let (events, event_rx) = mpsc::channel(4);
+            let (_workspaces, terminals, _runtimes) = restore(
+                snapshot,
+                None,
+                24,
+                80,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let pinned = terminals
+                .values()
+                .next()
+                .expect("restored terminal should exist")
+                .pinned;
+            drop(event_rx);
+            pinned
+        };
+
+        assert!(
+            restore_once(&snapshot),
+            "a pinned pane comes back pinned after a restart"
+        );
+
+        // The same session as written by a build that had no pin: every
+        // `pinned` key stripped from the stored JSON.
+        let mut stored = serde_json::to_value(&snapshot).expect("serialize session");
+        assert!(
+            stored["workspaces"][0]["tabs"][0]["panes"]["0"]
+                .get("pinned")
+                .is_some(),
+            "the captured session states the pin: {stored}"
+        );
+        strip_key(&mut stored, "pinned");
+        assert!(
+            stored["workspaces"][0]["tabs"][0]["panes"]["0"]
+                .get("pinned")
+                .is_none(),
+            "the older session says nothing about a pin: {stored}"
+        );
+        let older: SessionSnapshot =
+            serde_json::from_value(stored).expect("an older session still loads");
+
+        assert!(
+            !restore_once(&older),
+            "a session written before the pin restores every pane unpinned"
+        );
+    }
+
+    fn strip_key(value: &mut serde_json::Value, key: &str) {
+        match value {
+            serde_json::Value::Object(object) => {
+                object.remove(key);
+                for child in object.values_mut() {
+                    strip_key(child, key);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    strip_key(item, key);
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[tokio::test]
     async fn restore_carries_the_status_clock_a_handoff_captured() {
         let cwd = std::env::current_dir().unwrap();
@@ -1469,6 +1594,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -1559,6 +1685,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -1682,6 +1809,7 @@ mod tests {
                             // that the deadline passed on the way here.
                             agent_status_resolve_by: Some(now - 5),
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -1770,6 +1898,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: Some(crate::pane::unix_now_secs() + 60),
                             agent_status_saw_other: true,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -1856,6 +1985,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: Some(crate::pane::unix_now_secs() - 5),
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -1933,6 +2063,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -2009,6 +2140,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -2086,6 +2218,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -2168,6 +2301,7 @@ mod tests {
                             agent_status_changed_at: None,
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -2250,6 +2384,7 @@ mod tests {
                                 agent_status_changed_at: None,
                                 agent_status_resolve_by: None,
                                 agent_status_saw_other: false,
+                                pinned: false,
                             },
                         ),
                         (
@@ -2265,6 +2400,7 @@ mod tests {
                                 agent_status_changed_at: None,
                                 agent_status_resolve_by: None,
                                 agent_status_saw_other: false,
+                                pinned: false,
                             },
                         ),
                     ]),
@@ -2322,6 +2458,7 @@ mod tests {
                     agent_status_changed_at: None,
                     agent_status_resolve_by: None,
                     agent_status_saw_other: false,
+                    pinned: false,
                 },
             )
         };
@@ -2341,6 +2478,7 @@ mod tests {
             agent_status_changed_at: None,
             agent_status_resolve_by: None,
             agent_status_saw_other: false,
+            pinned: false,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -2496,6 +2634,7 @@ mod tests {
                             agent_status_changed_at: None,
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            pinned: false,
                         },
                     )]),
                     zoomed: false,
@@ -2805,6 +2944,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                pinned: false,
             },
         );
         let mut history = SessionHistorySnapshot {

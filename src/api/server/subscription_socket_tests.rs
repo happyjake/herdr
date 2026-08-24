@@ -239,6 +239,7 @@ fn reply_to_probe(request: ApiRequestMessage) {
                 mouse_tracking: false,
                 alternate_screen: false,
                 agent_status_changed_at: None,
+                pinned: false,
                 revision: 0,
             },
         },
