@@ -52,10 +52,12 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     last_status: Option<crate::api::schema::AgentStatus>,
     last_presentation: Option<PanePresentationSnapshot>,
     last_sequence: u64,
-    /// The ring position setup finished at. Entries at or below it landed
-    /// before the seeding probe read the pane, so what they say about the
-    /// kept presentation fields is older than what the subscription already
-    /// knows.
+    /// The ring position sampled before the seeding probe read the pane.
+    /// Entries at or below it landed before that read, so what they say about
+    /// the kept presentation fields is older than what the subscription
+    /// already knows. The sample is taken before the read rather than after it
+    /// so that this stays true: an entry published while the probe was being
+    /// answered is newer than the state it returned, and speaks for itself.
     probe_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
     request_prefix: String,
@@ -219,9 +221,17 @@ impl ActiveSubscription {
                 pane_id,
                 agent_status,
             } => {
+                // Sample the ring before the probe reads the pane, never after.
+                // Entries at or below this sample were published before the
+                // read, so the state the probe returns already accounts for
+                // them. An entry published from here on may carry a kept field
+                // the probe never saw, and the only safe reading of it is its
+                // own: repeating truth the probe already had costs a subscriber
+                // one redundant delivery, while substituting the probe's copy
+                // over a newer one hides a change that nothing later repeats.
                 let last_sequence = event_hub.current_sequence();
+                let probe_sequence = last_sequence;
                 let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
-                let probe_sequence = event_hub.current_sequence();
                 let last_status = probe.agent_status;
                 let last_presentation = PanePresentationSnapshot::from(&probe);
                 let initial_event = agent_status
@@ -1278,6 +1288,83 @@ mod tests {
                 .expect("seeded presentation")
                 .pinned,
             "the seeded presentation carries it too, so an unpin fires as a change"
+        );
+    }
+
+    /// A kept field changed while the seeding probe was being answered: the
+    /// app read the pane, then the change landed and published, then setup
+    /// sampled the ring. The published entry is newer than the state the probe
+    /// returned, so it must reach the subscriber with its own label and pin.
+    /// Substituting the probe's copy would hand the subscriber the old bits
+    /// and leave them standing, because nothing later repeats a change that
+    /// has already been published.
+    #[test]
+    fn a_kept_field_changed_while_the_probe_was_answered_is_not_read_as_a_replay() {
+        let event_hub = EventHub::default();
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        // What the app had already read when the change landed.
+        let mut before_the_change = pane_info_with_pin(false);
+        before_the_change.agent_status = AgentStatus::Working;
+        let published = event_hub.clone();
+        let responder = std::thread::spawn(move || loop {
+            match api_rx.try_recv() {
+                Ok(message) => {
+                    let response = serde_json::json!({
+                        "id": message.request.id,
+                        "result": { "type": "pane_info", "pane": before_the_change },
+                    });
+                    // The change lands and publishes after that read and
+                    // before setup can sample the ring.
+                    published.push(kept_presentation_event(None, Some("reviewer"), true));
+                    let _ = message.respond_to.send(response.to_string());
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => std::thread::yield_now(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        });
+
+        let subscription = ActiveSubscription::new(
+            Subscription::PaneAgentStatusChanged {
+                pane_id: "pane_1".into(),
+                agent_status: None,
+            },
+            "test",
+            0,
+            &api_tx,
+            &event_hub,
+            event_hub.current_sequence(),
+        )
+        .expect("agent status subscription");
+        drop(api_tx);
+        responder.join().expect("responder thread");
+
+        let ActiveSubscription::AgentStatusChanged(mut subscription) = subscription else {
+            panic!("wrong subscription kind");
+        };
+        let event = subscription
+            .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
+            .expect("the published change is delivered");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert!(
+            data.pinned,
+            "the delivered entry carries the pin it published, not the one the probe read"
+        );
+        assert_eq!(
+            data.label.as_deref(),
+            Some("reviewer"),
+            "and the label it published, for the same reason"
+        );
+
+        let remembered = subscription
+            .last_presentation
+            .as_ref()
+            .expect("remembered presentation");
+        assert!(
+            remembered.pinned && remembered.label.as_deref() == Some("reviewer"),
+            "and the subscription remembers them, so the next probe sees no change to report"
         );
     }
 
