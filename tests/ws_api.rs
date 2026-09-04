@@ -2025,6 +2025,14 @@ fn oversize_attachment_requests_die_at_the_unchanged_transport_cap() {
     cleanup_spawned_herdr(server.child, server.base);
 }
 
+/// Where a recorded attachment path is rewritten to live. Neutral and
+/// absolute, so the fixture still proves the contract's paste-safe shape
+/// without naming the machine that recorded it.
+const FIXTURE_SCRATCH_DIR: &str = "/tmp/herdr-attachments";
+
+/// And where its server binary is rewritten to live, for the same reason.
+const FIXTURE_SERVER_EXE: &str = "/opt/herdr/herdr";
+
 /// Recorded wire fixture for the mobile repo's fake herdr server — the same
 /// discipline as its pane-read recordings: real request/response frames in
 /// the `{firstLiveFrameIndex, recording: [{dir, ms, frame}]}` envelope.
@@ -2053,9 +2061,37 @@ fn attachment_fixture_for_the_mobile_fake_server_is_current() {
             fixture_path.display()
         )
     });
+    // A fixture two repositories share may not carry the machine that
+    // recorded it: no home or temp root, no per-user scratch dir, no uid.
+    for machine_specific in [
+        "/private/tmp/",
+        "/hws-",
+        "herdr-attachments-",
+        "/Users/",
+        "/home/",
+    ] {
+        assert!(
+            !content.contains(machine_specific),
+            "the fixture names the recording machine ({machine_specific}); \
+             re-record it so the recorder's normalization applies"
+        );
+    }
+
     let fixture: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(fixture["firstLiveFrameIndex"], 0);
     let frames = fixture["recording"].as_array().unwrap();
+    for entry in frames {
+        if let Some(path) = entry["frame"]["result"]["path"].as_str() {
+            assert!(
+                path.starts_with(&format!("{FIXTURE_SCRATCH_DIR}/")),
+                "every recorded attachment path must wear the neutral fixture \
+                 scratch dir: {path}"
+            );
+        }
+        if let Some(exe) = entry["frame"]["result"]["exe"].as_str() {
+            assert_eq!(exe, FIXTURE_SERVER_EXE);
+        }
+    }
 
     let recv_frame = |id: &str| -> &serde_json::Value {
         frames
@@ -2161,7 +2197,15 @@ fn record_attachment_fixture(fixture_path: &Path) {
         // machine keeps its build is no part of the contract, and pinning a
         // shared fixture to one checkout only makes it wrong elsewhere.
         if let Some(exe) = frame.pointer_mut("/result/exe") {
-            *exe = serde_json::Value::String("/opt/herdr/herdr".to_string());
+            *exe = serde_json::Value::String(FIXTURE_SERVER_EXE.to_string());
+        }
+        // Same for a stored attachment's path: the contract is the shape of
+        // the name the server gives the file, not the temp root and uid of
+        // whichever machine happened to record it.
+        if let Some(path) = frame.pointer_mut("/result/path") {
+            if let Some(basename) = path.as_str().and_then(|path| path.rsplit('/').next()) {
+                *path = serde_json::Value::String(format!("{FIXTURE_SCRATCH_DIR}/{basename}"));
+            }
         }
         frames.push(serde_json::json!({
             "dir": dir,

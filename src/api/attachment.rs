@@ -588,11 +588,31 @@ fn unique_seed() -> u128 {
 /// before the success response is encoded, so a returned path never names a
 /// partial file; any failure removes the temp artifact.
 fn write_atomically(dir: &Path, name: &FinalName, bytes: &[u8]) -> io::Result<CreatedAttachment> {
+    write_atomically_with(dir, name, |file| {
+        file.write_all(bytes).and_then(|()| file.flush())
+    })
+}
+
+/// The staging half, with the write itself named so a failing one can be
+/// exercised: a write that gives out partway must leave the scratch dir as
+/// it found it, not a half-written file for the sweep to carry for a day.
+fn write_atomically_with(
+    dir: &Path,
+    name: &FinalName,
+    write: impl Fn(&mut fs::File) -> io::Result<()>,
+) -> io::Result<CreatedAttachment> {
     place(dir, name, |staged_path| {
         let mut file = open_exclusive(staged_path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
+        let written = write(&mut file);
         drop(file);
+        if let Err(err) = written {
+            // This staging file is this call's own — nothing has been
+            // renamed onto it and no other caller can hold it, which is
+            // what makes removing it safe. A chunked upload's partial is
+            // the opposite case and is never removed on a failed append.
+            let _ = fs::remove_file(staged_path);
+            return Err(err);
+        }
         Ok(())
     })
 }
@@ -1023,6 +1043,35 @@ mod tests {
         ));
 
         assert_eq!(dir_entries(&dir), Vec::<PathBuf>::new());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_that_gives_out_partway_leaves_no_file_or_staging_artifact() {
+        let dir = unique_test_dir("write-failure");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Both shapes a create can name: the photo contract's server-named
+        // file, and one wearing a client name.
+        for name in [
+            FinalName::new(1, None, Some("png")),
+            FinalName::new(2, Some("crash.log"), None),
+        ] {
+            let gives_out_partway = |file: &mut fs::File| {
+                file.write_all(b"the first half of a file")?;
+                Err(io::Error::other("the volume gave out mid-write"))
+            };
+
+            let failed = write_atomically_with(&dir, &name, gives_out_partway);
+
+            assert!(failed.is_err(), "the write failure must reach the caller");
+            assert_eq!(
+                dir_entries(&dir),
+                Vec::<PathBuf>::new(),
+                "a failed write must leave neither the file nor its half-written staging artifact"
+            );
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -52,8 +52,8 @@
       "frame": {
         "id": "req_attach_png",
         "result": {
-          "expires_at": 1788593000,
-          "path": "/private/tmp/hws-68205-1788506599089673000/runtime/herdr-attachments-501/attachment-1788506600154134000-0.png",
+          "expires_at": 1788595069,
+          "path": "/tmp/herdr-attachments/attachment-1788508669100809000-0.png",
           "type": "attachment_created"
         }
       },
@@ -75,8 +75,8 @@
       "frame": {
         "id": "req_attach_jpeg",
         "result": {
-          "expires_at": 1788593000,
-          "path": "/private/tmp/hws-68205-1788506599089673000/runtime/herdr-attachments-501/attachment-1788506600154517000-0.jpg",
+          "expires_at": 1788595069,
+          "path": "/tmp/herdr-attachments/attachment-1788508669101209000-0.jpg",
           "type": "attachment_created"
         }
       },
@@ -99,8 +99,8 @@
       "frame": {
         "id": "req_attach_named",
         "result": {
-          "expires_at": 1788593000,
-          "path": "/private/tmp/hws-68205-1788506599089673000/runtime/herdr-attachments-501/attachment-1788506600154916000-0-crash_report.log",
+          "expires_at": 1788595069,
+          "path": "/tmp/herdr-attachments/attachment-1788508669101673000-0-crash_report.log",
           "type": "attachment_created"
         }
       },
@@ -192,7 +192,7 @@
         "id": "req_upload_begin",
         "result": {
           "type": "attachment_upload_started",
-          "upload_id": "upload-1788506600155857000-0"
+          "upload_id": "upload-1788508669102515000-0"
         }
       },
       "ms": 15
@@ -205,7 +205,7 @@
         "params": {
           "bytes_b64": "Zmlyc3QgaGFsZiBvZiBhIHNlc3Npb24gbG9nCg==",
           "offset": 0,
-          "upload_id": "upload-1788506600155857000-0"
+          "upload_id": "upload-1788508669102515000-0"
         }
       },
       "ms": 16
@@ -229,7 +229,7 @@
         "params": {
           "bytes_b64": "c2Vjb25kIGhhbGYK",
           "offset": 28,
-          "upload_id": "upload-1788506600155857000-0"
+          "upload_id": "upload-1788508669102515000-0"
         }
       },
       "ms": 18
@@ -252,7 +252,7 @@
         "method": "attachment.commit",
         "params": {
           "size": 40,
-          "upload_id": "upload-1788506600155857000-0"
+          "upload_id": "upload-1788508669102515000-0"
         }
       },
       "ms": 20
@@ -262,8 +262,8 @@
       "frame": {
         "id": "req_upload_commit",
         "result": {
-          "expires_at": 1788593000,
-          "path": "/private/tmp/hws-68205-1788506599089673000/runtime/herdr-attachments-501/attachment-1788506600156565000-0-session.log",
+          "expires_at": 1788595069,
+          "path": "/tmp/herdr-attachments/attachment-1788508669103201000-0-session.log",
           "type": "attachment_created"
         }
       },
