@@ -59,6 +59,16 @@ pub enum Method {
     ServerReloadAgentManifests(EmptyParams),
     #[serde(rename = "attachment.create")]
     AttachmentCreate(AttachmentCreateParams),
+    // A file beyond one message's carry (ADR-0047). Additive verbs, with the
+    // reserved partial file as the whole upload state: a server that
+    // predates them cannot parse the method, and `file_attachments` in the
+    // pong capabilities is the positive signal that it can.
+    #[serde(rename = "attachment.begin")]
+    AttachmentBegin(AttachmentBeginParams),
+    #[serde(rename = "attachment.append")]
+    AttachmentAppend(AttachmentAppendParams),
+    #[serde(rename = "attachment.commit")]
+    AttachmentCommit(AttachmentCommitParams),
     // The credential registry (ADR-0026). Additive verbs: a server that
     // predates them cannot parse the method and answers `invalid_request`,
     // which is how a client learns the capability is absent. `protocol` is

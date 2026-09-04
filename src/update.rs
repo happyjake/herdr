@@ -2860,6 +2860,7 @@ mod tests {
                     send_affirm: true,
                     stream_multiplex: true,
                     credential_registry: true,
+                    file_attachments: None,
                 }),
             },
         };

@@ -1430,6 +1430,455 @@ fn an_over_cap_attachment_that_fits_the_transport_gets_the_distinct_error() {
     cleanup_spawned_herdr(server.child, server.base);
 }
 
+/// The sizes the server declares it will take. A client hard-codes neither,
+/// so neither does this test.
+fn declared_file_attachment_limits(response: &serde_json::Value) -> (usize, u64) {
+    let declared = &response["result"]["capabilities"]["file_attachments"];
+    assert!(
+        declared.is_object(),
+        "the pong must declare file_attachments: {response}"
+    );
+    (
+        declared["chunk_bytes"].as_u64().unwrap() as usize,
+        declared["max_bytes"].as_u64().unwrap(),
+    )
+}
+
+/// Deterministic bytes that are not an image and do not compress into
+/// coincidence, so a wrongly ordered or duplicated chunk shows up.
+fn upload_payload(size: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(size);
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    while bytes.len() < size {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        bytes.extend_from_slice(&state.to_le_bytes());
+    }
+    bytes.truncate(size);
+    bytes
+}
+
+fn begin_request(id: &str, name: &str, size: u64) -> String {
+    format!(
+        r#"{{"id":"{id}","method":"attachment.begin","params":{{"name":"{name}","size":{size}}}}}"#
+    )
+}
+
+fn append_request(id: &str, upload_id: &str, offset: usize, bytes: &[u8]) -> String {
+    format!(
+        r#"{{"id":"{id}","method":"attachment.append","params":{{"upload_id":"{upload_id}","offset":{offset},"bytes_b64":"{}"}}}}"#,
+        base64_of(bytes)
+    )
+}
+
+fn commit_request(id: &str, upload_id: &str, size: u64) -> String {
+    format!(
+        r#"{{"id":"{id}","method":"attachment.commit","params":{{"upload_id":"{upload_id}","size":{size}}}}}"#
+    )
+}
+
+#[test]
+fn the_pong_declares_the_file_attachment_sizes_identically_over_both_transports() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+
+    let ping = r#"{"id":"req_file_attachments_cap","method":"ping","params":{}}"#;
+    let mut unix_reader = JsonLineReader::connect(&server.socket_path);
+    unix_reader.send_line(ping);
+    let unix_raw = unix_reader.read_raw_line(Duration::from_secs(5));
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    ws.send(ping);
+    let ws_raw = ws.read_raw(Duration::from_secs(5));
+    assert_eq!(unix_raw, ws_raw, "raw pong payloads must be identical");
+
+    let pong: serde_json::Value = serde_json::from_str(&ws_raw).unwrap();
+    let (chunk_bytes, max_bytes) = declared_file_attachment_limits(&pong);
+    assert_eq!(max_bytes, 67_108_864);
+    assert_eq!(chunk_bytes, 783_360);
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn a_named_attachment_stores_any_file_over_both_transports() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let scratch_dir = attachment_scratch_dir(&server);
+
+    // Bytes that no sniff would ever accept, which is the point: a client
+    // that names its file gets the file it named.
+    let log = b"panic: index out of range\n\tat main.rs:42\n".to_vec();
+    let request = format!(
+        r#"{{"id":"req_attach_named","method":"attachment.create","params":{{"bytes_b64":"{}","name":"crash reports/2026-01-02 run.log"}}}}"#,
+        base64_of(&log)
+    );
+
+    let unix_response = unix_request(&server.socket_path, &request);
+    assert_eq!(
+        unix_response["result"]["type"], "attachment_created",
+        "unexpected response: {unix_response}"
+    );
+    let unix_path = PathBuf::from(unix_response["result"]["path"].as_str().unwrap());
+    assert_eq!(unix_path.parent(), Some(scratch_dir.as_path()));
+    assert_eq!(fs::read(&unix_path).unwrap(), log);
+
+    let name = unix_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(!name.contains(' '), "path must stay paste-safe: {name}");
+    assert!(
+        name.ends_with("-2026-01-02_run.log"),
+        "the stored file must wear the client's name: {name}"
+    );
+
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let ws_response = ws.request(&request);
+    let ws_path = PathBuf::from(ws_response["result"]["path"].as_str().unwrap());
+    assert_ne!(unix_path, ws_path, "the server names every file uniquely");
+    assert_eq!(fs::read(&ws_path).unwrap(), log);
+
+    // The photo contract is untouched: the same bytes with no name are still
+    // refused for not being an image.
+    let unnamed = format!(
+        r#"{{"id":"req_attach_unnamed","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
+        base64_of(&log)
+    );
+    assert_eq!(
+        unix_request(&server.socket_path, &unnamed)["error"]["code"],
+        "attachment_unsupported_format"
+    );
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn a_file_beyond_one_message_lands_through_a_chunked_upload() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let scratch_dir = attachment_scratch_dir(&server);
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+
+    let pong = ws.request(r#"{"id":"req_chunked_cap","method":"ping","params":{}}"#);
+    let (chunk_bytes, _max_bytes) = declared_file_attachment_limits(&pong);
+
+    // A log of the size this feature exists for: tens of megabytes, far past
+    // anything one message can carry.
+    let payload = upload_payload(50 * 1024 * 1024);
+    assert!(payload.len() > chunk_bytes * 10);
+
+    let begin = ws.request(&begin_request(
+        "req_begin",
+        "logs/agent session.log",
+        payload.len() as u64,
+    ));
+    assert_eq!(
+        begin["result"]["type"], "attachment_upload_started",
+        "unexpected response: {begin}"
+    );
+    let upload_id = begin["result"]["upload_id"].as_str().unwrap().to_string();
+    assert!(upload_id.len() <= 128, "upload id too long: {upload_id}");
+    assert!(
+        upload_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        "upload id outside the contract's charset: {upload_id}"
+    );
+
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        let end = (offset + chunk_bytes).min(payload.len());
+        let appended = ws.request(&append_request(
+            "req_append",
+            &upload_id,
+            offset,
+            &payload[offset..end],
+        ));
+        assert_eq!(
+            appended["result"]["type"], "attachment_appended",
+            "unexpected response: {appended}"
+        );
+        assert_eq!(
+            appended["result"]["received"].as_u64().unwrap(),
+            end as u64,
+            "received must be the bytes on disk"
+        );
+        offset = end;
+    }
+
+    let committed = ws.request(&commit_request(
+        "req_commit",
+        &upload_id,
+        payload.len() as u64,
+    ));
+    let path = assert_committed_upload(&committed, &scratch_dir, &payload, "-agent_session.log");
+
+    assert_eq!(
+        scratch_entries(&scratch_dir),
+        vec![path],
+        "a finished upload leaves only the file it produced"
+    );
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+/// Assert one successful `attachment.commit` against the same observable
+/// contract `attachment.create` answers with, plus the client's name.
+fn assert_committed_upload(
+    response: &serde_json::Value,
+    scratch_dir: &Path,
+    sent_bytes: &[u8],
+    name_suffix: &str,
+) -> PathBuf {
+    assert_eq!(
+        response["result"]["type"], "attachment_created",
+        "unexpected response: {response}"
+    );
+    let path = PathBuf::from(response["result"]["path"].as_str().unwrap());
+    assert!(
+        path.is_absolute(),
+        "path must be absolute: {}",
+        path.display()
+    );
+    assert_eq!(path.parent(), Some(scratch_dir));
+
+    let stored = fs::read(&path).unwrap();
+    assert_eq!(stored.len(), sent_bytes.len(), "wrong number of bytes");
+    assert!(
+        stored == sent_bytes,
+        "stored bytes differ from what was sent"
+    );
+
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(!name.contains(' '), "name must be space-free: {name}");
+    assert!(
+        name.ends_with(name_suffix),
+        "the stored file must wear the client's name: {name}"
+    );
+
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a committed upload must be owner-only");
+    }
+
+    let expires_at = response["result"]["expires_at"].as_u64().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        expires_at >= now + ATTACHMENT_TTL_SECS - 120
+            && expires_at <= now + ATTACHMENT_TTL_SECS + 120,
+        "expires_at must be about now + 24h, got {expires_at} (now {now})"
+    );
+
+    path
+}
+
+#[test]
+fn appends_may_ride_in_flight_because_one_connection_answers_in_order() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let scratch_dir = attachment_scratch_dir(&server);
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+
+    let chunks: Vec<Vec<u8>> = (0..4u8)
+        .map(|index| vec![b'a' + index; 4096 + usize::from(index)])
+        .collect();
+    let whole: Vec<u8> = chunks.concat();
+
+    let begin = ws.request(&begin_request(
+        "req_begin",
+        "pipelined.bin",
+        whole.len() as u64,
+    ));
+    let upload_id = begin["result"]["upload_id"].as_str().unwrap().to_string();
+
+    // Four appends written before any answer is read: the contract's own
+    // pipelining rule, which only holds if the connection answers in order.
+    let mut offset = 0usize;
+    let mut expected = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        ws.send(&append_request(
+            &format!("req_append_{index}"),
+            &upload_id,
+            offset,
+            chunk,
+        ));
+        offset += chunk.len();
+        expected.push((format!("req_append_{index}"), offset as u64));
+    }
+    for (id, received) in expected {
+        let response = ws.read_json(Duration::from_secs(10));
+        assert_eq!(response["id"], id, "answers must arrive in order");
+        assert_eq!(response["result"]["received"].as_u64().unwrap(), received);
+    }
+
+    let committed = ws.request(&commit_request(
+        "req_commit",
+        &upload_id,
+        whole.len() as u64,
+    ));
+    assert_committed_upload(&committed, &scratch_dir, &whole, "-pipelined.bin");
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn chunked_upload_refusals_carry_their_named_codes_and_leave_the_partial_alone() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+    let scratch_dir = attachment_scratch_dir(&server);
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+
+    let pong = ws.request(r#"{"id":"req_refusal_cap","method":"ping","params":{}}"#);
+    let (_chunk_bytes, max_bytes) = declared_file_attachment_limits(&pong);
+
+    // Over the ceiling: refused before a byte flies, naming both numbers.
+    let refused = ws.request(&begin_request("req_begin_huge", "huge.bin", max_bytes + 1));
+    assert_eq!(refused["error"]["code"], "attachment_too_large");
+    let message = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&(max_bytes + 1).to_string()) && message.contains(&max_bytes.to_string()),
+        "the refusal must name both numbers: {message}"
+    );
+    assert_eq!(
+        scratch_entries(&scratch_dir),
+        Vec::<PathBuf>::new(),
+        "a refused begin must leave no file"
+    );
+
+    // An id this server never minted reaches no file at all.
+    for (id, method, params) in [
+        (
+            "req_append_unknown",
+            "attachment.append",
+            r#"{"upload_id":"upload-nope-0","offset":0,"bytes_b64":"aGk="}"#,
+        ),
+        (
+            "req_append_traversal",
+            "attachment.append",
+            r#"{"upload_id":"upload-../escape","offset":0,"bytes_b64":"aGk="}"#,
+        ),
+        (
+            "req_commit_unknown",
+            "attachment.commit",
+            r#"{"upload_id":"upload-nope-0","size":0}"#,
+        ),
+    ] {
+        let response = ws.request(&format!(
+            r#"{{"id":"{id}","method":"{method}","params":{params}}}"#
+        ));
+        assert_eq!(
+            response["error"]["code"], "attachment_unknown_upload",
+            "unexpected response: {response}"
+        );
+    }
+    assert_eq!(scratch_entries(&scratch_dir), Vec::<PathBuf>::new());
+
+    // A live upload refuses everything that does not match the disk.
+    let begin = ws.request(&begin_request("req_begin", "notes.txt", 16));
+    let upload_id = begin["result"]["upload_id"].as_str().unwrap().to_string();
+    let partial = scratch_dir.join(format!("{upload_id}.partial"));
+    assert_eq!(
+        ws.request(&append_request("req_first", &upload_id, 0, b"12345"))["result"]["received"]
+            .as_u64()
+            .unwrap(),
+        5
+    );
+
+    let duplicate = ws.request(&append_request("req_duplicate", &upload_id, 0, b"12345"));
+    assert_eq!(duplicate["error"]["code"], "attachment_offset_mismatch");
+    assert!(
+        duplicate["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains('5'),
+        "the refusal must carry received: {duplicate}"
+    );
+
+    let ahead = ws.request(&append_request("req_ahead", &upload_id, 9, b"12345"));
+    assert_eq!(ahead["error"]["code"], "attachment_offset_mismatch");
+
+    let past_declared = ws.request(&append_request("req_past", &upload_id, 5, &[b'x'; 12]));
+    assert_eq!(past_declared["error"]["code"], "attachment_too_large");
+
+    let short_commit = ws.request(&commit_request("req_short", &upload_id, 16));
+    assert_eq!(short_commit["error"]["code"], "attachment_size_mismatch");
+    assert_eq!(
+        fs::read(&partial).unwrap(),
+        b"12345",
+        "a refused commit must leave the partial exactly as it was"
+    );
+
+    // Which is why the client can finish the file it started.
+    ws.request(&append_request("req_rest", &upload_id, 5, b"67890"));
+    let committed = ws.request(&commit_request("req_commit", &upload_id, 10));
+    let path = assert_committed_upload(&committed, &scratch_dir, b"1234567890", "-notes.txt");
+    assert_eq!(scratch_entries(&scratch_dir), vec![path]);
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn an_abandoned_upload_is_swept_like_any_other_scratch_file() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let ws_port = pick_free_port();
+
+    // An upload abandoned before an earlier server run ended: both files
+    // past the TTL, exactly what a listener restart finds.
+    let user_id = unsafe { libc::geteuid() };
+    let scratch_dir = runtime_dir.join(format!("herdr-attachments-{user_id}"));
+    fs::create_dir_all(&scratch_dir).unwrap();
+    let stale = SystemTime::now() - Duration::from_secs(ATTACHMENT_TTL_SECS + 3600);
+    let abandoned: Vec<PathBuf> = ["upload-1-0.partial", "upload-1-0.upload"]
+        .iter()
+        .map(|name| {
+            let path = scratch_dir.join(name);
+            fs::write(&path, b"abandoned").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(stale)
+                .unwrap();
+            path
+        })
+        .collect();
+    let fresh = scratch_dir.join("upload-2-0.partial");
+    fs::write(&fresh, b"still going").unwrap();
+
+    let child = spawn_herdr_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        &websocket_section(ws_port),
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while abandoned.iter().any(|path| path.exists()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    for path in &abandoned {
+        assert!(
+            !path.exists(),
+            "the sweep must remove an abandoned upload: {}",
+            path.display()
+        );
+    }
+    assert!(fresh.exists(), "an upload within the TTL must survive");
+
+    cleanup_spawned_herdr(child, base);
+}
+
 #[test]
 fn attachment_sweep_removes_expired_files_at_listener_start_and_spares_fresh_ones() {
     let _lock = test_lock();
@@ -1623,7 +2072,16 @@ fn attachment_fixture_for_the_mobile_fake_server_is_current() {
 
     assert_eq!(recv_frame("req_ping")["frame"]["result"]["type"], "pong");
 
-    for (id, extension) in [("req_attach_png", ".png"), ("req_attach_jpeg", ".jpg")] {
+    assert!(
+        recv_frame("req_ping")["frame"]["result"]["capabilities"]["file_attachments"].is_object(),
+        "the pong must declare the file attachment sizes"
+    );
+
+    for (id, extension) in [
+        ("req_attach_png", ".png"),
+        ("req_attach_jpeg", ".jpg"),
+        ("req_attach_named", "-crash_report.log"),
+    ] {
         let sent = send_frame(id);
         assert_eq!(sent["frame"]["method"], "attachment.create");
         assert!(sent["frame"]["params"]["bytes_b64"].is_string());
@@ -1636,6 +2094,44 @@ fn attachment_fixture_for_the_mobile_fake_server_is_current() {
         assert!(path.ends_with(extension), "wrong extension: {path}");
         assert!(result["expires_at"].as_u64().unwrap() > 0);
     }
+    assert_eq!(
+        send_frame("req_attach_named")["frame"]["params"]["name"],
+        "logs/crash report.log"
+    );
+
+    // The chunked upload, whole: an id minted once and echoed by every call
+    // that follows it.
+    let upload_id = recv_frame("req_upload_begin")["frame"]["result"]["upload_id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        recv_frame("req_upload_begin")["frame"]["result"]["type"],
+        "attachment_upload_started"
+    );
+    for (index, id) in ["req_upload_append_0", "req_upload_append_1"]
+        .iter()
+        .enumerate()
+    {
+        let sent = send_frame(id);
+        assert_eq!(sent["frame"]["method"], "attachment.append");
+        assert_eq!(sent["frame"]["params"]["upload_id"], upload_id);
+        let result = &recv_frame(id)["frame"]["result"];
+        assert_eq!(result["type"], "attachment_appended");
+        assert!(
+            result["received"].as_u64().unwrap() > index as u64,
+            "received must grow with every chunk"
+        );
+    }
+    assert_eq!(
+        send_frame("req_upload_commit")["frame"]["params"]["upload_id"],
+        upload_id
+    );
+    let committed = &recv_frame("req_upload_commit")["frame"]["result"];
+    assert_eq!(committed["type"], "attachment_created");
+    let path = committed["path"].as_str().unwrap();
+    assert!(!path.contains(' '), "path must be space-free: {path}");
+    assert!(path.ends_with("-session.log"), "wrong name: {path}");
+    assert!(committed["expires_at"].as_u64().unwrap() > 0);
 
     assert_eq!(
         recv_frame("req_attach_bad_format")["frame"]["error"]["code"],
@@ -1644,6 +2140,10 @@ fn attachment_fixture_for_the_mobile_fake_server_is_current() {
     assert_eq!(
         recv_frame("req_attach_bad_b64")["frame"]["error"]["code"],
         "invalid_params"
+    );
+    assert_eq!(
+        recv_frame("req_upload_unknown")["frame"]["error"]["code"],
+        "attachment_unknown_upload"
     );
 }
 
@@ -1656,10 +2156,17 @@ fn record_attachment_fixture(fixture_path: &Path) {
     // A monotonic tick instead of wall-clock keeps the fixture deterministic
     // while preserving order — same convention as the mobile repo captures.
     let mut record = |dir: &str, raw: &str, frames: &mut Vec<serde_json::Value>| {
+        let mut frame: serde_json::Value = serde_json::from_str(raw).unwrap();
+        // The pong names the running binary's own path. Where the recording
+        // machine keeps its build is no part of the contract, and pinning a
+        // shared fixture to one checkout only makes it wrong elsewhere.
+        if let Some(exe) = frame.pointer_mut("/result/exe") {
+            *exe = serde_json::Value::String("/opt/herdr/herdr".to_string());
+        }
         frames.push(serde_json::json!({
             "dir": dir,
             "ms": seq,
-            "frame": serde_json::from_str::<serde_json::Value>(raw).unwrap(),
+            "frame": frame,
         }));
         seq += 1;
     };
@@ -1675,10 +2182,16 @@ fn record_attachment_fixture(fixture_path: &Path) {
             base64_of(&test_jpeg_bytes())
         ),
         format!(
+            r#"{{"id":"req_attach_named","method":"attachment.create","params":{{"bytes_b64":"{}","name":"logs/crash report.log"}}}}"#,
+            base64_of(b"panic: index out of range\n")
+        ),
+        format!(
             r#"{{"id":"req_attach_bad_format","method":"attachment.create","params":{{"bytes_b64":"{}"}}}}"#,
             base64_of(b"GIF89a not a supported image")
         ),
         (r#"{"id":"req_attach_bad_b64","method":"attachment.create","params":{"bytes_b64":"definitely %% not base64"}}"#)
+            .to_string(),
+        (r#"{"id":"req_upload_unknown","method":"attachment.append","params":{"upload_id":"upload-nope-0","offset":0,"bytes_b64":"aGk="}}"#)
             .to_string(),
     ];
     for request in requests {
@@ -1687,6 +2200,42 @@ fn record_attachment_fixture(fixture_path: &Path) {
         let response = ws.read_raw(Duration::from_secs(5));
         record("recv", &response, &mut frames);
     }
+
+    // A chunked upload, whose ids only the server can mint, so its requests
+    // are built from the answers as they arrive.
+    let chunks: [&[u8]; 2] = [b"first half of a session log\n", b"second half\n"];
+    let size: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+    let begin = begin_request("req_upload_begin", "logs/session.log", size as u64);
+    record("send", &begin, &mut frames);
+    ws.send(&begin);
+    let begun = ws.read_raw(Duration::from_secs(5));
+    record("recv", &begun, &mut frames);
+    let upload_id = serde_json::from_str::<serde_json::Value>(&begun).unwrap()["result"]
+        ["upload_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut offset = 0usize;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let append = append_request(
+            &format!("req_upload_append_{index}"),
+            &upload_id,
+            offset,
+            chunk,
+        );
+        offset += chunk.len();
+        record("send", &append, &mut frames);
+        ws.send(&append);
+        let response = ws.read_raw(Duration::from_secs(5));
+        record("recv", &response, &mut frames);
+    }
+
+    let commit = commit_request("req_upload_commit", &upload_id, size as u64);
+    record("send", &commit, &mut frames);
+    ws.send(&commit);
+    let response = ws.read_raw(Duration::from_secs(5));
+    record("recv", &response, &mut frames);
 
     let fixture = serde_json::json!({
         "firstLiveFrameIndex": 0,

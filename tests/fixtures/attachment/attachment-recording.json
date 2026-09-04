@@ -16,13 +16,22 @@
         "id": "req_ping",
         "result": {
           "capabilities": {
+            "credential_registry": true,
             "detached_server_daemon": true,
-            "live_handoff": true
+            "file_attachments": {
+              "chunk_bytes": 783360,
+              "max_bytes": 67108864
+            },
+            "live_handoff": true,
+            "send_affirm": true,
+            "stream_multiplex": true
           },
+          "exe": "/opt/herdr/herdr",
           "name": "ws-test-server",
-          "protocol": 15,
+          "protocol": 21,
+          "reach": "ws-test-host",
           "type": "pong",
-          "version": "0.7.1"
+          "version": "0.8.2"
         }
       },
       "ms": 1
@@ -43,8 +52,8 @@
       "frame": {
         "id": "req_attach_png",
         "result": {
-          "expires_at": 1783323107,
-          "path": "/private/tmp/hws-96460-1783236707443724000/runtime/herdr-attachments-501/attachment-1783236707722239000-0.png",
+          "expires_at": 1788593000,
+          "path": "/private/tmp/hws-68205-1788506599089673000/runtime/herdr-attachments-501/attachment-1788506600154134000-0.png",
           "type": "attachment_created"
         }
       },
@@ -66,12 +75,36 @@
       "frame": {
         "id": "req_attach_jpeg",
         "result": {
-          "expires_at": 1783323107,
-          "path": "/private/tmp/hws-96460-1783236707443724000/runtime/herdr-attachments-501/attachment-1783236707832919000-0.jpg",
+          "expires_at": 1788593000,
+          "path": "/private/tmp/hws-68205-1788506599089673000/runtime/herdr-attachments-501/attachment-1788506600154517000-0.jpg",
           "type": "attachment_created"
         }
       },
       "ms": 5
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_attach_named",
+        "method": "attachment.create",
+        "params": {
+          "bytes_b64": "cGFuaWM6IGluZGV4IG91dCBvZiByYW5nZQo=",
+          "name": "logs/crash report.log"
+        }
+      },
+      "ms": 6
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "id": "req_attach_named",
+        "result": {
+          "expires_at": 1788593000,
+          "path": "/private/tmp/hws-68205-1788506599089673000/runtime/herdr-attachments-501/attachment-1788506600154916000-0-crash_report.log",
+          "type": "attachment_created"
+        }
+      },
+      "ms": 7
     },
     {
       "dir": "send",
@@ -82,7 +115,7 @@
           "bytes_b64": "R0lGODlhIG5vdCBhIHN1cHBvcnRlZCBpbWFnZQ=="
         }
       },
-      "ms": 6
+      "ms": 8
     },
     {
       "dir": "recv",
@@ -93,7 +126,7 @@
         },
         "id": "req_attach_bad_format"
       },
-      "ms": 7
+      "ms": 9
     },
     {
       "dir": "send",
@@ -104,7 +137,7 @@
           "bytes_b64": "definitely %% not base64"
         }
       },
-      "ms": 8
+      "ms": 10
     },
     {
       "dir": "recv",
@@ -115,7 +148,126 @@
         },
         "id": "req_attach_bad_b64"
       },
-      "ms": 9
+      "ms": 11
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_upload_unknown",
+        "method": "attachment.append",
+        "params": {
+          "bytes_b64": "aGk=",
+          "offset": 0,
+          "upload_id": "upload-nope-0"
+        }
+      },
+      "ms": 12
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "error": {
+          "code": "attachment_unknown_upload",
+          "message": "no upload is in progress under that upload_id"
+        },
+        "id": "req_upload_unknown"
+      },
+      "ms": 13
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_upload_begin",
+        "method": "attachment.begin",
+        "params": {
+          "name": "logs/session.log",
+          "size": 40
+        }
+      },
+      "ms": 14
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "id": "req_upload_begin",
+        "result": {
+          "type": "attachment_upload_started",
+          "upload_id": "upload-1788506600155857000-0"
+        }
+      },
+      "ms": 15
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_upload_append_0",
+        "method": "attachment.append",
+        "params": {
+          "bytes_b64": "Zmlyc3QgaGFsZiBvZiBhIHNlc3Npb24gbG9nCg==",
+          "offset": 0,
+          "upload_id": "upload-1788506600155857000-0"
+        }
+      },
+      "ms": 16
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "id": "req_upload_append_0",
+        "result": {
+          "received": 28,
+          "type": "attachment_appended"
+        }
+      },
+      "ms": 17
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_upload_append_1",
+        "method": "attachment.append",
+        "params": {
+          "bytes_b64": "c2Vjb25kIGhhbGYK",
+          "offset": 28,
+          "upload_id": "upload-1788506600155857000-0"
+        }
+      },
+      "ms": 18
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "id": "req_upload_append_1",
+        "result": {
+          "received": 40,
+          "type": "attachment_appended"
+        }
+      },
+      "ms": 19
+    },
+    {
+      "dir": "send",
+      "frame": {
+        "id": "req_upload_commit",
+        "method": "attachment.commit",
+        "params": {
+          "size": 40,
+          "upload_id": "upload-1788506600155857000-0"
+        }
+      },
+      "ms": 20
+    },
+    {
+      "dir": "recv",
+      "frame": {
+        "id": "req_upload_commit",
+        "result": {
+          "expires_at": 1788593000,
+          "path": "/private/tmp/hws-68205-1788506599089673000/runtime/herdr-attachments-501/attachment-1788506600156565000-0-session.log",
+          "type": "attachment_created"
+        }
+      },
+      "ms": 21
     }
   ]
 }

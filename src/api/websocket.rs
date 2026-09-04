@@ -2063,6 +2063,7 @@ mod tests {
             send_affirm: true,
             stream_multiplex: true,
             credential_registry: true,
+            file_attachments: Some(crate::api::attachment::file_attachments_capability()),
         }));
         let mut websocket = connect_authorized(&server);
 

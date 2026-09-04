@@ -233,6 +233,74 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+/// Bytes still writable by this user on the volume holding `path`, which
+/// must already exist. Used to refuse an upload before its first byte
+/// rather than after filling the volume it lands on.
+#[cfg(unix)]
+// The block-count and block-size fields are 32 bits wide on some Unixes and
+// 64 on others, so the widening casts below are load-bearing on one target
+// and redundant on the next.
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn available_bytes_on_volume(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an interior NUL byte",
+        )
+    })?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(raw.as_ptr(), &mut stats) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Block counts are expressed in fragments; f_bsize is the documented
+    // stand-in when a filesystem reports no fragment size.
+    let block_bytes = if stats.f_frsize > 0 {
+        stats.f_frsize as u64
+    } else {
+        stats.f_bsize as u64
+    };
+    Ok((stats.f_bavail as u64).saturating_mul(block_bytes))
+}
+
+#[cfg(windows)]
+pub(crate) fn available_bytes_on_volume(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains an interior NUL byte",
+        ));
+    }
+    wide.push(0);
+
+    let mut available: u64 = 0;
+    let queried = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if queried == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(available)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn available_bytes_on_volume(_path: &std::path::Path) -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this platform reports no free-space figure",
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteSshConfigPaths {
     pub(crate) user_config: Option<std::path::PathBuf>,

@@ -52,6 +52,7 @@ pub fn server_capabilities() -> crate::api::schema::ServerCapabilities {
         send_affirm: true,
         stream_multiplex: true,
         credential_registry: true,
+        file_attachments: Some(attachment::file_attachments_capability()),
     }
 }
 

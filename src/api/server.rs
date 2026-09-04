@@ -687,6 +687,15 @@ fn handle_request(
         Method::AttachmentCreate(params) => {
             crate::api::attachment::handle_create(request.id, &params)
         }
+        Method::AttachmentBegin(params) => {
+            crate::api::attachment::handle_begin(request.id, &params)
+        }
+        Method::AttachmentAppend(params) => {
+            crate::api::attachment::handle_append(request.id, &params)
+        }
+        Method::AttachmentCommit(params) => {
+            crate::api::attachment::handle_commit(request.id, &params)
+        }
         // The credential registry is runtime state beside the session, not
         // app state, so it is served here on the connection thread — the one
         // place both transports pass through, which is what makes the verbs
@@ -721,6 +730,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
         Method::AttachmentCreate(_) => "attachment.create",
+        Method::AttachmentBegin(_) => "attachment.begin",
+        Method::AttachmentAppend(_) => "attachment.append",
+        Method::AttachmentCommit(_) => "attachment.commit",
         Method::CredentialMint(_) => "credential.mint",
         Method::CredentialList(_) => "credential.list",
         Method::CredentialRevoke(_) => "credential.revoke",
@@ -1543,6 +1555,7 @@ mod tests {
                 send_affirm: true,
                 stream_multiplex: true,
                 credential_registry: true,
+                file_attachments: Some(crate::api::attachment::file_attachments_capability()),
             }),
             None,
             None,
@@ -1725,6 +1738,7 @@ mod tests {
                     id: id.into(),
                     method: Method::AttachmentCreate(crate::api::schema::AttachmentCreateParams {
                         bytes_b64,
+                        name: None,
                     }),
                 },
                 &tx,

@@ -358,6 +358,7 @@ fn request_round_trips_for_attachment_create() {
         id: "req_attach".into(),
         method: Method::AttachmentCreate(AttachmentCreateParams {
             bytes_b64: "aGVyZHI=".into(),
+            name: None,
         }),
     };
 
@@ -383,6 +384,136 @@ fn attachment_created_response_round_trips() {
     assert!(json.contains("\"expires_at\":1800000000"));
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
+}
+
+#[test]
+fn request_round_trips_for_attachment_create_with_a_name() {
+    let request = Request {
+        id: "req_attach_named".into(),
+        method: Method::AttachmentCreate(AttachmentCreateParams {
+            bytes_b64: "aGVyZHI=".into(),
+            name: Some("crash log.txt".into()),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "attachment.create");
+    assert_eq!(json["params"]["name"], "crash log.txt");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
+fn an_attachment_create_without_a_name_carries_no_name_field() {
+    // The photo contract's request stays byte-identical to what clients
+    // that predate files already send.
+    let request = Request {
+        id: "req_attach".into(),
+        method: Method::AttachmentCreate(AttachmentCreateParams {
+            bytes_b64: "aGVyZHI=".into(),
+            name: None,
+        }),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert_eq!(
+        json,
+        r#"{"id":"req_attach","method":"attachment.create","params":{"bytes_b64":"aGVyZHI="}}"#
+    );
+}
+
+#[test]
+fn request_round_trips_for_the_chunked_upload_verbs() {
+    let begin = Request {
+        id: "req_attach_begin".into(),
+        method: Method::AttachmentBegin(AttachmentBeginParams {
+            name: "session.log".into(),
+            size: 52_428_800,
+        }),
+    };
+    let json = serde_json::to_value(&begin).unwrap();
+    assert_eq!(json["method"], "attachment.begin");
+    assert_eq!(json["params"]["name"], "session.log");
+    assert_eq!(json["params"]["size"], 52_428_800);
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), begin);
+
+    let append = Request {
+        id: "req_attach_append".into(),
+        method: Method::AttachmentAppend(AttachmentAppendParams {
+            upload_id: "upload-17-0".into(),
+            offset: 783_360,
+            bytes_b64: "aGVyZHI=".into(),
+        }),
+    };
+    let json = serde_json::to_value(&append).unwrap();
+    assert_eq!(json["method"], "attachment.append");
+    assert_eq!(json["params"]["upload_id"], "upload-17-0");
+    assert_eq!(json["params"]["offset"], 783_360);
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), append);
+
+    let commit = Request {
+        id: "req_attach_commit".into(),
+        method: Method::AttachmentCommit(AttachmentCommitParams {
+            upload_id: "upload-17-0".into(),
+            size: 52_428_800,
+        }),
+    };
+    let json = serde_json::to_value(&commit).unwrap();
+    assert_eq!(json["method"], "attachment.commit");
+    assert_eq!(json["params"]["upload_id"], "upload-17-0");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), commit);
+}
+
+#[test]
+fn chunked_upload_responses_round_trip() {
+    let started = SuccessResponse {
+        id: "req_attach_begin".into(),
+        result: ResponseResult::AttachmentUploadStarted {
+            upload_id: "upload-17-0".into(),
+        },
+    };
+    let json = serde_json::to_string(&started).unwrap();
+    assert!(json.contains(r#""type":"attachment_upload_started""#));
+    assert!(json.contains(r#""upload_id":"upload-17-0""#));
+    assert_eq!(
+        serde_json::from_str::<SuccessResponse>(&json).unwrap(),
+        started
+    );
+
+    let appended = SuccessResponse {
+        id: "req_attach_append".into(),
+        result: ResponseResult::AttachmentAppended { received: 783_360 },
+    };
+    let json = serde_json::to_string(&appended).unwrap();
+    assert!(json.contains(r#""type":"attachment_appended""#));
+    assert!(json.contains(r#""received":783360"#));
+    assert_eq!(
+        serde_json::from_str::<SuccessResponse>(&json).unwrap(),
+        appended
+    );
+}
+
+#[test]
+fn the_file_attachments_capability_is_additive_for_older_peers() {
+    // A pong from a server that takes photos only carries no
+    // `file_attachments`, and must still parse.
+    let old_pong = r#"{"id":"req_old","result":{"type":"pong","version":"0.1.0","protocol":6,"capabilities":{"live_handoff":true}}}"#;
+    let restored: SuccessResponse = serde_json::from_str(old_pong).unwrap();
+    match restored.result {
+        ResponseResult::Pong { capabilities, .. } => {
+            let capabilities = capabilities.expect("capabilities must parse");
+            assert_eq!(capabilities.file_attachments, None);
+        }
+        other => panic!("expected pong, got {other:?}"),
+    }
+
+    // And this build declares both numbers, with the chunk size derived
+    // from the message cap rather than retyped.
+    let declared = crate::api::server_capabilities()
+        .file_attachments
+        .expect("this build stores file attachments");
+    assert_eq!(declared.max_bytes, 67_108_864);
+    assert_eq!(declared.chunk_bytes, 783_360);
 }
 
 #[test]
@@ -828,6 +959,10 @@ fn success_response_round_trips() {
                 send_affirm: true,
                 stream_multiplex: true,
                 credential_registry: true,
+                file_attachments: Some(FileAttachmentsCapability {
+                    max_bytes: 67_108_864,
+                    chunk_bytes: 783_360,
+                }),
             }),
             name: Some("the-mini".into()),
             reach: Some("mini".into()),

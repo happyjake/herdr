@@ -1759,11 +1759,80 @@
           ],
           "type": "object"
         },
+        "AttachmentAppendParams": {
+          "properties": {
+            "bytes_b64": {
+              "description": "Chunk bytes encoded as standard base64, at most\n`capabilities.file_attachments.chunk_bytes` decoded.",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Byte offset this chunk starts at, which must equal the bytes already\non disk — the partial file is the whole upload state.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "upload_id": {
+              "description": "The `upload_id` `attachment.begin` minted. Opaque: echo it back.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "upload_id",
+            "offset",
+            "bytes_b64"
+          ],
+          "type": "object"
+        },
+        "AttachmentBeginParams": {
+          "properties": {
+            "name": {
+              "description": "The file's own name, sanitized by the server into the stored name.",
+              "type": "string"
+            },
+            "size": {
+              "description": "Total bytes the upload will carry. Refused up front when it is over\n`capabilities.file_attachments.max_bytes` or the scratch volume has\nno room for it.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "size"
+          ],
+          "type": "object"
+        },
+        "AttachmentCommitParams": {
+          "properties": {
+            "size": {
+              "description": "Total bytes the finished file must hold. A partial of any other size\nis refused and left alone.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "upload_id": {
+              "description": "The `upload_id` `attachment.begin` minted.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "upload_id",
+            "size"
+          ],
+          "type": "object"
+        },
         "AttachmentCreateParams": {
           "properties": {
             "bytes_b64": {
-              "description": "Image bytes encoded as standard base64 (RFC 4648, padding accepted).",
+              "description": "Attachment bytes encoded as standard base64 (RFC 4648, padding\naccepted). At most `capabilities.file_attachments.chunk_bytes`\ndecoded, so the request still fits the unchanged message cap.",
               "type": "string"
+            },
+            "name": {
+              "description": "The file's own name, as the client knows it. Absent keeps the photo\ncontract exactly: the bytes must sniff as JPEG, PNG, or WebP, and the\nserver names the file alone. Present accepts any bytes verbatim and\ncarries the sanitized name into the stored file's name.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -4777,6 +4846,54 @@
         {
           "properties": {
             "method": {
+              "const": "attachment.begin",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttachmentBeginParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "attachment.append",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttachmentAppendParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "attachment.commit",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttachmentCommitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "credential.mint",
               "type": "string"
             },
@@ -7487,6 +7604,28 @@
           ],
           "type": "string"
         },
+        "FileAttachmentsCapability": {
+          "description": "What a chunked upload may carry on this server. Absent from the pong\ncapabilities of a server that predates files, which takes photos only.",
+          "properties": {
+            "chunk_bytes": {
+              "description": "Largest decoded payload one `attachment.create` or\n`attachment.append` may carry, so a client sizes its chunks from the\nserver instead of hard-coding the message cap.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_bytes": {
+              "description": "Largest total size `attachment.begin` accepts.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "max_bytes",
+            "chunk_bytes"
+          ],
+          "type": "object"
+        },
         "InstalledPluginInfo": {
           "properties": {
             "actions": {
@@ -9223,6 +9362,42 @@
             {
               "properties": {
                 "type": {
+                  "const": "attachment_upload_started",
+                  "type": "string"
+                },
+                "upload_id": {
+                  "description": "Opaque, server-minted handle for the reserved partial file. Echo\nit on `attachment.append` and `attachment.commit`; never parse it.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "upload_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "received": {
+                  "description": "Bytes on disk after this append — the offset the next chunk must\ndeclare, and the numerator of the client's progress.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "attachment_appended",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "received"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
                   "const": "workspace_info",
                   "type": "string"
                 },
@@ -10434,6 +10609,17 @@
             "detached_server_daemon": {
               "default": false,
               "type": "boolean"
+            },
+            "file_attachments": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/FileAttachmentsCapability"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Whether this server stores any file as an attachment — a `name` on\n`attachment.create`, plus `attachment.begin`/`append`/`commit` for a\nfile beyond one message — and the sizes it accepts. Additive: absent\nin pongs of servers that predate it, which take photos only."
             },
             "live_handoff": {
               "type": "boolean"
