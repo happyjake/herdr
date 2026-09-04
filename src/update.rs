@@ -2857,6 +2857,7 @@ mod tests {
                 send_affirm: false,
                 stream_multiplex: false,
                 credential_registry: false,
+                file_attachments: None,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2935,6 +2936,7 @@ mod tests {
                     send_affirm: true,
                     stream_multiplex: true,
                     credential_registry: true,
+                    file_attachments: None,
                 }),
             },
         };
@@ -3197,6 +3199,7 @@ mod tests {
                     send_affirm: false,
                     stream_multiplex: false,
                     credential_registry: false,
+                    file_attachments: None,
                 }),
             },
         };

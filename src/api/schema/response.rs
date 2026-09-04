@@ -94,6 +94,16 @@ pub enum ResponseResult {
         /// Unix seconds after which the TTL sweep may remove the file.
         expires_at: u64,
     },
+    AttachmentUploadStarted {
+        /// Opaque, server-minted handle for the reserved partial file. Echo
+        /// it on `attachment.append` and `attachment.commit`; never parse it.
+        upload_id: String,
+    },
+    AttachmentAppended {
+        /// Bytes on disk after this append — the offset the next chunk must
+        /// declare, and the numerator of the client's progress.
+        received: u64,
+    },
     WorkspaceInfo {
         workspace: WorkspaceInfo,
     },
