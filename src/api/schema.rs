@@ -154,6 +154,11 @@ operations::define_operations! {
     CredentialRevoke(CredentialRevokeParams) => "credential.revoke", false, false;
     CredentialRevokeAll(CredentialActorParams) => "credential.revoke_all", false, false;
     PaneSetPinned(PaneSetPinnedParams) => "pane.set_pinned", false, false;
+    ServerLookupPlace(ServerLookupPlaceParams) => "server.lookup_place", false, false;
+    AttachmentBegin(AttachmentBeginParams) => "attachment.begin", false, false;
+    AttachmentAppend(AttachmentAppendParams) => "attachment.append", false, false;
+    AttachmentCommit(AttachmentCommitParams) => "attachment.commit", false, false;
+    PanePromptTrail(PaneTarget) => "pane.prompt_trail", false, false;
 }
 
 #[cfg(test)]

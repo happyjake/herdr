@@ -815,6 +815,8 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
                     display_agent: data.display_agent,
                     state_labels: data.state_labels,
                     label: data.label,
+                    label_source: data.label_source,
+                    label_at: data.label_at,
                     pinned: data.pinned,
                 },
             },
@@ -826,6 +828,34 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A matched wait hands on every kept field the event carried, the
+    /// label's provenance included: a client that waits instead of
+    /// subscribing must not learn less about the pane.
+    #[test]
+    fn a_matched_wait_carries_the_labels_provenance_through() {
+        let matched = serde_json::json!({
+            "event": "pane.agent_status_changed",
+            "data": {
+                "pane_id": "wG4:p1",
+                "workspace_id": "wG4",
+                "agent_status": "working",
+                "label": "beacon relay",
+                "label_source": "editor",
+                "label_at": 1_700_000_000u64,
+                "pinned": true,
+            },
+        });
+
+        let response: serde_json::Value =
+            serde_json::from_str(&wait_matched_response("req_wait", matched)).unwrap();
+
+        let data = &response["result"]["event"]["data"];
+        assert_eq!(data["label"], "beacon relay");
+        assert_eq!(data["label_source"], "editor");
+        assert_eq!(data["label_at"], 1_700_000_000u64);
+        assert_eq!(data["pinned"], true);
+    }
 
     #[test]
     fn agent_wait_probe_only_translates_agent_disappearance() {

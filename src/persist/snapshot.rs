@@ -149,6 +149,15 @@ pub struct PaneSnapshot {
     /// existed restores every pane unpinned instead of failing the session.
     #[serde(default)]
     pub pinned: bool,
+    /// Who wrote the label, when it was not a person. Absent from a
+    /// snapshot written before provenance was kept, which restores a label
+    /// that is nobody's — the same thing it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_source: Option<crate::api::schema::LabelSource>,
+    /// Unix seconds at which the label was written, absent for the same
+    /// reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_at: Option<u64>,
 }
 
 /// The socket API's name for a status, as stored in a snapshot.
@@ -190,6 +199,17 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    /// The record file the harness reported for this session, when it named
+    /// one its `value` does not already name.
+    ///
+    /// Captured so a restart or a handoff keeps reading the record the
+    /// harness itself pointed at, rather than falling back to a derivation
+    /// that may not find a conversation filed somewhere unusual. Absent
+    /// from a snapshot written before it was kept, and from a session whose
+    /// harness reported no path; a reader derives the file from `value`
+    /// then, exactly as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -410,6 +430,8 @@ fn capture_tab(
         let agent_status_saw_other =
             durable_agent_status.is_some_and(|claim| claim.saw_other_status);
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
+        let label_source = terminal.and_then(|terminal| terminal.label_source);
+        let label_at = terminal.and_then(|terminal| terminal.label_at);
         let pinned = terminal.is_some_and(|terminal| terminal.pinned);
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
@@ -431,6 +453,7 @@ fn capture_tab(
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
+                        record_path: session_ref.record_path.clone(),
                     });
                 }
             }
@@ -442,6 +465,7 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
+                    record_path: session.session_ref.record_path.clone(),
                 })
         });
         let agent_resume = terminal
@@ -466,6 +490,8 @@ fn capture_tab(
                 agent_status_resolve_by,
                 agent_status_saw_other,
                 pinned,
+                label_source,
+                label_at,
             },
         );
     }
@@ -890,6 +916,65 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_pane_carries_whose_its_label_is_and_when_it_was_written() {
+        let mut state = state_with_workspaces(&["provenance-capture"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_manual_label_from_at(
+                "beacon relay".into(),
+                Some(crate::api::schema::LabelSource::Editor),
+                1_700_000_000,
+            );
+
+        let snapshot = capture_from_state(&state);
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("captured pane");
+        assert_eq!(pane.label.as_deref(), Some("beacon relay"));
+        assert_eq!(
+            pane.label_source,
+            Some(crate::api::schema::LabelSource::Editor)
+        );
+        assert_eq!(pane.label_at, Some(1_700_000_000));
+
+        let json = serde_json::to_value(pane).expect("serialize pane");
+        assert_eq!(json["label_source"], "editor");
+        assert_eq!(json["label_at"], 1_700_000_000u64);
+        let read_back: PaneSnapshot =
+            serde_json::from_value(json).expect("a captured pane reads back");
+        assert_eq!(
+            read_back.label_source,
+            Some(crate::api::schema::LabelSource::Editor)
+        );
+        assert_eq!(read_back.label_at, Some(1_700_000_000));
+
+        // A name nobody in particular gave carries no source, and the keys
+        // it has nothing to say with stay out of the file.
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_manual_label("beacon relay".into());
+        let snapshot = capture_from_state(&state);
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("captured pane");
+        let json = serde_json::to_value(pane).expect("serialize pane");
+        assert!(json.get("label_source").is_none());
+        assert!(json.get("label_at").is_some());
+    }
+
+    #[test]
     fn a_snapshot_written_before_the_pin_restores_every_pane_unpinned() {
         let json = r#"{
             "cwd": "/tmp",
@@ -901,6 +986,11 @@ mod tests {
         assert!(
             !pane.pinned,
             "a pane written before the pin existed restores unpinned"
+        );
+        assert_eq!(
+            (pane.label_source, pane.label_at),
+            (None, None),
+            "and one written before provenance restores a name that is nobody's"
         );
     }
 
@@ -957,6 +1047,8 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             },
         );
         panes.insert(
@@ -974,6 +1066,8 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             },
         );
 
@@ -1560,6 +1654,72 @@ mod tests {
         assert_eq!(agent_session.value, session_path);
     }
 
+    /// A harness that says where it is writing has that kept with the
+    /// session, so a restart reads the conversation where the harness
+    /// pointed rather than where a derivation would look.
+    #[test]
+    fn capture_contract_keeps_the_record_path_a_harness_reported() {
+        let mut state = state_with_workspaces(&["one"]);
+        let record_path = test_session_path("records/beacon-relay.jsonl");
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(
+                    "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22",
+                )
+                .unwrap()
+                .with_record_path(Some(record_path.clone())),
+            });
+
+        let snapshot = capture_from_state(&state);
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("agent session should be captured");
+
+        assert_eq!(agent_session.value, "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22");
+        assert_eq!(
+            agent_session.record_path.as_deref(),
+            Some(record_path.as_str())
+        );
+
+        let json = serde_json::to_value(agent_session).expect("serialize agent session");
+        assert_eq!(json["record_path"], record_path);
+        let read_back: PaneAgentSessionSnapshot =
+            serde_json::from_value(json).expect("a captured session reads back");
+        assert_eq!(read_back.record_path.as_deref(), Some(record_path.as_str()));
+
+        // A session whose harness named no file says nothing about one.
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(
+                    "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22",
+                )
+                .unwrap(),
+            });
+        let snapshot = capture_from_state(&state);
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("agent session should be captured");
+        let json = serde_json::to_value(agent_session).expect("serialize agent session");
+        assert!(json.get("record_path").is_none());
+    }
+
     #[test]
     fn capture_contract_includes_reported_agent_resume() {
         let mut state = state_with_workspaces(&["one"]);
@@ -1665,6 +1825,8 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             },
         );
         panes.insert(
@@ -1684,6 +1846,8 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             },
         );
 

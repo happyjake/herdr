@@ -353,7 +353,28 @@ crate::cli::projection::cli_params! {
         pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub label: Option<String> => binding::label(),
+        /// Who this name is from, when it is not from a person.
+        ///
+        /// Absent is the ordinary rename — someone typing a name, at the desk
+        /// or anywhere else — and it clears any source the label was standing
+        /// with. A blank or absent `label` clears the label, the source and the
+        /// time together. Additive: a server that predates the field ignores
+        /// it, keeps no source, and every name there reads as a person's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source: Option<LabelSource> => Field::new(None::<LabelSource>),
     }
+}
+
+/// Who wrote a pane's label, when it was not a person.
+///
+/// Kept beside the label rather than derived, and never shown: it is there
+/// so a client that names panes by itself can tell its own names from the
+/// ones people and skills gave, and leave those alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelSource {
+    /// A client's own automatic namer wrote it.
+    Editor,
 }
 
 crate::cli::projection::cli_params! {
@@ -630,7 +651,87 @@ pub struct PaneInfo {
     /// and write it only when the user asks for it.
     #[serde(default)]
     pub pinned: bool,
+    /// Who wrote the standing `label`, when it was not a person.
+    ///
+    /// Always serialized, like `pinned` and for the same reason: a client
+    /// reads the absence of this key as a server that keeps no provenance
+    /// at all, so a null — a name a person or a skill gave — has to stay
+    /// distinguishable from "this server has no such notion".
+    #[serde(default)]
+    pub label_source: Option<LabelSource>,
+    /// Unix seconds at which the standing `label` was written.
+    ///
+    /// Always serialized, for the same reason. Null when no label stands,
+    /// and on a label restored from a session captured before the write
+    /// time was kept.
+    #[serde(default)]
+    pub label_at: Option<u64>,
     pub revision: u64,
+}
+
+/// What a pane's session record says was asked of it.
+///
+/// Read from the harness's own file of the conversation, never from the
+/// screen: the person's words, or a supervising agent's, and never the
+/// agent's tool traffic, its results, or what the harness injected on the
+/// person's behalf. Every field is always serialized, so a client reads a
+/// null as a real absence rather than as a server that has nothing to say.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PromptTrail {
+    /// The harness whose record this was read from.
+    pub agent: PromptTrailAgent,
+    /// The first real prompt of the conversation, cut to about four hundred
+    /// code points. Null when the record holds no prompt at all.
+    pub first: Option<TrailPrompt>,
+    /// The last three real prompts, oldest first, each cut to about two
+    /// hundred and forty code points. The first prompt appears here too
+    /// while it is still among the last three.
+    pub recent: Vec<TrailPrompt>,
+    /// The title the harness wrote for this conversation, when it wrote one
+    /// worth reading. Null for a harness that writes none, and for a
+    /// fallback title that says nothing the prompts do not.
+    pub title: Option<String>,
+    /// Real prompts in the record.
+    pub count: u32,
+    /// Unix seconds at which the newest real prompt arrived, as the harness
+    /// dated it. Null when the record dates nothing.
+    pub newest_at: Option<u64>,
+}
+
+/// One prompt of a trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TrailPrompt {
+    /// The prompt as it was asked, whitespace collapsed and cut to the
+    /// length its place in the trail allows.
+    pub text: String,
+    /// Unix seconds at which the harness recorded it, when it recorded one.
+    pub at: Option<u64>,
+}
+
+/// A harness whose session record a trail can be read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptTrailAgent {
+    Claude,
+    Codex,
+    Pi,
+}
+
+/// Why a pane has no trail. Never an error: a pane with no trail is an
+/// ordinary pane, and a client reads it from the screen instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptTrailReason {
+    /// The pane reports no agent session — a plain shell, or a pane whose
+    /// harness never reported one.
+    NoSession,
+    /// The pane reports a session for a harness whose records this server
+    /// does not read.
+    UnsupportedAgent,
+    /// The record the session names is not on this desk.
+    NoRecord,
+    /// The record is there but could not be read within its bounds.
+    Unreadable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

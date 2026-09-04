@@ -749,6 +749,7 @@ mod tests {
                             agent: "claude".into(),
                             kind: crate::agent_resume::AgentSessionRefKind::Id,
                             value: "session-1".into(),
+                            record_path: None,
                         }),
                         launch_argv: None,
                         agent_status: None,
@@ -756,6 +757,8 @@ mod tests {
                         agent_status_resolve_by: None,
                         agent_status_saw_other: false,
                         pinned: false,
+                        label_source: None,
+                        label_at: None,
                     },
                 )
             })

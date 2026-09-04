@@ -533,6 +533,10 @@ fn restore_tab(
         }
 
         let saved_label = saved_pane.and_then(|p| p.label.clone());
+        // A snapshot written before provenance was kept leaves both absent,
+        // and the label restores as nobody's and undated.
+        let saved_label_source = saved_pane.and_then(|p| p.label_source);
+        let saved_label_at = saved_pane.and_then(|p| p.label_at);
         // A snapshot written before the pin existed leaves this absent, and the
         // pane restores unpinned.
         let saved_pinned = saved_pane.is_some_and(|p| p.pinned);
@@ -649,9 +653,7 @@ fn restore_tab(
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
-            if let Some(label) = saved_label {
-                terminal.set_manual_label(label);
-            }
+            terminal.restore_manual_label(saved_label, saved_label_source, saved_label_at);
             terminal.set_pinned(saved_pinned);
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
@@ -750,9 +752,7 @@ fn restore_tab(
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
                     }
                 }
-                if let Some(label) = saved_label {
-                    terminal.set_manual_label(label);
-                }
+                terminal.restore_manual_label(saved_label, saved_label_source, saved_label_at);
                 terminal.set_pinned(saved_pinned);
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
@@ -955,6 +955,7 @@ fn persisted_agent_session_from_snapshot(
         &session.agent,
         session.kind,
         &session.value,
+        session.record_path.clone(),
     )
 }
 
@@ -1234,6 +1235,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            record_path: None,
         };
 
         assert!(restore_plan_for_snapshot(&session, false).is_none());
@@ -1247,8 +1249,60 @@ mod tests {
             agent: "claude".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
+            record_path: None,
         };
         assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
+    }
+
+    /// The record path a harness reported comes back with the session, so a
+    /// restart or a handoff keeps reading the conversation where the
+    /// harness said it was. The resume itself still spells the id.
+    #[test]
+    fn a_restored_session_keeps_the_record_path_it_was_captured_with() {
+        let record_path = test_session_path("records/beacon-relay.jsonl");
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22".into(),
+            record_path: Some(record_path.clone()),
+        };
+
+        let restored =
+            persisted_agent_session_from_snapshot(&session).expect("a restorable session");
+        assert_eq!(
+            restored.session_ref.value,
+            "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22"
+        );
+        assert_eq!(
+            restored.session_ref.record_path.as_deref(),
+            Some(record_path.as_str())
+        );
+        assert_eq!(
+            restore_plan_for_snapshot(&session, true).unwrap().argv,
+            vec!["claude", "--resume", "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22"],
+            "a resume is still spelled with the id, whatever else came back"
+        );
+
+        // A session written before the path was kept has the key stripped
+        // from its stored form, and comes back as the id alone.
+        let mut stored = serde_json::to_value(&session).expect("serialize session");
+        assert!(stored.get("record_path").is_some());
+        strip_key(&mut stored, "record_path");
+        let older: super::super::snapshot::PaneAgentSessionSnapshot =
+            serde_json::from_value(stored).expect("an older session still loads");
+        assert_eq!(older.record_path, None);
+
+        let restored = persisted_agent_session_from_snapshot(&older).expect("a restorable session");
+        assert_eq!(
+            restored.session_ref.value,
+            "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22"
+        );
+        assert_eq!(restored.session_ref.record_path, None);
+        assert_eq!(
+            restore_plan_for_snapshot(&older, true).unwrap().argv,
+            vec!["claude", "--resume", "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22"]
+        );
     }
 
     #[test]
@@ -1259,6 +1313,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            record_path: None,
         };
         let mut resumed = HashSet::new();
 
@@ -1281,6 +1336,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            record_path: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1312,6 +1368,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            record_path: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1352,6 +1409,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            record_path: None,
         };
         let resume = super::super::snapshot::PaneAgentResumeSnapshot {
             source: "herdr:pi".into(),
@@ -1425,6 +1483,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            record_path: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1457,6 +1516,7 @@ mod tests {
             agent: "hermes".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "hermes-session".into(),
+            record_path: None,
         };
 
         let preserved = restored_terminal_agent_session(Some(&session), false)
@@ -1473,6 +1533,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            record_path: None,
         };
         let mut resumed = HashSet::new();
         assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_some());
@@ -1515,6 +1576,7 @@ mod tests {
                 agent: "opencode".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "keep-my-session".into(),
+                record_path: None,
             });
             let (events, _rx) = mpsc::channel(32);
             let (workspaces, terminals, runtimes) = restore(
@@ -1609,6 +1671,7 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                record_path: None,
                             }),
                             agent_resume: None,
                             launch_argv: None,
@@ -1617,6 +1680,8 @@ mod tests {
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -1700,6 +1765,8 @@ mod tests {
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
                             pinned: true,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -1769,6 +1836,108 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn restore_carries_whose_a_label_is_and_defaults_an_older_session_to_nobodys() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: Some("beacon relay".into()),
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                            agent_status: None,
+                            agent_status_changed_at: None,
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
+                            label_source: Some(crate::api::schema::LabelSource::Editor),
+                            label_at: Some(1_700_000_000),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+
+        let restore_once = |snapshot: &SessionSnapshot| {
+            let (events, event_rx) = mpsc::channel(4);
+            let (_workspaces, terminals, _runtimes) = restore(
+                snapshot,
+                None,
+                24,
+                80,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let terminal = terminals
+                .values()
+                .next()
+                .expect("restored terminal should exist");
+            let kept = (
+                terminal.manual_label.clone(),
+                terminal.label_source,
+                terminal.label_at,
+            );
+            drop(event_rx);
+            kept
+        };
+
+        assert_eq!(
+            restore_once(&snapshot),
+            (
+                Some("beacon relay".into()),
+                Some(crate::api::schema::LabelSource::Editor),
+                Some(1_700_000_000)
+            ),
+            "a label comes back with whose it is and when it was written, not restamped"
+        );
+
+        // The same session as written by a build that kept no provenance:
+        // both keys stripped from the stored JSON.
+        let mut stored = serde_json::to_value(&snapshot).expect("serialize session");
+        strip_key(&mut stored, "label_source");
+        strip_key(&mut stored, "label_at");
+        let older: SessionSnapshot =
+            serde_json::from_value(stored).expect("an older session still loads");
+
+        assert_eq!(
+            restore_once(&older),
+            (Some("beacon relay".into()), None, None),
+            "a session written before provenance restores a name that is nobody's and undated"
+        );
+    }
+
     fn strip_key(value: &mut serde_json::Value, key: &str) {
         match value {
             serde_json::Value::Object(object) => {
@@ -1818,6 +1987,8 @@ mod tests {
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -1910,6 +2081,8 @@ mod tests {
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -2035,6 +2208,8 @@ mod tests {
                             agent_status_resolve_by: Some(now - 5),
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -2125,6 +2300,8 @@ mod tests {
                             agent_status_resolve_by: Some(crate::pane::unix_now_secs() + 60),
                             agent_status_saw_other: true,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -2205,6 +2382,7 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                record_path: None,
                             }),
                             agent_resume: None,
                             launch_argv: None,
@@ -2213,6 +2391,8 @@ mod tests {
                             agent_status_resolve_by: Some(crate::pane::unix_now_secs() - 5),
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -2292,6 +2472,8 @@ mod tests {
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -2362,6 +2544,7 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                record_path: None,
                             }),
                             agent_resume: None,
                             launch_argv: None,
@@ -2370,6 +2553,8 @@ mod tests {
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -2449,6 +2634,8 @@ mod tests {
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -2533,6 +2720,8 @@ mod tests {
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -2617,6 +2806,8 @@ mod tests {
                                 agent_status_resolve_by: None,
                                 agent_status_saw_other: false,
                                 pinned: false,
+                                label_source: None,
+                                label_at: None,
                             },
                         ),
                         (
@@ -2634,6 +2825,8 @@ mod tests {
                                 agent_status_resolve_by: None,
                                 agent_status_saw_other: false,
                                 pinned: false,
+                                label_source: None,
+                                label_at: None,
                             },
                         ),
                     ]),
@@ -2693,6 +2886,8 @@ mod tests {
                     agent_status_resolve_by: None,
                     agent_status_saw_other: false,
                     pinned: false,
+                    label_source: None,
+                    label_at: None,
                 },
             )
         };
@@ -2706,6 +2901,7 @@ mod tests {
                 agent: "codex".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "codex-session".into(),
+                record_path: None,
             }),
             agent_resume: None,
             launch_argv: None,
@@ -2714,6 +2910,8 @@ mod tests {
             agent_status_resolve_by: None,
             agent_status_saw_other: false,
             pinned: false,
+            label_source: None,
+            label_at: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -2863,6 +3061,7 @@ mod tests {
                                 agent: "codex".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "codex-session".into(),
+                                record_path: None,
                             }),
                             agent_resume: None,
                             launch_argv: None,
@@ -2871,6 +3070,8 @@ mod tests {
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
                             pinned: false,
+                            label_source: None,
+                            label_at: None,
                         },
                     )]),
                     zoomed: false,
@@ -3182,6 +3383,8 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             },
         );
         let mut history = SessionHistorySnapshot {

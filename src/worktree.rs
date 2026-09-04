@@ -136,6 +136,12 @@ fn usable_home_component(value: Option<OsString>) -> Option<OsString> {
     Some(value)
 }
 
+/// The home directory a leading `~` expands against, resolved exactly the
+/// way [`expand_tilde_path`] resolves it.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    home_dir_from_env(cfg!(windows), |key| std::env::var_os(key)).ok()
+}
+
 pub(crate) fn expand_tilde_absolute_path(path: &str) -> PathBuf {
     let path = expand_tilde_path(path);
     if path.is_absolute() {

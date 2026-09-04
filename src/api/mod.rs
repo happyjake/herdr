@@ -3,6 +3,8 @@ mod attachment;
 pub mod client;
 pub(crate) mod credentials;
 mod event_hub;
+mod place_lookup;
+mod prompt_trail;
 pub mod schema;
 mod server;
 mod server_executable;
@@ -57,6 +59,7 @@ pub fn server_capabilities() -> crate::api::schema::ServerCapabilities {
         send_affirm: true,
         stream_multiplex: true,
         credential_registry: true,
+        file_attachments: Some(attachment::file_attachments_capability()),
     }
 }
 

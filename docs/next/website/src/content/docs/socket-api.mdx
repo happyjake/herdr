@@ -96,14 +96,14 @@ Raw socket method names use dot notation:
 
 | Area | Methods |
 | --- | --- |
-| Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests` |
+| Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests`, `server.lookup_place` |
 | Notification | `notification.show` |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.prompt_trail`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -112,6 +112,82 @@ Raw socket method names use dot notation:
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
+
+`server.lookup_place` turns a directory name into absolute directories this
+server has already been to. It takes `query` and an optional `limit` (capped at
+eight, and the default), and returns `places`: ranked `{ path, source }`
+records for directories that still exist, where `source` is `workspace`, `z`,
+`claude`, `tmux`, or `session`. The answer comes from memory alone — the
+server's own live and persisted workspaces, the z frecency database, the Claude
+Code project list, live tmux pane directories, and the working directories
+recent agent sessions started in — and never from a disk search, so a directory
+nobody has opened here is not a place it can name. Every source is optional and
+a missing one is skipped silently.
+
+Matching is case-insensitive. A folder-name match outranks a path-only match;
+inside a tier a query the folder spells out outranks one that only survived a
+typo (edit distance up to two on the folder name for queries of five or more
+characters, one below that), and matches still level stay in source order. A
+query starting with `/` or `~` is a literal path instead: it is answered as
+itself when it exists, and otherwise its folder name is run through the matcher
+so the near miss comes back as a candidate. A blank query or a `limit` of zero
+is refused with `invalid_params`.
+
+The lookup is bounded rather than best-effort: it is answered off the app
+thread, tmux gets two seconds before it is skipped, the whole request gives up
+after five and answers an empty list, and only two lookups run at a time per
+server, so a client that asks faster than the server can answer queues instead
+of piling on.
+
+The method is additive: a server that predates it cannot parse the method and
+refuses the request, which is how a client learns the lookup is absent.
+
+`pane.prompt_trail` answers what a pane's session record says was asked of
+it. It takes `pane_id` and returns the pane, its terminal, and either a
+`trail` or the `reason` there is none — both keys are always present, and
+exactly one of them is ever set. A trail carries `agent` (`claude`, `codex`
+or `pi`), `first` (the first real prompt, cut to about four hundred code
+points), `recent` (the last three, oldest first, cut to about two hundred
+and forty each), `title` (the harness's own title, when it wrote one worth
+reading), `count`, and `newest_at` in unix seconds. Each prompt is
+`{ text, at }`, where `at` is the time the harness dated it, or null.
+
+A prompt is what was typed as the user turn, by a person or by a
+supervising agent; a slash command counts when it carries arguments, and is
+read back as `/name args`. A tool call or its result, what the harness
+injected — reminders, attachments, a preamble, environment or permissions
+context — command output, notifications, and compaction or continuation
+summaries are none of them prompts. A title that is only the harness's own
+name, or the first prompt said again, is answered as null.
+
+Having no trail is an ordinary condition rather than a failure: `reason` is
+`no_session` for a pane that reports no agent session, `unsupported_agent`
+for a harness whose records this server does not read, `no_record` when the
+file is not on this desk, and `unreadable` when it is there but cannot be
+read within its bounds — past the size bound, holding a line past the line
+bound, holding nothing that parses, or still being read when the request's
+deadline arrives. An unknown pane is refused with `pane_not_found`.
+
+Which file a session names is the session's business, never a search. A
+path the harness itself reported wins, and is honoured only where it can be
+nothing but a record: resolved, a regular `.jsonl` file inside the
+operator's home. Anything else — a link out of home, a link to nowhere,
+another kind of file, a directory — is passed over for the file derived
+from the session id, exactly as if nothing had been reported. The reported
+path is kept with the session, so a restart or a handoff still reads the
+record the harness pointed at.
+
+The read is bounded like the place lookup: it is answered off the app
+thread, which is asked only which pane this is; the record is walked a line
+at a time and never loaded whole; 64 MiB is the bound on what one read
+takes, enforced as it goes rather than only on the file's size beforehand,
+so a record being written to cannot outgrow it mid-read; one line may run
+to 16 MiB, which is room for a prompt carrying a pasted image, and a line
+past that refuses the record instead of being skipped; the whole request
+gives up after five seconds; and only two reads run at a time per server.
+
+The method is additive: a server that predates it cannot parse the method
+and refuses the request, which is how a client learns the trail is absent.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
@@ -970,18 +1046,33 @@ publishes the event on its own, with `agent_status` reporting whatever the pane
 already held, so a subscribed client sees a rename as it happens rather than at
 its next snapshot.
 
-The payload also carries `pinned`, the pane's pin. Changing it publishes the
-event on its own in the same way a label change does, with `agent_status`
-reporting whatever the pane already held.
+The payload also carries `pinned`, the pane's pin, and `label_source` and
+`label_at`, which say whose the standing label is and when it was written.
+Changing any of them publishes the event on its own in the same way a label
+change does, with `agent_status` reporting whatever the pane already held.
 
-`label` and `pinned` are the presentation fields always present in this
-payload: `label` is `null` when the pane has no manual label and `pinned` is
-`true` or `false`, where the others are omitted when unset. That is deliberate.
-A client must be able to tell a cleared label (`"label": null`) or an unpinned
-pane (`"pinned": false`) from a server that predates the field (no key at all),
-and keep what it already learned in the second case. `PaneInfo.label` in
-`pane.get`, `session.snapshot`, and the `pane.rename` response is unchanged and
-stays omitted when unset; `PaneInfo.pinned` is always present there too.
+`label`, `label_source`, `label_at` and `pinned` are the presentation fields
+always present in this payload: `label`, `label_source` and `label_at` are
+`null` when there is nothing to say and `pinned` is `true` or `false`, where
+the others are omitted when unset. That is deliberate. A client must be able to
+tell a cleared label (`"label": null`), a name nobody automatic gave
+(`"label_source": null`) or an unpinned pane (`"pinned": false`) from a server
+that predates the field (no key at all), and keep what it already learned in
+the second case. `PaneInfo.label` in `pane.get`, `session.snapshot`, and the
+`pane.rename` response is unchanged and stays omitted when unset;
+`PaneInfo.pinned`, `PaneInfo.label_source` and `PaneInfo.label_at` are always
+present there too.
+
+`pane.rename` takes an optional `source`, today only `"editor"`, which marks a
+name a client's own automatic namer wrote rather than one a person typed. Every
+non-empty rename stamps `label_at` and takes the request's `source`, so a
+rename without one clears any source that was standing — once someone commits a
+name in their own words, even the same words, it is theirs. A blank or absent
+`label` clears the label, the source and the time together. Other writers of a
+pane's label — `layout.apply`, a plugin's pane title, the desk's own pane menu
+— stamp the time and claim no source. The field is additive: a server that
+predates it ignores it, keeps no source, and every name there reads as a
+person's.
 
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a

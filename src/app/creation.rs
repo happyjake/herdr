@@ -374,6 +374,8 @@ impl App {
             alternate_screen: false,
             agent_status_changed_at: Some(pane.agent_status_changed_at_for(agent_status)),
             pinned: terminal.pinned,
+            label_source: terminal.label_source,
+            label_at: terminal.label_at,
             revision: terminal.revision,
         })
     }
@@ -436,6 +438,7 @@ fn terminal_agent_session_info(
                 agent: authority.agent_label.clone(),
                 kind: session_ref.kind,
                 value: session_ref.value.clone(),
+                record_path: session_ref.record_path.clone(),
             });
         }
     }
@@ -448,5 +451,6 @@ fn terminal_agent_session_info(
             agent: session.agent.clone(),
             kind: session.session_ref.kind,
             value: session.session_ref.value.clone(),
+            record_path: session.session_ref.record_path.clone(),
         })
 }

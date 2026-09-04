@@ -903,6 +903,28 @@ fn handle_request(
         Method::AttachmentCreate(params) => {
             crate::api::attachment::handle_create(request.id, &params)
         }
+        // The place lookup reads dotfiles, walks session directories, and
+        // shells out to tmux. Served here, on the connection thread, so the
+        // app thread is only ever asked for the live pane directories it
+        // already holds in memory.
+        Method::ServerLookupPlace(params) => {
+            crate::api::place_lookup::handle_lookup(request.id, &params, api_tx)
+        }
+        // A trail opens a session record, walks it and parses it. Served
+        // here for the same reason, with the app asked only for the pane's
+        // own identity and the session it reports.
+        Method::PanePromptTrail(params) => {
+            crate::api::prompt_trail::handle_prompt_trail(request.id, &params, api_tx)
+        }
+        Method::AttachmentBegin(params) => {
+            crate::api::attachment::handle_begin(request.id, &params)
+        }
+        Method::AttachmentAppend(params) => {
+            crate::api::attachment::handle_append(request.id, &params)
+        }
+        Method::AttachmentCommit(params) => {
+            crate::api::attachment::handle_commit(request.id, &params)
+        }
         // The credential registry is runtime state beside the session, not
         // app state, so it is served here on the connection thread — the one
         // place both transports pass through, which is what makes the verbs
@@ -926,6 +948,13 @@ fn handle_request(
             None,
         ),
     }
+}
+
+/// The wire name of a method, for tests that need to say which request a
+/// fake app was handed.
+#[cfg(test)]
+pub(super) fn api_method_name_for_test(method: &Method) -> &'static str {
+    api_method_name(method)
 }
 
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
@@ -1558,6 +1587,8 @@ mod tests {
             alternate_screen: false,
             agent_status_changed_at: Some(1_700_000_000),
             pinned: false,
+            label_source: None,
+            label_at: None,
             revision: 0,
         }
     }
@@ -1854,6 +1885,7 @@ mod tests {
                 send_affirm: true,
                 stream_multiplex: true,
                 credential_registry: true,
+                file_attachments: Some(crate::api::attachment::file_attachments_capability()),
             }),
             None,
             None,
@@ -2047,6 +2079,7 @@ mod tests {
                     id: id.into(),
                     method: Method::AttachmentCreate(crate::api::schema::AttachmentCreateParams {
                         bytes_b64,
+                        name: None,
                     }),
                 },
                 &tx,

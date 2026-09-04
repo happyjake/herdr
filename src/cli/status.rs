@@ -428,6 +428,7 @@ mod tests {
                 send_affirm: false,
                 stream_multiplex: false,
                 credential_registry: false,
+                file_attachments: None,
             }),
         }
     }

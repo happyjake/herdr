@@ -10,13 +10,14 @@ use super::integrations::{
 use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
     PaneMouseRouting, PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult,
-    PaneResizeResult, PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult,
+    PaneResizeResult, PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult, PromptTrail,
+    PromptTrailReason,
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
     PluginPaneInfo,
 };
-use super::server::ServerCapabilities;
+use super::server::{PlaceInfo, ServerCapabilities};
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
@@ -86,6 +87,11 @@ pub enum ResponseResult {
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
     },
+    ServerLookupPlace {
+        /// Ranked directories that exist, best first, at most the request's
+        /// `limit`. Empty when nothing in this server's memory matched.
+        places: Vec<PlaceInfo>,
+    },
     AttachmentCreated {
         /// Absolute, space-free path of the fully written attachment file.
         /// The success response is encoded only after the file is renamed
@@ -93,6 +99,16 @@ pub enum ResponseResult {
         path: String,
         /// Unix seconds after which the TTL sweep may remove the file.
         expires_at: u64,
+    },
+    AttachmentUploadStarted {
+        /// Opaque, server-minted handle for the reserved partial file. Echo
+        /// it on `attachment.append` and `attachment.commit`; never parse it.
+        upload_id: String,
+    },
+    AttachmentAppended {
+        /// Bytes on disk after this append — the offset the next chunk must
+        /// declare, and the numerator of the client's progress.
+        received: u64,
     },
     WorkspaceInfo {
         workspace: WorkspaceInfo,
@@ -162,6 +178,18 @@ pub enum ResponseResult {
     },
     PaneList {
         panes: Vec<PaneInfo>,
+    },
+    /// What a pane's session record says was asked of it.
+    ///
+    /// `trail` and `reason` are always serialized and exactly one of them is
+    /// ever set: a pane with no trail says why in `reason` rather than
+    /// failing, because having no trail is an ordinary condition a client
+    /// answers by reading the screen instead.
+    PromptTrail {
+        pane_id: String,
+        terminal_id: String,
+        trail: Option<PromptTrail>,
+        reason: Option<PromptTrailReason>,
     },
     PaneCurrent {
         pane: PaneInfo,

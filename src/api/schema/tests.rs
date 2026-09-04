@@ -359,6 +359,7 @@ fn request_round_trips_for_attachment_create() {
         id: "req_attach".into(),
         method: Method::AttachmentCreate(AttachmentCreateParams {
             bytes_b64: "aGVyZHI=".into(),
+            name: None,
         }),
     };
 
@@ -384,6 +385,218 @@ fn attachment_created_response_round_trips() {
     assert!(json.contains("\"expires_at\":1800000000"));
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
+}
+
+#[test]
+fn request_round_trips_for_attachment_create_with_a_name() {
+    let request = Request {
+        id: "req_attach_named".into(),
+        method: Method::AttachmentCreate(AttachmentCreateParams {
+            bytes_b64: "aGVyZHI=".into(),
+            name: Some("crash log.txt".into()),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "attachment.create");
+    assert_eq!(json["params"]["name"], "crash log.txt");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
+fn an_attachment_create_without_a_name_carries_no_name_field() {
+    // The photo contract's request stays byte-identical to what clients
+    // that predate files already send.
+    let request = Request {
+        id: "req_attach".into(),
+        method: Method::AttachmentCreate(AttachmentCreateParams {
+            bytes_b64: "aGVyZHI=".into(),
+            name: None,
+        }),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert_eq!(
+        json,
+        r#"{"id":"req_attach","method":"attachment.create","params":{"bytes_b64":"aGVyZHI="}}"#
+    );
+}
+
+#[test]
+fn request_round_trips_for_the_chunked_upload_verbs() {
+    let begin = Request {
+        id: "req_attach_begin".into(),
+        method: Method::AttachmentBegin(AttachmentBeginParams {
+            name: "session.log".into(),
+            size: 52_428_800,
+        }),
+    };
+    let json = serde_json::to_value(&begin).unwrap();
+    assert_eq!(json["method"], "attachment.begin");
+    assert_eq!(json["params"]["name"], "session.log");
+    assert_eq!(json["params"]["size"], 52_428_800);
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), begin);
+
+    let append = Request {
+        id: "req_attach_append".into(),
+        method: Method::AttachmentAppend(AttachmentAppendParams {
+            upload_id: "upload-17-0".into(),
+            offset: 783_360,
+            bytes_b64: "aGVyZHI=".into(),
+        }),
+    };
+    let json = serde_json::to_value(&append).unwrap();
+    assert_eq!(json["method"], "attachment.append");
+    assert_eq!(json["params"]["upload_id"], "upload-17-0");
+    assert_eq!(json["params"]["offset"], 783_360);
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), append);
+
+    let commit = Request {
+        id: "req_attach_commit".into(),
+        method: Method::AttachmentCommit(AttachmentCommitParams {
+            upload_id: "upload-17-0".into(),
+            size: 52_428_800,
+        }),
+    };
+    let json = serde_json::to_value(&commit).unwrap();
+    assert_eq!(json["method"], "attachment.commit");
+    assert_eq!(json["params"]["upload_id"], "upload-17-0");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), commit);
+}
+
+#[test]
+fn chunked_upload_responses_round_trip() {
+    let started = SuccessResponse {
+        id: "req_attach_begin".into(),
+        result: ResponseResult::AttachmentUploadStarted {
+            upload_id: "upload-17-0".into(),
+        },
+    };
+    let json = serde_json::to_string(&started).unwrap();
+    assert!(json.contains(r#""type":"attachment_upload_started""#));
+    assert!(json.contains(r#""upload_id":"upload-17-0""#));
+    assert_eq!(
+        serde_json::from_str::<SuccessResponse>(&json).unwrap(),
+        started
+    );
+
+    let appended = SuccessResponse {
+        id: "req_attach_append".into(),
+        result: ResponseResult::AttachmentAppended { received: 783_360 },
+    };
+    let json = serde_json::to_string(&appended).unwrap();
+    assert!(json.contains(r#""type":"attachment_appended""#));
+    assert!(json.contains(r#""received":783360"#));
+    assert_eq!(
+        serde_json::from_str::<SuccessResponse>(&json).unwrap(),
+        appended
+    );
+}
+
+#[test]
+fn the_file_attachments_capability_is_additive_for_older_peers() {
+    // A pong from a server that takes photos only carries no
+    // `file_attachments`, and must still parse.
+    let old_pong = r#"{"id":"req_old","result":{"type":"pong","version":"0.1.0","protocol":6,"capabilities":{"live_handoff":true}}}"#;
+    let restored: SuccessResponse = serde_json::from_str(old_pong).unwrap();
+    match restored.result {
+        ResponseResult::Pong { capabilities, .. } => {
+            let capabilities = capabilities.expect("capabilities must parse");
+            assert_eq!(capabilities.file_attachments, None);
+        }
+        other => panic!("expected pong, got {other:?}"),
+    }
+
+    // And this build declares both numbers, with the chunk size derived
+    // from the message cap rather than retyped.
+    let declared = crate::api::server_capabilities()
+        .file_attachments
+        .expect("this build stores file attachments");
+    assert_eq!(declared.max_bytes, 67_108_864);
+    assert_eq!(declared.chunk_bytes, 783_360);
+}
+
+#[test]
+fn request_round_trips_for_server_lookup_place() {
+    let request = Request {
+        id: "req_place".into(),
+        method: Method::ServerLookupPlace(ServerLookupPlaceParams {
+            query: "rocket".into(),
+            limit: Some(4),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "server.lookup_place");
+    assert_eq!(json["params"]["query"], "rocket");
+    assert_eq!(json["params"]["limit"], 4);
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
+fn a_lookup_without_a_limit_carries_no_limit_field() {
+    let request = Request {
+        id: "req_place".into(),
+        method: Method::ServerLookupPlace(ServerLookupPlaceParams {
+            query: "rocket".into(),
+            limit: None,
+        }),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert_eq!(
+        json,
+        r#"{"id":"req_place","method":"server.lookup_place","params":{"query":"rocket"}}"#
+    );
+}
+
+#[test]
+fn the_lookup_result_names_every_place_and_the_memory_it_came_from() {
+    let response = SuccessResponse {
+        id: "req_place".into(),
+        result: ResponseResult::ServerLookupPlace {
+            places: vec![
+                PlaceInfo {
+                    path: "/home/user/code/rocket".into(),
+                    source: PlaceSource::Workspace,
+                },
+                PlaceInfo {
+                    path: "/home/user/code/rocket-app".into(),
+                    source: PlaceSource::Z,
+                },
+            ],
+        },
+    };
+
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["type"], "server_lookup_place");
+    assert_eq!(
+        json["result"]["places"][0]["path"],
+        "/home/user/code/rocket"
+    );
+    assert_eq!(json["result"]["places"][0]["source"], "workspace");
+    assert_eq!(json["result"]["places"][1]["source"], "z");
+    let restored: SuccessResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
+fn every_place_source_keeps_its_wire_name() {
+    for (source, name) in [
+        (PlaceSource::Workspace, "workspace"),
+        (PlaceSource::Z, "z"),
+        (PlaceSource::Claude, "claude"),
+        (PlaceSource::Tmux, "tmux"),
+        (PlaceSource::Session, "session"),
+    ] {
+        assert_eq!(serde_json::to_value(source).unwrap(), name);
+        assert_eq!(
+            serde_json::from_value::<PlaceSource>(serde_json::json!(name)).unwrap(),
+            source
+        );
+    }
 }
 
 #[test]
@@ -541,6 +754,229 @@ fn agent_view_requests_round_trip() {
     let request: Request = serde_json::from_value(clear_json.clone()).unwrap();
     assert!(matches!(request.method, Method::AgentViewClear(_)));
     assert_eq!(serde_json::to_value(request).unwrap(), clear_json);
+}
+
+#[test]
+fn a_rename_says_nothing_about_a_source_unless_it_has_one() {
+    let plain: Request = serde_json::from_value(serde_json::json!({
+        "id": "req_rename",
+        "method": "pane.rename",
+        "params": { "pane_id": "wG4:p1", "label": "beacon relay" },
+    }))
+    .unwrap();
+    assert_eq!(
+        plain.method,
+        Method::PaneRename(PaneRenameParams {
+            pane_id: "wG4:p1".into(),
+            label: Some("beacon relay".into()),
+            source: None,
+        })
+    );
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(
+        json["params"].get("source").is_none(),
+        "a rename with nobody behind it serializes no key: {json}"
+    );
+
+    let from_a_namer = Request {
+        id: "req_rename".into(),
+        method: Method::PaneRename(PaneRenameParams {
+            pane_id: "wG4:p1".into(),
+            label: Some("beacon relay".into()),
+            source: Some(LabelSource::Editor),
+        }),
+    };
+    let json = serde_json::to_value(&from_a_namer).unwrap();
+    assert_eq!(json["params"]["source"], "editor");
+    assert_eq!(
+        serde_json::from_value::<Request>(json).unwrap(),
+        from_a_namer
+    );
+}
+
+#[test]
+fn pane_info_always_states_whose_the_label_is_and_when_it_was_written() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "pane_1",
+        "terminal_id": "terminal_1",
+        "workspace_id": "workspace_1",
+        "tab_id": "tab_1",
+        "focused": true,
+        "agent_status": "unknown",
+        "revision": 0
+    }))
+    .unwrap();
+
+    assert_eq!(
+        (pane.label_source, pane.label_at),
+        (None, None),
+        "a pane read from a server that keeps no provenance has none"
+    );
+    let json = serde_json::to_value(&pane).unwrap();
+    assert!(
+        json["label_source"].is_null() && json["label_at"].is_null(),
+        "both keys stay present and null, so their absence can only mean a \
+         server that keeps no provenance at all: {json}"
+    );
+
+    let named = PaneInfo {
+        label: Some("beacon relay".into()),
+        label_source: Some(LabelSource::Editor),
+        label_at: Some(1_700_000_000),
+        ..pane
+    };
+    let json = serde_json::to_value(&named).unwrap();
+    assert_eq!(json["label_source"], "editor");
+    assert_eq!(json["label_at"], 1_700_000_000u64);
+    assert_eq!(serde_json::from_value::<PaneInfo>(json).unwrap(), named);
+}
+
+#[test]
+fn the_status_event_carries_the_labels_provenance_beside_the_label() {
+    let event = PaneAgentStatusChangedEvent {
+        pane_id: "pane_1".into(),
+        workspace_id: "workspace_1".into(),
+        agent_status: AgentStatus::Working,
+        agent: Some("pi".into()),
+        title: None,
+        display_agent: None,
+        state_labels: HashMap::new(),
+        label: Some("beacon relay".into()),
+        label_source: Some(LabelSource::Editor),
+        label_at: Some(1_700_000_000),
+        pinned: false,
+    };
+
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["label_source"], "editor");
+    assert_eq!(json["label_at"], 1_700_000_000u64);
+    assert_eq!(
+        serde_json::from_value::<PaneAgentStatusChangedEvent>(json).unwrap(),
+        event
+    );
+
+    let nobodys = PaneAgentStatusChangedEvent {
+        label_source: None,
+        label_at: None,
+        ..event
+    };
+    let json = serde_json::to_value(&nobodys).unwrap();
+    assert!(
+        json["label_source"].is_null() && json["label_at"].is_null(),
+        "both keys stay present and null, as the label and the pin do: {json}"
+    );
+}
+
+#[test]
+fn prompt_trail_request_names_the_pane_and_nothing_else() {
+    let json = serde_json::json!({
+        "id": "req_trail",
+        "method": "pane.prompt_trail",
+        "params": { "pane_id": "wG4:p1" },
+    });
+
+    let request: Request = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(
+        request.method,
+        Method::PanePromptTrail(PaneTarget {
+            pane_id: "wG4:p1".into(),
+        })
+    );
+    assert_eq!(serde_json::to_value(request).unwrap(), json);
+}
+
+#[test]
+fn a_prompt_trail_result_keeps_every_field_it_has_nothing_to_say_about() {
+    let answered = SuccessResponse {
+        id: "req_trail".into(),
+        result: ResponseResult::PromptTrail {
+            pane_id: "wG4:p1".into(),
+            terminal_id: "term_beacon".into(),
+            trail: Some(PromptTrail {
+                agent: PromptTrailAgent::Claude,
+                first: Some(TrailPrompt {
+                    text: "why does the beacon relay drop frames".into(),
+                    at: Some(1772615700),
+                }),
+                recent: vec![TrailPrompt {
+                    text: "pin it to the encoder".into(),
+                    at: None,
+                }],
+                title: None,
+                count: 2,
+                newest_at: Some(1772617212),
+            }),
+            reason: None,
+        },
+    };
+
+    let json = serde_json::to_value(&answered).unwrap();
+    assert_eq!(json["result"]["type"], "prompt_trail");
+    // A null is a real absence, never a key a reader has to guess at.
+    assert!(json["result"]["trail"]["title"].is_null());
+    assert!(json["result"]["trail"]["recent"][0]["at"].is_null());
+    assert!(json["result"]["reason"].is_null());
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(json).unwrap(),
+        answered
+    );
+}
+
+#[test]
+fn a_pane_with_no_trail_answers_the_reason_on_the_wire() {
+    for (reason, wire) in [
+        (PromptTrailReason::NoSession, "no_session"),
+        (PromptTrailReason::UnsupportedAgent, "unsupported_agent"),
+        (PromptTrailReason::NoRecord, "no_record"),
+        (PromptTrailReason::Unreadable, "unreadable"),
+    ] {
+        let answered = SuccessResponse {
+            id: "req_trail".into(),
+            result: ResponseResult::PromptTrail {
+                pane_id: "wG4:p1".into(),
+                terminal_id: "term_beacon".into(),
+                trail: None,
+                reason: Some(reason),
+            },
+        };
+        let json = serde_json::to_value(&answered).unwrap();
+        assert_eq!(json["result"]["reason"], wire);
+        assert!(json["result"]["trail"].is_null());
+        assert_eq!(
+            serde_json::from_value::<SuccessResponse>(json).unwrap(),
+            answered
+        );
+    }
+}
+
+#[test]
+fn a_reported_record_path_rides_with_the_session_and_is_absent_without_one() {
+    let bare: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+        "source": "herdr:claude",
+        "agent": "claude",
+        "kind": "id",
+        "value": "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22",
+    }))
+    .unwrap();
+    assert_eq!(bare.record_path, None);
+    assert!(
+        serde_json::to_value(&bare)
+            .unwrap()
+            .get("record_path")
+            .is_none(),
+        "a session with no reported record must serialize no key"
+    );
+
+    let reported = AgentSessionInfo {
+        record_path: Some("/invented/records/beacon.jsonl".into()),
+        ..bare
+    };
+    let json = serde_json::to_value(&reported).unwrap();
+    assert_eq!(json["record_path"], "/invented/records/beacon.jsonl");
+    assert_eq!(
+        serde_json::from_value::<AgentSessionInfo>(json).unwrap(),
+        reported
+    );
 }
 
 #[test]
@@ -887,9 +1323,13 @@ fn success_response_round_trips() {
                 send_affirm: true,
                 stream_multiplex: true,
                 credential_registry: true,
+                file_attachments: Some(FileAttachmentsCapability {
+                    max_bytes: 67_108_864,
+                    chunk_bytes: 783_360,
+                }),
             }),
-            name: Some("the-mini".into()),
-            reach: Some("mini".into()),
+            name: Some("home-box".into()),
+            reach: Some("home-box".into()),
             advertised_endpoint: Some("wss://a-host.example.net:8443".into()),
             session: Some("mobile".into()),
             exe: Some("/opt/herdr".into()),
@@ -1032,6 +1472,8 @@ fn worktree_request_and_response_round_trip() {
                 alternate_screen: false,
                 agent_status_changed_at: Some(1_700_000_000),
                 pinned: false,
+                label_source: None,
+                label_at: None,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1467,6 +1909,8 @@ fn create_response_round_trips_with_root_pane() {
                 alternate_screen: false,
                 agent_status_changed_at: None,
                 pinned: false,
+                label_source: None,
+                label_at: None,
                 revision: 0,
             },
         },
