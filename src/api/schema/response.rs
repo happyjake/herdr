@@ -16,7 +16,7 @@ use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
     PluginPaneInfo,
 };
-use super::server::ServerCapabilities;
+use super::server::{PlaceInfo, ServerCapabilities};
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
@@ -85,6 +85,11 @@ pub enum ResponseResult {
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
+    },
+    ServerLookupPlace {
+        /// Ranked directories that exist, best first, at most the request's
+        /// `limit`. Empty when nothing in this server's memory matched.
+        places: Vec<PlaceInfo>,
     },
     AttachmentCreated {
         /// Absolute, space-free path of the fully written attachment file.

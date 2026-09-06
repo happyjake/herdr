@@ -518,6 +518,88 @@ fn the_file_attachments_capability_is_additive_for_older_peers() {
 }
 
 #[test]
+fn request_round_trips_for_server_lookup_place() {
+    let request = Request {
+        id: "req_place".into(),
+        method: Method::ServerLookupPlace(ServerLookupPlaceParams {
+            query: "rocket".into(),
+            limit: Some(4),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "server.lookup_place");
+    assert_eq!(json["params"]["query"], "rocket");
+    assert_eq!(json["params"]["limit"], 4);
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
+fn a_lookup_without_a_limit_carries_no_limit_field() {
+    let request = Request {
+        id: "req_place".into(),
+        method: Method::ServerLookupPlace(ServerLookupPlaceParams {
+            query: "rocket".into(),
+            limit: None,
+        }),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert_eq!(
+        json,
+        r#"{"id":"req_place","method":"server.lookup_place","params":{"query":"rocket"}}"#
+    );
+}
+
+#[test]
+fn the_lookup_result_names_every_place_and_the_memory_it_came_from() {
+    let response = SuccessResponse {
+        id: "req_place".into(),
+        result: ResponseResult::ServerLookupPlace {
+            places: vec![
+                PlaceInfo {
+                    path: "/home/user/code/rocket".into(),
+                    source: PlaceSource::Workspace,
+                },
+                PlaceInfo {
+                    path: "/home/user/code/rocket-app".into(),
+                    source: PlaceSource::Z,
+                },
+            ],
+        },
+    };
+
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["type"], "server_lookup_place");
+    assert_eq!(
+        json["result"]["places"][0]["path"],
+        "/home/user/code/rocket"
+    );
+    assert_eq!(json["result"]["places"][0]["source"], "workspace");
+    assert_eq!(json["result"]["places"][1]["source"], "z");
+    let restored: SuccessResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
+fn every_place_source_keeps_its_wire_name() {
+    for (source, name) in [
+        (PlaceSource::Workspace, "workspace"),
+        (PlaceSource::Z, "z"),
+        (PlaceSource::Claude, "claude"),
+        (PlaceSource::Tmux, "tmux"),
+        (PlaceSource::Session, "session"),
+    ] {
+        assert_eq!(serde_json::to_value(source).unwrap(), name);
+        assert_eq!(
+            serde_json::from_value::<PlaceSource>(serde_json::json!(name)).unwrap(),
+            source
+        );
+    }
+}
+
+#[test]
 fn request_round_trips_for_agent_explain() {
     let request = Request {
         id: "req_agent_explain".into(),

@@ -7,7 +7,8 @@ use super::snapshot::{
     SessionSnapshot, SNAPSHOT_VERSION,
 };
 
-pub(super) fn session_path() -> PathBuf {
+/// Where this session's layout is saved.
+pub fn session_path() -> PathBuf {
     crate::session::data_dir().join("session.json")
 }
 
@@ -86,8 +87,16 @@ pub fn clear_history() {
 }
 
 pub fn load() -> Option<SessionSnapshot> {
-    let path = session_path();
-    let content = match std::fs::read_to_string(&path) {
+    load_from_path(&session_path())
+}
+
+/// The saved layout at one path, or nothing when there is none to read.
+///
+/// Separate from [`load`] so a caller that already knows which file it
+/// means — a test with a fixture, or a reader that is not the session's
+/// owner — does not have to go through the process-wide session path.
+pub fn load_from_path(path: &Path) -> Option<SessionSnapshot> {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!(

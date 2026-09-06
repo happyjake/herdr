@@ -10,7 +10,7 @@ mod restore;
 mod snapshot;
 mod writer;
 
-pub use self::io::{clear_history, load, load_history};
+pub use self::io::{clear_history, load, load_from_path, load_history, session_path};
 pub use self::restore::restore;
 #[cfg(unix)]
 pub use self::restore::{handoff_pane_aliases, restore_handoff};

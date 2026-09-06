@@ -781,6 +781,13 @@ fn handle_request(
         Method::AttachmentCreate(params) => {
             crate::api::attachment::handle_create(request.id, &params)
         }
+        // The place lookup reads dotfiles, walks session directories, and
+        // shells out to tmux. Served here, on the connection thread, so the
+        // app thread is only ever asked for the live pane directories it
+        // already holds in memory.
+        Method::ServerLookupPlace(params) => {
+            crate::api::place_lookup::handle_lookup(request.id, &params, api_tx)
+        }
         Method::AttachmentBegin(params) => {
             crate::api::attachment::handle_begin(request.id, &params)
         }
@@ -815,6 +822,13 @@ fn handle_request(
     }
 }
 
+/// The wire name of a method, for tests that need to say which request a
+/// fake app was handed.
+#[cfg(test)]
+pub(super) fn api_method_name_for_test(method: &Method) -> &'static str {
+    api_method_name(method)
+}
+
 pub(crate) fn api_method_name(method: &Method) -> &'static str {
     match method {
         Method::Ping(_) => "ping",
@@ -824,6 +838,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ServerSshAgentRegister(_) => "server.ssh_agent.register",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
+        Method::ServerLookupPlace(_) => "server.lookup_place",
         Method::AttachmentCreate(_) => "attachment.create",
         Method::AttachmentBegin(_) => "attachment.begin",
         Method::AttachmentAppend(_) => "attachment.append",

@@ -644,13 +644,12 @@ fn ping_response_is_identical_over_unix_socket_and_websocket() {
     ws.send(request);
     let ws_raw = ws.read_raw(Duration::from_secs(5));
 
-    let local_only = "\"ssh_agent_registration\":true";
     assert!(
         ws_raw.contains("\"ssh_agent_registration\":false"),
         "the websocket cannot hold an SSH agent lease: {ws_raw}"
     );
     assert_eq!(
-        unix_raw.replace(local_only, "\"ssh_agent_registration\":false"),
+        transport_neutral_raw_pong(&unix_raw),
         ws_raw,
         "raw ping payloads must be identical"
     );
@@ -679,6 +678,15 @@ fn ping_response_is_identical_over_unix_socket_and_websocket() {
 /// A unix-socket pong as the websocket would report it. An SSH agent
 /// registration is a lease held by one local connection, so only the unix
 /// socket can offer it; everything else must match across transports.
+fn transport_neutral_raw_pong(unix_raw: &str) -> String {
+    unix_raw.replace(
+        "\"ssh_agent_registration\":true",
+        "\"ssh_agent_registration\":false",
+    )
+}
+
+/// A unix-socket pong as the websocket would report it (see
+/// [`transport_neutral_raw_pong`] for the raw line).
 fn transport_neutral_pong(mut pong: serde_json::Value) -> serde_json::Value {
     if let Some(capabilities) = pong["result"]["capabilities"].as_object_mut() {
         capabilities.insert("ssh_agent_registration".into(), false.into());
@@ -1512,7 +1520,11 @@ fn the_pong_declares_the_file_attachment_sizes_identically_over_both_transports(
     let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
     ws.send(ping);
     let ws_raw = ws.read_raw(Duration::from_secs(5));
-    assert_eq!(unix_raw, ws_raw, "raw pong payloads must be identical");
+    assert_eq!(
+        transport_neutral_raw_pong(&unix_raw),
+        ws_raw,
+        "raw pong payloads must be identical"
+    );
 
     let pong: serde_json::Value = serde_json::from_str(&ws_raw).unwrap();
     let (chunk_bytes, max_bytes) = declared_file_attachment_limits(&pong);
@@ -2649,7 +2661,7 @@ fn listening_tcp_local_ports(pid: u32) -> Vec<u16> {
     ports
 }
 
-// ---- The credential registry (ADR-0026) ----
+// ---- The credential registry ----
 //
 // The verbs are served on the connection thread, the one place both
 // transports pass through, so these tests drive them over the Unix socket
@@ -2739,10 +2751,7 @@ fn credential_verbs_answer_identically_over_unix_socket_and_websocket() {
     ws.send(ping);
     let ws_raw = ws.read_raw(Duration::from_secs(5));
     assert_eq!(
-        unix_raw.replace(
-            "\"ssh_agent_registration\":true",
-            "\"ssh_agent_registration\":false"
-        ),
+        transport_neutral_raw_pong(&unix_raw),
         ws_raw,
         "raw pong payloads must be identical"
     );

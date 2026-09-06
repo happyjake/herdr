@@ -20,6 +20,46 @@ pub struct ServerSshAgentRegisterParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServerLookupPlaceParams {
+    /// What to look up. Text starting with `/` or `~` is a literal path,
+    /// checked for existence; anything else is a place name, matched
+    /// case-insensitively against the directories this server remembers.
+    pub query: String,
+    /// How many places to answer with, capped at eight. Absent means the
+    /// cap. Zero is refused rather than answered, which is what the
+    /// declared minimum says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub limit: Option<u32>,
+}
+
+/// Which of the server's memories held a place. Never a disk search: a
+/// directory nobody has opened here is not a place this server can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceSource {
+    /// A directory one of this server's own workspaces stands in, live or
+    /// in the persisted layout.
+    Workspace,
+    /// The z frecency database.
+    Z,
+    /// The Claude Code project list.
+    Claude,
+    /// The working directory of a live tmux pane.
+    Tmux,
+    /// The working directory a recent agent session started in.
+    Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PlaceInfo {
+    /// Absolute path of a directory that exists on this server.
+    pub path: String,
+    /// The memory this place came out of.
+    pub source: PlaceSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AttachmentCreateParams {
     /// Attachment bytes encoded as standard base64 (RFC 4648, padding
     /// accepted). At most `capabilities.file_attachments.chunk_bytes`
@@ -110,7 +150,7 @@ pub struct ServerCapabilities {
     /// servers that predate it.
     #[serde(default)]
     pub stream_multiplex: bool,
-    /// Whether this server keeps a credential registry (ADR-0026): the
+    /// Whether this server keeps a credential registry: the
     /// pairing's managing credential plus any minted limited credentials,
     /// with `credential.mint`, `credential.list`, `credential.revoke`, and
     /// `credential.revoke_all`. Additive: absent (false) in pongs of servers

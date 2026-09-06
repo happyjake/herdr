@@ -3,6 +3,7 @@ mod attachment;
 pub mod client;
 pub(crate) mod credentials;
 mod event_hub;
+mod place_lookup;
 pub mod schema;
 mod server;
 mod server_executable;
