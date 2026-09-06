@@ -57,6 +57,11 @@ pub enum Method {
     ServerAgentManifests(EmptyParams),
     #[serde(rename = "server.reload_agent_manifests")]
     ServerReloadAgentManifests(EmptyParams),
+    // Turning a place name into directories this server has been to
+    // (ADR-0054). Additive: a server that predates it cannot parse the
+    // method, and a client reads that refusal as the lookup's absence.
+    #[serde(rename = "server.lookup_place")]
+    ServerLookupPlace(ServerLookupPlaceParams),
     #[serde(rename = "attachment.create")]
     AttachmentCreate(AttachmentCreateParams),
     // A file beyond one message's carry (ADR-0047). Additive verbs, with the

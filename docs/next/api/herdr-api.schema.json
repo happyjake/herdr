@@ -3950,6 +3950,27 @@
           },
           "type": "object"
         },
+        "ServerLookupPlaceParams": {
+          "properties": {
+            "limit": {
+              "description": "How many places to answer with, capped at eight. Absent means the\ncap.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "query": {
+              "description": "What to look up. Text starting with `/` or `~` is a literal path,\nchecked for existence; anything else is a place name, matched\ncase-insensitively against the directories this server remembers.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        },
         "SplitDirection": {
           "enum": [
             "right",
@@ -4819,6 +4840,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.lookup_place",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerLookupPlaceParams"
             }
           },
           "required": [
@@ -8667,6 +8704,53 @@
           ],
           "type": "object"
         },
+        "PlaceInfo": {
+          "properties": {
+            "path": {
+              "description": "Absolute path of a directory that exists on this server.",
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/schemas/success_response/$defs/PlaceSource",
+              "description": "The memory this place came out of."
+            }
+          },
+          "required": [
+            "path",
+            "source"
+          ],
+          "type": "object"
+        },
+        "PlaceSource": {
+          "description": "Which of the server's memories held a place. Never a disk search: a\ndirectory nobody has opened here is not a place this server can name.",
+          "oneOf": [
+            {
+              "const": "workspace",
+              "description": "A directory one of this server's own workspaces stands in, live or\nin the persisted layout.",
+              "type": "string"
+            },
+            {
+              "const": "z",
+              "description": "The z frecency database.",
+              "type": "string"
+            },
+            {
+              "const": "claude",
+              "description": "The Claude Code project list.",
+              "type": "string"
+            },
+            {
+              "const": "tmux",
+              "description": "The working directory of a live tmux pane.",
+              "type": "string"
+            },
+            {
+              "const": "session",
+              "description": "The working directory a recent agent session started in.",
+              "type": "string"
+            }
+          ]
+        },
         "PluginActionContext": {
           "enum": [
             "global",
@@ -9332,6 +9416,26 @@
               "required": [
                 "type",
                 "snapshot"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "places": {
+                  "description": "Ranked directories that exist, best first, at most the request's\n`limit`. Empty when nothing in this server's memory matched.",
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/PlaceInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "server_lookup_place",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "places"
               ],
               "type": "object"
             },

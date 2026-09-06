@@ -7,6 +7,7 @@ mod integrations;
 mod layouts;
 mod pane_graphics;
 mod panes;
+mod places;
 pub(crate) mod plugins;
 mod responses;
 mod session;
@@ -1140,6 +1141,9 @@ impl App {
                         reason: crate::api::schema::ClientWindowTitleReason::NoForegroundClient,
                     },
                 );
+            }
+            Method::ServerLookupPlace(params) => {
+                return self.handle_server_lookup_place(request.id, params);
             }
             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),

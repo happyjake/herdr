@@ -729,6 +729,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ServerReloadConfig(_) => "server.reload_config",
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
+        Method::ServerLookupPlace(_) => "server.lookup_place",
         Method::AttachmentCreate(_) => "attachment.create",
         Method::AttachmentBegin(_) => "attachment.begin",
         Method::AttachmentAppend(_) => "attachment.append",

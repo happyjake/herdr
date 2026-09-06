@@ -96,7 +96,7 @@ Raw socket method names use dot notation:
 
 | Area | Methods |
 | --- | --- |
-| Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests` |
+| Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests`, `server.lookup_place` |
 | Notification | `notification.show` |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
@@ -112,6 +112,29 @@ Raw socket method names use dot notation:
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
+
+`server.lookup_place` turns a directory name into absolute directories this
+server has already been to. It takes `query` and an optional `limit` (capped at
+eight, and the default), and returns `places`: ranked `{ path, source }`
+records for directories that still exist, where `source` is `workspace`, `z`,
+`claude`, `tmux`, or `session`. The answer comes from memory alone — the
+server's own live and persisted workspaces, the z frecency database, the Claude
+Code project list, live tmux pane directories, and the working directories
+recent agent sessions started in — and never from a disk search, so a directory
+nobody has opened here is not a place it can name. Every source is optional and
+a missing one is skipped silently.
+
+Matching is case-insensitive. A folder-name match outranks a path-only match;
+inside a tier a query the folder spells out outranks one that only survived a
+typo (edit distance up to two on the folder name for queries of five or more
+characters, one below that), and matches still level stay in source order. A
+query starting with `/` or `~` is a literal path instead: it is answered as
+itself when it exists, and otherwise its folder name is run through the matcher
+so the near miss comes back as a candidate. A blank query or a `limit` of zero
+is refused with `invalid_params`.
+
+The method is additive: a server that predates it cannot parse the method and
+refuses the request, which is how a client learns the lookup is absent.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
