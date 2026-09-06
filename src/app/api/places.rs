@@ -100,31 +100,31 @@ mod tests {
     #[test]
     fn a_query_is_read_without_its_surrounding_space() {
         let params = ServerLookupPlaceParams {
-            query: "  herdr \n".into(),
+            query: "  rocket \n".into(),
             limit: None,
         };
-        assert_eq!(read_params(&params), Ok(("herdr", MAX_PLACES)));
+        assert_eq!(read_params(&params), Ok(("rocket", MAX_PLACES)));
     }
 
     #[test]
     fn a_limit_of_zero_is_refused_and_a_large_one_is_capped() {
         let refused = ServerLookupPlaceParams {
-            query: "herdr".into(),
+            query: "rocket".into(),
             limit: Some(0),
         };
         assert_eq!(read_params(&refused), Err("limit must be at least 1"));
 
         let capped = ServerLookupPlaceParams {
-            query: "herdr".into(),
+            query: "rocket".into(),
             limit: Some(500),
         };
-        assert_eq!(read_params(&capped), Ok(("herdr", MAX_PLACES)));
+        assert_eq!(read_params(&capped), Ok(("rocket", MAX_PLACES)));
 
         let smaller = ServerLookupPlaceParams {
-            query: "herdr".into(),
+            query: "rocket".into(),
             limit: Some(3),
         };
-        assert_eq!(read_params(&smaller), Ok(("herdr", 3)));
+        assert_eq!(read_params(&smaller), Ok(("rocket", 3)));
     }
 
     #[tokio::test]

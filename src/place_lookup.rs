@@ -757,26 +757,26 @@ mod tests {
     #[test]
     fn a_typo_on_the_folder_name_still_finds_the_place() {
         let home = FixtureHome::new();
-        let herdr = home.dir("code/herdr");
-        home.z(&[(herdr.as_str(), 10.0)]);
+        let rocket = home.dir("code/rocket");
+        home.z(&[(rocket.as_str(), 10.0)]);
 
-        let places = lookup(&home.desk(), "herder", MAX_PLACES);
-        assert_eq!(paths(&places), vec![herdr]);
+        let places = lookup(&home.desk(), "rocjet", MAX_PLACES);
+        assert_eq!(paths(&places), vec![rocket]);
     }
 
     #[test]
     fn a_name_nothing_remembers_answers_nothing() {
         let home = FixtureHome::new();
-        let herdr = home.dir("code/herdr");
-        home.z(&[(herdr.as_str(), 10.0)]);
+        let rocket = home.dir("code/rocket");
+        home.z(&[(rocket.as_str(), 10.0)]);
 
         assert!(lookup(&home.desk(), "qqqqqq", MAX_PLACES).is_empty());
     }
 
     #[test]
     fn the_tolerance_widens_at_five_characters() {
-        assert_eq!(tolerance_for(&chars("herd")), 1);
-        assert_eq!(tolerance_for(&chars("herdr")), 2);
+        assert_eq!(tolerance_for(&chars("rock")), 1);
+        assert_eq!(tolerance_for(&chars("rocket")), 2);
 
         // Four characters, two edits away: refused.
         assert_eq!(match_key(&chars("abcd"), 1, "/x/abef"), None);
@@ -792,10 +792,10 @@ mod tests {
             Some((1, 0, 0))
         );
         assert_eq!(
-            match_key(&chars("herder"), 2, "/code/herdr"),
+            match_key(&chars("rocjet"), 2, "/code/rocket"),
             Some((0, 1, 1))
         );
-        assert_eq!(match_key(&chars("herder"), 2, "/code/nothing"), None);
+        assert_eq!(match_key(&chars("rocjet"), 2, "/code/nothing"), None);
     }
 
     #[test]
@@ -833,12 +833,12 @@ mod tests {
     #[test]
     fn a_literal_path_that_is_gone_comes_back_as_its_near_miss() {
         let home = FixtureHome::new();
-        let real = home.dir("code/herdr-mobile");
+        let real = home.dir("code/rocket-app");
         home.z(&[(real.as_str(), 10.0)]);
 
         // One wrong character in the folder name of a path that is spelled
         // out in full.
-        let typo = home.absent("code/herdr-mobil");
+        let typo = home.absent("code/rocket-ap");
         let places = lookup(&home.desk(), &typo, MAX_PLACES);
         assert_eq!(paths(&places), vec![real]);
     }
