@@ -3953,9 +3953,9 @@
         "ServerLookupPlaceParams": {
           "properties": {
             "limit": {
-              "description": "How many places to answer with, capped at eight. Absent means the\ncap.",
+              "description": "How many places to answer with, capped at eight. Absent means the\ncap. Zero is refused rather than answered, which is what the\ndeclared minimum says.",
               "format": "uint32",
-              "minimum": 0,
+              "minimum": 1,
               "type": [
                 "integer",
                 "null"

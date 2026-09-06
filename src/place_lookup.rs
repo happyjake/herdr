@@ -7,12 +7,20 @@
 //! in. Nothing here browses the disk, so a directory nobody has ever opened
 //! is not a place this server can name. Every source is optional and a
 //! missing or unreadable one is skipped without a word.
+//!
+//! Comparison folds both sides to NFC and then lowercases them, which is
+//! the same rule the phone-side matcher applies, so the two agree on a
+//! decomposed accent. Full Unicode case folding is deliberately not applied
+//! — `ß` and `ss` stay different here as they do there — and that is the
+//! known residual.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::Deserialize;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::api::schema::PlaceSource;
 
@@ -22,14 +30,14 @@ pub(crate) const MAX_PLACES: usize = 8;
 /// Newest session transcripts whose first line is read, per agent.
 const SESSION_FILES_READ: usize = 40;
 
-/// Transcripts one walk collects before it stops descending. Session
-/// directories are named by date, so the walk visits them newest name
-/// first and this bound keeps a long history off the request path.
+/// Transcripts one walk examines before it stops descending. The walk
+/// enters bucket directories newest first, so the bound cuts off the oldest
+/// history rather than the newest sessions, and the newest transcripts are
+/// then chosen by modification time across every bucket it did reach.
 const SESSION_FILES_SCANNED: usize = 400;
 
-/// Largest source file this reads. A lookup runs on the same thread that
-/// serves every other request, so a pathological dotfile is skipped rather
-/// than parsed.
+/// Largest source file this reads, so a pathological dotfile is skipped
+/// rather than parsed.
 const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// What this server remembers, in the order the sources are trusted.
@@ -87,22 +95,28 @@ pub(crate) fn lookup(desk: &Desk, query: &str, limit: usize) -> Vec<Place> {
                 source,
             }];
         }
-        let name = folder_name(&literal).to_string();
+        let name = folder_name(&literal);
         return rank(&name, candidates, limit);
     }
 
     rank(query, candidates, limit)
 }
 
+/// How long tmux gets to answer before the lookup goes on without it.
+pub(crate) const TMUX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Working directories of live tmux panes, or nothing at all when tmux is
-/// not installed, not running, or unhappy.
-pub(crate) fn tmux_pane_dirs() -> Vec<PathBuf> {
-    let output = std::process::Command::new("tmux")
+/// not installed, not running, unhappy, or simply too slow. A wedged tmux
+/// server is a source that is missing, never a request that hangs, so the
+/// process is killed when the deadline passes.
+pub(crate) async fn tmux_pane_dirs() -> Vec<PathBuf> {
+    let mut command = tokio::process::Command::new("tmux");
+    command
         .args(["list-panes", "-a", "-F", "#{pane_current_path}"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(output) = output else {
+        .kill_on_drop(true);
+    let Ok(Ok(output)) = tokio::time::timeout(TMUX_TIMEOUT, command.output()).await else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -222,11 +236,13 @@ fn expand_tilde(query: &str, home: Option<&Path>) -> String {
         .map_or_else(|| query.to_string(), str::to_string)
 }
 
-fn folder_name(path: &str) -> &str {
-    match path.trim_end_matches('/').rsplit_once('/') {
-        Some((_, name)) if !name.is_empty() => name,
-        _ => path,
-    }
+/// The last component of a path, read the way the platform reads paths, so
+/// a Windows source keeps its folder tier instead of matching whole drive
+/// strings.
+fn folder_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_string(), |name| name.to_string_lossy().into())
 }
 
 /// Order the matches.
@@ -239,7 +255,7 @@ fn folder_name(path: &str) -> &str {
 /// and the check happens after the sort so a lookup stats what it reports
 /// rather than everything it remembers.
 fn rank(query: &str, candidates: Vec<Candidate>, limit: usize) -> Vec<Place> {
-    let query: Vec<char> = query.to_lowercase().chars().collect();
+    let query = folded(query);
     if query.is_empty() || limit == 0 {
         return Vec::new();
     }
@@ -254,17 +270,28 @@ fn rank(query: &str, candidates: Vec<Candidate>, limit: usize) -> Vec<Place> {
 
     matched.sort_by_key(|(tier, kind, distance, order, _)| (*tier, *kind, *distance, *order));
 
+    let mut answered = HashSet::new();
     let mut places = Vec::new();
     for (_, _, _, _, candidate) in matched {
         if places.len() == limit {
             break;
         }
-        if Path::new(&candidate.path).is_dir() {
-            places.push(Place {
-                path: candidate.path,
-                source: candidate.source,
-            });
+        let path = Path::new(&candidate.path);
+        if !path.is_dir() {
+            continue;
         }
+        // Two spellings of one directory — a symlink and what it points at,
+        // say — are one place. The canonical form is only the key; the
+        // answer keeps the spelling that ranked first, which is the one the
+        // server actually remembers.
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(&candidate.path));
+        if !answered.insert(key) {
+            continue;
+        }
+        places.push(Place {
+            path: candidate.path,
+            source: candidate.source,
+        });
     }
     places
 }
@@ -285,20 +312,28 @@ fn tolerance_for(query: &[char]) -> usize {
 /// of match (subsequence, then edit distance), then how far the edit
 /// distance ran.
 fn match_key(query: &[char], tolerance: usize, path: &str) -> Option<(u8, u8, usize)> {
-    let lower: Vec<char> = path.to_lowercase().chars().collect();
-    let folder_start = lower.iter().rposition(|c| *c == '/').map_or(0, |at| at + 1);
-    let folder = &lower[folder_start..];
-
-    if is_subsequence(query, folder) {
+    let folder = folded(&folder_name(path));
+    if is_subsequence(query, &folder) {
         return Some((0, 0, 0));
     }
-    if let Some(distance) = edit_distance_within(query, folder, tolerance) {
+    if let Some(distance) = edit_distance_within(query, &folder, tolerance) {
         return Some((0, 1, distance));
     }
-    if is_subsequence(query, &lower) {
+    if is_subsequence(query, &folded(path)) {
         return Some((1, 0, 0));
     }
     None
+}
+
+/// Fold one side of a comparison: NFC first, so a decomposed accent is the
+/// same letter as a precomposed one, then lowercase.
+fn folded(value: &str) -> Vec<char> {
+    value
+        .nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .chars()
+        .collect()
 }
 
 fn is_subsequence(needle: &[char], haystack: &[char]) -> bool {
@@ -393,6 +428,24 @@ fn claude_dirs(home: Option<&Path>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Directories the saved layout stands in: each workspace's own, then its
+/// panes' in pane order, so one file always reads the same way.
+pub(crate) fn persisted_layout_dirs(path: &Path) -> Vec<PathBuf> {
+    let Some(snapshot) = crate::persist::load_from_path(path) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for workspace in &snapshot.workspaces {
+        dirs.push(workspace.identity_cwd.clone());
+        for tab in &workspace.tabs {
+            let mut panes: Vec<_> = tab.panes.iter().collect();
+            panes.sort_by_key(|(number, _)| **number);
+            dirs.extend(panes.into_iter().map(|(_, pane)| pane.cwd.clone()));
+        }
+    }
+    dirs
+}
+
 #[derive(Deserialize)]
 struct SessionHead {
     #[serde(default)]
@@ -430,40 +483,53 @@ fn session_dirs(home: Option<&Path>) -> Vec<String> {
 /// Collect the newest `.jsonl` files sitting exactly `depth` directories
 /// under `root`. The walk is a fixed shape, not a search: it never looks
 /// wider than the layout an agent writes its sessions in.
+///
+/// The newest are chosen by modification time across every bucket the walk
+/// reached — not per bucket and not in traversal order — so one fresh
+/// transcript is never hidden by a crowd of old ones filed elsewhere. The
+/// walk enters buckets newest first and stops after
+/// [`SESSION_FILES_SCANNED`] transcripts, so the bound cuts the oldest
+/// history rather than the newest sessions.
 fn newest_transcripts(root: &Path, depth: usize) -> Vec<PathBuf> {
     let mut found = Vec::new();
     walk_transcripts(root, depth, &mut found);
 
-    let mut dated: Vec<(std::time::SystemTime, PathBuf)> = found
-        .into_iter()
-        .filter_map(|path| {
-            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-            Some((modified, path))
-        })
-        .collect();
-    dated.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    dated
+    found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    found
         .into_iter()
         .take(SESSION_FILES_READ)
         .map(|(_, path)| path)
         .collect()
 }
 
-fn walk_transcripts(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+fn walk_transcripts(dir: &Path, depth: usize, found: &mut Vec<(SystemTime, PathBuf)>) {
     if found.len() >= SESSION_FILES_SCANNED {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut names: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+    let mut children: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((modified, entry.path()))
+        })
         .collect();
-    // Session directories are named by date, so the newest name first is
-    // the newest session first, and the scan bound keeps the tail unread.
-    names.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+    // Newest first, with the name as a stable tiebreak, so the bound below
+    // cuts the oldest history rather than whichever bucket sorts last.
+    children.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.file_name().cmp(&left.1.file_name()))
+    });
 
-    for path in names {
+    for (modified, path) in children {
         if found.len() >= SESSION_FILES_SCANNED {
             return;
         }
@@ -472,7 +538,7 @@ fn walk_transcripts(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
             {
-                found.push(path);
+                found.push((modified, path));
             }
         } else if path.is_dir() {
             walk_transcripts(&path, depth - 1, found);
@@ -906,6 +972,137 @@ mod tests {
         home.z(&[(odd.as_str(), 10.0)]);
 
         assert_eq!(paths(&lookup(&home.desk(), "sigma", MAX_PLACES)), vec![odd]);
+    }
+
+    #[test]
+    fn a_saved_layout_is_a_source() {
+        let home = FixtureHome::new();
+        let workspace = home.dir("code/upsilon-workspace");
+        let pane = home.dir("code/upsilon-pane");
+        home.write(
+            "session.json",
+            &serde_json::json!({
+                "version": 3,
+                "workspaces": [{
+                    "id": "wtest",
+                    "identity_cwd": workspace,
+                    "tabs": [{
+                        "layout": { "Pane": 0 },
+                        "panes": {
+                            "0": { "cwd": workspace },
+                            "1": { "cwd": pane }
+                        },
+                        "zoomed": false,
+                        "focused": 0,
+                        "root_pane": 0
+                    }],
+                    "active_tab": 0
+                }],
+                "active": 0,
+                "selected": 0
+            })
+            .to_string(),
+        );
+
+        let dirs = persisted_layout_dirs(&home.root.join("session.json"));
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from(&workspace),
+                PathBuf::from(&workspace),
+                PathBuf::from(&pane)
+            ]
+        );
+
+        // And a layout that is not there is simply not a source.
+        assert!(persisted_layout_dirs(&home.root.join("nothing.json")).is_empty());
+    }
+
+    #[test]
+    fn the_newest_transcript_wins_over_a_crowded_older_bucket() {
+        let home = FixtureHome::new();
+        let crowded = home.dir("code/tau-crowded");
+        let newest = home.dir("code/tau-newest");
+
+        // The crowd is written first and named so it sorts first by name:
+        // only reading modification times can put the lone newer
+        // transcript ahead of it.
+        let stamp = std::time::SystemTime::now();
+        for index in 0..SESSION_FILES_SCANNED {
+            home.write(
+                &format!(".pi/agent/sessions/zzz-crowd/{index}.jsonl"),
+                &format!(
+                    "{{\"cwd\": {}}}\n",
+                    serde_json::to_string(&crowded).unwrap()
+                ),
+            );
+            set_modified(
+                &home
+                    .root
+                    .join(format!(".pi/agent/sessions/zzz-crowd/{index}.jsonl")),
+                stamp - std::time::Duration::from_secs(3600),
+            );
+        }
+        home.write(
+            ".pi/agent/sessions/aaa-fresh/one.jsonl",
+            &format!("{{\"cwd\": {}}}\n", serde_json::to_string(&newest).unwrap()),
+        );
+        set_modified(
+            &home.root.join(".pi/agent/sessions/aaa-fresh/one.jsonl"),
+            stamp,
+        );
+
+        let places = lookup(&home.desk(), "tau", MAX_PLACES);
+        assert_eq!(
+            places.first().map(|place| place.path.as_str()),
+            Some(newest.as_str()),
+            "places: {places:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_directory_reached_two_ways_is_one_place() {
+        let home = FixtureHome::new();
+        let real = home.dir("code/phi");
+        let alias = home.absent("code/phi-alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("fixture symlink");
+
+        // The alias is the hotter z entry, so it is the spelling that
+        // ranks first and the spelling the answer keeps.
+        home.z(&[(alias.as_str(), 500.0), (real.as_str(), 1.0)]);
+
+        let places = lookup(&home.desk(), "phi", MAX_PLACES);
+        assert_eq!(paths(&places), vec![alias.as_str()]);
+    }
+
+    #[test]
+    fn a_decomposed_accent_is_the_same_letter_as_a_precomposed_one() {
+        // The same word, written both ways, must fold to one thing.
+        assert_eq!(folded("cafe\u{301}"), folded("CAF\u{c9}"));
+        assert_eq!(
+            match_key(&folded("caf\u{e9}"), 1, "/code/Cafe\u{301}"),
+            Some((0, 0, 0))
+        );
+
+        let home = FixtureHome::new();
+        let cafe = home.dir("code/caf\u{e9}");
+        home.z(&[(cafe.as_str(), 10.0)]);
+
+        assert_eq!(
+            paths(&lookup(&home.desk(), "cafe\u{301}", MAX_PLACES)),
+            vec![cafe]
+        );
+    }
+
+    #[test]
+    fn the_folder_name_comes_from_the_platform_s_path_rules() {
+        assert_eq!(folder_name("/code/zeta"), "zeta");
+        assert_eq!(folder_name("/code/zeta/"), "zeta");
+        // A path with no last component is all the name there is.
+        assert_eq!(folder_name("/"), "/");
+        #[cfg(windows)]
+        assert_eq!(folder_name(r"C:\code\zeta"), "zeta");
     }
 
     fn chars(value: &str) -> Vec<char> {

@@ -133,6 +133,12 @@ itself when it exists, and otherwise its folder name is run through the matcher
 so the near miss comes back as a candidate. A blank query or a `limit` of zero
 is refused with `invalid_params`.
 
+The lookup is bounded rather than best-effort: it is answered off the app
+thread, tmux gets two seconds before it is skipped, the whole request gives up
+after five and answers an empty list, and only two lookups run at a time per
+server, so a client that asks faster than the server can answer queues instead
+of piling on.
+
 The method is additive: a server that predates it cannot parse the method and
 refuses the request, which is how a client learns the lookup is absent.
 

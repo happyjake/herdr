@@ -9,7 +9,7 @@ pub mod plugin_registry;
 mod restore;
 mod snapshot;
 
-pub use self::io::{clear, clear_history, load, load_history, save};
+pub use self::io::{clear, clear_history, load, load_from_path, load_history, save, session_path};
 pub use self::restore::restore;
 #[cfg(unix)]
 pub use self::restore::{handoff_pane_aliases, restore_handoff};

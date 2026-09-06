@@ -20,8 +20,10 @@ pub struct ServerLookupPlaceParams {
     /// case-insensitively against the directories this server remembers.
     pub query: String,
     /// How many places to answer with, capped at eight. Absent means the
-    /// cap.
+    /// cap. Zero is refused rather than answered, which is what the
+    /// declared minimum says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub limit: Option<u32>,
 }
 
