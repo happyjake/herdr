@@ -9,11 +9,19 @@
 //! answers; the saved layout and every other source are read off the
 //! connection's own blocking pool.
 //!
-//! Three bounds keep a slow or hostile desk from turning into a stuck
-//! request: tmux gets its own short deadline, the whole gather runs under
-//! an overall deadline that answers nothing when it fires, and only two
-//! lookups run at a time per server process so a client cannot multiply the
-//! cost by reconnecting.
+//! One deadline covers the whole request — the wait for a turn, the ask to
+//! the app, tmux, and the scan alike — and a request that runs out of time
+//! anywhere under it answers an empty list, the same answer a desk with no
+//! match gives. Inside that, tmux and the app each carry their own shorter
+//! bound.
+//!
+//! Only two lookups run at a time per server process, and the turn is held
+//! by the scan rather than by the request waiting on it. A blocking scan
+//! cannot be cancelled, so a request that gives up leaves its scan running
+//! and its turn taken until the scan is genuinely over; the next request
+//! waits for a real vacancy instead of starting work beside it. The
+//! blocking pool is sized to the same number, so even a mistake cannot
+//! grow it.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -35,8 +43,10 @@ const LOOKUP_DEADLINE: Duration = Duration::from_secs(5);
 /// Lookups allowed to run at once in this process.
 const CONCURRENT_LOOKUPS: usize = 2;
 
-/// How long the app gets to hand back its live pane directories.
-const LIVE_DIRS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the app gets to hand back its live pane directories. Shorter
+/// than the whole request's deadline, so a silent app is the inner bound
+/// rather than the thing that spends the request.
+const LIVE_DIRS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Where one lookup's memory is to be read from.
 ///
@@ -44,9 +54,11 @@ const LIVE_DIRS_TIMEOUT: Duration = Duration::from_secs(5);
 /// hands over a fixture, which is what keeps the tests off the machine's
 /// own desk.
 pub(super) struct Sources {
-    /// Directories the server's live panes stand in, already asked of the
-    /// app.
-    pub live: Vec<PathBuf>,
+    /// Reads the directories the server's live panes stand in. Held as
+    /// something still to do, not something already done, because asking
+    /// the app blocks and every part of a lookup belongs inside the same
+    /// deadline and the same turn.
+    pub live: Box<dyn FnOnce() -> Vec<PathBuf> + Send>,
     /// Home directory carrying the dotfile sources.
     pub home: Option<PathBuf>,
     /// The saved layout to read, when there is one to read.
@@ -72,17 +84,23 @@ pub(super) fn handle_lookup(
         }
     };
 
-    // The sources are read inside the gate, so the app request this
-    // lookup makes is bounded by the same two-at-a-time rule as the
-    // filesystem work behind it.
-    let places = blocking_lookup(query, limit, LOOKUP_DEADLINE, || Sources {
-        live: live_pane_dirs(api_tx),
+    let api_tx = api_tx.clone();
+    let sources = Sources {
+        live: Box::new(move || live_pane_dirs(&api_tx)),
         home: crate::worktree::home_dir(),
         persisted: Some(crate::persist::session_path()),
         consult_tmux: true,
-    });
+    };
 
-    encode(request_id, places)
+    respond(request_id, query, limit, sources)
+}
+
+/// Answer one already-read lookup from the sources it names.
+fn respond(request_id: String, query: &str, limit: usize, sources: Sources) -> String {
+    encode(
+        request_id,
+        blocking_lookup(query, limit, LOOKUP_DEADLINE, sources),
+    )
 }
 
 fn encode(request_id: String, places: Vec<Place>) -> String {
@@ -161,6 +179,10 @@ fn runtime() -> Option<&'static Runtime> {
         .get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(CONCURRENT_LOOKUPS)
+                // As many blocking threads as there are turns to be had, so
+                // the pool cannot grow past the concurrency bound however
+                // this file is later edited.
+                .max_blocking_threads(CONCURRENT_LOOKUPS)
                 .thread_name("herdr-place-lookup")
                 .enable_all()
                 .build()
@@ -174,28 +196,22 @@ fn permits() -> &'static Arc<Semaphore> {
     PERMITS.get_or_init(|| Arc::new(Semaphore::new(CONCURRENT_LOOKUPS)))
 }
 
-/// Run one lookup to completion from a blocking thread.
+/// Run one lookup to completion from a blocking thread, whole.
 ///
-/// `sources` is read after the gate is passed, so whatever it costs to
-/// collect counts against the same bound as the lookup itself.
+/// The deadline starts here and covers everything: waiting for a turn,
+/// asking the app, asking tmux, and the scan.
 pub(super) fn blocking_lookup(
     query: &str,
     limit: usize,
     deadline: Duration,
-    sources: impl FnOnce() -> Sources,
+    sources: Sources,
 ) -> Vec<Place> {
     let Some(runtime) = runtime() else {
         return Vec::new();
     };
-    // A queue rather than a refusal: a caller that arrives third waits its
-    // turn instead of adding to the load.
-    let Ok(_permit) = runtime.block_on(Arc::clone(permits()).acquire_owned()) else {
-        return Vec::new();
-    };
-    let sources = sources();
     runtime.block_on(within_deadline(
         deadline,
-        gather(query.to_string(), limit, sources),
+        lookup(query.to_string(), limit, sources),
     ))
 }
 
@@ -210,15 +226,40 @@ async fn within_deadline(
         .unwrap_or_default()
 }
 
-async fn gather(query: String, limit: usize, sources: Sources) -> Vec<Place> {
+async fn lookup(query: String, limit: usize, sources: Sources) -> Vec<Place> {
+    // A queue rather than a refusal: a caller that arrives third waits its
+    // turn instead of adding to the load, and gives up when the deadline
+    // above says so.
+    let Ok(permit) = Arc::clone(permits()).acquire_owned().await else {
+        return Vec::new();
+    };
     let tmux = if sources.consult_tmux {
         place_lookup::tmux_pane_dirs().await
     } else {
         Vec::new()
     };
+    scan(permit, query, limit, sources, tmux).await
+}
 
+/// The blocking half of a lookup: ask the app, read the saved layout and
+/// the home sources, match, rank.
+///
+/// The turn travels into the closure rather than staying with the request
+/// that started it. A blocking task cannot be cancelled, so a request that
+/// gives up at its deadline leaves this scan running — and the place it
+/// was counted in stays taken until the scan itself is over, which is what
+/// keeps the number of scans in flight at the bound instead of the number
+/// of requests still waiting.
+async fn scan(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    query: String,
+    limit: usize,
+    sources: Sources,
+    tmux: Vec<PathBuf>,
+) -> Vec<Place> {
     tokio::task::spawn_blocking(move || {
-        let mut workspaces = sources.live;
+        let _permit = permit;
+        let mut workspaces = (sources.live)();
         if let Some(persisted) = sources.persisted.as_deref() {
             workspaces.extend(place_lookup::persisted_layout_dirs(persisted));
         }
@@ -303,8 +344,14 @@ mod tests {
 
         /// Sources that name this fixture and nothing on the real desk.
         fn sources(&self, live: Vec<PathBuf>) -> Sources {
+            self.sources_from(move || live)
+        }
+
+        /// The same, with the live directories read by a closure the test
+        /// controls, so a stalled or counted scan can be staged.
+        fn sources_from(&self, live: impl FnOnce() -> Vec<PathBuf> + Send + 'static) -> Sources {
             Sources {
-                live,
+                live: Box::new(live),
                 home: Some(self.root.clone()),
                 persisted: Some(self.root.join("session.json")),
                 consult_tmux: false,
@@ -408,7 +455,7 @@ mod tests {
             methods
         });
 
-        let dirs = live_pane_dirs(&tx);
+        let dirs = live_pane_dirs(&tx.clone());
         drop(tx);
         let methods = responder.join().expect("responder");
 
@@ -456,9 +503,12 @@ mod tests {
             .to_string(),
         );
 
-        let places = blocking_lookup("zephyr", MAX_PLACES, LOOKUP_DEADLINE, || {
-            fixture.sources(vec![PathBuf::from(&live)])
-        });
+        let places = blocking_lookup(
+            "zephyr",
+            MAX_PLACES,
+            LOOKUP_DEADLINE,
+            fixture.sources(vec![PathBuf::from(&live)]),
+        );
 
         let paths: Vec<&str> = places.iter().map(|place| place.path.as_str()).collect();
         assert_eq!(paths, vec![live, saved, pane_dir, z]);
@@ -503,11 +553,174 @@ mod tests {
         // And the real lookup does answer under the real deadline, so the
         // deadline is not quietly swallowing every result.
         assert_eq!(
-            blocking_lookup("omega", MAX_PLACES, LOOKUP_DEADLINE, || fixture
-                .sources(vec![PathBuf::from(&live)]))
+            blocking_lookup(
+                "omega",
+                MAX_PLACES,
+                LOOKUP_DEADLINE,
+                fixture.sources(vec![PathBuf::from(&live)])
+            )
             .len(),
             1
         );
+    }
+
+    #[test]
+    fn the_success_response_is_the_shape_a_client_reads() {
+        let fixture = Fixture::new();
+        let live = fixture.dir("code/iris");
+
+        let response = respond(
+            "req_place".into(),
+            "iris",
+            MAX_PLACES,
+            fixture.sources(vec![PathBuf::from(&live)]),
+        );
+
+        assert_eq!(
+            response,
+            format!(
+                r#"{{"id":"req_place","result":{{"type":"server_lookup_place","places":[{{"path":"{live}","source":"workspace"}}]}}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_scan_that_outlives_its_request_keeps_its_turn() {
+        let fixture = Fixture::new();
+        let live = fixture.dir("code/sable");
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Arc::new(std::sync::Mutex::new(held));
+
+        // Two requests whose scans will not finish until this test lets
+        // them, each given a deadline it is bound to miss.
+        let abandoned: Vec<_> = (0..CONCURRENT_LOOKUPS)
+            .map(|_| {
+                let started = Arc::clone(&started);
+                let finished = Arc::clone(&finished);
+                let held = Arc::clone(&held);
+                let sources = fixture.sources_from(move || {
+                    started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Bounded, so a regression that waits this scan out
+                    // shows up as a slow answer rather than a hung test.
+                    let _ = held
+                        .lock()
+                        .expect("gate")
+                        .recv_timeout(Duration::from_secs(5));
+                    finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Vec::new()
+                });
+                std::thread::spawn(move || {
+                    blocking_lookup("sable", MAX_PLACES, Duration::from_millis(200), sources)
+                })
+            })
+            .collect();
+
+        // Wait until both scans are genuinely running.
+        let waiting_until = std::time::Instant::now() + Duration::from_secs(10);
+        while started.load(std::sync::atomic::Ordering::SeqCst) < CONCURRENT_LOOKUPS {
+            assert!(
+                std::time::Instant::now() < waiting_until,
+                "the stuck scans never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Both requests give up at their deadline and answer nothing,
+        // while their scans are still running.
+        for thread in abandoned {
+            assert!(thread.join().expect("abandoned request").is_empty());
+        }
+
+        // The turns belong to the scans, not to the requests that walked
+        // away from them, so nothing is free while those scans run.
+        assert_eq!(
+            permits().available_permits(),
+            0,
+            "an abandoned request handed its turn back while its scan was still running"
+        );
+
+        // A third request therefore finds no turn free. It answers empty
+        // inside its own deadline, and no third scan is ever started — not
+        // while the two are stuck, and not once they are released either.
+        let counted = Arc::clone(&started);
+        let began = std::time::Instant::now();
+        let places = blocking_lookup(
+            "sable",
+            MAX_PLACES,
+            Duration::from_millis(200),
+            fixture.sources_from(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vec![PathBuf::from(&live)]
+            }),
+        );
+        let waited = began.elapsed();
+
+        assert!(places.is_empty(), "places: {places:?}");
+        assert!(
+            waited < Duration::from_secs(1),
+            "the third request waited {waited:?}, far past its own deadline"
+        );
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            CONCURRENT_LOOKUPS,
+            "a third scan started while two were still running"
+        );
+
+        for _ in 0..CONCURRENT_LOOKUPS {
+            release.send(()).expect("release the stuck scans");
+        }
+
+        // Let the released scans finish and hand their turns back. A scan
+        // the third request had queued behind them would run now, so the
+        // count is read again after the pool has been free for a while.
+        let freed_by = std::time::Instant::now() + Duration::from_secs(10);
+        while finished.load(std::sync::atomic::Ordering::SeqCst) < CONCURRENT_LOOKUPS
+            || permits().available_permits() < CONCURRENT_LOOKUPS
+        {
+            assert!(
+                std::time::Instant::now() < freed_by,
+                "a finished scan never gave its turn back"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            CONCURRENT_LOOKUPS,
+            "a third scan ran after the two before it were released"
+        );
+    }
+
+    #[test]
+    fn a_stalled_app_spends_the_deadline_and_no_more() {
+        let fixture = Fixture::new();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+
+        // The app never answers. The request gives up at its deadline
+        // rather than waiting out the ask.
+        let began = std::time::Instant::now();
+        let places = blocking_lookup(
+            "quartz",
+            MAX_PLACES,
+            Duration::from_millis(200),
+            fixture.sources_from(move || {
+                // Bounded for the same reason: a request that waits the
+                // app out is a slow answer here, not a hung test.
+                let _ = held.recv_timeout(Duration::from_secs(3));
+                Vec::new()
+            }),
+        );
+        let waited = began.elapsed();
+
+        assert!(places.is_empty(), "places: {places:?}");
+        assert!(
+            waited < Duration::from_secs(1),
+            "a stalled app held the request for {waited:?}"
+        );
+
+        drop(release);
     }
 
     #[test]
