@@ -145,6 +145,15 @@ pub struct PaneSnapshot {
     /// existed restores every pane unpinned instead of failing the session.
     #[serde(default)]
     pub pinned: bool,
+    /// Who wrote the label, when it was not a person. Absent from a
+    /// snapshot written before provenance was kept, which restores a label
+    /// that is nobody's — the same thing it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_source: Option<crate::api::schema::LabelSource>,
+    /// Unix seconds at which the label was written, absent for the same
+    /// reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_at: Option<u64>,
 }
 
 /// The socket API's name for a status, as stored in a snapshot.
@@ -395,6 +404,8 @@ fn capture_tab(
         let agent_status_saw_other =
             durable_agent_status.is_some_and(|claim| claim.saw_other_status);
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
+        let label_source = terminal.and_then(|terminal| terminal.label_source);
+        let label_at = terminal.and_then(|terminal| terminal.label_at);
         let pinned = terminal.is_some_and(|terminal| terminal.pinned);
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
@@ -443,6 +454,8 @@ fn capture_tab(
                 agent_status_resolve_by,
                 agent_status_saw_other,
                 pinned,
+                label_source,
+                label_at,
             },
         );
     }
@@ -835,6 +848,65 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_pane_carries_whose_its_label_is_and_when_it_was_written() {
+        let mut state = state_with_workspaces(&["provenance-capture"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_manual_label_from_at(
+                "beacon relay".into(),
+                Some(crate::api::schema::LabelSource::Editor),
+                1_700_000_000,
+            );
+
+        let snapshot = capture_from_state(&state);
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("captured pane");
+        assert_eq!(pane.label.as_deref(), Some("beacon relay"));
+        assert_eq!(
+            pane.label_source,
+            Some(crate::api::schema::LabelSource::Editor)
+        );
+        assert_eq!(pane.label_at, Some(1_700_000_000));
+
+        let json = serde_json::to_value(pane).expect("serialize pane");
+        assert_eq!(json["label_source"], "editor");
+        assert_eq!(json["label_at"], 1_700_000_000u64);
+        let read_back: PaneSnapshot =
+            serde_json::from_value(json).expect("a captured pane reads back");
+        assert_eq!(
+            read_back.label_source,
+            Some(crate::api::schema::LabelSource::Editor)
+        );
+        assert_eq!(read_back.label_at, Some(1_700_000_000));
+
+        // A name nobody in particular gave carries no source, and the keys
+        // it has nothing to say with stay out of the file.
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_manual_label("beacon relay".into());
+        let snapshot = capture_from_state(&state);
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("captured pane");
+        let json = serde_json::to_value(pane).expect("serialize pane");
+        assert!(json.get("label_source").is_none());
+        assert!(json.get("label_at").is_some());
+    }
+
+    #[test]
     fn a_snapshot_written_before_the_pin_restores_every_pane_unpinned() {
         let json = r#"{
             "cwd": "/tmp",
@@ -846,6 +918,11 @@ mod tests {
         assert!(
             !pane.pinned,
             "a pane written before the pin existed restores unpinned"
+        );
+        assert_eq!(
+            (pane.label_source, pane.label_at),
+            (None, None),
+            "and one written before provenance restores a name that is nobody's"
         );
     }
 
@@ -901,6 +978,8 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             },
         );
         panes.insert(
@@ -917,6 +996,8 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             },
         );
 
@@ -1470,6 +1551,8 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             },
         );
         panes.insert(
@@ -1488,6 +1571,8 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             },
         );
 

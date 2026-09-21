@@ -1093,6 +1093,9 @@ impl App {
                             crate::api::schema::PaneRenameParams {
                                 pane_id,
                                 label: Some(new_name),
+                                // The desk's own rename is a person's own
+                                // words, and claims no source.
+                                source: None,
                             },
                         );
                     }
@@ -1284,6 +1287,7 @@ impl App {
                         crate::api::schema::PaneRenameParams {
                             pane_id,
                             label: None,
+                            source: None,
                         },
                     );
                 }

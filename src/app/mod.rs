@@ -4239,6 +4239,7 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id: "w1:p1".into(),
                 label: Some("logs".into()),
+                source: None,
             }),
         };
         let worktree_list = crate::api::schema::Request {
@@ -4509,6 +4510,7 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id: pane_id.clone(),
                 label: Some("reviewer".into()),
+                source: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4535,6 +4537,7 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id,
                 label: None,
+                source: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4743,6 +4746,7 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id: pane_id.clone(),
                 label: Some("reviewer".into()),
+                source: None,
             }),
         });
         let renamed = app.event_hub.events_after(sequence);
@@ -4759,6 +4763,7 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id: pane_id.clone(),
                 label: None,
+                source: None,
             }),
         });
         let cleared = app.event_hub.events_after(sequence);
@@ -4863,6 +4868,7 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id: pane_id.clone(),
                 label: Some("reviewer".into()),
+                source: None,
             }),
         });
 
@@ -4893,6 +4899,7 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id: pane_id.clone(),
                 label: None,
+                source: None,
             }),
         });
 
@@ -4905,10 +4912,13 @@ mod tests {
         );
     }
 
+    /// A name committed again in the same words is still a name committed:
+    /// the write time moves, so the pane publishes it. What is republished
+    /// is the same label, which is what makes the repeat harmless to fold.
     #[test]
-    fn pane_rename_to_the_same_label_publishes_nothing() {
+    fn pane_rename_in_the_same_words_restamps_the_label_and_publishes_it() {
         let mut app = test_app();
-        let workspace = Workspace::test_new("api-pane-rename-noop");
+        let workspace = Workspace::test_new("api-pane-rename-again");
         let pane = workspace.tabs[0].root_pane;
         app.state.workspaces = vec![workspace];
         app.state.ensure_test_terminals();
@@ -4921,8 +4931,11 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id: pane_id.clone(),
                 label: Some("reviewer".into()),
+                source: Some(crate::api::schema::LabelSource::Editor),
             }),
         });
+        let written_at = app.pane_info(0, pane).unwrap().label_at;
+        assert!(written_at.is_some());
 
         let sequence = app.event_hub.current_sequence();
         app.handle_api_request(crate::api::schema::Request {
@@ -4930,10 +4943,136 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id,
                 label: Some("  reviewer  ".into()),
+                source: None,
             }),
         });
 
-        assert!(agent_status_event_labels_after(&app, sequence).is_empty());
+        assert_eq!(
+            agent_status_event_labels_after(&app, sequence),
+            vec![Some("reviewer".to_string())],
+            "the same words, committed again, are published as the standing name"
+        );
+        let pane_info = app.pane_info(0, pane).unwrap();
+        assert_eq!(pane_info.label.as_deref(), Some("reviewer"));
+        assert_eq!(
+            pane_info.label_source, None,
+            "and taking the name in your own words makes it yours"
+        );
+        assert!(pane_info.label_at >= written_at);
+    }
+
+    #[test]
+    fn a_rename_says_whose_the_name_is_and_when_it_was_written() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-rename-source");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let before = crate::pane::unix_now_secs();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_editor".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: Some("beacon relay".into()),
+                source: Some(crate::api::schema::LabelSource::Editor),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["pane"]["label"], "beacon relay");
+        assert_eq!(response["result"]["pane"]["label_source"], "editor");
+        let stamped = response["result"]["pane"]["label_at"].as_u64().unwrap();
+        assert!(stamped >= before);
+
+        // A rename with nobody behind it clears the source, and restamps.
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_person".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: Some("frame drops".into()),
+                source: None,
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["pane"]["label"], "frame drops");
+        assert!(
+            response["result"]["pane"]["label_source"].is_null(),
+            "a name in a person's own words is nobody else's: {response}"
+        );
+        assert!(response["result"]["pane"]["label_at"].as_u64().unwrap() >= stamped);
+
+        // A clear forgets the name and everything kept about it.
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req_pane_rename_clear_source".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id,
+                label: None,
+                source: Some(crate::api::schema::LabelSource::Editor),
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(response["result"]["pane"].get("label").is_none());
+        assert!(response["result"]["pane"]["label_source"].is_null());
+        assert!(response["result"]["pane"]["label_at"].is_null());
+    }
+
+    /// A rename that moves nothing but whose the name is still publishes:
+    /// the source is a kept field like the label itself.
+    #[test]
+    fn a_rename_that_only_changes_whose_the_name_is_publishes_the_pane() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-rename-source-only");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_source_only_first".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: pane_id.clone(),
+                label: Some("beacon relay".into()),
+                source: None,
+            }),
+        });
+
+        let sequence = app.event_hub.current_sequence();
+        app.handle_api_request(crate::api::schema::Request {
+            id: "req_source_only_second".into(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id,
+                label: Some("beacon relay".into()),
+                source: Some(crate::api::schema::LabelSource::Editor),
+            }),
+        });
+
+        let published: Vec<_> = app
+            .event_hub
+            .events_after(sequence)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                crate::api::schema::EventData::PaneAgentStatusChanged {
+                    label,
+                    label_source,
+                    label_at,
+                    ..
+                } => Some((label, label_source, label_at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published.len(), 1, "one change publishes one event");
+        assert_eq!(published[0].0.as_deref(), Some("beacon relay"));
+        assert_eq!(
+            published[0].1,
+            Some(crate::api::schema::LabelSource::Editor)
+        );
+        assert!(published[0].2.is_some());
     }
 
     #[test]
@@ -4984,6 +5123,7 @@ mod tests {
             method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
                 pane_id,
                 label: Some("reviewer".into()),
+                source: None,
             }),
         });
 
@@ -5016,6 +5156,11 @@ mod tests {
             agent_status_event_labels_after(&app, sequence),
             vec![Some("reviewer".to_string())]
         );
+        // A name typed at the desk is the person's own, so it claims no
+        // source — only its write time is kept.
+        let pane_info = app.pane_info(0, pane).unwrap();
+        assert_eq!(pane_info.label_source, None);
+        assert!(pane_info.label_at.is_some());
     }
 
     #[test]

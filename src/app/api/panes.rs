@@ -1191,14 +1191,28 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let previous_label = terminal.manual_label.clone();
+        let before = (
+            terminal.manual_label.clone(),
+            terminal.label_source,
+            terminal.label_at,
+        );
         match params.label.map(|label| label.trim().to_string()) {
-            Some(label) if !label.is_empty() => terminal.set_manual_label(label),
+            // A name committed again in the same words is still a name
+            // committed: it restamps the time and takes the source, which
+            // is how someone re-typing an automatic name makes it theirs.
+            Some(label) if !label.is_empty() => {
+                terminal.set_manual_label_from(label, params.source)
+            }
             _ => terminal.clear_manual_label(),
         }
-        let label_changed = terminal.manual_label != previous_label;
+        let kept_changed = before
+            != (
+                terminal.manual_label.clone(),
+                terminal.label_source,
+                terminal.label_at,
+            );
         self.state.mark_session_dirty();
-        if label_changed {
+        if kept_changed {
             self.emit_pane_kept_presentation_changed(ws_idx, pane_id);
         }
         let pane = self.pane_info(ws_idx, pane_id).unwrap();

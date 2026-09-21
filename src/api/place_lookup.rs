@@ -305,6 +305,8 @@ mod tests {
             alternate_screen: false,
             agent_status_changed_at: None,
             pinned: false,
+            label_source: None,
+            label_at: None,
             revision: 0,
         }
     }

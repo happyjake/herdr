@@ -248,6 +248,27 @@ pub struct PaneRenameParams {
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Who this name is from, when it is not from a person.
+    ///
+    /// Absent is the ordinary rename — someone typing a name, at the desk
+    /// or anywhere else — and it clears any source the label was standing
+    /// with. A blank or absent `label` clears the label, the source and the
+    /// time together. Additive: a server that predates the field ignores
+    /// it, keeps no source, and every name there reads as a person's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<LabelSource>,
+}
+
+/// Who wrote a pane's label, when it was not a person.
+///
+/// Kept beside the label rather than derived, and never shown: it is there
+/// so a client that names panes by itself can tell its own names from the
+/// ones people and skills gave, and leave those alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelSource {
+    /// A client's own automatic namer wrote it.
+    Editor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -574,6 +595,21 @@ pub struct PaneInfo {
     /// and write it only when the user asks for it.
     #[serde(default)]
     pub pinned: bool,
+    /// Who wrote the standing `label`, when it was not a person.
+    ///
+    /// Always serialized, like `pinned` and for the same reason: a client
+    /// reads the absence of this key as a server that keeps no provenance
+    /// at all, so a null — a name a person or a skill gave — has to stay
+    /// distinguishable from "this server has no such notion".
+    #[serde(default)]
+    pub label_source: Option<LabelSource>,
+    /// Unix seconds at which the standing `label` was written.
+    ///
+    /// Always serialized, for the same reason. Null when no label stands,
+    /// and on a label restored from a session captured before the write
+    /// time was kept.
+    #[serde(default)]
+    pub label_at: Option<u64>,
     pub revision: u64,
 }
 

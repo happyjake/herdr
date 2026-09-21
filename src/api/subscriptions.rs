@@ -75,6 +75,8 @@ struct PanePresentationSnapshot {
     display_agent: Option<String>,
     state_labels: std::collections::HashMap<String, String>,
     label: Option<String>,
+    label_source: Option<crate::api::schema::LabelSource>,
+    label_at: Option<u64>,
     pinned: bool,
 }
 
@@ -85,6 +87,8 @@ impl PanePresentationSnapshot {
             display_agent: pane.display_agent.clone(),
             state_labels: pane.state_labels.clone(),
             label: pane.label.clone(),
+            label_source: pane.label_source,
+            label_at: pane.label_at,
             pinned: pane.pinned,
         }
     }
@@ -93,17 +97,28 @@ impl PanePresentationSnapshot {
         title: &Option<String>,
         display_agent: &Option<String>,
         state_labels: &std::collections::HashMap<String, String>,
-        label: &Option<String>,
-        pinned: bool,
+        kept: &KeptPresentation,
     ) -> Self {
         Self {
             title: title.clone(),
             display_agent: display_agent.clone(),
             state_labels: state_labels.clone(),
-            label: label.clone(),
-            pinned,
+            label: kept.label.clone(),
+            label_source: kept.label_source,
+            label_at: kept.label_at,
+            pinned: kept.pinned,
         }
     }
+}
+
+/// The fields a pane keeps rather than derives, carried together through a
+/// replay so a guard cannot put one of them back and let another through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeptPresentation {
+    label: Option<String>,
+    label_source: Option<crate::api::schema::LabelSource>,
+    label_at: Option<u64>,
+    pinned: bool,
 }
 
 pub(super) struct ActiveEventSubscription {
@@ -245,6 +260,8 @@ impl ActiveSubscription {
                         display_agent: probe.display_agent,
                         state_labels: probe.state_labels,
                         label: probe.label,
+                        label_source: probe.label_source,
+                        label_at: probe.label_at,
                         pinned: probe.pinned,
                     });
 
@@ -380,6 +397,8 @@ impl ActiveAgentStatusChangedSubscription {
                 display_agent,
                 state_labels,
                 label,
+                label_source,
+                label_at,
                 pinned,
             } = event.data
             else {
@@ -402,21 +421,22 @@ impl ActiveAgentStatusChangedSubscription {
                 .last_presentation
                 .as_ref()
                 .filter(|_| sequence <= self.probe_sequence);
-            let label = match replayed {
-                Some(known) => known.label.clone(),
-                None => label,
+            let kept = match replayed {
+                Some(known) => KeptPresentation {
+                    label: known.label.clone(),
+                    label_source: known.label_source,
+                    label_at: known.label_at,
+                    pinned: known.pinned,
+                },
+                None => KeptPresentation {
+                    label,
+                    label_source,
+                    label_at,
+                    pinned,
+                },
             };
-            let pinned = match replayed {
-                Some(known) => known.pinned,
-                None => pinned,
-            };
-            let current_presentation = PanePresentationSnapshot::from_event(
-                &title,
-                &display_agent,
-                &state_labels,
-                &label,
-                pinned,
-            );
+            let current_presentation =
+                PanePresentationSnapshot::from_event(&title, &display_agent, &state_labels, &kept);
             self.last_status = Some(agent_status);
             self.last_presentation = Some(current_presentation);
             if self
@@ -437,8 +457,10 @@ impl ActiveAgentStatusChangedSubscription {
                     title,
                     display_agent,
                     state_labels,
-                    label,
-                    pinned,
+                    label: kept.label,
+                    label_source: kept.label_source,
+                    label_at: kept.label_at,
+                    pinned: kept.pinned,
                 }),
             }));
         }
@@ -506,6 +528,8 @@ impl ActiveAgentStatusChangedSubscription {
                 display_agent: pane.display_agent,
                 state_labels: pane.state_labels,
                 label: pane.label,
+                label_source: pane.label_source,
+                label_at: pane.label_at,
                 pinned: pane.pinned,
             }),
         })
@@ -648,16 +672,18 @@ mod tests {
     }
 
     fn labelled_presentation_event(title: Option<&str>, label: Option<&str>) -> EventEnvelope {
-        kept_presentation_event(title, label, false)
+        kept_presentation_event(title, label, None, None, false)
     }
 
     fn pinned_presentation_event(pinned: bool) -> EventEnvelope {
-        kept_presentation_event(None, None, pinned)
+        kept_presentation_event(None, None, None, None, pinned)
     }
 
     fn kept_presentation_event(
         title: Option<&str>,
         label: Option<&str>,
+        label_source: Option<crate::api::schema::LabelSource>,
+        label_at: Option<u64>,
         pinned: bool,
     ) -> EventEnvelope {
         EventEnvelope {
@@ -671,6 +697,8 @@ mod tests {
                 display_agent: None,
                 state_labels: HashMap::new(),
                 label: label.map(str::to_string),
+                label_source,
+                label_at,
                 pinned,
             },
         }
@@ -723,6 +751,8 @@ mod tests {
             alternate_screen: false,
             agent_status_changed_at: Some(1_700_000_000),
             pinned: false,
+            label_source: None,
+            label_at: None,
             revision: 0,
         }
     }
@@ -829,6 +859,8 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             }),
             last_sequence,
             probe_sequence: event_hub.current_sequence(),
@@ -869,6 +901,8 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             }),
             last_sequence,
             probe_sequence: event_hub.current_sequence(),
@@ -882,6 +916,8 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             }),
             request_prefix: "test".into(),
         };
@@ -915,6 +951,8 @@ mod tests {
             state_labels: HashMap::new(),
             label: None,
             pinned: false,
+            label_source: None,
+            label_at: None,
         };
         let json = serde_json::to_value(&unset).expect("serialize event");
         assert!(
@@ -1101,6 +1139,8 @@ mod tests {
             state_labels: HashMap::new(),
             label: None,
             pinned: false,
+            label_source: None,
+            label_at: None,
         };
         let json = serde_json::to_value(&unpinned).expect("serialize event");
         assert_eq!(
@@ -1176,6 +1216,140 @@ mod tests {
             panic!("wrong event data");
         };
         assert!(!data.pinned);
+    }
+
+    fn pane_info_labelled_by(
+        label: Option<&str>,
+        label_source: Option<crate::api::schema::LabelSource>,
+        label_at: Option<u64>,
+    ) -> PaneInfo {
+        PaneInfo {
+            label: label.map(str::to_string),
+            label_source,
+            label_at,
+            ..pane_info_with_scroll(None)
+        }
+    }
+
+    /// Whose a name is, and when it was written, are kept fields like the
+    /// label itself: a change to either alone is news, even when the words
+    /// have not moved.
+    #[test]
+    fn a_change_of_only_whose_the_name_is_still_publishes() {
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: None,
+            last_status: Some(AgentStatus::Unknown),
+            last_presentation: Some(PanePresentationSnapshot::from(&pane_info_labelled_by(
+                Some("reviewer"),
+                Some(crate::api::schema::LabelSource::Editor),
+                Some(1_700_000_000),
+            ))),
+            last_sequence: 0,
+            probe_sequence: 0,
+            initial_event: None,
+            request_prefix: "test".into(),
+        };
+
+        // The same words, now a person's.
+        let event = subscription
+            .event_from_snapshot(pane_info_labelled_by(
+                Some("reviewer"),
+                None,
+                Some(1_700_000_000),
+            ))
+            .expect("a source change is a change");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert_eq!(data.label.as_deref(), Some("reviewer"));
+        assert_eq!(data.label_source, None);
+        assert_eq!(data.label_at, Some(1_700_000_000));
+
+        // The same words and the same hand, written again.
+        let event = subscription
+            .event_from_snapshot(pane_info_labelled_by(
+                Some("reviewer"),
+                None,
+                Some(1_700_000_900),
+            ))
+            .expect("a restamp is a change");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert_eq!(data.label_at, Some(1_700_000_900));
+
+        // And nothing moving is still nothing to say.
+        assert!(subscription
+            .event_from_snapshot(pane_info_labelled_by(
+                Some("reviewer"),
+                None,
+                Some(1_700_000_900)
+            ))
+            .is_none());
+    }
+
+    /// The replay guard puts back every kept field the probe already knew,
+    /// not just the label and the pin.
+    #[test]
+    fn a_setup_window_entry_reports_all_the_kept_fields_the_probe_found() {
+        let event_hub = EventHub::default();
+        let last_sequence = event_hub.current_sequence();
+        // An entry from before the probe, carrying an older provenance.
+        event_hub.push(kept_presentation_event(
+            None,
+            Some("earlier name"),
+            None,
+            Some(1_700_000_000),
+            false,
+        ));
+        let probed = pane_info_labelled_by(
+            Some("reviewer"),
+            Some(crate::api::schema::LabelSource::Editor),
+            Some(1_700_000_900),
+        );
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: None,
+            last_status: Some(AgentStatus::Working),
+            last_presentation: Some(PanePresentationSnapshot::from(&probed)),
+            last_sequence,
+            probe_sequence: event_hub.current_sequence(),
+            initial_event: None,
+            request_prefix: "test".into(),
+        };
+
+        let event = subscription
+            .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
+            .expect("setup-window delivery");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert_eq!(data.label.as_deref(), Some("reviewer"));
+        assert_eq!(
+            data.label_source,
+            Some(crate::api::schema::LabelSource::Editor),
+            "a stale entry must not un-say whose the standing name is"
+        );
+        assert_eq!(data.label_at, Some(1_700_000_900));
+
+        // An entry published after the probe speaks for itself, provenance
+        // and all.
+        event_hub.push(kept_presentation_event(
+            None,
+            Some("reviewer"),
+            None,
+            Some(1_700_001_500),
+            false,
+        ));
+        let event = subscription
+            .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
+            .expect("live delivery");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("wrong event data");
+        };
+        assert_eq!(data.label_source, None);
+        assert_eq!(data.label_at, Some(1_700_001_500));
     }
 
     #[test]
@@ -1316,7 +1490,13 @@ mod tests {
                     });
                     // The change lands and publishes after that read and
                     // before setup can sample the ring.
-                    published.push(kept_presentation_event(None, Some("reviewer"), true));
+                    published.push(kept_presentation_event(
+                        None,
+                        Some("reviewer"),
+                        None,
+                        None,
+                        true,
+                    ));
                     let _ = message.respond_to.send(response.to_string());
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => std::thread::yield_now(),
@@ -1366,6 +1546,11 @@ mod tests {
             remembered.pinned && remembered.label.as_deref() == Some("reviewer"),
             "and the subscription remembers them, so the next probe sees no change to report"
         );
+        assert_eq!(
+            (remembered.label_source, remembered.label_at),
+            (None, None),
+            "including whose the name is and when it was written"
+        );
     }
 
     #[test]
@@ -1383,6 +1568,8 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             }),
             last_sequence,
             probe_sequence: event_hub.current_sequence(),
@@ -1396,6 +1583,8 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                label_source: None,
+                label_at: None,
             }),
             request_prefix: "test".into(),
         };

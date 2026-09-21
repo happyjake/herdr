@@ -708,6 +708,117 @@ fn agent_view_requests_round_trip() {
 }
 
 #[test]
+fn a_rename_says_nothing_about_a_source_unless_it_has_one() {
+    let plain: Request = serde_json::from_value(serde_json::json!({
+        "id": "req_rename",
+        "method": "pane.rename",
+        "params": { "pane_id": "wG4:p1", "label": "beacon relay" },
+    }))
+    .unwrap();
+    assert_eq!(
+        plain.method,
+        Method::PaneRename(PaneRenameParams {
+            pane_id: "wG4:p1".into(),
+            label: Some("beacon relay".into()),
+            source: None,
+        })
+    );
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(
+        json["params"].get("source").is_none(),
+        "a rename with nobody behind it serializes no key: {json}"
+    );
+
+    let from_a_namer = Request {
+        id: "req_rename".into(),
+        method: Method::PaneRename(PaneRenameParams {
+            pane_id: "wG4:p1".into(),
+            label: Some("beacon relay".into()),
+            source: Some(LabelSource::Editor),
+        }),
+    };
+    let json = serde_json::to_value(&from_a_namer).unwrap();
+    assert_eq!(json["params"]["source"], "editor");
+    assert_eq!(
+        serde_json::from_value::<Request>(json).unwrap(),
+        from_a_namer
+    );
+}
+
+#[test]
+fn pane_info_always_states_whose_the_label_is_and_when_it_was_written() {
+    let pane: PaneInfo = serde_json::from_value(serde_json::json!({
+        "pane_id": "pane_1",
+        "terminal_id": "terminal_1",
+        "workspace_id": "workspace_1",
+        "tab_id": "tab_1",
+        "focused": true,
+        "agent_status": "unknown",
+        "revision": 0
+    }))
+    .unwrap();
+
+    assert_eq!(
+        (pane.label_source, pane.label_at),
+        (None, None),
+        "a pane read from a server that keeps no provenance has none"
+    );
+    let json = serde_json::to_value(&pane).unwrap();
+    assert!(
+        json["label_source"].is_null() && json["label_at"].is_null(),
+        "both keys stay present and null, so their absence can only mean a \
+         server that keeps no provenance at all: {json}"
+    );
+
+    let named = PaneInfo {
+        label: Some("beacon relay".into()),
+        label_source: Some(LabelSource::Editor),
+        label_at: Some(1_700_000_000),
+        ..pane
+    };
+    let json = serde_json::to_value(&named).unwrap();
+    assert_eq!(json["label_source"], "editor");
+    assert_eq!(json["label_at"], 1_700_000_000u64);
+    assert_eq!(serde_json::from_value::<PaneInfo>(json).unwrap(), named);
+}
+
+#[test]
+fn the_status_event_carries_the_labels_provenance_beside_the_label() {
+    let event = PaneAgentStatusChangedEvent {
+        pane_id: "pane_1".into(),
+        workspace_id: "workspace_1".into(),
+        agent_status: AgentStatus::Working,
+        agent: Some("pi".into()),
+        title: None,
+        display_agent: None,
+        state_labels: HashMap::new(),
+        label: Some("beacon relay".into()),
+        label_source: Some(LabelSource::Editor),
+        label_at: Some(1_700_000_000),
+        pinned: false,
+    };
+
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["label_source"], "editor");
+    assert_eq!(json["label_at"], 1_700_000_000u64);
+    assert_eq!(
+        serde_json::from_value::<PaneAgentStatusChangedEvent>(json).unwrap(),
+        event
+    );
+
+    let nobodys = PaneAgentStatusChangedEvent {
+        label_source: None,
+        label_at: None,
+        ..event
+    };
+    let json = serde_json::to_value(&nobodys).unwrap();
+    assert!(
+        json["label_source"].is_null() && json["label_at"].is_null(),
+        "both keys stay present and null, as the label and the pin do: {json}"
+    );
+}
+
+#[test]
 fn prompt_trail_request_names_the_pane_and_nothing_else() {
     let json = serde_json::json!({
         "id": "req_trail",
@@ -1301,6 +1412,8 @@ fn worktree_request_and_response_round_trip() {
                 alternate_screen: false,
                 agent_status_changed_at: Some(1_700_000_000),
                 pinned: false,
+                label_source: None,
+                label_at: None,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1735,6 +1848,8 @@ fn create_response_round_trips_with_root_pane() {
                 alternate_screen: false,
                 agent_status_changed_at: None,
                 pinned: false,
+                label_source: None,
+                label_at: None,
                 revision: 0,
             },
         },
