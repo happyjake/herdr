@@ -191,6 +191,11 @@ pub enum Method {
     PaneCurrent(PaneCurrentParams),
     #[serde(rename = "pane.get")]
     PaneGet(PaneTarget),
+    // What a pane's session record says was asked of it. Additive: a server
+    // that predates it cannot parse the method, and a client reads that
+    // refusal as the trail's absence.
+    #[serde(rename = "pane.prompt_trail")]
+    PanePromptTrail(PaneTarget),
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
     #[serde(rename = "pane.input.set")]

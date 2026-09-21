@@ -4,6 +4,7 @@ pub mod client;
 pub(crate) mod credentials;
 mod event_hub;
 mod place_lookup;
+mod prompt_trail;
 pub mod schema;
 mod server;
 mod server_executable;

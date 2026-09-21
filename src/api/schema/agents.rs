@@ -232,4 +232,10 @@ pub struct AgentSessionInfo {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    /// The record file the harness reported for this session, when it named
+    /// one its `value` does not already name. Additive and absent from an
+    /// older server, and from a report that carried no path: a reader
+    /// derives the file from `value` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_path: Option<String>,
 }

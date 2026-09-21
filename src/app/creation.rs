@@ -537,6 +537,7 @@ fn terminal_agent_session_info(
                 agent: authority.agent_label.clone(),
                 kind: session_ref.kind,
                 value: session_ref.value.clone(),
+                record_path: session_ref.record_path.clone(),
             });
         }
     }
@@ -549,5 +550,6 @@ fn terminal_agent_session_info(
             agent: session.agent.clone(),
             kind: session.session_ref.kind,
             value: session.session_ref.value.clone(),
+            record_path: session.session_ref.record_path.clone(),
         })
 }

@@ -71,6 +71,13 @@
             "kind": {
               "$ref": "#/schemas/event/$defs/AgentSessionRefKind"
             },
+            "record_path": {
+              "description": "The record file the harness reported for this session, when it named\none its `value` does not already name. Additive and absent from an\nolder server, and from a report that carried no path: a reader\nderives the file from `value` instead.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "source": {
               "type": "string"
             },
@@ -5827,6 +5834,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.prompt_trail",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.focus",
               "type": "string"
             },
@@ -6834,6 +6857,13 @@
             },
             "kind": {
               "$ref": "#/schemas/success_response/$defs/AgentSessionRefKind"
+            },
+            "record_path": {
+              "description": "The record file the harness reported for this session, when it named\none its `value` does not already name. Additive and absent from an\nolder server, and from a report that carried no path: a reader\nderives the file from `value` instead.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "source": {
               "type": "string"
@@ -9317,6 +9347,95 @@
             }
           ]
         },
+        "PromptTrail": {
+          "description": "What a pane's session record says was asked of it.\n\nRead from the harness's own file of the conversation, never from the\nscreen: the person's words, or a supervising agent's, and never the\nagent's tool traffic, its results, or what the harness injected on the\nperson's behalf. Every field is always serialized, so a client reads a\nnull as a real absence rather than as a server that has nothing to say.",
+          "properties": {
+            "agent": {
+              "$ref": "#/schemas/success_response/$defs/PromptTrailAgent",
+              "description": "The harness whose record this was read from."
+            },
+            "count": {
+              "description": "Real prompts in the record.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "first": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/TrailPrompt"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The first real prompt of the conversation, cut to about four hundred\ncode points. Null when the record holds no prompt at all."
+            },
+            "newest_at": {
+              "description": "Unix seconds at which the newest real prompt arrived, as the harness\ndated it. Null when the record dates nothing.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "recent": {
+              "description": "The last three real prompts, oldest first, each cut to about two\nhundred and forty code points. The first prompt appears here too\nwhile it is still among the last three.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/TrailPrompt"
+              },
+              "type": "array"
+            },
+            "title": {
+              "description": "The title the harness wrote for this conversation, when it wrote one\nworth reading. Null for a harness that writes none, and for a\nfallback title that says nothing the prompts do not.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "agent",
+            "recent",
+            "count"
+          ],
+          "type": "object"
+        },
+        "PromptTrailAgent": {
+          "description": "A harness whose session record a trail can be read from.",
+          "enum": [
+            "claude",
+            "codex",
+            "pi"
+          ],
+          "type": "string"
+        },
+        "PromptTrailReason": {
+          "description": "Why a pane has no trail. Never an error: a pane with no trail is an\nordinary pane, and a client reads it from the screen instead.",
+          "oneOf": [
+            {
+              "const": "no_session",
+              "description": "The pane reports no agent session — a plain shell, or a pane whose\nharness never reported one.",
+              "type": "string"
+            },
+            {
+              "const": "unsupported_agent",
+              "description": "The pane reports a session for a harness whose records this server\ndoes not read.",
+              "type": "string"
+            },
+            {
+              "const": "no_record",
+              "description": "The record the session names is not on this desk.",
+              "type": "string"
+            },
+            {
+              "const": "unreadable",
+              "description": "The record is there but could not be read within its bounds.",
+              "type": "string"
+            }
+          ]
+        },
         "ReadFormat": {
           "enum": [
             "text",
@@ -9854,6 +9973,47 @@
               "required": [
                 "type",
                 "panes"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "What a pane's session record says was asked of it.\n\n`trail` and `reason` are always serialized and exactly one of them is\never set: a pane with no trail says why in `reason` rather than\nfailing, because having no trail is an ordinary condition a client\nanswers by reading the screen instead.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/PromptTrailReason"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "trail": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/PromptTrail"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "prompt_trail",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "terminal_id"
               ],
               "type": "object"
             },
@@ -10857,6 +11017,28 @@
             "focused",
             "pane_count",
             "agent_status"
+          ],
+          "type": "object"
+        },
+        "TrailPrompt": {
+          "description": "One prompt of a trail.",
+          "properties": {
+            "at": {
+              "description": "Unix seconds at which the harness recorded it, when it recorded one.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "text": {
+              "description": "The prompt as it was asked, whitespace collapsed and cut to the\nlength its place in the trail allows.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
           ],
           "type": "object"
         },

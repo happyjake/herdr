@@ -577,6 +577,71 @@ pub struct PaneInfo {
     pub revision: u64,
 }
 
+/// What a pane's session record says was asked of it.
+///
+/// Read from the harness's own file of the conversation, never from the
+/// screen: the person's words, or a supervising agent's, and never the
+/// agent's tool traffic, its results, or what the harness injected on the
+/// person's behalf. Every field is always serialized, so a client reads a
+/// null as a real absence rather than as a server that has nothing to say.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PromptTrail {
+    /// The harness whose record this was read from.
+    pub agent: PromptTrailAgent,
+    /// The first real prompt of the conversation, cut to about four hundred
+    /// code points. Null when the record holds no prompt at all.
+    pub first: Option<TrailPrompt>,
+    /// The last three real prompts, oldest first, each cut to about two
+    /// hundred and forty code points. The first prompt appears here too
+    /// while it is still among the last three.
+    pub recent: Vec<TrailPrompt>,
+    /// The title the harness wrote for this conversation, when it wrote one
+    /// worth reading. Null for a harness that writes none, and for a
+    /// fallback title that says nothing the prompts do not.
+    pub title: Option<String>,
+    /// Real prompts in the record.
+    pub count: u32,
+    /// Unix seconds at which the newest real prompt arrived, as the harness
+    /// dated it. Null when the record dates nothing.
+    pub newest_at: Option<u64>,
+}
+
+/// One prompt of a trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TrailPrompt {
+    /// The prompt as it was asked, whitespace collapsed and cut to the
+    /// length its place in the trail allows.
+    pub text: String,
+    /// Unix seconds at which the harness recorded it, when it recorded one.
+    pub at: Option<u64>,
+}
+
+/// A harness whose session record a trail can be read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptTrailAgent {
+    Claude,
+    Codex,
+    Pi,
+}
+
+/// Why a pane has no trail. Never an error: a pane with no trail is an
+/// ordinary pane, and a client reads it from the screen instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptTrailReason {
+    /// The pane reports no agent session — a plain shell, or a pane whose
+    /// harness never reported one.
+    NoSession,
+    /// The pane reports a session for a harness whose records this server
+    /// does not read.
+    UnsupportedAgent,
+    /// The record the session names is not on this desk.
+    NoRecord,
+    /// The record is there but could not be read within its bounds.
+    Unreadable,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneScrollInfo {
     pub offset_from_bottom: u64,
