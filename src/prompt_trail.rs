@@ -31,10 +31,14 @@ use crate::api::schema::{PromptTrail, PromptTrailAgent, PromptTrailReason, Trail
 /// declines to read rather than one it reads slowly.
 pub(crate) const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Longest single line this parses. A prompt bigger than this says nothing
-/// a name could be made of, and holding one in memory to find that out is
-/// the cost the bound exists to refuse.
-const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// Longest single line this parses.
+///
+/// Generous on purpose: an image pasted into a prompt rides inside the
+/// user's own line as base64 and runs to several megabytes, so a small
+/// bound here would quietly drop real prompts. A line past even this is
+/// not stepped over — the record is answered as unreadable, because a
+/// record whose prompts this cannot read is not a record it can speak for.
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Code points the first prompt is cut to.
 const FIRST_PROMPT_CHARS: usize = 400;
@@ -95,7 +99,9 @@ pub(crate) fn trail_agent(agent: &str) -> Option<PromptTrailAgent> {
 ///
 /// A path the harness reported beats a derived one: the harness knows
 /// where it is writing, and a derivation is only ever a good guess about a
-/// layout.
+/// layout. It beats it only where it is credible, though — see
+/// [`reported_record`] — and a path that is not falls back to the
+/// derivation as though nothing had been reported.
 pub(crate) fn record_path(
     home: Option<&Path>,
     agent: PromptTrailAgent,
@@ -103,8 +109,8 @@ pub(crate) fn record_path(
     value: &str,
     reported: Option<&str>,
 ) -> Option<PathBuf> {
-    if let Some(reported) = reported.map(Path::new).filter(|path| path.is_file()) {
-        return Some(reported.to_path_buf());
+    if let Some(reported) = reported.and_then(|reported| reported_record(home, reported)) {
+        return Some(reported);
     }
 
     match (agent, kind) {
@@ -118,22 +124,67 @@ pub(crate) fn record_path(
     }
 }
 
+/// A path a harness reported, when it is one worth opening.
+///
+/// The report arrives over the same socket anything else does, and what
+/// comes back out of a record is published as the words someone typed. So
+/// a reported path is honoured only where it can be nothing but a session
+/// record: a real file, of the one extension every harness here writes,
+/// inside the operator's own home. Both sides are resolved first, so a
+/// link pointing out of home is out of home, and a link to nowhere is
+/// nothing.
+///
+/// Deliberately not pinned to the default directories. A harness whose
+/// configuration directory has been moved reports a legitimate path that
+/// no fixed root would recognise, and refusing it would cost a real trail
+/// to catch what the home boundary already catches.
+fn reported_record(home: Option<&Path>, reported: &str) -> Option<PathBuf> {
+    let home = home?.canonicalize().ok()?;
+    let path = Path::new(reported).canonicalize().ok()?;
+    (path.starts_with(&home)
+        && path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        && std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()))
+    .then_some(path)
+}
+
+/// What one read is allowed to spend. Held as a value rather than read
+/// from the constants, so the bounds themselves can be exercised without a
+/// fixture the size of the bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bounds {
+    record_bytes: u64,
+    line_bytes: usize,
+}
+
+impl Bounds {
+    const DEFAULT: Self = Self {
+        record_bytes: MAX_RECORD_BYTES,
+        line_bytes: MAX_LINE_BYTES,
+    };
+}
+
 /// Read one record into the trail it holds.
 pub(crate) fn read(path: &Path, agent: PromptTrailAgent) -> Result<PromptTrail, PromptTrailReason> {
     let metadata = std::fs::metadata(path).map_err(|_| PromptTrailReason::NoRecord)?;
     if !metadata.is_file() {
         return Err(PromptTrailReason::NoRecord);
     }
+    // The cheap refusal: a file already past the bound is never opened. It
+    // is not the whole of the bound, though — a record being written to can
+    // pass it while this walks — so the read counts its own bytes too.
     if metadata.len() > MAX_RECORD_BYTES {
         return Err(PromptTrailReason::Unreadable);
     }
     let file = std::fs::File::open(path).map_err(|_| PromptTrailReason::Unreadable)?;
-    read_lines(std::io::BufReader::new(file), agent)
+    read_lines(std::io::BufReader::new(file), agent, Bounds::DEFAULT)
 }
 
 fn read_lines(
     mut reader: impl BufRead,
     agent: PromptTrailAgent,
+    bounds: Bounds,
 ) -> Result<PromptTrail, PromptTrailReason> {
     let mut first: Option<TrailPrompt> = None;
     // The first prompt whole, only so a title can be judged against what it
@@ -143,22 +194,37 @@ fn read_lines(
     let mut title: Option<String> = None;
     let mut count: u32 = 0;
     let mut newest_at: Option<u64> = None;
+    // Whether this record said anything at all, and whether any of it was
+    // JSON. A file full of something else is not an empty conversation.
+    let mut lines_read: u64 = 0;
+    let mut lines_parsed: u64 = 0;
 
+    let mut consumed: u64 = 0;
     let mut line = Vec::new();
     loop {
-        match read_line_bounded(&mut reader, &mut line) {
+        match read_line_bounded(&mut reader, &mut line, &mut consumed, bounds.line_bytes) {
             Ok(LineRead::End) => break,
-            // A line past the cap is stepped over whole: it is neither a
-            // prompt this counts nor a reason to abandon the record.
-            Ok(LineRead::TooLong) => continue,
+            // A line too big to hold is a prompt this cannot read, and a
+            // trail that quietly left it out would be a wrong answer rather
+            // than a partial one.
+            Ok(LineRead::TooLong) => return Err(PromptTrailReason::Unreadable),
             Ok(LineRead::Line) => {}
             Err(_) => return Err(PromptTrailReason::Unreadable),
+        }
+        // A record that grew past the bound while this was walking it is
+        // the same refusal as one that was already past it.
+        if consumed > bounds.record_bytes {
+            return Err(PromptTrailReason::Unreadable);
+        }
+        if line.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            lines_read += 1;
         }
         // A record's last line is often half written, and a harness may log
         // anything at all; neither is a record this cannot read.
         let Ok(parsed) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
+        lines_parsed += 1;
 
         if let Some(found) = claude_title(agent, &parsed) {
             title = Some(found);
@@ -188,6 +254,13 @@ fn read_lines(
             text: cut(&text, RECENT_PROMPT_CHARS),
             at,
         });
+    }
+
+    // Something was in this file and none of it was JSON: whatever it is,
+    // it is not a conversation this can read, and answering an empty trail
+    // would say the pane was never asked anything.
+    if lines_read > 0 && lines_parsed == 0 {
+        return Err(PromptTrailReason::Unreadable);
     }
 
     // A title that is the harness's own name, or the first prompt said
@@ -348,29 +421,70 @@ fn tag_contents<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     Some(&text[start..end])
 }
 
+/// How an attached image is written into a user turn.
+const IMAGE_TAG_OPEN: &str = "<image";
+const IMAGE_TAG_CLOSE: &str = "</image>";
+
 /// An attached image reads as one, wherever in the text it was written.
+///
+/// The whole element goes — the opening tag, whatever it wrapped, and the
+/// closing tag — because what it wrapped is the harness's own account of
+/// the file rather than anything the person said. A tag left open keeps
+/// the words after it, and a closing tag with no element around it is
+/// dropped where it stands, so neither can surface in a prompt.
+///
+/// Each image is read on its own. One left open followed by a complete one
+/// is two images with the person's words between them, never one image
+/// reaching forward to a closing tag that was never its own.
 fn replace_image_tags(text: &str) -> String {
-    const OPEN: &str = "<image";
     let mut replaced = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find(OPEN) {
-        let after = &rest[start + OPEN.len()..];
-        // A word that merely begins the same way is not a tag.
-        if !matches!(after.chars().next(), Some('>') | Some(' ')) {
-            let (head, tail) = rest.split_at(start + OPEN.len());
-            replaced.push_str(head);
-            rest = tail;
-            continue;
-        }
+    while let Some(start) = next_image_tag(rest) {
+        let after = &rest[start + IMAGE_TAG_OPEN.len()..];
         let Some(end) = after.find('>') else {
             break;
         };
         replaced.push_str(&rest[..start]);
         replaced.push_str("[image]");
-        rest = &after[end + 1..];
+        let inside = &after[end + 1..];
+        rest = match element_end(inside) {
+            Some(closed) => &inside[closed + IMAGE_TAG_CLOSE.len()..],
+            None => inside,
+        };
     }
     replaced.push_str(rest);
-    replaced
+    // A closing tag is no opening one, so a remnant of an element whose
+    // start never reached the record is swept up here.
+    replaced.replace(IMAGE_TAG_CLOSE, "")
+}
+
+/// Where the next image tag opens. A word that merely begins the same way
+/// is not a tag and is walked past.
+fn next_image_tag(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(found) = text[from..].find(IMAGE_TAG_OPEN) {
+        let start = from + found;
+        let after = &text[start + IMAGE_TAG_OPEN.len()..];
+        if matches!(after.chars().next(), Some('>') | Some(' ')) {
+            return Some(start);
+        }
+        from = start + IMAGE_TAG_OPEN.len();
+    }
+    None
+}
+
+/// Where this element's own closing tag is, counting from just inside its
+/// opening tag.
+///
+/// A closing tag is this element's only when it comes before the next one
+/// opens. Past that it belongs to the image that opened in between, and
+/// this tag was simply left open.
+fn element_end(inside: &str) -> Option<usize> {
+    let closed = inside.find(IMAGE_TAG_CLOSE)?;
+    match next_image_tag(inside) {
+        Some(next) if next < closed => None,
+        _ => Some(closed),
+    }
 }
 
 /// One prompt as a row of text: whitespace runs become one space, control
@@ -415,18 +529,23 @@ enum LineRead {
     End,
 }
 
-/// Read one line, holding what is kept of it to [`MAX_LINE_BYTES`].
+/// Read one line, holding it to `line_bytes` and adding what it costs to
+/// `consumed`.
 ///
-/// A line past the cap is still walked to its end — the next line has to
-/// start where it really starts — but nothing of it is kept, so a record
-/// holding one enormous line costs the cap rather than the line.
-fn read_line_bounded(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<LineRead> {
+/// `TooLong` ends the read rather than skipping a line: the reader is
+/// deliberately left where it stands, unadvanced, because a record whose
+/// prompts cannot be read is refused whole. Nothing may carry on past it.
+fn read_line_bounded(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    consumed: &mut u64,
+    line_bytes: usize,
+) -> std::io::Result<LineRead> {
     line.clear();
-    let mut over_cap = false;
     let mut read_anything = false;
 
     loop {
-        let (ended, consumed) = {
+        let (ended, taken) = {
             let available = match reader.fill_buf() {
                 Ok(available) => available,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -437,46 +556,33 @@ fn read_line_bounded(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::
             }
             match available.iter().position(|byte| *byte == b'\n') {
                 Some(index) => {
-                    keep_bounded(line, &available[..index], &mut over_cap);
+                    if line.len() + index > line_bytes {
+                        return Ok(LineRead::TooLong);
+                    }
+                    line.extend_from_slice(&available[..index]);
                     (true, index + 1)
                 }
                 None => {
-                    keep_bounded(line, available, &mut over_cap);
+                    if line.len() + available.len() > line_bytes {
+                        return Ok(LineRead::TooLong);
+                    }
+                    line.extend_from_slice(available);
                     (false, available.len())
                 }
             }
         };
-        reader.consume(consumed);
+        reader.consume(taken);
+        *consumed = consumed.saturating_add(taken as u64);
         read_anything = true;
         if ended {
-            return Ok(line_read(over_cap));
+            return Ok(LineRead::Line);
         }
     }
 
     if !read_anything {
         return Ok(LineRead::End);
     }
-    Ok(line_read(over_cap))
-}
-
-fn line_read(over_cap: bool) -> LineRead {
-    if over_cap {
-        LineRead::TooLong
-    } else {
-        LineRead::Line
-    }
-}
-
-fn keep_bounded(line: &mut Vec<u8>, chunk: &[u8], over_cap: &mut bool) {
-    if *over_cap {
-        return;
-    }
-    if line.len() + chunk.len() > MAX_LINE_BYTES {
-        *over_cap = true;
-        line.clear();
-        return;
-    }
-    line.extend_from_slice(chunk);
+    Ok(LineRead::Line)
 }
 
 /// The claude record for one session id: a file of that name filed under
@@ -783,6 +889,13 @@ mod tests {
                     { "type": "input_text", "text": "here is the trace <image 1> and the log" },
                 ]},
             }),
+            serde_json::json!({
+                "timestamp": "2026-03-05T08:12:00.000Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [
+                    { "type": "input_text", "text": "<image 1>harbour-form.png</image> how shall I fill in this form" },
+                ]},
+            }),
         ])
     }
 
@@ -900,7 +1013,7 @@ mod tests {
         let trail = read(&record, PromptTrailAgent::Codex).expect("a readable record");
 
         assert_eq!(trail.agent, PromptTrailAgent::Codex);
-        assert_eq!(trail.count, 2);
+        assert_eq!(trail.count, 3);
         assert_eq!(
             trail.first.as_ref().map(|first| first.text.as_str()),
             Some("rewrite the lantern parser so it streams")
@@ -910,12 +1023,52 @@ mod tests {
             vec![
                 "rewrite the lantern parser so it streams",
                 "here is the trace [image] and the log",
+                // The whole element reads as one image: what it wrapped is
+                // the harness's account of the file, and a closing tag left
+                // standing would be read as part of what was asked.
+                "[image] how shall I fill in this form",
             ]
         );
         // The web already holds codex's own terminal title; the record's is
         // none of a trail's business.
         assert_eq!(trail.title, None);
-        assert_eq!(trail.newest_at, Some(1772698140));
+        assert_eq!(trail.newest_at, Some(1772698320));
+    }
+
+    #[test]
+    fn an_image_element_reads_as_one_image_however_it_was_written() {
+        // An element with the harness's own account of the file inside it.
+        assert_eq!(
+            replace_image_tags("<image 1>harbour-form.png</image> how shall I fill this in"),
+            "[image] how shall I fill this in"
+        );
+        // A tag left open keeps the words after it.
+        assert_eq!(
+            replace_image_tags("here is the trace <image 1> and the log"),
+            "here is the trace [image] and the log"
+        );
+        // A closing tag with no element around it is dropped where it
+        // stands rather than surfacing as part of the prompt.
+        assert_eq!(
+            replace_image_tags("</image> how shall I fill this in"),
+            " how shall I fill this in"
+        );
+        // One left open, then a complete one: two images, with the words
+        // between them kept. The second element's closing tag was never
+        // the first tag's to reach forward to.
+        assert_eq!(
+            replace_image_tags("<image 1> and see <image 2>photo</image> for comparison"),
+            "[image] and see [image] for comparison"
+        );
+        // Two of them, and a word that merely begins the same way.
+        assert_eq!(
+            replace_image_tags("<image 1>a</image> and <image 2>b</image> of the images"),
+            "[image] and [image] of the images"
+        );
+        assert_eq!(
+            replace_image_tags("the imagery of the harbour"),
+            "the imagery of the harbour"
+        );
     }
 
     #[test]
@@ -1006,26 +1159,123 @@ mod tests {
         );
     }
 
+    /// A prompt too big to hold is a prompt this cannot read, and a trail
+    /// that quietly left it out would be a wrong answer rather than a
+    /// partial one — so the whole record is refused instead.
     #[test]
-    fn a_line_past_its_own_bound_is_stepped_over_whole() {
-        let home = FixtureHome::new();
-        let enormous = claude_user(&"x".repeat(MAX_LINE_BYTES + 16), "2026-03-04T09:15:00Z");
-        let record = home.write(
-            "records/long-line.jsonl",
-            &lines(&[
-                claude_user("first, the short one", "2026-03-04T09:14:00Z"),
-                enormous,
-                claude_user("and the short one after it", "2026-03-04T09:16:00Z"),
-            ]),
-        );
+    fn a_line_past_its_own_bound_refuses_the_record() {
+        let small = Bounds {
+            record_bytes: 1024 * 1024,
+            line_bytes: 256,
+        };
+        let record = lines(&[
+            claude_user("first, the short one", "2026-03-04T09:14:00Z"),
+            claude_user(&"x".repeat(small.line_bytes), "2026-03-04T09:15:00Z"),
+            claude_user("and the short one after it", "2026-03-04T09:16:00Z"),
+        ]);
 
-        let trail = read(&record, PromptTrailAgent::Claude).expect("a readable record");
-
-        assert_eq!(trail.count, 2);
         assert_eq!(
-            texts(&trail.recent),
-            vec!["first, the short one", "and the short one after it"]
+            read_lines(record.as_bytes(), PromptTrailAgent::Claude, small),
+            Err(PromptTrailReason::Unreadable)
         );
+
+        // Everything inside the bound still reads.
+        let within = lines(&[claude_user("first, the short one", "2026-03-04T09:14:00Z")]);
+        assert_eq!(
+            read_lines(within.as_bytes(), PromptTrailAgent::Claude, small)
+                .expect("a readable record")
+                .count,
+            1
+        );
+    }
+
+    /// The line bound is generous on purpose: a pasted image rides inside
+    /// the user's own line as base64, and a bound that cut those off would
+    /// drop real prompts rather than protect anything.
+    #[test]
+    fn the_line_bound_is_roomy_enough_for_a_prompt_carrying_an_image() {
+        const {
+            assert!(
+                MAX_LINE_BYTES >= 8 * 1024 * 1024,
+                "a prompt with an image pasted into it runs to several megabytes"
+            );
+            assert!(
+                (MAX_LINE_BYTES as u64) < MAX_RECORD_BYTES,
+                "one line must not be allowed to outgrow the whole record"
+            );
+        }
+    }
+
+    /// A file that is not a record at all must not read as a pane nobody
+    /// ever asked anything.
+    #[test]
+    fn a_record_whose_lines_are_not_json_is_unreadable() {
+        let home = FixtureHome::new();
+        let record = home.write(
+            "records/not-a-record.jsonl",
+            "the ferry timetable\nand some more of it\n",
+        );
+
+        assert_eq!(
+            read(&record, PromptTrailAgent::Claude),
+            Err(PromptTrailReason::Unreadable)
+        );
+
+        // A record with one readable line among the noise is still a
+        // record: a harness writes its own last line half finished.
+        let half_written = home.write(
+            "records/half-written.jsonl",
+            &(lines(&[claude_user(
+                "trace the ferry import",
+                "2026-03-04T09:15:00Z",
+            )]) + "{\"type\":\"user\",\"mess"),
+        );
+        assert_eq!(
+            read(&half_written, PromptTrailAgent::Claude)
+                .expect("a readable record")
+                .count,
+            1
+        );
+
+        // And an empty file is an empty trail, not an unreadable one.
+        let empty = home.write("records/empty.jsonl", "");
+        assert_eq!(
+            read(&empty, PromptTrailAgent::Claude)
+                .expect("a readable record")
+                .count,
+            0
+        );
+    }
+
+    /// A record being written to can pass the bound while this is walking
+    /// it, so the bound is on the bytes actually taken, not only on what a
+    /// stat said before the read.
+    #[test]
+    fn a_record_that_grows_past_the_bound_mid_read_is_unreadable() {
+        let bound = Bounds {
+            record_bytes: 4096,
+            line_bytes: 1024,
+        };
+        let mut record = lines(&[claude_user(
+            "trace the ferry import",
+            "2026-03-04T09:15:00Z",
+        )]);
+        while record.len() as u64 <= bound.record_bytes {
+            record.push_str(&lines(&[claude_user(
+                "and keep tracing it",
+                "2026-03-04T09:16:00Z",
+            )]));
+        }
+
+        assert_eq!(
+            read_lines(record.as_bytes(), PromptTrailAgent::Claude, bound),
+            Err(PromptTrailReason::Unreadable)
+        );
+
+        // The same record, well short of the bound, still reads.
+        let within = &record[..bound.record_bytes as usize / 2];
+        let within = &within[..within.rfind('\n').expect("a whole line") + 1];
+        assert!(read_lines(within.as_bytes(), PromptTrailAgent::Claude, bound).is_ok());
     }
 
     #[test]
@@ -1072,7 +1322,9 @@ mod tests {
                 id,
                 reported.to_str(),
             ),
-            Some(reported)
+            // Resolved, because a reported path is only honoured once it
+            // has been: it names the same file either way.
+            Some(reported.canonicalize().expect("a real fixture record"))
         );
 
         // A reported path that is not there falls back to the derivation
@@ -1085,6 +1337,83 @@ mod tests {
             home.path().join("elsewhere/gone.jsonl").to_str(),
         )
         .is_some_and(|path| path.ends_with(format!("{id}.jsonl"))));
+    }
+
+    #[test]
+    fn a_reported_path_is_honoured_only_where_it_can_only_be_a_record() {
+        let home = FixtureHome::new();
+        let id = "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22";
+        let derived = home.write(&format!(".claude/projects/-invented-beacon/{id}.jsonl"), "");
+
+        let reported = |path: Option<&Path>| {
+            record_path(
+                Some(home.path()),
+                PromptTrailAgent::Claude,
+                AgentSessionRefKind::Id,
+                id,
+                path.and_then(Path::to_str),
+            )
+        };
+
+        // A record filed somewhere unusual inside home is still a record:
+        // a harness whose configuration directory has moved reports one.
+        let relocated = home.write("elsewhere/records/moved.jsonl", "");
+        assert_eq!(
+            reported(Some(&relocated)),
+            Some(relocated.canonicalize().expect("a real fixture record"))
+        );
+
+        // Outside home it is not this server's to read.
+        let outside = std::env::temp_dir().join(format!(
+            "herdr-prompt-trail-outside-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&outside, "").expect("a file outside the fixture home");
+        assert_eq!(
+            reported(Some(&outside)),
+            Some(derived.clone()),
+            "a path outside home falls back to the derivation"
+        );
+
+        // Nor by way of a link that leads out of it.
+        #[cfg(unix)]
+        {
+            let link = home.path().join("elsewhere/linked.jsonl");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&outside, &link).expect("a link out of home");
+            assert_eq!(
+                reported(Some(&link)),
+                Some(derived.clone()),
+                "a link under home pointing outside it is still outside it"
+            );
+
+            let dangling = home.path().join("elsewhere/dangling.jsonl");
+            let _ = std::fs::remove_file(&dangling);
+            std::os::unix::fs::symlink(home.path().join("elsewhere/gone.jsonl"), &dangling)
+                .expect("a link to nowhere");
+            assert_eq!(reported(Some(&dangling)), Some(derived.clone()));
+        }
+        let _ = std::fs::remove_file(&outside);
+
+        // Only the one extension every harness here writes.
+        let wrong_kind = home.write("elsewhere/records/notes.txt", "");
+        assert_eq!(reported(Some(&wrong_kind)), Some(derived.clone()));
+
+        // And never a directory.
+        let directory = home.path().join("elsewhere/records");
+        assert_eq!(reported(Some(&directory)), Some(derived.clone()));
+
+        // A desk with no home to measure against honours no reported path.
+        assert_eq!(
+            record_path(
+                None,
+                PromptTrailAgent::Claude,
+                AgentSessionRefKind::Id,
+                id,
+                relocated.to_str(),
+            ),
+            None
+        );
     }
 
     #[test]

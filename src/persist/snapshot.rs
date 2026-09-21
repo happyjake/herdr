@@ -190,6 +190,17 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    /// The record file the harness reported for this session, when it named
+    /// one its `value` does not already name.
+    ///
+    /// Captured so a restart or a handoff keeps reading the record the
+    /// harness itself pointed at, rather than falling back to a derivation
+    /// that may not find a conversation filed somewhere unusual. Absent
+    /// from a snapshot written before it was kept, and from a session whose
+    /// harness reported no path; a reader derives the file from `value`
+    /// then, exactly as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -433,6 +444,7 @@ fn capture_tab(
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
+                        record_path: session_ref.record_path.clone(),
                     });
                 }
             }
@@ -444,6 +456,7 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
+                    record_path: session.session_ref.record_path.clone(),
                 })
         });
         panes.insert(
@@ -1620,6 +1633,72 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Path
         );
         assert_eq!(agent_session.value, session_path);
+    }
+
+    /// A harness that says where it is writing has that kept with the
+    /// session, so a restart reads the conversation where the harness
+    /// pointed rather than where a derivation would look.
+    #[test]
+    fn capture_contract_keeps_the_record_path_a_harness_reported() {
+        let mut state = state_with_workspaces(&["one"]);
+        let record_path = test_session_path("records/beacon-relay.jsonl");
+        let root = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(
+                    "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22",
+                )
+                .unwrap()
+                .with_record_path(Some(record_path.clone())),
+            });
+
+        let snapshot = capture_from_state(&state);
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("agent session should be captured");
+
+        assert_eq!(agent_session.value, "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22");
+        assert_eq!(
+            agent_session.record_path.as_deref(),
+            Some(record_path.as_str())
+        );
+
+        let json = serde_json::to_value(agent_session).expect("serialize agent session");
+        assert_eq!(json["record_path"], record_path);
+        let read_back: PaneAgentSessionSnapshot =
+            serde_json::from_value(json).expect("a captured session reads back");
+        assert_eq!(read_back.record_path.as_deref(), Some(record_path.as_str()));
+
+        // A session whose harness named no file says nothing about one.
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(
+                    "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22",
+                )
+                .unwrap(),
+            });
+        let snapshot = capture_from_state(&state);
+        let agent_session = snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+            .agent_session
+            .as_ref()
+            .expect("agent session should be captured");
+        let json = serde_json::to_value(agent_session).expect("serialize agent session");
+        assert!(json.get("record_path").is_none());
     }
 
     #[test]

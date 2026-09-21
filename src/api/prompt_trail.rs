@@ -28,8 +28,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 
 use crate::api::schema::{
-    AgentSessionInfo, ErrorResponse, Method, PaneTarget, PromptTrail, PromptTrailReason, Request,
-    ResponseResult, SuccessResponse,
+    AgentSessionInfo, ErrorResponse, Method, PaneTarget, PromptTrail, PromptTrailAgent,
+    PromptTrailReason, Request, ResponseResult, SuccessResponse,
 };
 use crate::api::ApiRequestSender;
 
@@ -58,7 +58,30 @@ pub(super) struct Sources {
     pub pane: Box<dyn FnOnce() -> String + Send>,
     /// Home directory the records are filed under.
     pub home: Option<PathBuf>,
+    /// Reads one record into a trail. Production walks the file; a test
+    /// hands over a reader it controls, so a read that outlives the
+    /// deadline can be staged without a record the size of the bound.
+    pub record: RecordReader,
 }
+
+/// Which pane a request turned out to be about.
+///
+/// Published out of the read as soon as the app names it, so a read that
+/// then outruns the deadline can still answer for that pane rather than
+/// failing the request. A pane with an unreadable record is an ordinary
+/// answer; a request that never learned which pane it was about is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneIdentity {
+    pane_id: String,
+    terminal_id: String,
+}
+
+type SeenPane = Arc<std::sync::Mutex<Option<PaneIdentity>>>;
+
+/// Reads one record into a trail.
+type RecordReader = Box<
+    dyn FnOnce(&std::path::Path, PromptTrailAgent) -> Result<PromptTrail, PromptTrailReason> + Send,
+>;
 
 /// What one request has to say, before it is encoded.
 enum Answer {
@@ -93,6 +116,7 @@ pub(super) fn handle_prompt_trail(
     let sources = Sources {
         pane: Box::new(move || ask_for_pane(&pane_id, &api_tx)),
         home: crate::worktree::home_dir(),
+        record: Box::new(crate::prompt_trail::read),
     };
 
     respond(request_id, sources)
@@ -185,18 +209,38 @@ fn blocking_trail(deadline: Duration, sources: Sources) -> Answer {
     let Some(runtime) = runtime() else {
         return unavailable("no runtime to read a prompt trail on");
     };
-    runtime.block_on(within_deadline(deadline, trail(sources)))
+    let seen: SeenPane = Arc::new(std::sync::Mutex::new(None));
+    runtime.block_on(within_deadline(
+        deadline,
+        trail(sources, Arc::clone(&seen)),
+        &seen,
+    ))
 }
 
-/// Hold one trail to its deadline. A read that cannot finish in time says
-/// so rather than answering a pane it never identified.
+/// Hold one trail to its deadline.
+///
+/// What running out of time means depends on how far the request got. Once
+/// the app has named the pane, a read still going is a record this server
+/// could not read in the time it allows itself, which is one of the
+/// ordinary reasons a pane has no trail. Before that, the request never
+/// learned which pane it was about, and there is nothing to answer for.
 async fn within_deadline(
     deadline: Duration,
     work: impl std::future::Future<Output = Answer>,
+    seen: &SeenPane,
 ) -> Answer {
-    tokio::time::timeout(deadline, work)
-        .await
-        .unwrap_or_else(|_| unavailable("timed out reading the prompt trail"))
+    match tokio::time::timeout(deadline, work).await {
+        Ok(answer) => answer,
+        Err(_) => match seen.lock().ok().and_then(|pane| pane.clone()) {
+            Some(pane) => Answer::Trail {
+                pane_id: pane.pane_id,
+                terminal_id: pane.terminal_id,
+                trail: None,
+                reason: Some(PromptTrailReason::Unreadable),
+            },
+            None => unavailable("timed out reading the prompt trail"),
+        },
+    }
 }
 
 fn unavailable(message: &str) -> Answer {
@@ -206,14 +250,14 @@ fn unavailable(message: &str) -> Answer {
     }
 }
 
-async fn trail(sources: Sources) -> Answer {
+async fn trail(sources: Sources, seen: SeenPane) -> Answer {
     // A queue rather than a refusal: a caller that arrives third waits its
     // turn instead of adding to the load, and gives up when the deadline
     // above says so.
     let Ok(permit) = Arc::clone(permits()).acquire_owned().await else {
         return unavailable("no turn to read a prompt trail in");
     };
-    read(permit, sources).await
+    read(permit, sources, seen).await
 }
 
 /// The blocking half of a trail: ask the app, find the record, read it.
@@ -224,17 +268,27 @@ async fn trail(sources: Sources) -> Answer {
 /// was counted in stays taken until the read itself is over, which is what
 /// keeps the number of reads in flight at the bound instead of the number
 /// of requests still waiting.
-async fn read(permit: tokio::sync::OwnedSemaphorePermit, sources: Sources) -> Answer {
+async fn read(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    sources: Sources,
+    seen: SeenPane,
+) -> Answer {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        answer_from(&(sources.pane)(), sources.home.as_deref())
+        let Sources { pane, home, record } = sources;
+        answer_from(&pane(), home.as_deref(), record, &seen)
     })
     .await
     .unwrap_or_else(|_| unavailable("the prompt trail read did not finish"))
 }
 
 /// Turn the app's answer about a pane into this request's answer.
-fn answer_from(pane_response: &str, home: Option<&std::path::Path>) -> Answer {
+fn answer_from(
+    pane_response: &str,
+    home: Option<&std::path::Path>,
+    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<PromptTrail, PromptTrailReason>,
+    seen: &SeenPane,
+) -> Answer {
     let pane = match serde_json::from_str::<SuccessResponse>(pane_response) {
         Ok(response) => match response.result {
             ResponseResult::PaneInfo { pane } => pane,
@@ -253,7 +307,16 @@ fn answer_from(pane_response: &str, home: Option<&std::path::Path>) -> Answer {
         }
     };
 
-    let (trail, reason) = match trail_for(pane.agent_session.as_ref(), home) {
+    // Said before the record is opened, so a read that outruns the deadline
+    // still has a pane to answer for.
+    if let Ok(mut identity) = seen.lock() {
+        *identity = Some(PaneIdentity {
+            pane_id: pane.pane_id.clone(),
+            terminal_id: pane.terminal_id.clone(),
+        });
+    }
+
+    let (trail, reason) = match trail_for(pane.agent_session.as_ref(), home, record) {
         Ok(trail) => (Some(trail), None),
         Err(reason) => (None, Some(reason)),
     };
@@ -269,6 +332,7 @@ fn answer_from(pane_response: &str, home: Option<&std::path::Path>) -> Answer {
 fn trail_for(
     session: Option<&AgentSessionInfo>,
     home: Option<&std::path::Path>,
+    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<PromptTrail, PromptTrailReason>,
 ) -> Result<PromptTrail, PromptTrailReason> {
     let session = session.ok_or(PromptTrailReason::NoSession)?;
     let agent = crate::prompt_trail::trail_agent(&session.agent)
@@ -281,7 +345,7 @@ fn trail_for(
         session.record_path.as_deref(),
     )
     .ok_or(PromptTrailReason::NoRecord)?;
-    crate::prompt_trail::read(&path, agent)
+    record(&path, agent)
 }
 
 #[cfg(test)]
@@ -333,6 +397,24 @@ mod tests {
             Sources {
                 pane: Box::new(pane),
                 home: Some(self.root.clone()),
+                record: Box::new(crate::prompt_trail::read),
+            }
+        }
+
+        /// The same again, with the record read by a closure the test
+        /// controls, so a read that outlives the deadline can be staged
+        /// without a record the size of the bound.
+        fn sources_reading(
+            &self,
+            pane_response: String,
+            record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<PromptTrail, PromptTrailReason>
+                + Send
+                + 'static,
+        ) -> Sources {
+            Sources {
+                pane: Box::new(move || pane_response),
+                home: Some(self.root.clone()),
+                record: Box::new(record),
             }
         }
     }
@@ -683,6 +765,61 @@ mod tests {
         assert!(
             waited < Duration::from_secs(1),
             "a stalled app held the request for {waited:?}"
+        );
+
+        drop(release);
+    }
+
+    /// Once the app has named the pane, a record this server could not read
+    /// in the time it allows itself is one of the ordinary reasons a pane
+    /// has no trail — not a transport failure the client has to guess at.
+    #[test]
+    fn a_read_that_outlives_the_deadline_says_the_record_was_unreadable() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &format!(".claude/projects/-invented-beacon/{CLAUDE_SESSION}.jsonl"),
+            &claude_record(),
+        );
+        let (release, held) = std::sync::mpsc::channel::<()>();
+
+        let began = std::time::Instant::now();
+        let answer = blocking_trail(
+            Duration::from_millis(200),
+            fixture.sources_reading(
+                pane_response(pane(Some(session(
+                    "claude",
+                    AgentSessionRefKind::Id,
+                    CLAUDE_SESSION,
+                )))),
+                move |_, _| {
+                    // Bounded, so a regression that waits this read out is a
+                    // slow answer here rather than a hung test.
+                    let _ = held.recv_timeout(Duration::from_secs(3));
+                    Err(PromptTrailReason::NoRecord)
+                },
+            ),
+        );
+        let waited = began.elapsed();
+
+        match answer {
+            Answer::Trail {
+                pane_id,
+                terminal_id,
+                trail,
+                reason,
+            } => {
+                assert_eq!(pane_id, "wG4:p1");
+                assert_eq!(terminal_id, "term_beacon");
+                assert_eq!(trail, None);
+                assert_eq!(reason, Some(PromptTrailReason::Unreadable));
+            }
+            Answer::Refused { code, message } => {
+                panic!("a read that ran long was refused as {code}: {message}")
+            }
+        }
+        assert!(
+            waited < Duration::from_secs(1),
+            "the request waited {waited:?}, far past its own deadline"
         );
 
         drop(release);

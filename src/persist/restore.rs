@@ -907,6 +907,7 @@ fn persisted_agent_session_from_snapshot(
         &session.agent,
         session.kind,
         &session.value,
+        session.record_path.clone(),
     )
 }
 
@@ -1124,6 +1125,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            record_path: None,
         };
 
         assert!(restore_plan_for_snapshot(&session, false).is_none());
@@ -1137,8 +1139,60 @@ mod tests {
             agent: "claude".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
+            record_path: None,
         };
         assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
+    }
+
+    /// The record path a harness reported comes back with the session, so a
+    /// restart or a handoff keeps reading the conversation where the
+    /// harness said it was. The resume itself still spells the id.
+    #[test]
+    fn a_restored_session_keeps_the_record_path_it_was_captured_with() {
+        let record_path = test_session_path("records/beacon-relay.jsonl");
+        let session = super::super::snapshot::PaneAgentSessionSnapshot {
+            source: "herdr:claude".into(),
+            agent: "claude".into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22".into(),
+            record_path: Some(record_path.clone()),
+        };
+
+        let restored =
+            persisted_agent_session_from_snapshot(&session).expect("a restorable session");
+        assert_eq!(
+            restored.session_ref.value,
+            "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22"
+        );
+        assert_eq!(
+            restored.session_ref.record_path.as_deref(),
+            Some(record_path.as_str())
+        );
+        assert_eq!(
+            restore_plan_for_snapshot(&session, true).unwrap().argv,
+            vec!["claude", "--resume", "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22"],
+            "a resume is still spelled with the id, whatever else came back"
+        );
+
+        // A session written before the path was kept has the key stripped
+        // from its stored form, and comes back as the id alone.
+        let mut stored = serde_json::to_value(&session).expect("serialize session");
+        assert!(stored.get("record_path").is_some());
+        strip_key(&mut stored, "record_path");
+        let older: super::super::snapshot::PaneAgentSessionSnapshot =
+            serde_json::from_value(stored).expect("an older session still loads");
+        assert_eq!(older.record_path, None);
+
+        let restored = persisted_agent_session_from_snapshot(&older).expect("a restorable session");
+        assert_eq!(
+            restored.session_ref.value,
+            "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22"
+        );
+        assert_eq!(restored.session_ref.record_path, None);
+        assert_eq!(
+            restore_plan_for_snapshot(&older, true).unwrap().argv,
+            vec!["claude", "--resume", "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22"]
+        );
     }
 
     #[test]
@@ -1149,6 +1203,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+            record_path: None,
         };
         let mut resumed = HashSet::new();
 
@@ -1171,6 +1226,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            record_path: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1196,6 +1252,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            record_path: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1224,6 +1281,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            record_path: None,
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1250,6 +1308,7 @@ mod tests {
             agent: "hermes".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "hermes-session".into(),
+            record_path: None,
         };
 
         let preserved = restored_terminal_agent_session(Some(&session), false)
@@ -1266,6 +1325,7 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            record_path: None,
         };
         let mut resumed = HashSet::new();
         assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_some());
@@ -1300,6 +1360,7 @@ mod tests {
                 agent: "opencode".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "keep-my-session".into(),
+                record_path: None,
             });
             let (events, _rx) = mpsc::channel(32);
             let (workspaces, terminals, runtimes) = restore(
@@ -1389,6 +1450,7 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                record_path: None,
                             }),
                             launch_argv: None,
                             agent_status: None,
@@ -2092,6 +2154,7 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                record_path: None,
                             }),
                             launch_argv: None,
                             agent_status: Some("idle".into()),
@@ -2251,6 +2314,7 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+                                record_path: None,
                             }),
                             launch_argv: None,
                             agent_status: Some("working".into()),
@@ -2601,6 +2665,7 @@ mod tests {
                 agent: "codex".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "codex-session".into(),
+                record_path: None,
             }),
             launch_argv: None,
             agent_status: None,
@@ -2759,6 +2824,7 @@ mod tests {
                                 agent: "codex".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "codex-session".into(),
+                                record_path: None,
                             }),
                             launch_argv: None,
                             agent_status: None,
