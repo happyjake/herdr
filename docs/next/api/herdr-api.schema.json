@@ -716,6 +716,28 @@
                     "null"
                   ]
                 },
+                "label_at": {
+                  "default": null,
+                  "description": "Unix seconds at which that label was written. Always serialized,\nfor the same reason.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "label_source": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/event/$defs/LabelSource"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Who wrote that label, when it was not a person. Always\nserialized, for the same reason the label is."
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -801,6 +823,16 @@
           ],
           "type": "string"
         },
+        "LabelSource": {
+          "description": "Who wrote a pane's label, when it was not a person.\n\nKept beside the label rather than derived, and never shown: it is there\nso a client that names panes by itself can tell its own names from the\nones people and skills gave, and leave those alone.",
+          "oneOf": [
+            {
+              "const": "editor",
+              "description": "A client's own automatic namer wrote it.",
+              "type": "string"
+            }
+          ]
+        },
         "PaneInfo": {
           "properties": {
             "agent": {
@@ -862,6 +894,28 @@
                 "string",
                 "null"
               ]
+            },
+            "label_at": {
+              "default": null,
+              "description": "Unix seconds at which the standing `label` was written.\n\nAlways serialized, for the same reason. Null when no label stands,\nand on a label restored from a session captured before the write\ntime was kept.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "label_source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/LabelSource"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Who wrote the standing `label`, when it was not a person.\n\nAlways serialized, like `pinned` and for the same reason: a client\nreads the absence of this key as a server that keeps no provenance\nat all, so a null — a name a person or a skill gave — has to stay\ndistinguishable from \"this server has no such notion\"."
             },
             "mouse_tracking": {
               "default": false,
@@ -2404,6 +2458,16 @@
           ],
           "type": "object"
         },
+        "LabelSource": {
+          "description": "Who wrote a pane's label, when it was not a person.\n\nKept beside the label rather than derived, and never shown: it is there\nso a client that names panes by itself can tell its own names from the\nones people and skills gave, and leave those alone.",
+          "oneOf": [
+            {
+              "const": "editor",
+              "description": "A client's own automatic namer wrote it.",
+              "type": "string"
+            }
+          ]
+        },
         "LayoutApplyParams": {
           "properties": {
             "focus": {
@@ -3102,6 +3166,17 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/LabelSource"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who this name is from, when it is not from a person.\n\nAbsent is the ordinary rename — someone typing a name, at the desk\nor anywhere else — and it clears any source the label was standing\nwith. A blank or absent `label` clears the label, the source and the\ntime together. Additive: a server that predates the field ignores\nit, keeps no source, and every name there reads as a person's."
             }
           },
           "required": [
@@ -6815,6 +6890,16 @@
           ],
           "type": "string"
         },
+        "LabelSource": {
+          "description": "Who wrote a pane's label, when it was not a person.\n\nKept beside the label rather than derived, and never shown: it is there\nso a client that names panes by itself can tell its own names from the\nones people and skills gave, and leave those alone.",
+          "oneOf": [
+            {
+              "const": "editor",
+              "description": "A client's own automatic namer wrote it.",
+              "type": "string"
+            }
+          ]
+        },
         "PaneAgentStatusChangedEvent": {
           "properties": {
             "agent": {
@@ -6839,6 +6924,28 @@
                 "string",
                 "null"
               ]
+            },
+            "label_at": {
+              "default": null,
+              "description": "Unix seconds at which that label was written. Always serialized, for\nthe same reason.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "label_source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/LabelSource"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Who wrote that label, when it was not a person. Always serialized,\nfor the same reason the label is."
             },
             "pane_id": {
               "type": "string"
@@ -7344,7 +7451,7 @@
           "type": "object"
         },
         "CredentialTier": {
-          "description": "What a credential is allowed to do (ADR-0026).\n\nA server honors one managing credential — the pairing's token — and any\nnumber of limited credentials it has minted. Both drive the whole pane\nAPI; the tier decides only who may manage the registry itself.",
+          "description": "What a credential is allowed to do.\n\nA server honors one managing credential — the pairing's token — and any\nnumber of limited credentials it has minted. Both drive the whole pane\nAPI; the tier decides only who may manage the registry itself.",
           "oneOf": [
             {
               "const": "managing",
@@ -7964,6 +8071,28 @@
                     "null"
                   ]
                 },
+                "label_at": {
+                  "default": null,
+                  "description": "Unix seconds at which that label was written. Always serialized,\nfor the same reason.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "label_source": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/LabelSource"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Who wrote that label, when it was not a person. Always\nserialized, for the same reason the label is."
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -8270,6 +8399,16 @@
           ],
           "type": "object"
         },
+        "LabelSource": {
+          "description": "Who wrote a pane's label, when it was not a person.\n\nKept beside the label rather than derived, and never shown: it is there\nso a client that names panes by itself can tell its own names from the\nones people and skills gave, and leave those alone.",
+          "oneOf": [
+            {
+              "const": "editor",
+              "description": "A client's own automatic namer wrote it.",
+              "type": "string"
+            }
+          ]
+        },
         "LayoutDescription": {
           "properties": {
             "focused_pane_id": {
@@ -8527,6 +8666,28 @@
                 "string",
                 "null"
               ]
+            },
+            "label_at": {
+              "default": null,
+              "description": "Unix seconds at which the standing `label` was written.\n\nAlways serialized, for the same reason. Null when no label stands,\nand on a label restored from a session captured before the write\ntime was kept.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "label_source": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/LabelSource"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Who wrote the standing `label`, when it was not a person.\n\nAlways serialized, like `pinned` and for the same reason: a client\nreads the absence of this key as a server that keeps no provenance\nat all, so a null — a name a person or a skill gave — has to stay\ndistinguishable from \"this server has no such notion\"."
             },
             "mouse_tracking": {
               "default": false,
@@ -11443,7 +11604,7 @@
           "properties": {
             "credential_registry": {
               "default": false,
-              "description": "Whether this server keeps a credential registry (ADR-0026): the\npairing's managing credential plus any minted limited credentials,\nwith `credential.mint`, `credential.list`, `credential.revoke`, and\n`credential.revoke_all`. Additive: absent (false) in pongs of servers\nthat predate it, which refuse the verbs as unparseable methods.",
+              "description": "Whether this server keeps a credential registry: the\npairing's managing credential plus any minted limited credentials,\nwith `credential.mint`, `credential.list`, `credential.revoke`, and\n`credential.revoke_all`. Additive: absent (false) in pongs of servers\nthat predate it, which refuse the verbs as unparseable methods.",
               "type": "boolean"
             },
             "detached_server_daemon": {

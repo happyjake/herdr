@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn advertised_client_shell_method_shapes_stay_at_the_v1_contract() {
-        let expected: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
+        let mut expected: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/endpoint-method-shapes-v1.json"
         )))
@@ -296,6 +296,14 @@ mod tests {
         assert_eq!(
             actual.remove("pane.link.resolve").as_deref(),
             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
+        );
+        // pane.rename carries an optional `source` (who wrote the name) that a
+        // v1 client never sends; freeze the extended shape here, next to the
+        // published one it extends.
+        expected.remove("pane.rename");
+        assert_eq!(
+            actual.remove("pane.rename").as_deref(),
+            Some("b0056f475b6042078c05bdad90bc4f3d10934d6af11e4b2cc98d2e6ddb362f13")
         );
 
         assert_eq!(

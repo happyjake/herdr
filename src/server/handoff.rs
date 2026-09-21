@@ -681,6 +681,8 @@ mod tests {
                         agent_status_resolve_by: None,
                         agent_status_saw_other: false,
                         pinned: false,
+                        label_source: None,
+                        label_at: None,
                     },
                 )
             })

@@ -16,16 +16,36 @@ mod worktrees;
 use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
 use crate::events::AppEvent;
 
+/// The fields a pane keeps rather than derives, read and published
+/// together so no publisher can report one of them and forget another.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct KeptPanePresentation {
+    label: Option<String>,
+    label_source: Option<crate::api::schema::LabelSource>,
+    label_at: Option<u64>,
+    pinned: bool,
+}
+
+impl KeptPanePresentation {
+    fn of(terminal: &crate::terminal::TerminalState) -> Self {
+        Self {
+            label: terminal.manual_label.clone(),
+            label_source: terminal.label_source,
+            label_at: terminal.label_at,
+            pinned: terminal.pinned,
+        }
+    }
+}
+
 /// The one place a `pane.agent_status_changed` payload is built, so every
-/// publisher reports the pane's manual label alongside its status.
+/// publisher reports the pane's kept fields alongside its status.
 fn pane_agent_status_changed_event(
     pane_id: String,
     workspace_id: String,
     agent_status: crate::api::schema::AgentStatus,
     agent: Option<String>,
     presentation: crate::terminal::EffectivePresentation,
-    label: Option<String>,
-    pinned: bool,
+    kept: KeptPanePresentation,
 ) -> crate::api::schema::EventEnvelope {
     crate::api::schema::EventEnvelope {
         event: crate::api::schema::EventKind::PaneAgentStatusChanged,
@@ -37,8 +57,10 @@ fn pane_agent_status_changed_event(
             title: presentation.title,
             display_agent: presentation.display_agent,
             state_labels: presentation.state_labels,
-            label,
-            pinned,
+            label: kept.label,
+            label_source: kept.label_source,
+            label_at: kept.label_at,
+            pinned: kept.pinned,
         },
     }
 }
@@ -761,23 +783,22 @@ impl App {
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
         {
-            let (label, pinned) = self.pane_kept_presentation(update.ws_idx, update.pane_id);
             let event = pane_agent_status_changed_event(
                 pane_id,
                 workspace_id,
                 agent_status,
                 update.agent_label.clone(),
                 update.presentation.clone(),
-                label,
-                pinned,
+                self.pane_kept_presentation(update.ws_idx, update.pane_id),
             );
             self.emit_event(event);
         }
     }
 
     /// Publish the pane's presentation because a field the pane keeps rather
-    /// than derives changed: its manual label, or its pin. The agent status is
-    /// reported exactly as the pane holds it; only the kept field moved.
+    /// than derives changed: its manual label, whose that label is, when it
+    /// was written, or its pin. The agent status is reported exactly as the
+    /// pane holds it; only the kept field moved.
     ///
     /// Every writer of either field publishes through here, so a subscriber
     /// hears them the same way and neither can go out on its own path.
@@ -806,28 +827,24 @@ impl App {
             pane_agent_status(terminal.state, pane.seen),
             terminal.effective_agent_label().map(str::to_string),
             terminal.effective_presentation(),
-            terminal.manual_label.clone(),
-            terminal.pinned,
+            KeptPanePresentation::of(terminal),
         ))
     }
 
     /// The kept presentation fields of a pane's terminal, read together so a
-    /// published event cannot report one of them and forget the other.
+    /// published event cannot report one of them and forget another.
     fn pane_kept_presentation(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
-    ) -> (Option<String>, bool) {
-        let Some(terminal) = self
-            .state
+    ) -> KeptPanePresentation {
+        self.state
             .workspaces
             .get(ws_idx)
             .and_then(|ws| ws.pane_state(pane_id))
             .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
-        else {
-            return (None, false);
-        };
-        (terminal.manual_label.clone(), terminal.pinned)
+            .map(KeptPanePresentation::of)
+            .unwrap_or_default()
     }
 
     pub(crate) fn sync_toast_deadline(

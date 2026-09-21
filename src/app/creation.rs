@@ -362,6 +362,8 @@ impl App {
             alternate_screen,
             agent_status_changed_at: Some(pane.agent_status_changed_at_for(agent_status)),
             pinned: terminal.pinned,
+            label_source: terminal.label_source,
+            label_at: terminal.label_at,
             revision: terminal.revision,
         })
     }

@@ -978,6 +978,9 @@ impl ClientShellState {
                 crate::api::schema::PaneRenameParams {
                     pane_id,
                     label: Some(trimmed.to_owned()),
+                    // The desk's own rename is a person's own words, and
+                    // claims no source.
+                    source: None,
                 },
             )),
         };

@@ -529,8 +529,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
             finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         Method::PaneWaitForOutput(params) => {
-            let response =
-                wait_for_output(request_id.clone(), params, transport, api_tx, running)?;
+            let response = wait_for_output(request_id.clone(), params, transport, api_tx, running)?;
             finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         method_body => serve_simple_request(
@@ -1580,6 +1579,8 @@ mod tests {
             alternate_screen: false,
             agent_status_changed_at: Some(1_700_000_000),
             pinned: false,
+            label_source: None,
+            label_at: None,
             revision: 0,
         }
     }
@@ -2140,13 +2141,7 @@ mod tests {
         let server_running = Arc::clone(&running);
         let event_hub = EventHub::default();
         let server_thread = std::thread::spawn(move || {
-            handle_connection(
-                server,
-                &api_tx,
-                &event_hub,
-                &server_running,
-                None,
-            )
+            handle_connection(server, &api_tx, &event_hub, &server_running, None)
         });
 
         let msg = api_rx.blocking_recv().unwrap();
@@ -2185,14 +2180,7 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = EventHub::default();
-        handle_connection(
-            server,
-            &api_tx,
-            &event_hub,
-            &running,
-            None,
-        )
-        .unwrap();
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_1");
@@ -2219,14 +2207,7 @@ mod tests {
 
         let running = Arc::new(AtomicBool::new(true));
         let event_hub = EventHub::default();
-        handle_connection(
-            server,
-            &api_tx,
-            &event_hub,
-            &running,
-            None,
-        )
-        .unwrap();
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_2");
@@ -2287,14 +2268,7 @@ mod tests {
         client.flush().unwrap();
 
         let running = Arc::new(AtomicBool::new(true));
-        handle_connection(
-            server,
-            &api_tx,
-            &event_hub,
-            &running,
-            None,
-        )
-        .unwrap();
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
 
         let response: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response["id"], "wait_close");
@@ -2353,13 +2327,7 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(
-                server,
-                &api_tx,
-                &event_hub,
-                &server_running,
-                None,
-            );
+            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
             done_tx.send(result).unwrap();
         });
 
@@ -2480,13 +2448,7 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(
-                server,
-                &api_tx,
-                &event_hub,
-                &server_running,
-                None,
-            );
+            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
             done_tx.send(result).unwrap();
         });
 
@@ -2524,13 +2486,8 @@ mod tests {
         let server_event_hub = event_hub.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(
-                server,
-                &api_tx,
-                &server_event_hub,
-                &server_running,
-                None,
-            );
+            let result =
+                handle_connection(server, &api_tx, &server_event_hub, &server_running, None);
             done_tx.send(result).unwrap();
         });
 
@@ -2579,13 +2536,8 @@ mod tests {
         let server_event_hub = event_hub.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(
-                server,
-                &api_tx,
-                &server_event_hub,
-                &server_running,
-                None,
-            );
+            let result =
+                handle_connection(server, &api_tx, &server_event_hub, &server_running, None);
             done_tx.send(result).unwrap();
         });
 
@@ -2629,13 +2581,7 @@ mod tests {
         let event_hub = EventHub::default();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server_thread = std::thread::spawn(move || {
-            let result = handle_connection(
-                server,
-                &api_tx,
-                &event_hub,
-                &server_running,
-                None,
-            );
+            let result = handle_connection(server, &api_tx, &event_hub, &server_running, None);
             done_tx.send(result).unwrap();
         });
 

@@ -397,6 +397,9 @@ impl ClientShellState {
                 Method::PaneRename(PaneRenameParams {
                     pane_id,
                     label: None,
+                    // The desk's own rename is a person's own words, and
+                    // claims no source.
+                    source: None,
                 }),
                 outcome,
             ),

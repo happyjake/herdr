@@ -1014,18 +1014,33 @@ publishes the event on its own, with `agent_status` reporting whatever the pane
 already held, so a subscribed client sees a rename as it happens rather than at
 its next snapshot.
 
-The payload also carries `pinned`, the pane's pin. Changing it publishes the
-event on its own in the same way a label change does, with `agent_status`
-reporting whatever the pane already held.
+The payload also carries `pinned`, the pane's pin, and `label_source` and
+`label_at`, which say whose the standing label is and when it was written.
+Changing any of them publishes the event on its own in the same way a label
+change does, with `agent_status` reporting whatever the pane already held.
 
-`label` and `pinned` are the presentation fields always present in this
-payload: `label` is `null` when the pane has no manual label and `pinned` is
-`true` or `false`, where the others are omitted when unset. That is deliberate.
-A client must be able to tell a cleared label (`"label": null`) or an unpinned
-pane (`"pinned": false`) from a server that predates the field (no key at all),
-and keep what it already learned in the second case. `PaneInfo.label` in
-`pane.get`, `session.snapshot`, and the `pane.rename` response is unchanged and
-stays omitted when unset; `PaneInfo.pinned` is always present there too.
+`label`, `label_source`, `label_at` and `pinned` are the presentation fields
+always present in this payload: `label`, `label_source` and `label_at` are
+`null` when there is nothing to say and `pinned` is `true` or `false`, where
+the others are omitted when unset. That is deliberate. A client must be able to
+tell a cleared label (`"label": null`), a name nobody automatic gave
+(`"label_source": null`) or an unpinned pane (`"pinned": false`) from a server
+that predates the field (no key at all), and keep what it already learned in
+the second case. `PaneInfo.label` in `pane.get`, `session.snapshot`, and the
+`pane.rename` response is unchanged and stays omitted when unset;
+`PaneInfo.pinned`, `PaneInfo.label_source` and `PaneInfo.label_at` are always
+present there too.
+
+`pane.rename` takes an optional `source`, today only `"editor"`, which marks a
+name a client's own automatic namer wrote rather than one a person typed. Every
+non-empty rename stamps `label_at` and takes the request's `source`, so a
+rename without one clears any source that was standing — once someone commits a
+name in their own words, even the same words, it is theirs. A blank or absent
+`label` clears the label, the source and the time together. Other writers of a
+pane's label — `layout.apply`, a plugin's pane title, the desk's own pane menu
+— stamp the time and claim no source. The field is additive: a server that
+predates it ignores it, keeps no source, and every name there reads as a
+person's.
 
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a

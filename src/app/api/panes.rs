@@ -12,9 +12,9 @@ use crate::api::schema::{
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendMouseParams, PaneSendTextParams, PaneSetPinnedParams, PaneSplitParams,
-    PaneSwapParams, PaneSwapReason, PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange,
-    PaneZoomMode, PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
+    PaneSendMouseParams, PaneSendTextParams, PaneSetPinnedParams, PaneSplitParams, PaneSwapParams,
+    PaneSwapReason, PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode,
+    PaneZoomParams, PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 #[cfg(test)]
 use crate::api::schema::{ReadFormat, ReadSource};
@@ -105,7 +105,9 @@ fn write_send_input_segments(
     for segment in segments {
         if segment.delay_before.is_zero() {
             if let Some(bytes) = held.replace(segment.bytes) {
-                runtime.try_send_bytes(bytes).map_err(|err| err.to_string())?;
+                runtime
+                    .try_send_bytes(bytes)
+                    .map_err(|err| err.to_string())?;
             }
         } else {
             runtime
@@ -119,7 +121,9 @@ fn write_send_input_segments(
         }
     }
     if let Some(bytes) = held {
-        runtime.try_send_bytes(bytes).map_err(|err| err.to_string())?;
+        runtime
+            .try_send_bytes(bytes)
+            .map_err(|err| err.to_string())?;
     }
     Ok(())
 }
@@ -1586,14 +1590,28 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let previous_label = terminal.manual_label.clone();
+        let before = (
+            terminal.manual_label.clone(),
+            terminal.label_source,
+            terminal.label_at,
+        );
         match params.label.map(|label| label.trim().to_string()) {
-            Some(label) if !label.is_empty() => terminal.set_manual_label(label),
+            // A name committed again in the same words is still a name
+            // committed: it restamps the time and takes the source, which
+            // is how someone re-typing an automatic name makes it theirs.
+            Some(label) if !label.is_empty() => {
+                terminal.set_manual_label_from(label, params.source)
+            }
             _ => terminal.clear_manual_label(),
         }
-        let label_changed = terminal.manual_label != previous_label;
+        let kept_changed = before
+            != (
+                terminal.manual_label.clone(),
+                terminal.label_source,
+                terminal.label_at,
+            );
         self.state.mark_session_dirty();
-        if label_changed {
+        if kept_changed {
             self.emit_pane_kept_presentation_changed(ws_idx, pane_id);
         }
         let pane = self.pane_info(ws_idx, pane_id).unwrap();
@@ -4475,7 +4493,10 @@ mod tests {
                 if let Ok(bytes) = rx.try_recv() {
                     return bytes;
                 }
-                assert!(std::time::Instant::now() < deadline, "pane write never arrived");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pane write never arrived"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
@@ -4625,7 +4646,10 @@ mod tests {
         );
         // A pill path tapped inline after prose still splits off.
         assert_eq!(
-            planned_segments("rotation just rebuilds everything. /tmp/att/rot-1.jpg", &[b"\r"]),
+            planned_segments(
+                "rotation just rebuilds everything. /tmp/att/rot-1.jpg",
+                &[b"\r"]
+            ),
             vec![
                 ("rotation just rebuilds everything. ".into(), none),
                 ("/tmp/att/rot-1.jpg".into(), none),

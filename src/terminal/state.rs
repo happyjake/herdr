@@ -139,6 +139,14 @@ pub struct TerminalState {
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub terminal_title: Option<String>,
     pub manual_label: Option<String>,
+    /// Who wrote the standing label, when it was not a person. Kept beside
+    /// the label and cleared with it: an ordinary rename, by anyone, leaves
+    /// this None, which is what says the name is theirs.
+    pub label_source: Option<crate::api::schema::LabelSource>,
+    /// Unix seconds at which the standing label was written. Stamped by
+    /// every writer of a label, so a client can tell a name older than the
+    /// work from one written since.
+    pub label_at: Option<u64>,
     /// Whether the user has pinned this terminal. Kept, never derived: it is
     /// set only by an explicit request, persists with the session, and says
     /// nothing about the label, the agent, or anything the terminal does.
@@ -181,6 +189,8 @@ impl TerminalState {
             persisted_agent_session: None,
             terminal_title: None,
             manual_label: None,
+            label_source: None,
+            label_at: None,
             pinned: false,
             agent_name: None,
             agent_name_owner: None,
@@ -1940,13 +1950,65 @@ impl TerminalState {
         })
     }
 
+    /// Write a label nobody in particular is answerable for: the desk's own
+    /// rename, an applied layout, a plugin's pane title.
     pub fn set_manual_label(&mut self, label: String) {
+        self.set_manual_label_from(label, None);
+    }
+
+    /// Write a label, saying whose it is. A source of None is a person's or
+    /// a skill's name and clears whatever stood before, which is the point:
+    /// once someone says it in their own words, it is theirs.
+    pub fn set_manual_label_from(
+        &mut self,
+        label: String,
+        source: Option<crate::api::schema::LabelSource>,
+    ) {
+        self.set_manual_label_from_at(label, source, crate::pane::unix_now_secs());
+    }
+
+    /// Same as [`TerminalState::set_manual_label_from`] with an explicit
+    /// clock.
+    pub fn set_manual_label_from_at(
+        &mut self,
+        label: String,
+        source: Option<crate::api::schema::LabelSource>,
+        now_unix: u64,
+    ) {
         let label = label.trim().to_string();
-        self.manual_label = (!label.is_empty()).then_some(label);
+        if label.is_empty() {
+            self.clear_manual_label();
+            return;
+        }
+        self.manual_label = Some(label);
+        self.label_source = source;
+        self.label_at = Some(now_unix);
     }
 
     pub fn clear_manual_label(&mut self) {
         self.manual_label = None;
+        self.label_source = None;
+        self.label_at = None;
+    }
+
+    /// Put a captured label back exactly as it stood: its words, whose it
+    /// is, and when it was written.
+    ///
+    /// A restore is not a rename, so nothing here is stamped afresh, and a
+    /// session captured before provenance existed restores a label that is
+    /// nobody's and undated — which is what it was.
+    pub fn restore_manual_label(
+        &mut self,
+        label: Option<String>,
+        source: Option<crate::api::schema::LabelSource>,
+        at: Option<u64>,
+    ) {
+        let label = label
+            .map(|label| label.trim().to_string())
+            .filter(|label| !label.is_empty());
+        self.label_source = label.as_ref().and(source);
+        self.label_at = label.as_ref().and(at);
+        self.manual_label = label;
     }
 
     pub fn set_pinned(&mut self, pinned: bool) {
@@ -2302,6 +2364,120 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    #[test]
+    fn a_label_is_stamped_with_when_it_was_written_and_whose_it_is() {
+        let mut terminal = test_terminal();
+        assert_eq!(
+            (
+                terminal.manual_label.as_deref(),
+                terminal.label_source,
+                terminal.label_at
+            ),
+            (None, None, None),
+            "a terminal nobody has named stands for nobody"
+        );
+
+        terminal.set_manual_label_from_at(
+            "  beacon relay  ".into(),
+            Some(crate::api::schema::LabelSource::Editor),
+            1_700_000_000,
+        );
+        assert_eq!(terminal.manual_label.as_deref(), Some("beacon relay"));
+        assert_eq!(
+            terminal.label_source,
+            Some(crate::api::schema::LabelSource::Editor)
+        );
+        assert_eq!(terminal.label_at, Some(1_700_000_000));
+
+        // Someone saying it in their own words takes the name, even when the
+        // words are the same ones.
+        terminal.set_manual_label_from_at("beacon relay".into(), None, 1_700_000_900);
+        assert_eq!(terminal.manual_label.as_deref(), Some("beacon relay"));
+        assert_eq!(terminal.label_source, None);
+        assert_eq!(terminal.label_at, Some(1_700_000_900));
+
+        // A write with nobody behind it is what the desk's own rename, an
+        // applied layout and a plugin's pane title all are.
+        terminal.set_manual_label_from_at(
+            "beacon relay".into(),
+            Some(crate::api::schema::LabelSource::Editor),
+            1_700_001_000,
+        );
+        terminal.set_manual_label("beacon relay".into());
+        assert_eq!(terminal.label_source, None);
+        assert!(terminal.label_at.is_some_and(|at| at >= 1_700_001_000));
+
+        // A blank name is a clear, and a clear forgets everything about it.
+        terminal.set_manual_label_from_at(
+            "beacon relay".into(),
+            Some(crate::api::schema::LabelSource::Editor),
+            1_700_001_000,
+        );
+        terminal.set_manual_label_from_at("   ".into(), None, 1_700_001_100);
+        assert_eq!(
+            (
+                terminal.manual_label.as_deref(),
+                terminal.label_source,
+                terminal.label_at
+            ),
+            (None, None, None)
+        );
+
+        terminal.set_manual_label_from_at(
+            "beacon relay".into(),
+            Some(crate::api::schema::LabelSource::Editor),
+            1_700_001_200,
+        );
+        terminal.clear_manual_label();
+        assert_eq!(
+            (
+                terminal.manual_label.as_deref(),
+                terminal.label_source,
+                terminal.label_at
+            ),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn a_restored_label_is_put_back_exactly_as_it_stood() {
+        let mut terminal = test_terminal();
+        terminal.restore_manual_label(
+            Some("beacon relay".into()),
+            Some(crate::api::schema::LabelSource::Editor),
+            Some(1_700_000_000),
+        );
+        assert_eq!(terminal.manual_label.as_deref(), Some("beacon relay"));
+        assert_eq!(
+            terminal.label_source,
+            Some(crate::api::schema::LabelSource::Editor)
+        );
+        assert_eq!(terminal.label_at, Some(1_700_000_000));
+
+        // A session captured before provenance was kept restores a name that
+        // is nobody's and undated, which is what it was.
+        let mut older = test_terminal();
+        older.restore_manual_label(Some("beacon relay".into()), None, None);
+        assert_eq!(older.manual_label.as_deref(), Some("beacon relay"));
+        assert_eq!((older.label_source, older.label_at), (None, None));
+
+        // And provenance without a label to carry it is no provenance.
+        let mut unnamed = test_terminal();
+        unnamed.restore_manual_label(
+            None,
+            Some(crate::api::schema::LabelSource::Editor),
+            Some(1_700_000_000),
+        );
+        assert_eq!(
+            (
+                unnamed.manual_label.as_deref(),
+                unnamed.label_source,
+                unnamed.label_at
+            ),
+            (None, None, None)
+        );
     }
 
     fn test_session_path(name: &str) -> String {
