@@ -422,8 +422,15 @@ fn tag_contents<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 /// An attached image reads as one, wherever in the text it was written.
+///
+/// The whole element goes — the opening tag, whatever it wrapped, and the
+/// closing tag — because what it wrapped is the harness's own account of
+/// the file rather than anything the person said. A tag left open keeps
+/// the words after it, and a closing tag with no element around it is
+/// dropped where it stands, so neither can surface in a prompt.
 fn replace_image_tags(text: &str) -> String {
     const OPEN: &str = "<image";
+    const CLOSE: &str = "</image>";
     let mut replaced = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find(OPEN) {
@@ -440,10 +447,19 @@ fn replace_image_tags(text: &str) -> String {
         };
         replaced.push_str(&rest[..start]);
         replaced.push_str("[image]");
-        rest = &after[end + 1..];
+        let inside = &after[end + 1..];
+        // Everything up to the closing tag belonged to the element. With
+        // no closing tag there is nothing to close, and only the opening
+        // tag was the image.
+        rest = match inside.find(CLOSE) {
+            Some(closed) => &inside[closed + CLOSE.len()..],
+            None => inside,
+        };
     }
     replaced.push_str(rest);
-    replaced
+    // A closing tag is no opening one, so a remnant of an element whose
+    // start never reached the record is swept up here.
+    replaced.replace(CLOSE, "")
 }
 
 /// One prompt as a row of text: whitespace runs become one space, control
@@ -848,6 +864,13 @@ mod tests {
                     { "type": "input_text", "text": "here is the trace <image 1> and the log" },
                 ]},
             }),
+            serde_json::json!({
+                "timestamp": "2026-03-05T08:12:00.000Z",
+                "type": "response_item",
+                "payload": { "type": "message", "role": "user", "content": [
+                    { "type": "input_text", "text": "<image 1>harbour-form.png</image> how shall I fill in this form" },
+                ]},
+            }),
         ])
     }
 
@@ -965,7 +988,7 @@ mod tests {
         let trail = read(&record, PromptTrailAgent::Codex).expect("a readable record");
 
         assert_eq!(trail.agent, PromptTrailAgent::Codex);
-        assert_eq!(trail.count, 2);
+        assert_eq!(trail.count, 3);
         assert_eq!(
             trail.first.as_ref().map(|first| first.text.as_str()),
             Some("rewrite the lantern parser so it streams")
@@ -975,12 +998,45 @@ mod tests {
             vec![
                 "rewrite the lantern parser so it streams",
                 "here is the trace [image] and the log",
+                // The whole element reads as one image: what it wrapped is
+                // the harness's account of the file, and a closing tag left
+                // standing would be read as part of what was asked.
+                "[image] how shall I fill in this form",
             ]
         );
         // The web already holds codex's own terminal title; the record's is
         // none of a trail's business.
         assert_eq!(trail.title, None);
-        assert_eq!(trail.newest_at, Some(1772698140));
+        assert_eq!(trail.newest_at, Some(1772698320));
+    }
+
+    #[test]
+    fn an_image_element_reads_as_one_image_however_it_was_written() {
+        // An element with the harness's own account of the file inside it.
+        assert_eq!(
+            replace_image_tags("<image 1>harbour-form.png</image> how shall I fill this in"),
+            "[image] how shall I fill this in"
+        );
+        // A tag left open keeps the words after it.
+        assert_eq!(
+            replace_image_tags("here is the trace <image 1> and the log"),
+            "here is the trace [image] and the log"
+        );
+        // A closing tag with no element around it is dropped where it
+        // stands rather than surfacing as part of the prompt.
+        assert_eq!(
+            replace_image_tags("</image> how shall I fill this in"),
+            " how shall I fill this in"
+        );
+        // Two of them, and a word that merely begins the same way.
+        assert_eq!(
+            replace_image_tags("<image 1>a</image> and <image 2>b</image> of the images"),
+            "[image] and [image] of the images"
+        );
+        assert_eq!(
+            replace_image_tags("the imagery of the harbour"),
+            "the imagery of the harbour"
+        );
     }
 
     #[test]
