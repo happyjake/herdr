@@ -788,6 +788,12 @@ fn handle_request(
         Method::ServerLookupPlace(params) => {
             crate::api::place_lookup::handle_lookup(request.id, &params, api_tx)
         }
+        // A trail opens a session record, walks it and parses it. Served
+        // here for the same reason, with the app asked only for the pane's
+        // own identity and the session it reports.
+        Method::PanePromptTrail(params) => {
+            crate::api::prompt_trail::handle_prompt_trail(request.id, &params, api_tx)
+        }
         Method::AttachmentBegin(params) => {
             crate::api::attachment::handle_begin(request.id, &params)
         }
@@ -909,6 +915,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneList(_) => "pane.list",
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
+        Method::PanePromptTrail(_) => "pane.prompt_trail",
         Method::PaneFocus(_) => "pane.focus",
         Method::PaneInputSet(_) => "pane.input.set",
         Method::PaneLinkActivate(_) => "pane.link.activate",

@@ -5,10 +5,29 @@ use serde::{Deserialize, Serialize};
 const MAX_SESSION_ID_LEN: usize = 512;
 const MAX_SESSION_PATH_LEN: usize = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct AgentSessionRef {
     pub kind: AgentSessionRefKind,
     pub value: String,
+    /// The record file the harness reported for this session, when it
+    /// reported one the reference does not already name.
+    ///
+    /// Where the conversation was last seen on disk, never who it is: a
+    /// harness that names its session by id may still say which file it is
+    /// writing, and that beats a path derived from the id. Deliberately not
+    /// part of the comparison below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_path: Option<String>,
+}
+
+/// Two references are the same session when they name the same thing, and
+/// the record path never gets a say: the same conversation reported once
+/// with its file and once without is still one conversation, and every
+/// place that asks whether a session changed means exactly that.
+impl PartialEq for AgentSessionRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.value == other.value
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -38,6 +57,7 @@ impl AgentSessionRef {
         valid_session_id(&value).then_some(Self {
             kind: AgentSessionRefKind::Id,
             value,
+            record_path: None,
         })
     }
 
@@ -46,7 +66,20 @@ impl AgentSessionRef {
         valid_session_path(&value).then_some(Self {
             kind: AgentSessionRefKind::Path,
             value,
+            record_path: None,
         })
+    }
+
+    /// The same reference, remembering the record file the harness named.
+    ///
+    /// A path that is no path at all is dropped rather than kept, and a
+    /// reference that already is the path keeps none: the value says it.
+    pub fn with_record_path(mut self, path: Option<String>) -> Self {
+        self.record_path = match self.kind {
+            AgentSessionRefKind::Path => None,
+            AgentSessionRefKind::Id => path.filter(|path| valid_session_path(path)),
+        };
+        self
     }
 }
 
@@ -54,19 +87,25 @@ pub fn session_ref_from_report(
     source: &str,
     agent: &str,
     agent_session_id: Option<String>,
-    _agent_session_path: Option<String>,
+    agent_session_path: Option<String>,
 ) -> Option<AgentSessionRef> {
     if !is_official_agent_source(source, agent) {
         return None;
     }
 
     if agent == "pi" || agent == "omp" {
-        return _agent_session_path
+        return agent_session_path
             .and_then(AgentSessionRef::path)
             .or_else(|| agent_session_id.and_then(AgentSessionRef::id));
     }
 
-    agent_session_id.and_then(AgentSessionRef::id)
+    // A harness that names its session by id may report its record file
+    // too. The id stays the identity — it is what a resume is spelled with
+    // — and the file rides along, so whatever wants to read the
+    // conversation is spared deriving a path the harness already knows.
+    agent_session_id
+        .and_then(AgentSessionRef::id)
+        .map(|session_ref| session_ref.with_record_path(agent_session_path))
 }
 
 pub fn persisted_session_from_launch_args(

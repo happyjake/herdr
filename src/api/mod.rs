@@ -4,6 +4,7 @@ pub mod client;
 pub(crate) mod credentials;
 mod event_hub;
 mod place_lookup;
+mod prompt_trail;
 pub mod schema;
 mod server;
 mod server_executable;
@@ -25,12 +26,10 @@ pub(crate) use server_name::resolve_server_name;
 pub use server_name::SharedServerName;
 pub use server_reach::SharedServerReach;
 pub use status::{read_runtime_status_at, RuntimeStatus};
-pub(crate) use websocket::valid_token_chars as valid_websocket_token_chars;
-pub use websocket::{
-    start_websocket_server, SharedWebSocketToken, WebSocketServerHandle,
-};
 #[cfg(test)]
 pub(crate) use websocket::start_websocket_server_with_capabilities;
+pub(crate) use websocket::valid_token_chars as valid_websocket_token_chars;
+pub use websocket::{start_websocket_server, SharedWebSocketToken, WebSocketServerHandle};
 
 use std::path::PathBuf;
 

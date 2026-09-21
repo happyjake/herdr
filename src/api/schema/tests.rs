@@ -757,6 +757,118 @@ fn agent_view_requests_round_trip() {
 }
 
 #[test]
+fn prompt_trail_request_names_the_pane_and_nothing_else() {
+    let json = serde_json::json!({
+        "id": "req_trail",
+        "method": "pane.prompt_trail",
+        "params": { "pane_id": "wG4:p1" },
+    });
+
+    let request: Request = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(
+        request.method,
+        Method::PanePromptTrail(PaneTarget {
+            pane_id: "wG4:p1".into(),
+        })
+    );
+    assert_eq!(serde_json::to_value(request).unwrap(), json);
+}
+
+#[test]
+fn a_prompt_trail_result_keeps_every_field_it_has_nothing_to_say_about() {
+    let answered = SuccessResponse {
+        id: "req_trail".into(),
+        result: ResponseResult::PromptTrail {
+            pane_id: "wG4:p1".into(),
+            terminal_id: "term_beacon".into(),
+            trail: Some(PromptTrail {
+                agent: PromptTrailAgent::Claude,
+                first: Some(TrailPrompt {
+                    text: "why does the beacon relay drop frames".into(),
+                    at: Some(1772615700),
+                }),
+                recent: vec![TrailPrompt {
+                    text: "pin it to the encoder".into(),
+                    at: None,
+                }],
+                title: None,
+                count: 2,
+                newest_at: Some(1772617212),
+            }),
+            reason: None,
+        },
+    };
+
+    let json = serde_json::to_value(&answered).unwrap();
+    assert_eq!(json["result"]["type"], "prompt_trail");
+    // A null is a real absence, never a key a reader has to guess at.
+    assert!(json["result"]["trail"]["title"].is_null());
+    assert!(json["result"]["trail"]["recent"][0]["at"].is_null());
+    assert!(json["result"]["reason"].is_null());
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(json).unwrap(),
+        answered
+    );
+}
+
+#[test]
+fn a_pane_with_no_trail_answers_the_reason_on_the_wire() {
+    for (reason, wire) in [
+        (PromptTrailReason::NoSession, "no_session"),
+        (PromptTrailReason::UnsupportedAgent, "unsupported_agent"),
+        (PromptTrailReason::NoRecord, "no_record"),
+        (PromptTrailReason::Unreadable, "unreadable"),
+    ] {
+        let answered = SuccessResponse {
+            id: "req_trail".into(),
+            result: ResponseResult::PromptTrail {
+                pane_id: "wG4:p1".into(),
+                terminal_id: "term_beacon".into(),
+                trail: None,
+                reason: Some(reason),
+            },
+        };
+        let json = serde_json::to_value(&answered).unwrap();
+        assert_eq!(json["result"]["reason"], wire);
+        assert!(json["result"]["trail"].is_null());
+        assert_eq!(
+            serde_json::from_value::<SuccessResponse>(json).unwrap(),
+            answered
+        );
+    }
+}
+
+#[test]
+fn a_reported_record_path_rides_with_the_session_and_is_absent_without_one() {
+    let bare: AgentSessionInfo = serde_json::from_value(serde_json::json!({
+        "source": "herdr:claude",
+        "agent": "claude",
+        "kind": "id",
+        "value": "5f2a9c11-0b44-4d8e-9a10-6c3b7e5d1f22",
+    }))
+    .unwrap();
+    assert_eq!(bare.record_path, None);
+    assert!(
+        serde_json::to_value(&bare)
+            .unwrap()
+            .get("record_path")
+            .is_none(),
+        "a session with no reported record must serialize no key"
+    );
+
+    let reported = AgentSessionInfo {
+        record_path: Some("/invented/records/beacon.jsonl".into()),
+        ..bare
+    };
+    let json = serde_json::to_value(&reported).unwrap();
+    assert_eq!(json["record_path"], "/invented/records/beacon.jsonl");
+    assert_eq!(
+        serde_json::from_value::<AgentSessionInfo>(json).unwrap(),
+        reported
+    );
+}
+
+#[test]
 fn unknown_method_is_rejected() {
     let json = r#"{"id":"req_1","method":"nope","params":{}}"#;
     let err = serde_json::from_str::<Request>(json)

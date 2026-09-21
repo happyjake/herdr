@@ -106,6 +106,7 @@ fn is_routine_api_method(method: &str) -> bool {
     matches!(
         method,
         "pane.get"
+            | "pane.prompt_trail"
             | "pane.read"
             | "pane.list"
             | "workspace.list"

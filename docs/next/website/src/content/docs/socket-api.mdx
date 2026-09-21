@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.prompt_trail`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -141,6 +141,39 @@ of piling on.
 
 The method is additive: a server that predates it cannot parse the method and
 refuses the request, which is how a client learns the lookup is absent.
+
+`pane.prompt_trail` answers what a pane's session record says was asked of
+it. It takes `pane_id` and returns the pane, its terminal, and either a
+`trail` or the `reason` there is none — both keys are always present, and
+exactly one of them is ever set. A trail carries `agent` (`claude`, `codex`
+or `pi`), `first` (the first real prompt, cut to about four hundred code
+points), `recent` (the last three, oldest first, cut to about two hundred
+and forty each), `title` (the harness's own title, when it wrote one worth
+reading), `count`, and `newest_at` in unix seconds. Each prompt is
+`{ text, at }`, where `at` is the time the harness dated it, or null.
+
+A prompt is what was typed as the user turn, by a person or by a
+supervising agent; a slash command counts when it carries arguments, and is
+read back as `/name args`. A tool call or its result, what the harness
+injected — reminders, attachments, a preamble, environment or permissions
+context — command output, notifications, and compaction or continuation
+summaries are none of them prompts. A title that is only the harness's own
+name, or the first prompt said again, is answered as null.
+
+Having no trail is an ordinary condition rather than a failure: `reason` is
+`no_session` for a pane that reports no agent session, `unsupported_agent`
+for a harness whose records this server does not read, `no_record` when the
+file is not on this desk, and `unreadable` when it is there but cannot be
+read within its bounds. An unknown pane is refused with `pane_not_found`.
+
+The read is bounded like the place lookup: it is answered off the app
+thread, which is asked only which pane this is, the record is walked a line
+at a time and never loaded whole, a file over 64 MiB is `unreadable`, the
+whole request gives up after five seconds, and only two reads run at a time
+per server.
+
+The method is additive: a server that predates it cannot parse the method
+and refuses the request, which is how a client learns the trail is absent.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 

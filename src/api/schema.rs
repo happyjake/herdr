@@ -62,13 +62,13 @@ pub enum Method {
     #[serde(rename = "server.reload_agent_manifests")]
     ServerReloadAgentManifests(EmptyParams),
     // Turning a place name into directories this server has been to
-    // (ADR-0054). Additive: a server that predates it cannot parse the
+    // Additive: a server that predates it cannot parse the
     // method, and a client reads that refusal as the lookup's absence.
     #[serde(rename = "server.lookup_place")]
     ServerLookupPlace(ServerLookupPlaceParams),
     #[serde(rename = "attachment.create")]
     AttachmentCreate(AttachmentCreateParams),
-    // A file beyond one message's carry (ADR-0047). Additive verbs, with the
+    // A file beyond one message's carry. Additive verbs, with the
     // reserved partial file as the whole upload state: a server that
     // predates them cannot parse the method, and `file_attachments` in the
     // pong capabilities is the positive signal that it can.
@@ -78,7 +78,7 @@ pub enum Method {
     AttachmentAppend(AttachmentAppendParams),
     #[serde(rename = "attachment.commit")]
     AttachmentCommit(AttachmentCommitParams),
-    // The credential registry (ADR-0026). Additive verbs: a server that
+    // The credential registry. Additive verbs: a server that
     // predates them cannot parse the method and answers `invalid_request`,
     // which is how a client learns the capability is absent. `protocol` is
     // unchanged; `credential_registry` in the pong capabilities is the
@@ -215,6 +215,11 @@ pub enum Method {
     PaneCurrent(PaneCurrentParams),
     #[serde(rename = "pane.get")]
     PaneGet(PaneTarget),
+    // What a pane's session record says was asked of it. Additive: a server
+    // that predates it cannot parse the method, and a client reads that
+    // refusal as the trail's absence.
+    #[serde(rename = "pane.prompt_trail")]
+    PanePromptTrail(PaneTarget),
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
     #[serde(rename = "pane.input.set")]
