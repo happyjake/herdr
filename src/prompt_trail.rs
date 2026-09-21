@@ -421,6 +421,10 @@ fn tag_contents<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     Some(&text[start..end])
 }
 
+/// How an attached image is written into a user turn.
+const IMAGE_TAG_OPEN: &str = "<image";
+const IMAGE_TAG_CLOSE: &str = "</image>";
+
 /// An attached image reads as one, wherever in the text it was written.
 ///
 /// The whole element goes — the opening tag, whatever it wrapped, and the
@@ -428,38 +432,59 @@ fn tag_contents<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
 /// the file rather than anything the person said. A tag left open keeps
 /// the words after it, and a closing tag with no element around it is
 /// dropped where it stands, so neither can surface in a prompt.
+///
+/// Each image is read on its own. One left open followed by a complete one
+/// is two images with the person's words between them, never one image
+/// reaching forward to a closing tag that was never its own.
 fn replace_image_tags(text: &str) -> String {
-    const OPEN: &str = "<image";
-    const CLOSE: &str = "</image>";
     let mut replaced = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(start) = rest.find(OPEN) {
-        let after = &rest[start + OPEN.len()..];
-        // A word that merely begins the same way is not a tag.
-        if !matches!(after.chars().next(), Some('>') | Some(' ')) {
-            let (head, tail) = rest.split_at(start + OPEN.len());
-            replaced.push_str(head);
-            rest = tail;
-            continue;
-        }
+    while let Some(start) = next_image_tag(rest) {
+        let after = &rest[start + IMAGE_TAG_OPEN.len()..];
         let Some(end) = after.find('>') else {
             break;
         };
         replaced.push_str(&rest[..start]);
         replaced.push_str("[image]");
         let inside = &after[end + 1..];
-        // Everything up to the closing tag belonged to the element. With
-        // no closing tag there is nothing to close, and only the opening
-        // tag was the image.
-        rest = match inside.find(CLOSE) {
-            Some(closed) => &inside[closed + CLOSE.len()..],
+        rest = match element_end(inside) {
+            Some(closed) => &inside[closed + IMAGE_TAG_CLOSE.len()..],
             None => inside,
         };
     }
     replaced.push_str(rest);
     // A closing tag is no opening one, so a remnant of an element whose
     // start never reached the record is swept up here.
-    replaced.replace(CLOSE, "")
+    replaced.replace(IMAGE_TAG_CLOSE, "")
+}
+
+/// Where the next image tag opens. A word that merely begins the same way
+/// is not a tag and is walked past.
+fn next_image_tag(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(found) = text[from..].find(IMAGE_TAG_OPEN) {
+        let start = from + found;
+        let after = &text[start + IMAGE_TAG_OPEN.len()..];
+        if matches!(after.chars().next(), Some('>') | Some(' ')) {
+            return Some(start);
+        }
+        from = start + IMAGE_TAG_OPEN.len();
+    }
+    None
+}
+
+/// Where this element's own closing tag is, counting from just inside its
+/// opening tag.
+///
+/// A closing tag is this element's only when it comes before the next one
+/// opens. Past that it belongs to the image that opened in between, and
+/// this tag was simply left open.
+fn element_end(inside: &str) -> Option<usize> {
+    let closed = inside.find(IMAGE_TAG_CLOSE)?;
+    match next_image_tag(inside) {
+        Some(next) if next < closed => None,
+        _ => Some(closed),
+    }
 }
 
 /// One prompt as a row of text: whitespace runs become one space, control
@@ -1027,6 +1052,13 @@ mod tests {
         assert_eq!(
             replace_image_tags("</image> how shall I fill this in"),
             " how shall I fill this in"
+        );
+        // One left open, then a complete one: two images, with the words
+        // between them kept. The second element's closing tag was never
+        // the first tag's to reach forward to.
+        assert_eq!(
+            replace_image_tags("<image 1> and see <image 2>photo</image> for comparison"),
+            "[image] and see [image] for comparison"
         );
         // Two of them, and a word that merely begins the same way.
         assert_eq!(
