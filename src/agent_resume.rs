@@ -137,13 +137,17 @@ pub fn session_ref_from_snapshot(
     agent: &str,
     kind: AgentSessionRefKind,
     value: &str,
+    record_path: Option<String>,
 ) -> Option<PersistedAgentSession> {
     if !is_official_agent_source(source, agent) {
         return None;
     }
     let session_ref = match (agent, kind) {
         ("pi" | "omp", AgentSessionRefKind::Path) => AgentSessionRef::path(value)?,
-        (_, AgentSessionRefKind::Id) => AgentSessionRef::id(value)?,
+        // A captured record path comes back with the id it was captured
+        // beside, so a restart reads the conversation where the harness
+        // said it was rather than where a derivation would look.
+        (_, AgentSessionRefKind::Id) => AgentSessionRef::id(value)?.with_record_path(record_path),
         _ => return None,
     };
     Some(PersistedAgentSession {
@@ -742,49 +746,56 @@ mod tests {
             "herdr:mastracode",
             "mastracode",
             AgentSessionRefKind::Id,
-            "mastracode-session"
+            "mastracode-session",
+            None
         )
         .is_some());
         assert!(session_ref_from_snapshot(
             "herdr:hermes",
             "hermes",
             AgentSessionRefKind::Id,
-            "hermes-session"
+            "hermes-session",
+            None
         )
         .is_some());
         assert!(session_ref_from_snapshot(
             "herdr:opencode",
             "opencode",
             AgentSessionRefKind::Id,
-            "opencode-session"
+            "opencode-session",
+            None
         )
         .is_some());
         assert!(session_ref_from_snapshot(
             "herdr:kilo",
             "kilo",
             AgentSessionRefKind::Id,
-            "kilo-session"
+            "kilo-session",
+            None
         )
         .is_some());
         assert!(session_ref_from_snapshot(
             "herdr:copilot",
             "copilot",
             AgentSessionRefKind::Id,
-            "copilot-session"
+            "copilot-session",
+            None
         )
         .is_some());
         assert!(session_ref_from_snapshot(
             "herdr:devin",
             "devin",
             AgentSessionRefKind::Id,
-            "devin-session"
+            "devin-session",
+            None
         )
         .is_some());
         assert!(session_ref_from_snapshot(
             "herdr:antigravity_cli",
             "agy",
             AgentSessionRefKind::Id,
-            "agy-session"
+            "agy-session",
+            None
         )
         .is_some());
         let agy_session = absolute_test_path("agy-session");

@@ -620,6 +620,7 @@ mod tests {
                             agent: "claude".into(),
                             kind: crate::agent_resume::AgentSessionRefKind::Id,
                             value: "session-1".into(),
+                            record_path: None,
                         }),
                         launch_argv: None,
                         agent_status: None,

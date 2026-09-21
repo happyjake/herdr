@@ -164,13 +164,27 @@ Having no trail is an ordinary condition rather than a failure: `reason` is
 `no_session` for a pane that reports no agent session, `unsupported_agent`
 for a harness whose records this server does not read, `no_record` when the
 file is not on this desk, and `unreadable` when it is there but cannot be
-read within its bounds. An unknown pane is refused with `pane_not_found`.
+read within its bounds — past the size bound, holding a line past the line
+bound, holding nothing that parses, or still being read when the request's
+deadline arrives. An unknown pane is refused with `pane_not_found`.
+
+Which file a session names is the session's business, never a search. A
+path the harness itself reported wins, and is honoured only where it can be
+nothing but a record: resolved, a regular `.jsonl` file inside the
+operator's home. Anything else — a link out of home, a link to nowhere,
+another kind of file, a directory — is passed over for the file derived
+from the session id, exactly as if nothing had been reported. The reported
+path is kept with the session, so a restart or a handoff still reads the
+record the harness pointed at.
 
 The read is bounded like the place lookup: it is answered off the app
-thread, which is asked only which pane this is, the record is walked a line
-at a time and never loaded whole, a file over 64 MiB is `unreadable`, the
-whole request gives up after five seconds, and only two reads run at a time
-per server.
+thread, which is asked only which pane this is; the record is walked a line
+at a time and never loaded whole; 64 MiB is the bound on what one read
+takes, enforced as it goes rather than only on the file's size beforehand,
+so a record being written to cannot outgrow it mid-read; one line may run
+to 16 MiB, which is room for a prompt carrying a pasted image, and a line
+past that refuses the record instead of being skipped; the whole request
+gives up after five seconds; and only two reads run at a time per server.
 
 The method is additive: a server that predates it cannot parse the method
 and refuses the request, which is how a client learns the trail is absent.
