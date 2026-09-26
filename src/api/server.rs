@@ -60,6 +60,12 @@ pub(super) trait ApiTransport {
     fn peer_description(&self) -> Option<String> {
         None
     }
+
+    /// A subscription served on this connection fell behind the event
+    /// history and was told so with `events_lost`. Its stream is over; the
+    /// Unix socket ends with it, and a transport that multiplexes decides
+    /// what else ends.
+    fn note_events_lost(&mut self) {}
 }
 
 /// Whether a connection's peer is still around after a [`ApiTransport::pump_inbound`].
@@ -1232,6 +1238,7 @@ fn stream_subscriptions<T: ApiTransport>(
                             error,
                         },
                     )?;
+                    transport.note_events_lost();
                     return Ok(());
                 }
             };
@@ -1890,7 +1897,7 @@ mod tests {
             None,
             None,
             None,
-            &crate::api::SharedServerName::new("the-mini".to_string()),
+            &crate::api::SharedServerName::new("home-box".to_string()),
             &undeclared_server_reach(),
             &undeclared_advertised_endpoint(),
             &test_credentials(),
@@ -1899,7 +1906,7 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         match parsed.result {
-            ResponseResult::Pong { name, .. } => assert_eq!(name.as_deref(), Some("the-mini")),
+            ResponseResult::Pong { name, .. } => assert_eq!(name.as_deref(), Some("home-box")),
             other => panic!("expected pong, got {other:?}"),
         }
     }
@@ -1998,7 +2005,7 @@ mod tests {
     #[test]
     fn pong_publishes_the_advertised_endpoint_only_once_one_is_declared() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let server_name = crate::api::SharedServerName::new("the-mini".to_string());
+        let server_name = crate::api::SharedServerName::new("home-box".to_string());
         let server_reach = undeclared_server_reach();
         let advertised_endpoint = undeclared_advertised_endpoint();
         let ping = |id: &str| {
@@ -2045,7 +2052,7 @@ mod tests {
         // The addition is additive: the fields a client already reads keep
         // their names, their values, and the protocol version.
         assert!(declared.contains(r#""type":"pong""#), "{declared}");
-        assert!(declared.contains(r#""name":"the-mini""#), "{declared}");
+        assert!(declared.contains(r#""name":"home-box""#), "{declared}");
         assert!(
             declared.contains(&format!(
                 r#""protocol":{}"#,
