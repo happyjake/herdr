@@ -2646,6 +2646,9 @@ fn live_handoff_keeps_a_screen_detected_unseen_completion_done() {
         );
         thread::sleep(Duration::from_millis(50));
     };
+    // Dates are whole seconds; let one pass so a date taken at the handoff
+    // cannot equal the completion's by coincidence.
+    thread::sleep(Duration::from_millis(1_100));
 
     assert_ok(request(
         &api_socket,

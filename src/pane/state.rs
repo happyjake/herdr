@@ -231,12 +231,17 @@ impl PaneState {
     }
 
     /// Whether this pane is a completion nobody has read, carried over from
-    /// another process and not yet found again.
+    /// another process, whose restore window is still open.
     ///
-    /// Until something classifies the pane, what the new process learns about
-    /// it is recognition rather than activity: finding the agent again and
-    /// the not-yet-classified readings that come first are not a client
-    /// looking at the pane, so they must not mark the completion read.
+    /// Holds while the pane is unseen, the session recorded it as done, and
+    /// its restore window is live. It ends when a client views the pane, when
+    /// a reading that settles the window classifies it, or at the window's
+    /// deadline: 15 seconds after the restore, or the deadline the claim
+    /// already carried from an earlier restore. Until then, what the new
+    /// process learns about the pane is recognition rather than activity:
+    /// finding the agent again and the not-yet-classified readings that come
+    /// first are not a client looking at the pane, so they must not mark the
+    /// completion read.
     pub fn holds_unread_restored_completion(&self) -> bool {
         !self.seen
             && self.restore_window.is_some_and(|window| {
