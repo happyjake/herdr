@@ -305,6 +305,13 @@ mod tests {
             actual.remove("pane.rename").as_deref(),
             Some("b0056f475b6042078c05bdad90bc4f3d10934d6af11e4b2cc98d2e6ddb362f13")
         );
+        // pane.edit_scrollback carries an optional `line` to open the editor
+        // at; a v1 client omits it and gets the dump opened as before.
+        expected.remove("pane.edit_scrollback");
+        assert_eq!(
+            actual.remove("pane.edit_scrollback").as_deref(),
+            Some("f2ca0584d190a3716ecb8eb41c7032039f80952a6d2beb670ca8477152a55c95")
+        );
 
         assert_eq!(
             actual, expected,

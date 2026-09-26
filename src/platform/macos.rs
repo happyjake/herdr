@@ -212,10 +212,18 @@ pub(crate) fn pane_custom_command_pty_builder_platform(
     portable_pty::CommandBuilder::from_argv(raw_command_argv(command, "-c"))
 }
 
-pub(crate) fn scrollback_editor_argv(path: &Path) -> std::io::Result<Vec<String>> {
+pub(crate) fn scrollback_editor_argv(
+    path: &Path,
+    anchor_line: Option<usize>,
+) -> std::io::Result<Vec<String>> {
     let quoted_path = shell_quote(&path.display().to_string());
+    // `+N` is the vi-family open-at-line convention; editors that reject it
+    // are out of scope for the scrollback editor.
+    let open_at = anchor_line
+        .map(|line| format!(" +{}", line.max(1)))
+        .unwrap_or_default();
     let command = format!(
-        r#"scrollback_file={quoted_path}; eval "${{EDITOR:-vi}} \"\$scrollback_file\""; status=$?; rm -f "$scrollback_file"; exit $status"#
+        r#"scrollback_file={quoted_path}; eval "${{EDITOR:-vi}}{open_at} \"\$scrollback_file\""; status=$?; rm -f "$scrollback_file"; exit $status"#
     );
     Ok(vec!["/bin/sh".to_string(), "-c".to_string(), command])
 }
@@ -1382,11 +1390,22 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
     #[test]
     fn scrollback_editor_argv_preserves_unix_editor_shell_semantics() {
         let path = std::path::Path::new("/tmp/herdr scrollback.txt");
-        let argv = scrollback_editor_argv(path).unwrap();
+        let argv = scrollback_editor_argv(path, None).unwrap();
 
         assert_eq!(argv[0], "/bin/sh");
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+        assert!(!argv[2].contains(" +"), "{}", argv[2]);
+    }
+
+    #[test]
+    fn scrollback_editor_argv_opens_at_the_anchor_line() {
+        let path = std::path::Path::new("/tmp/herdr-scrollback.txt");
+
+        let at_line = scrollback_editor_argv(path, Some(42)).unwrap();
+        assert!(at_line[2].contains("EDITOR:-vi} +42 "), "{}", at_line[2]);
+        let first_line = scrollback_editor_argv(path, Some(0)).unwrap();
+        assert!(first_line[2].contains(" +1 "), "{}", first_line[2]);
     }
 }

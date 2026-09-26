@@ -1095,9 +1095,13 @@ impl ClientShellState {
             KeybindAction::ClearPane => Some(Method::PaneClear(PaneTarget {
                 pane_id: focused_pane?,
             })),
-            KeybindAction::EditScrollback => Some(Method::PaneEditScrollback(PaneTarget {
-                pane_id: focused_pane?,
-            })),
+            KeybindAction::EditScrollback => {
+                let pane_id = focused_pane?;
+                let line = self.scrollback_editor_anchor_line(&pane_id);
+                Some(Method::PaneEditScrollback(
+                    crate::api::schema::PaneEditScrollbackParams { pane_id, line },
+                ))
+            }
             KeybindAction::ResizePaneLeft
             | KeybindAction::ResizePaneDown
             | KeybindAction::ResizePaneUp

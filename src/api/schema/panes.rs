@@ -235,6 +235,17 @@ pub struct PaneResizeParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneEditScrollbackParams {
+    pub pane_id: String,
+    /// 1-based line of the scrollback dump to open the editor at, passed to
+    /// the editor as the vi-family `+N` argument. Absent opens the dump the
+    /// way the editor opens any file. A line past the end of the dump opens
+    /// at its last line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneScrollParams {
     pub pane_id: String,
     pub offset_from_bottom: u64,

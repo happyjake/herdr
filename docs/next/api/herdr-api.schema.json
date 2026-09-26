@@ -2854,6 +2854,26 @@
           },
           "type": "object"
         },
+        "PaneEditScrollbackParams": {
+          "properties": {
+            "line": {
+              "description": "1-based line of the scrollback dump to open the editor at, passed to\nthe editor as the vi-family `+N` argument. Absent opens the dump the\nway the editor opens any file. A line past the end of the dump opens\nat its last line.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneFocusDirectionParams": {
           "properties": {
             "direction": {
@@ -6185,7 +6205,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
+              "$ref": "#/schemas/request/$defs/PaneEditScrollbackParams"
             }
           },
           "required": [

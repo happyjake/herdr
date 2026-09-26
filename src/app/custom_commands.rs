@@ -304,7 +304,10 @@ impl App {
         Ok(())
     }
 
-    pub(crate) fn open_focused_scrollback_in_editor(&mut self) -> std::io::Result<()> {
+    pub(crate) fn open_focused_scrollback_in_editor(
+        &mut self,
+        line: Option<u64>,
+    ) -> std::io::Result<()> {
         let ws_idx = self
             .state
             .active
@@ -324,9 +327,15 @@ impl App {
             .recent_unwrapped_text_snapshot(usize::MAX)
             .text;
 
+        let anchor_line = line.map(|line| {
+            usize::try_from(line)
+                .unwrap_or(usize::MAX)
+                .clamp(1, scrollback.lines().count().max(1))
+        });
+
         let path = write_scrollback_temp_file(&scrollback)?;
 
-        let argv = match crate::platform::scrollback_editor_argv(&path) {
+        let argv = match crate::platform::scrollback_editor_argv(&path, anchor_line) {
             Ok(argv) => argv,
             Err(err) => {
                 let _ = fs::remove_file(&path);

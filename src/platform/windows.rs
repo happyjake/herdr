@@ -1184,7 +1184,12 @@ fn pane_custom_command_pty_builder_with_comspec(
     builder
 }
 
-pub(crate) fn scrollback_editor_argv(path: &std::path::Path) -> std::io::Result<Vec<String>> {
+pub(crate) fn scrollback_editor_argv(
+    path: &std::path::Path,
+    // Windows editors share no open-at-line convention, so the anchor is
+    // accepted and ignored.
+    _anchor_line: Option<usize>,
+) -> std::io::Result<Vec<String>> {
     let editor = std::env::var("VISUAL")
         .ok()
         .filter(|value| !value.trim().is_empty())

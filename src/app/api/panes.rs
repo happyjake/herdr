@@ -3,13 +3,13 @@ use bytes::Bytes;
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCopyMotion,
     PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
-    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
-    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
-    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMouseRouting, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
-    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
-    PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
-    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
+    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneEditScrollbackParams,
+    PaneFocusDirectionParams, PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo,
+    PaneInputSetParams, PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot,
+    PaneLayoutSplit, PaneListParams, PaneMouseRouting, PaneMoveDestination, PaneMoveParams,
+    PaneMoveReason, PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo,
+    PaneProcessInfoParams, PaneProcessInfoProcess, PaneReadParams, PaneReadResult,
+    PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
     PaneSendMouseParams, PaneSendTextParams, PaneSetPinnedParams, PaneSplitParams, PaneSwapParams,
@@ -300,9 +300,13 @@ impl App {
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
-    pub(super) fn handle_pane_edit_scrollback(&mut self, id: String, target: PaneTarget) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
-            return pane_not_found(id, &target.pane_id);
+    pub(super) fn handle_pane_edit_scrollback(
+        &mut self,
+        id: String,
+        params: PaneEditScrollbackParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
         };
         let is_focused = self.state.active == Some(ws_idx)
             && self
@@ -314,7 +318,7 @@ impl App {
         if !is_focused {
             return encode_error(id, "stale_pane_target", "pane is no longer focused");
         }
-        match self.open_focused_scrollback_in_editor() {
+        match self.open_focused_scrollback_in_editor(params.line) {
             Ok(()) => encode_success(id, ResponseResult::Ok {}),
             Err(err) => encode_error(id, "scrollback_editor_failed", err.to_string()),
         }
@@ -3952,13 +3956,85 @@ mod tests {
 
         let response = app.handle_pane_edit_scrollback(
             "req".into(),
-            PaneTarget {
+            PaneEditScrollbackParams {
                 pane_id: public_pane_id,
+                line: None,
             },
         );
 
         assert_eq!(metadata_error_code(&response), "stale_pane_target");
         assert!(app.overlay_panes.is_empty());
+    }
+
+    /// Opens the focused pane's scrollback in an editor that records its own
+    /// argv, and returns the recorded arguments with the dump's line count.
+    async fn edit_scrollback_editor_argv(line: Option<u64>) -> (Vec<String>, usize) {
+        let (mut app, public_pane_id, pane_id) = app_with_scrollback_runtime();
+        app.state.active = Some(0);
+        let dump_lines = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .expect("pane runtime")
+            .recent_unwrapped_text_snapshot(usize::MAX)
+            .text
+            .lines()
+            .count();
+        let recorded = std::env::temp_dir().join(format!(
+            "herdr-edit-scrollback-argv-{}-{}",
+            std::process::id(),
+            line.map_or_else(|| "none".to_string(), |line| line.to_string())
+        ));
+        let _ = std::fs::remove_file(&recorded);
+        // Each nextest test runs in its own process, so the editor variable is
+        // this test's alone.
+        std::env::set_var(
+            "EDITOR",
+            format!(
+                "sh -c 'printf \"%s\\n\" \"$@\" > {}.tmp && mv {}.tmp {}' sh",
+                recorded.display(),
+                recorded.display(),
+                recorded.display()
+            ),
+        );
+
+        let response = app.handle_pane_edit_scrollback(
+            "req".into(),
+            PaneEditScrollbackParams {
+                pane_id: public_pane_id,
+                line,
+            },
+        );
+        assert!(response.contains("\"type\":\"ok\""), "{response}");
+
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&recorded) {
+                let _ = std::fs::remove_file(&recorded);
+                return (text.lines().map(str::to_string).collect(), dump_lines);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the editor never ran");
+    }
+
+    #[tokio::test]
+    async fn api_edit_scrollback_opens_the_editor_at_the_requested_line() {
+        let (argv, _) = edit_scrollback_editor_argv(Some(3)).await;
+        assert_eq!(argv.len(), 2, "{argv:?}");
+        assert_eq!(argv[0], "+3");
+    }
+
+    #[tokio::test]
+    async fn api_edit_scrollback_clamps_a_line_past_the_dump_to_its_last_line() {
+        let (argv, dump_lines) = edit_scrollback_editor_argv(Some(10_000)).await;
+        assert_eq!(argv.len(), 2, "{argv:?}");
+        assert_eq!(argv[0], format!("+{dump_lines}"));
+    }
+
+    #[tokio::test]
+    async fn api_edit_scrollback_without_a_line_passes_only_the_dump() {
+        let (argv, _) = edit_scrollback_editor_argv(None).await;
+        assert_eq!(argv.len(), 1, "{argv:?}");
+        assert!(!argv[0].starts_with('+'), "{argv:?}");
     }
 
     #[tokio::test]

@@ -2,6 +2,47 @@ use super::*;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 impl ClientShellState {
+    /// The 1-based line of the scrollback dump the user is looking at, for
+    /// the scrollback editor to open at: the copy-mode cursor while copy mode
+    /// is on this pane, else the bottom of a scrolled-back view, else the
+    /// live cursor row. Rows count physical rows while the dump is unwrapped
+    /// text, so above a wrapped line the anchor lands a little low; the
+    /// server clamps it to the dump.
+    pub(super) fn scrollback_editor_anchor_line(&self, pane_id: &str) -> Option<u64> {
+        if let Some(copy_mode) = self
+            .copy_mode
+            .as_ref()
+            .filter(|copy_mode| copy_mode.pane_id == pane_id)
+        {
+            return Some(u64::from(copy_mode.cursor.row) + 1);
+        }
+        let hit = self.hits.panes.iter().find(|hit| hit.pane_id == pane_id)?;
+        let metrics = hit.scroll?;
+        let viewport_top = u64::try_from(
+            metrics
+                .max_offset_from_bottom
+                .saturating_sub(metrics.offset_from_bottom),
+        )
+        .unwrap_or(u64::MAX);
+        let bottom_row =
+            viewport_top.saturating_add(u64::from(hit.inner_rect.height.saturating_sub(1)));
+        if metrics.offset_from_bottom > 0 {
+            return Some(bottom_row + 1);
+        }
+        let cursor_row = self.pane_surface.as_ref().and_then(|surface| {
+            let pane = surface.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+            let cursor = surface
+                .frame
+                .cursor
+                .as_ref()
+                .filter(|cursor| cursor.visible)?;
+            let inner = pane.inner_rect;
+            (cursor.y >= inner.y && cursor.y < inner.y.saturating_add(inner.height))
+                .then(|| viewport_top.saturating_add(u64::from(cursor.y - inner.y)))
+        });
+        Some(cursor_row.unwrap_or(bottom_row).saturating_add(1))
+    }
+
     pub(super) fn reset_copy_pipeline(&mut self) {
         self.copy_session_generation = self.copy_session_generation.saturating_add(1);
         self.copy_operation_in_flight = false;
