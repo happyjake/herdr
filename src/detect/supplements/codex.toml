@@ -1,0 +1,22 @@
+id = "codex"
+min_engine_version = 3
+
+# Rules in this file are consulted only when the active codex manifest
+# (remote or bundled) matched nothing, so an updated remote manifest cannot
+# shadow them and any rule it adds still wins.
+
+# Codex closes every finished turn with a separator that carries the local
+# time, prefixed by the turn duration once a turn runs a minute or longer:
+#   Worked for 2h 48m 24s · Sep 23 at 8:01 PM
+#   8:01 PM
+# Only blank lines and a right-aligned tip may follow it before the composer.
+# The composer and footer stay visible while a turn runs, so they are not
+# evidence; a separator followed by anything else (a newly submitted prompt,
+# a notice, more output) is not either.
+[[rules]]
+id = "turn_complete_separator"
+state = "idle"
+priority = 200
+region = "before_current_prompt_marker"
+visible_idle = true
+regex = ['(?m)^[ \t─]*(?:Worked for (?:[0-9]+[dhm] )*[0-9]+[dhms] · )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)[ \t─]*(?:\r?\n[ \t]*(?:Tip: [^\r\n]*)?)*\z']

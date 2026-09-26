@@ -1,0 +1,19 @@
+• The parser now rejects empty headers, and the new regression test covers the case that failed.
+
+  Worked for 4m 12s · Sep 23 at 8:01 PM
+
+
+› clean the build directory and rebuild
+
+
+• I will remove the stale build output first.
+
+  Would you like to run the following command?
+
+  $ rm -rf build
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `rm -rf` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

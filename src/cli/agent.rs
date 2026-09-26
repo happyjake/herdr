@@ -183,7 +183,7 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
             .and_then(|value| value.as_str())
             .unwrap_or("-");
         println!(
-            "rule: {} (region={} priority={})",
+            "rule: {} (region={} priority={}){}",
             rule_id,
             rule.get("region")
                 .and_then(|value| value.as_str())
@@ -191,6 +191,7 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
             rule.get("priority")
                 .and_then(|value| value.as_i64())
                 .unwrap_or(0),
+            supplement_marker(rule.get("supplement")),
         );
         if let Some(preview) = matched_rule_region_preview(explain, rule_id) {
             println!("evidence: {preview:?}");
@@ -244,7 +245,7 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
         println!("evaluated_rules:");
         for rule in evaluated_rules {
             println!(
-                "  {} {} priority={} region={} state={}",
+                "  {} {} priority={} region={} state={}{}",
                 if rule["matched"].as_bool().unwrap_or(false) {
                     "✓"
                 } else {
@@ -253,7 +254,8 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
                 rule["id"].as_str().unwrap_or("-"),
                 rule["priority"].as_i64().unwrap_or(0),
                 rule["region"].as_str().unwrap_or("-"),
-                rule["state"].as_str().unwrap_or("unknown")
+                rule["state"].as_str().unwrap_or("unknown"),
+                supplement_marker(rule.get("supplement")),
             );
             let evidence = &rule["evidence"];
             println!(
@@ -274,14 +276,21 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
     }
 }
 
+fn supplement_marker(value: Option<&serde_json::Value>) -> &'static str {
+    if value.and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        " [supplement]"
+    } else {
+        ""
+    }
+}
+
 fn matched_rule_region_preview<'a>(
     explain: &'a serde_json::Value,
     rule_id: &str,
 ) -> Option<&'a str> {
-    explain["evaluated_rules"]
-        .as_array()?
-        .iter()
-        .find(|rule| rule["id"].as_str() == Some(rule_id))?["evidence"]["region_preview"]
+    explain["evaluated_rules"].as_array()?.iter().find(|rule| {
+        rule["matched"].as_bool() == Some(true) && rule["id"].as_str() == Some(rule_id)
+    })?["evidence"]["region_preview"]
         .as_str()
         .filter(|preview| !preview.is_empty())
 }

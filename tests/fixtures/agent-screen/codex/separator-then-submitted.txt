@@ -1,0 +1,12 @@
+• The parser now rejects empty headers, and the new regression test covers the case that failed.
+
+  Worked for 4m 12s · Sep 23 at 8:01 PM
+
+
+› now update the changelog
+
+
+› Ask Codex to do anything
+
+  ~/repo · main · 2 files changed · Context 34% used · model-name high
+  ? for shortcuts

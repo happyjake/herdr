@@ -1,0 +1,12 @@
+› what does the build script do?
+
+
+• It compiles the release binary, runs the unit tests, and writes the archive to dist/. Nothing is uploaded.
+
+  3:14 PM
+
+
+› Ask Codex to do anything
+
+  ~/repo · main · No changes · model-name high
+  ← for agents · ? for shortcuts

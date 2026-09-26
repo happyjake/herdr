@@ -96,6 +96,8 @@ pub struct MatchedRule {
     pub priority: i32,
     pub region: String,
     pub state: AgentState,
+    /// The rule came from the built-in supplement, not the active manifest.
+    pub supplement: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +108,7 @@ pub struct EvaluatedRule {
     pub evidence: RuleEvidence,
     pub state: AgentState,
     pub matched: bool,
+    pub supplement: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +265,46 @@ const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
     ("qwen", include_str!("manifests/qwen.toml")),
     ("copilot", include_str!("manifests/github-copilot.toml")),
 ];
+
+/// Rules evaluated only when the active remote or bundled manifest matched
+/// nothing. Remote catalog updates replace the active manifest, not these, so
+/// a rule kept here survives them while any rule a manifest adds still wins.
+const SUPPLEMENT_MANIFESTS: &[(&str, &str)] = &[("codex", include_str!("supplements/codex.toml"))];
+
+struct Supplement {
+    manifest: AgentManifest,
+    compiled_rules: Vec<CompiledRule>,
+}
+
+static SUPPLEMENTS: OnceLock<Vec<(Agent, Supplement)>> = OnceLock::new();
+
+fn supplement(agent: Agent) -> Option<&'static Supplement> {
+    SUPPLEMENTS
+        .get_or_init(|| {
+            SUPPLEMENT_MANIFESTS
+                .iter()
+                .map(|(id, content)| {
+                    let agent = parse_agent_label(id)
+                        .unwrap_or_else(|| panic!("supplement {id} names no known agent"));
+                    let manifest = parse_manifest(content)
+                        .unwrap_or_else(|err| panic!("supplement {id} manifest is invalid: {err}"));
+                    let compiled_rules = compile_manifest(&manifest).unwrap_or_else(|err| {
+                        panic!("supplement {id} manifest could not be compiled: {err}")
+                    });
+                    (
+                        agent,
+                        Supplement {
+                            manifest,
+                            compiled_rules,
+                        },
+                    )
+                })
+                .collect()
+        })
+        .iter()
+        .find(|(supplement_agent, _)| *supplement_agent == agent)
+        .map(|(_, supplement)| supplement)
+}
 
 static MANIFEST_CACHE: OnceLock<RwLock<ManifestCache>> = OnceLock::new();
 static MANIFEST_RELOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -435,40 +478,30 @@ fn evaluate_loaded_manifest(
     loaded: LoadedManifest,
     include_update_status: bool,
 ) -> DetectionExplain {
-    let mut matched: Option<(&ManifestRule, String)> = None;
     let mut evaluated_rules = Vec::new();
-
-    for (rule, compiled_rule) in loaded
-        .manifest
-        .rules
-        .iter()
-        .zip(loaded.compiled_rules.iter())
-    {
-        let region_text = region(input, &rule.region);
-        let matched_rule = compiled_rule_matches(compiled_rule, region_text);
-        evaluated_rules.push(EvaluatedRule {
-            id: rule.id.clone(),
-            priority: rule.priority,
-            region: rule.region.clone(),
-            evidence: rule_evidence(rule, region_text),
-            state: rule
-                .state
-                .map(AgentState::from)
-                .unwrap_or(AgentState::Unknown),
-            matched: matched_rule,
-        });
-
-        if !matched_rule {
-            continue;
-        }
-
-        match matched {
-            Some((previous, _)) if previous.priority >= rule.priority => {}
-            _ => matched = Some((rule, rule.region.clone())),
+    let mut matched = best_matching_rule(
+        &loaded.manifest.rules,
+        &loaded.compiled_rules,
+        input,
+        false,
+        &mut evaluated_rules,
+    );
+    let mut from_supplement = false;
+    // A local override is an explicit authoring choice and stays the sole authority.
+    if matched.is_none() && !matches!(loaded.source, ManifestSource::Override(_)) {
+        if let Some(supplement) = supplement(agent) {
+            matched = best_matching_rule(
+                &supplement.manifest.rules,
+                &supplement.compiled_rules,
+                input,
+                true,
+                &mut evaluated_rules,
+            );
+            from_supplement = matched.is_some();
         }
     }
 
-    let Some((rule, region_name)) = matched else {
+    let Some(rule) = matched else {
         return fallback_explain(
             Some(agent),
             Some((loaded, evaluated_rules)),
@@ -495,8 +528,9 @@ fn evaluate_loaded_manifest(
         matched_rule: Some(MatchedRule {
             id: rule.id.clone(),
             priority: rule.priority,
-            region: region_name,
+            region: rule.region.clone(),
             state,
+            supplement: from_supplement,
         }),
         screen_detection_skipped: false,
         visible_idle: rule.visible_idle && state == AgentState::Idle,
@@ -515,6 +549,42 @@ fn evaluate_loaded_manifest(
             .map(|status| status.last_result.clone()),
         remote_update_error: remote_update_status.and_then(|status| status.last_error),
     }
+}
+
+fn best_matching_rule<'a>(
+    rules: &'a [ManifestRule],
+    compiled_rules: &[CompiledRule],
+    input: DetectionInput<'_>,
+    supplement: bool,
+    evaluated_rules: &mut Vec<EvaluatedRule>,
+) -> Option<&'a ManifestRule> {
+    let mut matched: Option<&ManifestRule> = None;
+    for (rule, compiled_rule) in rules.iter().zip(compiled_rules.iter()) {
+        let region_text = region(input, &rule.region);
+        let matched_rule = compiled_rule_matches(compiled_rule, region_text);
+        evaluated_rules.push(EvaluatedRule {
+            id: rule.id.clone(),
+            priority: rule.priority,
+            region: rule.region.clone(),
+            evidence: rule_evidence(rule, region_text),
+            state: rule
+                .state
+                .map(AgentState::from)
+                .unwrap_or(AgentState::Unknown),
+            matched: matched_rule,
+            supplement,
+        });
+
+        if !matched_rule {
+            continue;
+        }
+
+        match matched {
+            Some(previous) if previous.priority >= rule.priority => {}
+            _ => matched = Some(rule),
+        }
+    }
+    matched
 }
 
 fn fallback_explain(
@@ -830,6 +900,7 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
             "priority": rule.priority,
             "region": rule.region,
             "state": agent_state_label(rule.state),
+            "supplement": rule.supplement,
         })
     });
     let evaluated_rules: Vec<_> = explain
@@ -842,6 +913,7 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
                 "region": rule.region,
                 "state": agent_state_label(rule.state),
                 "matched": rule.matched,
+                "supplement": rule.supplement,
                 "evidence": {
                     "contains": &rule.evidence.contains,
                     "regex": &rule.evidence.regex,
@@ -1539,5 +1611,7 @@ fn line_start_offset(content: &str, lines: &[&str], index: usize) -> usize {
 
 #[cfg(test)]
 mod codebuddy_tests;
+#[cfg(test)]
+mod codex_tests;
 #[cfg(test)]
 mod tests;

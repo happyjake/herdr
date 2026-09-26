@@ -1,0 +1,14 @@
+› run the unit tests and summarise failures
+
+
+• Ran cargo test --lib
+  └ running 212 tests
+    + Show details
+
+• Working (12s • esc to interrupt)
+
+
+› Ask Codex to do anything
+
+  ~/repo · main · No changes · Context 21% used · model-name high
+  ? for shortcuts

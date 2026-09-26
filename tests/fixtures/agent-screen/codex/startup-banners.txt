@@ -1,0 +1,60 @@
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP startup interrupted. The following servers were not initialized: apps
+
+⚠ MCP client for `apps` failed to start: MCP startup failed: handshaking with MCP server failed: Send message error Transport
+  [client::transport::EventNotificationTransport<transport::worker::WorkerTransport<transport::streamable_http_client::StreamableHttpClie
+  ntWorker<client::http_client_adapter::StreamableHttpClientAdapter>>>] error: unexpected server response: HTTP 401: {
+    "error": {
+      "message": "Provided authentication token is expired. Please try signing in again.",
+      "type": null,
+      "code": "token_expired",
+      "param": null
+    },
+    "status": 401,
+    "detail": {
+      "code": "token_expired",
+      "message": "Provided authentication token is expired. Please try signing in again."
+    }
+  }, when send initialize request: Send message error Transport
+  [client::transport::EventNotificationTransport<transport::worker::WorkerTransport<transport::streamable_http_client::StreamableHttpClie
+  ntWorker<client::http_client_adapter::StreamableHttpClientAdapter>>>] error: unexpected server response: HTTP 401: {
+    "error": {
+      "message": "Provided authentication token is expired. Please try signing in again.",
+      "type": null,
+      "code": "token_expired",
+      "param": null
+    },
+    "status": 401,
+    "detail": {
+      "code": "token_expired",
+      "message": "Provided authentication token is expired. Please try signing in again."
+    }
+  }, when send initialize request
+
+⚠ MCP startup incomplete (failed: apps)
+
+
+› Ask Codex to do anything
+
+  ~/repo · main · No changes · Context 19% used · model-name high
