@@ -567,7 +567,7 @@ fn restore_tab(
         // includes a status the restore itself produced, such as the Idle
         // pre-seeded for an agent about to be resumed: it is dated here, not
         // left for whichever request first notices it.
-        let restored_pane_state = |terminal: &TerminalState| {
+        let restored_pane_state = |terminal: &TerminalState, imported: bool| {
             let now_unix = crate::pane::unix_now_secs();
             let mut pane = match saved_agent_status_claim {
                 Some(claim) => PaneState::restored_from(terminal.id.clone(), claim, now_unix),
@@ -577,9 +577,14 @@ fn restore_tab(
             // restart or a handoff: neither is a client viewing the pane. This
             // reads the saved claim rather than the adopted one, because a
             // claim whose deadline passed is a verdict about time, and nobody
-            // having seen the pane is not.
-            pane.seen = saved_agent_status_claim
-                .is_none_or(|claim| claim.status != crate::api::schema::AgentStatus::Done);
+            // having seen the pane is not. Only the agent that completed can
+            // still be unread: a pane handed over live, or one whose agent is
+            // resumed and starts idle. A pane that comes back as a plain shell
+            // has nothing left to read.
+            let still_holds_the_agent = imported || terminal.state == AgentState::Idle;
+            pane.seen = !still_holds_the_agent
+                || saved_agent_status_claim
+                    .is_none_or(|claim| claim.status != crate::api::schema::AgentStatus::Done);
             let restored_status =
                 crate::app::api_helpers::pane_agent_status(terminal.state, pane.seen);
             if awaits_agent_resolution {
@@ -664,7 +669,7 @@ fn restore_tab(
                     std::time::Instant::now(),
                 );
             }
-            panes.insert(*id, restored_pane_state(&terminal));
+            panes.insert(*id, restored_pane_state(&terminal, false));
             terminals.push(terminal);
             continue;
         }
@@ -773,7 +778,7 @@ fn restore_tab(
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
                 }
-                panes.insert(*id, restored_pane_state(&terminal));
+                panes.insert(*id, restored_pane_state(&terminal, was_imported));
                 terminal_runtimes.insert(terminal_id, runtime);
                 terminals.push(terminal);
             }
@@ -1835,6 +1840,76 @@ mod tests {
         );
     }
 
+    /// Restores one pi pane whose session recorded `saved` at 1_000, with
+    /// agent resume on or off.
+    fn restore_pi_pane_saved_as(saved: &str, resume: bool) -> RestoredSession {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:pi".into(),
+                                agent: "pi".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Path,
+                                value: test_session_path("pi-session.jsonl"),
+                                record_path: None,
+                            }),
+                            launch_argv: None,
+                            agent_status: Some(saved.into()),
+                            agent_status_changed_at: Some(1_000),
+                            agent_status_resolve_by: None,
+                            agent_status_saw_other: false,
+                            pinned: false,
+                            label_source: None,
+                            label_at: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+        restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            resume,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+    }
+
     /// A restart resumes the agent and pre-seeds it idle. Whether that idle
     /// reads as done is what the session knew: a completion nobody had seen
     /// stays unread, and anything else restores as seen.
@@ -1847,74 +1922,7 @@ mod tests {
             ("idle", true, AgentStatus::Idle),
             ("working", true, AgentStatus::Idle),
         ] {
-            let cwd = std::env::current_dir().unwrap();
-            let snapshot = SessionSnapshot {
-                version: super::super::snapshot::SNAPSHOT_VERSION,
-                workspaces: vec![WorkspaceSnapshot {
-                    id: Some("workspace".into()),
-                    custom_name: None,
-                    identity_cwd: cwd.clone(),
-                    worktree_space: None,
-                    public_pane_numbers: HashMap::new(),
-                    next_public_pane_number: 0,
-                    public_tab_numbers: Vec::new(),
-                    next_public_tab_number: 0,
-                    tabs: vec![TabSnapshot {
-                        custom_name: None,
-                        layout: LayoutSnapshot::Pane(0),
-                        panes: HashMap::from([(
-                            0,
-                            super::super::snapshot::PaneSnapshot {
-                                cwd,
-                                label: None,
-                                agent_name: None,
-                                managed_agent_kind: None,
-                                agent_session: Some(
-                                    super::super::snapshot::PaneAgentSessionSnapshot {
-                                        source: "herdr:pi".into(),
-                                        agent: "pi".into(),
-                                        kind: crate::agent_resume::AgentSessionRefKind::Path,
-                                        value: test_session_path("pi-session.jsonl"),
-                                        record_path: None,
-                                    },
-                                ),
-                                launch_argv: None,
-                                agent_status: Some(saved.into()),
-                                agent_status_changed_at: Some(1_000),
-                                agent_status_resolve_by: None,
-                                agent_status_saw_other: false,
-                                pinned: false,
-                                label_source: None,
-                                label_at: None,
-                            },
-                        )]),
-                        zoomed: false,
-                        focused: Some(0),
-                        root_pane: Some(0),
-                    }],
-                    active_tab: 0,
-                }],
-                active: Some(0),
-                selected: 0,
-                sidebar_width: None,
-                sidebar_section_split: None,
-                collapsed_space_keys: Default::default(),
-            };
-            let (events, _event_rx) = mpsc::channel(4);
-
-            let (mut workspaces, terminals, _runtimes) = restore(
-                &snapshot,
-                None,
-                24,
-                80,
-                0,
-                test_restore_shell(),
-                crate::config::ShellModeConfig::NonLogin,
-                true,
-                events,
-                Arc::new(Notify::new()),
-                Arc::new(RenderSignal::new()),
-            );
+            let (mut workspaces, terminals, _runtimes) = restore_pi_pane_saved_as(saved, true);
 
             let terminal = terminals.values().next().expect("restored terminal");
             assert_eq!(terminal.state, AgentState::Idle, "{saved}: resumed idle");
@@ -1932,6 +1940,27 @@ mod tests {
                 assert_eq!(pane.agent_status_changed_at(), 1_000);
             }
         }
+    }
+
+    /// A pane that comes back as a plain shell has no completion left to
+    /// read. Restoring it unseen would make whatever agent is started there
+    /// later read as done the moment it is first seen idle.
+    #[tokio::test]
+    async fn restore_marks_a_done_pane_seen_when_it_comes_back_as_a_shell() {
+        let (workspaces, terminals, _runtimes) = restore_pi_pane_saved_as("done", false);
+
+        let terminal = terminals.values().next().expect("restored terminal");
+        assert_eq!(terminal.state, AgentState::Unknown, "not resumed");
+        let workspace = workspaces.first().expect("restored workspace");
+        let pane = workspace
+            .pane_state(workspace.tabs[0].root_pane)
+            .expect("restored pane");
+        assert!(pane.seen, "a plain shell restores as seen");
+        assert_ne!(
+            crate::app::api_helpers::pane_agent_status(AgentState::Idle, pane.seen),
+            crate::api::schema::AgentStatus::Done,
+            "an agent later found idle here is not an unread completion"
+        );
     }
 
     #[tokio::test]
