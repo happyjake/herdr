@@ -4,7 +4,7 @@ pub mod support;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +19,8 @@ use support::{
     wait_for_message_variant, wait_for_socket, SERVER_MESSAGE_ENDPOINT_CONTROL,
     SERVER_MESSAGE_SERVER_SHUTDOWN,
 };
+use tungstenite::client::IntoClientRequest;
+use tungstenite::{Message, WebSocket};
 
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
@@ -68,7 +70,36 @@ fn spawn_server_with_env(
         "onboarding = false\n",
     )
     .unwrap();
+    spawn_server_process(config_home, runtime_dir, api_socket, extra_env)
+}
 
+/// Debug builds read the herdr-dev config dir; write the release dir too so
+/// the config applies whichever build runs.
+fn write_config_everywhere(config_home: &Path, config: &str) {
+    for dir in ["herdr", "herdr-dev"] {
+        fs::create_dir_all(config_home.join(dir)).unwrap();
+        fs::write(config_home.join(dir).join("config.toml"), config).unwrap();
+    }
+}
+
+fn spawn_server_with_config_and_env(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+    config: &str,
+    extra_env: &[(&str, &str)],
+) -> SpawnedHerdr {
+    write_config_everywhere(config_home, config);
+    fs::create_dir_all(runtime_dir).unwrap();
+    spawn_server_process(config_home, runtime_dir, api_socket, extra_env)
+}
+
+fn spawn_server_process(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket: &Path,
+    extra_env: &[(&str, &str)],
+) -> SpawnedHerdr {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -2654,4 +2685,133 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
 #[test]
 fn live_handoff_after_restored_failure_rolls_back_old_server() {
     live_handoff_import_failure_rolls_back_old_server_at("after_restored");
+}
+
+fn websocket_config(port: u16, token: &str) -> String {
+    format!(
+        "onboarding = false\n[websocket_api]\nbind = \"127.0.0.1:{port}\"\ntoken = \"{token}\"\n"
+    )
+}
+
+fn websocket_request(addr: SocketAddr, token: &str) -> tungstenite::handshake::client::Request {
+    let mut request = format!("ws://{addr}").into_client_request().unwrap();
+    request.headers_mut().insert(
+        tungstenite::http::header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    request
+}
+
+fn websocket_connect(addr: SocketAddr, token: &str) -> WebSocket<TcpStream> {
+    let stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    match tungstenite::client::client(websocket_request(addr, token), stream) {
+        Ok((websocket, _response)) => websocket,
+        Err(err) => panic!("websocket handshake with token {token:?} failed: {err}"),
+    }
+}
+
+fn wait_for_websocket_listener(addr: SocketAddr, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if TcpStream::connect(addr).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("websocket listener did not appear at {addr}");
+}
+
+fn websocket_ping(websocket: &mut WebSocket<TcpStream>) -> serde_json::Value {
+    websocket
+        .send(Message::text(
+            r#"{"id":"test:ws:ping","method":"ping","params":{}}"#,
+        ))
+        .unwrap();
+    loop {
+        match websocket.read() {
+            Ok(Message::Text(text)) => return serde_json::from_str(text.as_str()).unwrap(),
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+            other => panic!("unexpected websocket read while waiting for pong: {other:?}"),
+        }
+    }
+}
+
+fn assert_websocket_pong(addr: SocketAddr, token: &str) {
+    let mut websocket = websocket_connect(addr, token);
+    let pong = websocket_ping(&mut websocket);
+    assert_eq!(pong["result"]["type"], "pong", "token {token:?}: {pong}");
+}
+
+fn assert_websocket_rejected(addr: SocketAddr, token: &str) {
+    match tungstenite::connect(websocket_request(addr, token)) {
+        Err(tungstenite::Error::Http(response)) => assert_eq!(
+            response.status().as_u16(),
+            401,
+            "token {token:?} should be rejected"
+        ),
+        Err(other) => panic!("expected http 401 for token {token:?}, got: {other:?}"),
+        Ok(_) => panic!("token {token:?} should be rejected, but the handshake succeeded"),
+    }
+}
+
+#[test]
+fn live_handoff_failure_keeps_reloaded_websocket_token() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let port = unused_local_port();
+    let ws_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let startup_token = "startup-token-a";
+    let rotated_token = "rotated-token-b";
+
+    let spawned = spawn_server_with_config_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &websocket_config(port, startup_token),
+        &[("HERDR_TEST_HANDOFF_IMPORT_FAIL", "after_restored")],
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    wait_for_websocket_listener(ws_addr, Duration::from_secs(10));
+    assert_websocket_pong(ws_addr, startup_token);
+
+    write_config_everywhere(&config_home, &websocket_config(port, rotated_token));
+    let reloaded = request(
+        &api_socket,
+        serde_json::json!({"id":"test:reload","method":"server.reload_config","params":{}}),
+    );
+    assert_eq!(reloaded["result"]["type"], "config_reload", "{reloaded}");
+    assert_websocket_pong(ws_addr, rotated_token);
+    assert_websocket_rejected(ws_addr, startup_token);
+
+    // The replacement fails after the old server released its public
+    // sockets, so the old server rebinds the websocket listener.
+    let failed = request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":{}}),
+    );
+    assert!(
+        failed.get("error").is_some(),
+        "after_restored handoff should fail: {failed}"
+    );
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(5));
+    wait_for_websocket_listener(ws_addr, Duration::from_secs(10));
+
+    assert_websocket_pong(ws_addr, rotated_token);
+    assert_websocket_rejected(ws_addr, startup_token);
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
 }

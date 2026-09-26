@@ -178,8 +178,14 @@ impl HeadlessServer {
         // the websocket listener now so the replacement server can bind it.
         // Live websocket clients are disconnected here and reconnect to the
         // replacement server; restore_public_sockets_after_failed_handoff
-        // rebinds on rollback.
-        let websocket_api_config = self.websocket_api_config.clone();
+        // rebinds on rollback. A reload rotates only the live listener's
+        // token slot, which the drop clears, so carry the live token into
+        // the stored config first or the rebind would revert to the token
+        // the server started with.
+        let mut websocket_api_config = self.websocket_api_config.clone();
+        if let Some(server) = &self.websocket_server {
+            websocket_api_config.token = Some(server.shared_token().current());
+        }
         self.set_websocket_api(websocket_api_config, None);
         if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
