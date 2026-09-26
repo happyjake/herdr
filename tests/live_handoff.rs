@@ -2324,6 +2324,198 @@ fn live_handoff_keeps_the_date_of_a_working_agent_with_a_resumable_session() {
 }
 
 #[test]
+fn live_handoff_keeps_an_unseen_completion_done() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let started_marker = base.join("agent-started");
+    let fake_pi = base.join("pi");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(
+        &fake_pi,
+        format!(
+            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n:\n",
+            started_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Move focus to another tab, so the agent's completion lands where nobody
+    // is looking and is reported as done rather than idle.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:tab:create",
+            "method": "tab.create",
+            "params": {"workspace_id": workspace_id, "focus": true}
+        }),
+    ));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-agent",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": fake_pi, "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&started_marker, Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:agent:wait-for-process",
+                "method": "agent.get",
+                "params": {"target": pane_id}
+            }),
+        );
+        if response.get("result").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent process was not detected: {response}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let agent_session = base.join("session.jsonl");
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:agent:session",
+            "method": "pane.report_agent_session",
+            "params": {
+                "pane_id": pane_id,
+                "source": "herdr:pi",
+                "agent": "pi",
+                "seq": 1,
+                "agent_session_path": agent_session,
+                "session_start_source": "startup"
+            }
+        }),
+    ));
+    for (seq, state) in [(2, "working"), (3, "idle")] {
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": format!("test:agent:report:{state}"),
+                "method": "pane.report_agent",
+                "params": {
+                    "pane_id": pane_id,
+                    "source": "herdr:pi",
+                    "agent": "pi",
+                    "state": state,
+                    "seq": seq,
+                    "agent_session_path": agent_session
+                }
+            }),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let response = request(
+                &api_socket,
+                serde_json::json!({
+                    "id": "test:pane:get:report",
+                    "method": "pane.get",
+                    "params": {"pane_id": pane_id}
+                }),
+            );
+            let status = response["result"]["pane"]["agent_status"].as_str();
+            // An unseen idle reads as done, which is what the control below
+            // waits for; here it is enough that the report was applied.
+            if status.is_some_and(|status| status == state || (state == "idle" && status == "done"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the {state} report was not applied: {response}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+    let pane_status = |id: &str| {
+        let response = request(
+            &api_socket,
+            serde_json::json!({
+                "id": format!("test:pane:get:{id}"),
+                "method": "pane.get",
+                "params": {"pane_id": pane_id}
+            }),
+        );
+        let pane = &response["result"]["pane"];
+        (
+            pane["agent_status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            pane["agent_status_changed_at"].as_u64(),
+            response.clone(),
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let done_since = loop {
+        let (status, changed_at, response) = pane_status("before");
+        if status == "done" {
+            break changed_at.expect("a done pane is dated");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the completion was not reported as done before the handoff: {response}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let (status, changed_at, response) = pane_status("after");
+    assert_eq!(
+        status, "done",
+        "a completion nobody saw must survive the handoff unread: {response}"
+    );
+    assert_eq!(
+        changed_at,
+        Some(done_since),
+        "the completion keeps the age it had before the handoff: {response}"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
     use std::os::unix::fs::PermissionsExt;
 
