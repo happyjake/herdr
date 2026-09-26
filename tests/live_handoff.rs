@@ -2746,13 +2746,24 @@ fn assert_websocket_pong(addr: SocketAddr, token: &str) {
 }
 
 fn assert_websocket_rejected(addr: SocketAddr, token: &str) {
-    match tungstenite::connect(websocket_request(addr, token)) {
-        Err(tungstenite::Error::Http(response)) => assert_eq!(
-            response.status().as_u16(),
-            401,
-            "token {token:?} should be rejected"
-        ),
-        Err(other) => panic!("expected http 401 for token {token:?}, got: {other:?}"),
+    let stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    match tungstenite::client::client(websocket_request(addr, token), stream) {
+        Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) => {
+            assert_eq!(
+                response.status().as_u16(),
+                401,
+                "token {token:?} should be rejected"
+            )
+        }
+        Err(tungstenite::HandshakeError::Failure(other)) => {
+            panic!("expected http 401 for token {token:?}, got: {other:?}")
+        }
+        Err(tungstenite::HandshakeError::Interrupted(_)) => {
+            panic!("handshake with token {token:?} timed out instead of being rejected")
+        }
         Ok(_) => panic!("token {token:?} should be rejected, but the handshake succeeded"),
     }
 }

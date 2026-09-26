@@ -2335,6 +2335,12 @@ fn server_stop_over_websocket_stops_the_server() {
     let mut server = start_ws_test_server();
 
     let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    // Only this test's own running server may answer the stop, so the exit
+    // below is attributable to it and not to a sibling on a reused port.
+    assert!(
+        server.child.child.try_wait().unwrap().is_none(),
+        "this test's server exited before server.stop was sent"
+    );
     let stopped = ws.request(r#"{"id":"req_stop","method":"server.stop","params":{}}"#);
     assert_eq!(stopped["result"]["type"], "ok", "{stopped}");
 

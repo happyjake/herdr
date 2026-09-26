@@ -187,7 +187,9 @@ pub struct HeadlessServer {
     #[cfg_attr(windows, allow(dead_code))]
     api_server: Option<api::ServerHandle>,
     /// Config for the optional WebSocket API listener, kept so a failed live
-    /// handoff can rebind the listener it released.
+    /// handoff can rebind the listener it released. Its token is the startup
+    /// token and goes stale after a reload: take the live token from the
+    /// running listener's `shared_token()` instead.
     websocket_api_config: crate::config::WebSocketApiConfig,
     websocket_server: Option<api::WebSocketServerHandle>,
     #[cfg(unix)]
