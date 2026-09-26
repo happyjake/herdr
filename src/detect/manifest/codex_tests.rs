@@ -2,8 +2,16 @@
 //! supplement. Codex draws its composer and footer while a turn runs, so the
 //! only idle evidence is the separator that closes a finished turn; screens
 //! without it must stay unknown rather than fall back to idle.
+//!
+//! The supplement is owned by this codebase rather than by the remotely
+//! updated manifest catalog, so its rule is pinned against captured screens
+//! here; the negative controls assert only the resulting state, never the
+//! bundled manifest's rule ids or priorities, and the engine precedence tests
+//! use synthetic manifests and minimal strings.
 
 use super::*;
+
+const SUPPLEMENT_RULE: &str = "turn_complete_separator";
 
 macro_rules! fixture {
     ($name:literal) => {
@@ -14,118 +22,110 @@ macro_rules! fixture {
     };
 }
 
-fn assert_detected(
-    screen: &str,
-    state: AgentState,
-    rule_id: Option<&str>,
-    supplement: bool,
-) -> DetectionExplain {
+fn explain_bundled(screen: &str) -> DetectionExplain {
     // Scratch config and state dirs keep the bundled manifest active.
     let detected = with_codex_manifest_dirs("fixture", || explain(Agent::Codex, screen));
     assert!(matches!(detected.source, Some(ManifestSource::Bundled)));
-
-    assert_eq!(detected.state, state);
-    assert_eq!(
-        detected.matched_rule.as_ref().map(|rule| rule.id.as_str()),
-        rule_id
-    );
-    assert_eq!(
-        detected.matched_rule.as_ref().map(|rule| rule.supplement),
-        rule_id.map(|_| supplement)
-    );
-    assert_eq!(detected.visible_idle, state == AgentState::Idle);
     detected
 }
 
-fn assert_turn_complete(screen: &str) {
-    assert_detected(
-        screen,
-        AgentState::Idle,
-        Some("turn_complete_separator"),
-        true,
-    );
+fn supplement_matched(detected: &DetectionExplain) -> bool {
+    detected
+        .matched_rule
+        .as_ref()
+        .is_some_and(|rule| rule.supplement && rule.id == SUPPLEMENT_RULE)
 }
 
-fn assert_ambiguous(screen: &str) {
-    let detected = assert_detected(screen, AgentState::Unknown, None, false);
-    assert_eq!(
-        detected.fallback_reason.as_deref(),
-        Some("codex_state_ambiguous")
-    );
-    assert!(detected
-        .evaluated_rules
-        .iter()
-        .any(|rule| rule.supplement && rule.id == "turn_complete_separator" && !rule.matched));
+fn assert_turn_complete(screen: &str) {
+    let detected = explain_bundled(screen);
+
+    assert_eq!(detected.state, AgentState::Idle);
+    assert!(supplement_matched(&detected));
+    assert!(detected.visible_idle);
+}
+
+fn assert_not_turn_complete(screen: &str, state: AgentState) {
+    let detected = explain_bundled(screen);
+
+    assert_eq!(detected.state, state);
+    assert!(!supplement_matched(&detected));
+    assert!(!detected.visible_idle);
 }
 
 #[test]
 fn codex_finished_turn_separator_reads_idle() {
     assert_turn_complete(fixture!("idle-turn-complete.txt"));
+    assert_turn_complete(fixture!("idle-same-day.txt"));
+    // The bare-time separator of a turn under a minute is inferred from
+    // codex's own time format strings; it has not yet been observed on screen.
     assert_turn_complete(fixture!("idle-short-turn.txt"));
 }
 
 #[test]
 fn codex_running_or_resumed_turn_is_not_idle() {
-    let working = assert_detected(
-        fixture!("working.txt"),
-        AgentState::Working,
-        Some("screen_working_fallback"),
-        false,
-    );
-    assert!(working.visible_working);
-
+    assert_not_turn_complete(fixture!("working.txt"), AgentState::Working);
     // Mid-turn prose with no status line was the false idle the generic fallback produced.
-    assert_ambiguous(fixture!("working-sentence-no-marker.txt"));
-    // A prompt submitted after the separator starts a new turn.
-    assert_ambiguous(fixture!("separator-then-submitted.txt"));
-
-    let blocked = assert_detected(
-        fixture!("blocked-after-separator.txt"),
-        AgentState::Blocked,
-        Some("live_strong_blocker"),
-        false,
+    assert_not_turn_complete(
+        fixture!("working-sentence-no-marker.txt"),
+        AgentState::Unknown,
     );
-    assert!(blocked.visible_blocker);
+    // A prompt submitted after the separator starts a new turn.
+    assert_not_turn_complete(
+        fixture!("separator-then-submitted.txt"),
+        AgentState::Unknown,
+    );
+    assert_not_turn_complete(fixture!("blocked-after-separator.txt"), AgentState::Blocked);
 }
 
 #[test]
 fn codex_screens_without_turn_end_evidence_stay_unknown() {
-    assert_ambiguous(fixture!("startup-banners.txt"));
-    assert_ambiguous(fixture!("auth-expired.txt"));
-    assert_ambiguous(fixture!("refusal-notice.txt"));
+    assert_not_turn_complete(fixture!("startup-banners.txt"), AgentState::Unknown);
+    assert_not_turn_complete(fixture!("auth-expired.txt"), AgentState::Unknown);
+    assert_not_turn_complete(fixture!("refusal-notice.txt"), AgentState::Unknown);
+}
+
+const SEPARATOR_SCREEN: &str = "• Done.\n\n  Worked for 1m 2s · 9:41 AM\n\n›\n";
+
+fn synthetic_codex_manifest(version: Option<&str>) -> String {
+    let header = match version {
+        Some(version) => format!(
+            "id = \"codex\"\nversion = \"{version}\"\nmin_engine_version = 3\nupdated_at = \"2026-06-10T12:00:00Z\"\n"
+        ),
+        None => "id = \"codex\"\n".to_string(),
+    };
+    format!(
+        "{header}\n[[rules]]\nid = \"test_working\"\nstate = \"working\"\ncontains = [\"working-marker\"]\n"
+    )
 }
 
 #[test]
-fn codex_supplement_applies_under_a_remote_manifest_without_the_rule() {
+fn codex_supplement_applies_only_when_the_active_remote_manifest_has_no_match() {
     with_codex_manifest_dirs("supplement-remote", || {
-        let remote = format!(
-            "{}\n[[rules]]\nid = \"remote_working\"\nstate = \"working\"\ncontains = [\"remote-working-marker\"]\n",
-            "id = \"codex\"\nversion = \"9999.01.01.1\"\nmin_engine_version = 3\nupdated_at = \"2026-06-10T12:00:00Z\"\n"
-        );
         let path = crate::detect::manifest_update::remote_manifest_path(Agent::Codex);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, remote).unwrap();
+        std::fs::write(path, synthetic_codex_manifest(Some("9999.01.01.1"))).unwrap();
         reload_manifests();
 
-        let idle = explain(Agent::Codex, fixture!("idle-turn-complete.txt"));
+        let idle = explain(Agent::Codex, SEPARATOR_SCREEN);
         assert!(matches!(idle.source, Some(ManifestSource::Remote { .. })));
         assert_eq!(idle.manifest_version.as_deref(), Some("9999.01.01.1"));
         assert_eq!(idle.state, AgentState::Idle);
         assert!(idle.visible_idle);
-        let rule = idle.matched_rule.expect("supplement rule matched");
-        assert_eq!(rule.id, "turn_complete_separator");
-        assert!(rule.supplement);
+        assert!(supplement_matched(&idle));
 
-        // A remote rule that matches still wins over the supplement.
-        let screen = format!(
-            "{}remote-working-marker\n",
-            fixture!("idle-turn-complete.txt")
-        );
-        let working = explain(Agent::Codex, &screen);
+        // A matching rule in the active manifest wins over the supplement.
+        let working = explain(Agent::Codex, &format!("working-marker\n{SEPARATOR_SCREEN}"));
         assert_eq!(working.state, AgentState::Working);
+        let rule = working.matched_rule.expect("remote rule matched");
+        assert_eq!(rule.id, "test_working");
+        assert!(!rule.supplement);
+        assert!(!working.evaluated_rules.iter().any(|rule| rule.supplement));
+
+        let no_separator = explain(Agent::Codex, "• Still thinking about it.\n\n›\n");
+        assert_eq!(no_separator.state, AgentState::Unknown);
         assert_eq!(
-            working.matched_rule.as_ref().map(|rule| rule.id.as_str()),
-            Some("remote_working")
+            no_separator.fallback_reason.as_deref(),
+            Some("codex_state_ambiguous")
         );
     });
 }
@@ -135,14 +135,10 @@ fn codex_supplement_defers_to_a_local_override() {
     with_codex_manifest_dirs("supplement-override", || {
         let path = override_path(Agent::Codex).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            path,
-            "id = \"codex\"\n\n[[rules]]\nid = \"test\"\nstate = \"working\"\ncontains = [\"override-marker\"]\n",
-        )
-        .unwrap();
+        std::fs::write(path, synthetic_codex_manifest(None)).unwrap();
         reload_manifests();
 
-        let detected = explain(Agent::Codex, fixture!("idle-turn-complete.txt"));
+        let detected = explain(Agent::Codex, SEPARATOR_SCREEN);
         assert!(matches!(detected.source, Some(ManifestSource::Override(_))));
         assert_eq!(detected.state, AgentState::Unknown);
         assert!(detected.matched_rule.is_none());
