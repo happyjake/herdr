@@ -41,7 +41,9 @@ fn assert_turn_complete(screen: &str) {
 
     assert_eq!(detected.state, AgentState::Idle);
     assert!(supplement_matched(&detected));
-    // Idle from the separator still passes through the working-to-idle hold.
+    // A pane holds this verdict until it settles, and a working pane also
+    // passes through the working-to-idle hold.
+    assert!(detected.idle_needs_settling);
     assert!(!detected.visible_idle);
 }
 
@@ -50,6 +52,7 @@ fn assert_not_turn_complete(screen: &str, state: AgentState) {
 
     assert_eq!(detected.state, state);
     assert!(!supplement_matched(&detected));
+    assert!(!detected.idle_needs_settling);
     assert!(!detected.visible_idle);
 }
 
@@ -57,6 +60,26 @@ fn assert_not_turn_complete(screen: &str, state: AgentState) {
 fn codex_finished_turn_separator_reads_idle() {
     assert_turn_complete(fixture!("idle-turn-complete.txt"));
     assert_turn_complete(fixture!("idle-same-day.txt"));
+    // The highest reasoning effort draws » as the composer glyph.
+    assert_turn_complete(fixture!("idle-ultra-effort.txt"));
+    // An empty focused composer can draw a braille starfield after its glyph.
+    assert_turn_complete(fixture!("idle-starfield-composer.txt"));
+}
+
+#[test]
+fn codex_separator_quoted_while_an_answer_streams_reads_idle_for_a_frame() {
+    // Codex hides its status line while an answer commits to history, so a
+    // frame whose last committed line quotes a separator is indistinguishable
+    // from a finished turn. Only the settle hold in the pane tells them apart.
+    assert_turn_complete(fixture!("streaming-quoted-separator.txt"));
+}
+
+#[test]
+fn codex_footer_or_tip_wrapped_to_column_zero_stays_unknown() {
+    // Known false negatives on narrow panes: the anchor only accepts indented
+    // footer and tip lines.
+    assert_not_turn_complete(fixture!("footer-wrapped-narrow.txt"), AgentState::Unknown);
+    assert_not_turn_complete(fixture!("tip-wrapped-narrow.txt"), AgentState::Unknown);
 }
 
 #[test]
@@ -72,9 +95,8 @@ fn codex_time_without_a_turn_duration_is_not_a_separator() {
 
 #[test]
 fn codex_turn_started_below_a_separator_is_not_idle() {
-    // While a turn runs, a braille dot replaces the space after the composer
-    // glyph, so the submitted prompt is the last plain prompt line and the
-    // previous turn's separator sits directly above it.
+    // The submitted prompt sits between the previous turn's separator and the
+    // composer, whatever the composer draws after its glyph.
     assert_not_turn_complete(
         fixture!("sparkle-composer-bullet-working.txt"),
         AgentState::Working,
@@ -84,7 +106,6 @@ fn codex_turn_started_below_a_separator_is_not_idle() {
         fixture!("sparkle-composer-hollow-working.txt"),
         fixture!("sparkle-composer-plain-working.txt"),
         fixture!("sparkle-composer-indented-prose.txt"),
-        fixture!("sparkle-composer-under-separator.txt"),
     ] {
         let detected = explain_bundled(screen);
         assert_ne!(detected.state, AgentState::Idle);
@@ -175,7 +196,7 @@ fn codex_supplement_defers_to_a_local_override() {
     });
 }
 
-fn with_codex_manifest_dirs<T>(name: &str, f: impl FnOnce() -> T) -> T {
+pub(crate) fn with_codex_manifest_dirs<T>(name: &str, f: impl FnOnce() -> T) -> T {
     let _guard = crate::config::test_config_env_lock().lock().unwrap();
     let old_config = std::env::var_os("XDG_CONFIG_HOME");
     let old_state = std::env::var_os("XDG_STATE_HOME");

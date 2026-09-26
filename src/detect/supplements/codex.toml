@@ -11,17 +11,19 @@ min_engine_version = 3
 #   Worked for 12m 34s · 9:41 AM
 # The composer and footer stay visible while a turn runs, so they are not
 # evidence on their own. The rule anchors to the physical end of the screen:
-# the separator, then only blank or tip lines, then exactly one composer line,
+# the separator, then only blank or tip lines, then exactly one composer line
+# (› normally, » at the highest reasoning effort, any glyph or text after it),
 # then only blank or indented footer lines. Anything else below the separator
 # (a submitted prompt, a status line, output, a notice) is a later turn.
-# While a turn runs the composer glyph animates (a braille dot replaces the
-# space after ›), so a sparkling composer anywhere rules the screen out.
-# The rule sets no visible_idle, so a working pane still passes through the
-# idle confirmation hold before it publishes idle.
+# A footer or tip that wraps to column 0 on a narrow pane also fails the
+# anchor; such a finished turn stays unknown.
+# Text alone cannot tell this separator from one an answer quotes while it
+# streams, so an idle verdict from this rule publishes only after it has held
+# across consecutive reads for a settle window. The rule sets no visible_idle,
+# so a working pane also passes through the idle confirmation hold.
 [[rules]]
 id = "turn_complete_separator"
 state = "idle"
 priority = 200
 region = "whole_recent"
-regex = ['(?m)^[ \t]*Worked for (?:[0-9]+[dhm] )*[0-9]+[dhms] · (?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)[ \t]*(?:\r?\n[ \t]*(?:Tip: [^\r\n]*)?)*\r?\n›[^\r\n]*(?:\r?\n(?:[ \t][^\r\n]*)?)*\z']
-not = [{ regex = ['(?m)^›[⠁⠂⠄⠈⠐⠠⡀⢀]'] }]
+regex = ['(?m)^[ \t]*Worked for (?:[0-9]+[dhm] )*[0-9]+[dhms] · (?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)[ \t]*(?:\r?\n[ \t]*(?:Tip: [^\r\n]*)?)*\r?\n[›»][^\r\n]*(?:\r?\n(?:[ \t][^\r\n]*)?)*\z']

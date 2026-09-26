@@ -1,0 +1,10 @@
+• The retry loop now backs off exponentially and stops after five attempts.
+
+  Worked for 12m 34s · 9:41 AM
+        Tip: Moving from Claude Code? Use /import to bring over your
+setup, project, and recent chats.
+
+› Ask Codex to do anything
+
+  ~/repo · main · No changes · Context 27% used · model-name high
+  ? for shortcuts

@@ -34,6 +34,9 @@ pub struct DetectionExplain {
     pub visible_idle: bool,
     pub visible_blocker: bool,
     pub visible_working: bool,
+    /// The idle verdict came from a supplement rule and must hold across
+    /// consecutive reads before a pane publishes it.
+    pub idle_needs_settling: bool,
     pub skip_state_update: bool,
     pub skipped_update_reason: Option<String>,
     pub fallback_reason: Option<String>,
@@ -445,6 +448,7 @@ pub fn explain_for_label(agent_label: &str, screen_content: &str) -> DetectionEx
             visible_idle: false,
             visible_blocker: false,
             visible_working: false,
+            idle_needs_settling: false,
             skip_state_update: false,
             skipped_update_reason: None,
             fallback_reason: Some("unknown_agent".to_string()),
@@ -468,6 +472,7 @@ impl DetectionExplain {
             visible_idle: self.visible_idle,
             visible_blocker: self.visible_blocker,
             visible_working: self.visible_working,
+            idle_needs_settling: self.idle_needs_settling,
         }
     }
 }
@@ -536,6 +541,7 @@ fn evaluate_loaded_manifest(
         visible_idle: rule.visible_idle && state == AgentState::Idle,
         visible_blocker: rule.visible_blocker && state == AgentState::Blocked,
         visible_working: rule.visible_working && state == AgentState::Working,
+        idle_needs_settling: from_supplement && state == AgentState::Idle,
         skip_state_update: rule.skip_state_update,
         skipped_update_reason,
         fallback_reason: None,
@@ -629,6 +635,7 @@ fn fallback_explain(
         visible_idle: false,
         visible_blocker: false,
         visible_working: false,
+        idle_needs_settling: false,
         skip_state_update: false,
         skipped_update_reason: None,
         fallback_reason: match agent {
@@ -941,6 +948,7 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
         "visible_idle": explain.visible_idle,
         "visible_blocker": explain.visible_blocker,
         "visible_working": explain.visible_working,
+        "idle_needs_settling": explain.idle_needs_settling,
         "screen_detection_skipped": explain.screen_detection_skipped,
         "skip_state_update": explain.skip_state_update,
         "skipped_update_reason": explain.skipped_update_reason,
@@ -1612,6 +1620,6 @@ fn line_start_offset(content: &str, lines: &[&str], index: usize) -> usize {
 #[cfg(test)]
 mod codebuddy_tests;
 #[cfg(test)]
-mod codex_tests;
+pub(crate) mod codex_tests;
 #[cfg(test)]
 mod tests;

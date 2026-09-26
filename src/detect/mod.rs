@@ -36,6 +36,10 @@ pub struct AgentDetection {
     /// activity is the normal working authority; this remains diagnostic
     /// metadata and for non-PTY fallback paths.
     pub visible_working: bool,
+    /// True when an idle verdict rests on screen text that a running turn
+    /// can also draw for a moment, so it must hold across consecutive reads
+    /// before it is published.
+    pub idle_needs_settling: bool,
 }
 
 /// Which agent we detected running in a pane.
@@ -314,6 +318,7 @@ pub fn detect_agent_with_osc(
             visible_idle: false,
             visible_blocker: false,
             visible_working: false,
+            idle_needs_settling: false,
         };
     };
     manifest::detect_with_osc(

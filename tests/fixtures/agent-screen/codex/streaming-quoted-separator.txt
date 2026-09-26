@@ -1,0 +1,11 @@
+› explain the codex idle rule in the monitor
+
+
+• The monitor keys idle off the line Codex prints when a turn closes. On screen it looks like this, right above the composer:
+
+  Worked for 2m 3s · 9:41 AM
+
+› Ask Codex to do anything
+
+  ~/repo · main · No changes · Context 27% used · model-name high
+  ? for shortcuts

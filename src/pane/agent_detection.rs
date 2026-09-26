@@ -11,6 +11,13 @@ pub(super) const STABLE_VISIBLE_SIGNAL_REFRESH: std::time::Duration =
     std::time::Duration::from_millis(800);
 pub(super) const AGENT_STARTUP_GRACE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(3);
+/// How long an idle verdict that needs settling must hold on every read
+/// before it publishes. Such a verdict rests on text a streaming answer can
+/// draw for a moment with no status line on screen; a finished turn's screen
+/// stays put. The flicker cap above covers frame-to-frame redraws, not pauses
+/// between streamed chunks, so this matches the startup grace window instead:
+/// long enough to outlast a pause in a stream, short enough for idle waits.
+pub(super) const SETTLED_IDLE_WINDOW: std::time::Duration = AGENT_STARTUP_GRACE_WINDOW;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DetectionPublishState {
@@ -18,12 +25,14 @@ pub(super) struct DetectionPublishState {
     pub(super) visible_idle: bool,
     pub(super) visible_blocker: bool,
     pub(super) visible_working: bool,
+    pub(super) idle_needs_settling: bool,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct PendingIdleConfirmation {
     started_at: Option<std::time::Instant>,
     confirmations: u8,
+    settling: bool,
 }
 
 impl PendingIdleConfirmation {
@@ -34,9 +43,10 @@ impl PendingIdleConfirmation {
     pub(super) fn clear(&mut self) {
         self.started_at = None;
         self.confirmations = 0;
+        self.settling = false;
     }
 
-    pub(super) fn should_hold_working_to_idle(
+    pub(super) fn should_hold_idle(
         &mut self,
         previous: DetectionPublishState,
         next: DetectionPublishState,
@@ -44,6 +54,33 @@ impl PendingIdleConfirmation {
         process_exited: bool,
         now: std::time::Instant,
     ) -> bool {
+        let is_idle_to_settle = previous.state != AgentState::Idle
+            && next.state == AgentState::Idle
+            && next.idle_needs_settling
+            && !next.visible_blocker
+            && !agent_changed
+            && !process_exited;
+
+        if is_idle_to_settle {
+            // Any other verdict in between clears the hold and restarts the window.
+            match self.started_at.filter(|_| self.settling) {
+                Some(started_at) if now.duration_since(started_at) >= SETTLED_IDLE_WINDOW => {
+                    self.clear();
+                    return false;
+                }
+                Some(_) => {}
+                None => {
+                    self.started_at = Some(now);
+                    self.confirmations = 0;
+                    self.settling = true;
+                }
+            }
+            return true;
+        }
+        if self.settling {
+            self.clear();
+        }
+
         let is_working_to_plain_idle = previous.state == AgentState::Working
             && next.state == AgentState::Idle
             && !next.visible_idle
@@ -189,7 +226,7 @@ pub(super) fn decide_detection_transition(
     input: DetectionTransitionInput,
     pending_idle: &mut PendingIdleConfirmation,
 ) -> DetectionTransitionDecision {
-    if pending_idle.should_hold_working_to_idle(
+    if pending_idle.should_hold_idle(
         input.previous_publish,
         input.next_publish,
         input.agent_changed,
@@ -246,18 +283,21 @@ pub(super) fn decide_screen_detection_publish(
     let visible_idle = detection.visible_idle && new_state == AgentState::Idle;
     let visible_blocker = detection.visible_blocker && new_state == AgentState::Blocked;
     let visible_working = detection.visible_working && new_state == AgentState::Working;
+    let idle_needs_settling = detection.idle_needs_settling && new_state == AgentState::Idle;
 
     let previous_publish = DetectionPublishState {
         state: input.current_state,
         visible_idle: input.last_visible_idle,
         visible_blocker: input.last_visible_blocker,
         visible_working: input.last_visible_working,
+        idle_needs_settling: false,
     };
     let next_publish = DetectionPublishState {
         state: new_state,
         visible_idle,
         visible_blocker,
         visible_working,
+        idle_needs_settling,
     };
     let stable_refresh_due = stable_visible_signal_refresh_due(
         previous_publish,
@@ -311,6 +351,7 @@ pub(super) fn detection_update_for_publish_with_osc(
             visible_idle: true,
             visible_blocker: false,
             visible_working: false,
+            idle_needs_settling: false,
         });
     }
 
@@ -346,6 +387,9 @@ pub(super) fn mark_detection_content_changed(detection_content_seq: &AtomicU64) 
 }
 
 #[cfg(test)]
+mod settled_idle_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -355,6 +399,7 @@ mod tests {
             visible_idle: false,
             visible_blocker: false,
             visible_working: false,
+            idle_needs_settling: false,
         }
     }
 
@@ -365,6 +410,7 @@ mod tests {
             visible_idle: state == AgentState::Idle,
             visible_blocker: false,
             visible_working: state == AgentState::Working,
+            idle_needs_settling: false,
         }
     }
 
@@ -485,22 +531,22 @@ mod tests {
         let next = publish_state(AgentState::Idle);
         let mut pending = PendingIdleConfirmation::default();
 
-        assert!(pending.should_hold_working_to_idle(previous, next, false, false, now));
-        assert!(pending.should_hold_working_to_idle(
+        assert!(pending.should_hold_idle(previous, next, false, false, now));
+        assert!(pending.should_hold_idle(
             previous,
             next,
             false,
             false,
             now + AGENT_PENDING_IDLE_RECHECK
         ));
-        assert!(pending.should_hold_working_to_idle(
+        assert!(pending.should_hold_idle(
             previous,
             next,
             false,
             false,
             now + AGENT_PENDING_IDLE_RECHECK * 2
         ));
-        assert!(!pending.should_hold_working_to_idle(
+        assert!(!pending.should_hold_idle(
             previous,
             next,
             false,
@@ -517,7 +563,7 @@ mod tests {
         next.visible_idle = true;
         let mut pending = PendingIdleConfirmation::default();
 
-        assert!(!pending.should_hold_working_to_idle(previous, next, false, false, now));
+        assert!(!pending.should_hold_idle(previous, next, false, false, now));
     }
 
     #[test]

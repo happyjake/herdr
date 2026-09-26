@@ -1,0 +1,9 @@
+• The retry loop now backs off exponentially and stops after five attempts.
+
+  Worked for 12m 34s · 9:41 AM
+
+› Ask Codex to do anything
+
+  ~/repo · main · No changes · Context
+27% used · model-name high
+  ? for shortcuts

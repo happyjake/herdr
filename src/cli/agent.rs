@@ -199,6 +199,9 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
     } else {
         println!("rule: none");
     }
+    if explain["idle_needs_settling"].as_bool().unwrap_or(false) {
+        println!("settle: a pane publishes this idle only after it holds across consecutive reads");
+    }
     if let Some(reason) = explain["fallback_reason"].as_str() {
         println!("fallback_reason: {reason}");
     }
