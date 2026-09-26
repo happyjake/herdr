@@ -2489,6 +2489,9 @@ fn live_handoff_keeps_an_unseen_completion_done() {
         );
         thread::sleep(Duration::from_millis(25));
     };
+    // Dates are whole seconds; let one pass so a date taken at the handoff
+    // cannot equal the completion's by coincidence.
+    thread::sleep(Duration::from_millis(1_100));
 
     assert_ok(request(
         &api_socket,
@@ -2497,10 +2500,39 @@ fn live_handoff_keeps_an_unseen_completion_done() {
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
 
-    let (status, changed_at, response) = pane_status("after");
+    let (status, _, response) = pane_status("after");
     assert_eq!(
         status, "done",
         "a completion nobody saw must survive the handoff unread: {response}"
+    );
+    // The agent confirming it is still idle settles the restored pane: it is
+    // the same unread completion, so it keeps that completion's age.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:agent:report:idle-again",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": pane_id,
+                "source": "herdr:pi",
+                "agent": "pi",
+                "state": "idle",
+                "seq": 4,
+                "agent_session_path": agent_session
+            }
+        }),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (status, changed_at, response) = loop {
+        let observed = pane_status("settled");
+        if observed.1 == Some(done_since) || Instant::now() >= deadline {
+            break observed;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        status, "done",
+        "the agent confirming its idle is not someone reading the pane: {response}"
     );
     assert_eq!(
         changed_at,
