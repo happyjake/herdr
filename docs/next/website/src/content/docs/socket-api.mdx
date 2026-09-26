@@ -100,6 +100,7 @@ Raw socket method names use dot notation:
 | Notification | `notification.show` |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
+| Attachment | `attachment.create`, `attachment.begin`, `attachment.append`, `attachment.commit` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
@@ -189,6 +190,39 @@ gives up after five seconds; and only two reads run at a time per server.
 The method is additive: a server that predates it cannot parse the method
 and refuses the request, which is how a client learns the trail is absent.
 
+`attachment.create` stores a file on the server so a client can hand an agent
+its path. It takes `bytes_b64`, the file's bytes in standard base64, and an
+optional `name`. Without `name` the bytes must be a JPEG, PNG, or WebP image
+and the server names the file; with `name` any bytes are accepted and the
+sanitized name is carried into the stored file's name. The answer is
+`attachment_created` with `path`, the absolute, whitespace-free path of the
+complete file, and `expires_at`, the unix time after which it may be swept.
+Files live in a per-user scratch directory under the system temp directory
+with owner-only permissions and are kept for a day; this is a hand-off
+point, not storage.
+
+A file larger than one message carries arrives in chunks instead:
+`attachment.begin` takes `name` and the total `size` and answers
+`attachment_upload_started` with an opaque `upload_id`; each
+`attachment.append` takes the `upload_id`, the byte `offset` it starts at,
+and `bytes_b64`, and answers `attachment_appended` with `received`, the bytes
+now on disk and the offset the next chunk must declare; `attachment.commit`
+takes the `upload_id` and the final `size` and answers `attachment_created`
+like `attachment.create`. The partial file on disk is the whole upload state,
+so a client that lost its connection resumes from the last `received` it
+saw — an append at any other offset is refused with
+`attachment_offset_mismatch`, whose message names the bytes stored — and an
+abandoned upload is swept like any other scratch file. Refusals carry
+`attachment_too_large`, `attachment_unsupported_format`,
+`attachment_unknown_upload`, `attachment_offset_mismatch`,
+`attachment_size_mismatch`, or `attachment_storage_failed`; bad base64 is
+`invalid_params`. The `ping` response advertises
+`capabilities.file_attachments` with `max_bytes`, the largest upload
+`attachment.begin` accepts, and `chunk_bytes`, the largest decoded payload
+one `attachment.create` or `attachment.append` may carry; size chunks from it
+rather than from a hard-coded number. A server without the capability takes
+photos through `attachment.create` only.
+
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
@@ -213,6 +247,16 @@ plain printable keys, special keys like `enter` and `esc`, modifier chords
 like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
 `f1`, and named punctuation like `minus` and `plus`. They do not accept
 `prefix+` binding strings.
+
+`pane.send_input` accepts an optional `send_id`, a client-generated unique id
+for one logical send. A server that already applied that id answers success
+without writing to the pane again, so a client whose connection dropped
+before the answer arrived can re-issue the same request after reconnecting
+without typing it twice. The server remembers a bounded number of recent ids
+across all panes, enough to outlast a reconnect, not an arbitrary delay.
+Servers that honor `send_id` advertise `capabilities.send_affirm` in the
+`ping` response; an older server ignores the field, so only re-issue when the
+capability is present.
 
 `pane.send_mouse` sends a click or wheel action to one pane. `row` and `col`
 are zero-based terminal cell coordinates and are clamped to the pane bounds.
@@ -895,6 +939,12 @@ Session-only official integrations report native session references with `pane.r
 
 If no native session reference is stored, the field is omitted.
 
+`agent_session` may also carry `record_path`, the session record file the
+integration reported (the `agent_session_path` parameter of
+`pane.report_agent` and `pane.report_agent_session`) when `value` does not
+already name it. It is absent when no path was reported and from older
+servers; derive the record from `value` in that case.
+
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
 `pane.set_pinned` sets or clears a pane's pin and answers `pane_info`, the way
@@ -985,7 +1035,9 @@ All entries must be valid: if any referenced pane does not exist, Herdr rejects
 the entire request with an error and closes the connection. Refresh the pane list
 and retry rather than assuming the other entries were subscribed.
 Lifecycle subscriptions start when the request is accepted and do not replay
-events retained before that point.
+events retained before that point. `events.subscribe` also accepts a boolean
+`live_only`, kept so clients that asked to skip replay keep working; since
+every subscription already starts live, it changes nothing.
 
 Lifecycle and agent-status events are drained in bounded batches, in order within
 each subscription. Event history is not durable. If a subscriber falls behind
@@ -1083,6 +1135,19 @@ herdr pane read w1:p1 --source detection
 
 `recent-unwrapped` is useful for logs because it ignores soft wrapping.
 `detection` returns the bottom-buffer snapshot used by agent screen detection.
+
+To page back through history, pass `offset_from_bottom` with source `recent`
+(counted in physical rows) or `recent_unwrapped` (counted in logical lines);
+other sources refuse it. The window of `lines` is read that far above the
+bottom without moving the pane's viewport, so it is independent of the
+`scroll` metrics on `PaneInfo`, which describe what the pane is showing. An
+offset read echoes `effective_offset`, the offset actually used after
+clamping at the top of scrollback, and `has_more`, whether content remains
+above the returned window; both are absent from reads without an offset.
+Inside a logical line taller than the window one step can cover fewer
+units, so page by the echoed `effective_offset` instead of adding a fixed
+amount. A pane whose history cannot be paged answers `has_more: false` at
+offset zero and refuses larger offsets.
 
 ## Waiting for state
 
