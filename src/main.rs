@@ -423,6 +423,19 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # `herdr pair` mints and stores this token and prints a QR pairing payload;
 # re-running it rotates the token. Token changes apply on config reload.
 # token = ""
+# Display name the server declares in the ping response and the pairing
+# payload. Display only, never identity. Unset or empty means the machine's
+# hostname. Applies on config reload.
+# name = "Home Box"
+# Route another machine uses to open a shell on this server, typically an
+# exact SSH alias. Never guessed from the name or hostname; unset or empty
+# means undeclared. Applies on config reload.
+# reach = "home-box"
+# URL clients should dial when something fronts the listener, such as a TLS
+# terminating proxy: a ws:// or wss:// URL with host, optional port, and
+# optional path only. Published in the ping response and used by the pairing
+# payload instead of ws://<bind>. Unset or empty keeps the bind-derived URL.
+# advertised_endpoint = "wss://a-host.example.net"
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
@@ -861,6 +874,24 @@ mod tests {
         let config: config::Config = toml::from_str(DEFAULT_CONFIG).unwrap();
         assert!(config.websocket_api.bind.is_none());
         assert!(config.websocket_api.token.is_none());
+        assert!(config.websocket_api.name.is_none());
+        assert!(config.websocket_api.reach.is_none());
+        assert!(config.websocket_api.advertised_endpoint.is_none());
+    }
+
+    #[test]
+    fn default_config_template_names_every_websocket_api_key() {
+        let section = DEFAULT_CONFIG
+            .split("\n[websocket_api]\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .expect("default config has a [websocket_api] section");
+        for key in ["bind", "token", "name", "reach", "advertised_endpoint"] {
+            assert!(
+                section.contains(&format!("\n# {key} = ")),
+                "[websocket_api] in the default config does not name {key}"
+            );
+        }
     }
 
     #[test]
