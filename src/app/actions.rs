@@ -1933,7 +1933,18 @@ impl AppState {
         };
         if completion_reset {
             self.pending_agent_notifications.remove(&pane_id);
-            self.workspaces[ws_idx].pane_state_mut(pane_id)?.seen = true;
+            let pane = self.workspaces[ws_idx].pane_state_mut(pane_id)?;
+            // A restored pane whose agent is recognised again, where none was
+            // recognised before, has not changed agent: the terminal came back
+            // without its label. A different agent or session still resets.
+            let reacquired = !mutation.session_ref_changed
+                && mutation
+                    .effective_state_change
+                    .as_ref()
+                    .is_some_and(|change| change.previous_agent_label.is_none());
+            if !(reacquired && pane.holds_unread_restored_completion()) {
+                pane.seen = true;
+            }
         }
         if mutation.session_ref_changed || managed_changed || agent_name_changed {
             self.mark_session_dirty();
@@ -2041,7 +2052,10 @@ impl AppState {
             .iter_mut()
             .find_map(|tab| tab.panes.get_mut(&pane_id))?;
 
-        if change.state != AgentState::Idle {
+        if change.state == AgentState::Unknown && pane.holds_unread_restored_completion() {
+            // Not activity: the pane has not been classified yet since it was
+            // restored, so this says nothing about whether anyone read it.
+        } else if change.state != AgentState::Idle {
             pane.seen = true;
         } else if !suppress_completion && is_completion_transition(change) {
             pane.seen = suppress_active_tab_notifications;

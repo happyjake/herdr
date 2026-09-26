@@ -230,6 +230,20 @@ impl PaneState {
         self.restore_window.map(|window| window.resolve_by)
     }
 
+    /// Whether this pane is a completion nobody has read, carried over from
+    /// another process and not yet found again.
+    ///
+    /// Until something classifies the pane, what the new process learns about
+    /// it is recognition rather than activity: finding the agent again and
+    /// the not-yet-classified readings that come first are not a client
+    /// looking at the pane, so they must not mark the completion read.
+    pub fn holds_unread_restored_completion(&self) -> bool {
+        !self.seen
+            && self.restore_window.is_some_and(|window| {
+                window.captured.0 == AgentStatus::Done && window.live_at(unix_now_secs())
+            })
+    }
+
     /// The date to report alongside `status`.
     ///
     /// Callers report the status derived live from the terminal, so this
