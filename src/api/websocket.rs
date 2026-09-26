@@ -233,7 +233,7 @@ impl WsAuthError {
 /// parameter.
 ///
 /// Any live credential is accepted — the pairing's managing credential and
-/// every minted limited one alike (ADR-0026) — and so is one this server
+/// every minted limited one alike — and so is one this server
 /// has revoked, which is admitted only to be told so on the socket. The tier travels with the
 /// connection and decides only what the credential may then manage; a
 /// limited credential drives the whole pane API exactly like the managing
@@ -855,6 +855,13 @@ fn ws_request_loop(
                     );
                     return Ok(());
                 }
+                if transport.events_lost {
+                    debug!(
+                        peer = %format_peer(transport.peer),
+                        "closing websocket api connection after a subscription lost event history"
+                    );
+                    return Ok(());
+                }
             }
             Ok(Message::Binary(_)) => {
                 transport.mark_inbound();
@@ -1057,6 +1064,10 @@ struct WsTransport {
     /// however the connection reaches its end — held stream, idle poll, or
     /// an answered request.
     revocation_verdict_sent: bool,
+    /// Whether a subscription on this connection lost event history. The
+    /// client has to resnapshot and resubscribe, and reconnecting is how it
+    /// does both, so the connection ends with that stream.
+    events_lost: bool,
 }
 
 impl WsTransport {
@@ -1071,6 +1082,7 @@ impl WsTransport {
             liveness: WsLiveness::new(ws_liveness_timing()),
             dispatch,
             revocation_verdict_sent: false,
+            events_lost: false,
         }
     }
 
@@ -1228,6 +1240,10 @@ impl WsTransport {
 }
 
 impl ApiTransport for WsTransport {
+    fn note_events_lost(&mut self) {
+        self.events_lost = true;
+    }
+
     fn write_message(&mut self, message: &str) -> io::Result<()> {
         let deadline = Instant::now() + FRAME_WRITE_TIMEOUT;
         let mut result = self.send_with_deadline(Message::text(message), deadline);
@@ -1735,7 +1751,7 @@ mod tests {
         }
     }
 
-    /// ADR-0026: a minted limited credential opens its own connection. The
+    /// A minted limited credential opens its own connection. The
     /// handshake accepts it exactly like the pairing token; only what it may
     /// then manage differs.
     #[test]
@@ -1867,7 +1883,7 @@ mod tests {
         handle: WebSocketServerHandle,
         server_name: crate::api::SharedServerName,
         credentials: crate::api::SharedCredentialRegistry,
-        _api_rx: mpsc::UnboundedReceiver<ApiRequestMessage>,
+        api_rx: mpsc::UnboundedReceiver<ApiRequestMessage>,
         event_hub: EventHub,
     }
 
@@ -1897,7 +1913,7 @@ mod tests {
             handle,
             server_name,
             credentials,
-            _api_rx: api_rx,
+            api_rx,
             event_hub,
         }
     }
@@ -1932,7 +1948,7 @@ mod tests {
         }
     }
 
-    /// The listener's half of ADR-0026: a minted credential connects like
+    /// The listener's half of the credential registry: a minted credential connects like
     /// any other, and a revoke reaches the connection it already holds —
     /// refused by code on its very next request. What that credential meets
     /// when it comes back is
@@ -2100,7 +2116,7 @@ mod tests {
         }
 
         // Auth runs inside the upgrade callback; nothing may reach dispatch.
-        assert!(server._api_rx.try_recv().is_err());
+        assert!(server.api_rx.try_recv().is_err());
     }
 
     #[test]
@@ -2121,7 +2137,7 @@ mod tests {
             other => panic!("expected http 401 rejection, got: {other:?}"),
         }
 
-        assert!(server._api_rx.try_recv().is_err());
+        assert!(server.api_rx.try_recv().is_err());
     }
 
     #[test]
@@ -2242,6 +2258,48 @@ mod tests {
         assert_eq!(response["result"]["type"], "pong");
     }
 
+    /// Agent registration is a lease held by a dedicated local socket. Over
+    /// the WebSocket it is refused out loud, with the request's id, and the
+    /// connection goes on serving requests and streams afterwards.
+    #[test]
+    fn ssh_agent_registration_is_refused_and_the_connection_stays_usable() {
+        let server = start_test_server();
+        let mut websocket = connect_authorized(&server);
+        let register = |id: &str| {
+            Message::text(format!(
+                r#"{{"id":"{id}","method":"server.ssh_agent.register","params":{{"socket_path":"/tmp/agent.sock"}}}}"#
+            ))
+        };
+
+        websocket.send(register("register_idle")).unwrap();
+        let refusal = read_json(&mut websocket);
+        assert_eq!(refusal["id"], "register_idle");
+        assert_eq!(refusal["error"]["code"], "unsupported_transport");
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"sub_live","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.focused"}],"live_only":true}}"#,
+            ))
+            .unwrap();
+        let ack = read_json(&mut websocket);
+        assert_eq!(ack["result"]["type"], "subscription_started");
+
+        websocket.send(register("register_streaming")).unwrap();
+        let refusal = read_json(&mut websocket);
+        assert_eq!(refusal["id"], "register_streaming");
+        assert_eq!(refusal["error"]["code"], "unsupported_transport");
+
+        server.event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: "w_after_register".to_string(),
+            },
+        });
+        let event = read_json(&mut websocket);
+        assert_eq!(event["event"], "workspace_focused");
+        assert_eq!(event["data"]["workspace_id"], "w_after_register");
+    }
+
     #[test]
     fn malformed_pane_send_mouse_gets_normal_invalid_request_refusals() {
         let server = start_test_server();
@@ -2272,6 +2330,92 @@ mod tests {
         let response = read_json(&mut websocket);
         assert_eq!(response["id"], "req_after_mouse_error");
         assert_eq!(response["result"]["type"], "pong");
+    }
+
+    /// A subscription that falls behind the event history ends its whole
+    /// websocket, not just its stream: reconnecting is how the client
+    /// resnapshots and resubscribes, and a socket left open would keep
+    /// answering requests while the client's events had silently stopped.
+    #[test]
+    fn a_subscription_that_loses_event_history_closes_the_websocket() {
+        let mut server = start_test_server();
+        let mut websocket = connect_authorized(&server);
+
+        websocket
+            .send(Message::text(
+                r#"{"id":"sub_lost","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.agent_status_changed","pane_id":"pane_1","agent_status":"working"}]}}"#,
+            ))
+            .unwrap();
+        // Hold the setup probe after the server pins its subscription cursor,
+        // then push more events than the history keeps.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probe = loop {
+            match server.api_rx.try_recv() {
+                Ok(request) => break request,
+                Err(_) => {
+                    assert!(Instant::now() < deadline, "no subscription probe");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        assert!(matches!(
+            probe.request.method,
+            crate::api::schema::Method::PaneGet(_)
+        ));
+        for index in 0..600 {
+            server.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::WorkspaceRenamed,
+                data: crate::api::schema::EventData::WorkspaceRenamed {
+                    workspace_id: "workspace_1".into(),
+                    label: format!("flood-{index}"),
+                },
+            });
+        }
+        let pane: crate::api::schema::PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id": "pane_1",
+            "terminal_id": "term_1",
+            "workspace_id": "workspace_1",
+            "tab_id": "tab_1",
+            "focused": true,
+            "agent_status": "working",
+            "revision": 0,
+        }))
+        .unwrap();
+        probe
+            .respond_to
+            .send(
+                serde_json::to_string(&crate::api::schema::SuccessResponse {
+                    id: probe.request.id,
+                    result: crate::api::schema::ResponseResult::PaneInfo { pane },
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let started = read_json(&mut websocket);
+        assert_eq!(started["id"], "sub_lost");
+        assert_eq!(started["result"]["type"], "subscription_started");
+        let lost = read_json(&mut websocket);
+        assert_eq!(lost["id"], "sub_lost");
+        assert_eq!(lost["error"]["code"], "events_lost");
+
+        // A read that times out means the server kept the socket open.
+        loop {
+            match websocket.read() {
+                Ok(Message::Close(_)) => break,
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                Ok(other) => panic!("unexpected frame after events_lost: {other:?}"),
+                Err(tungstenite::Error::Io(err))
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    panic!("the websocket stayed open after events_lost")
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     #[test]
