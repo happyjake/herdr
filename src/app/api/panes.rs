@@ -23,12 +23,19 @@ use crate::app::Mode;
 use crate::layout::{find_in_direction, NavDirection, PaneId};
 
 use super::super::api_helpers::{
-    detect_state_from_api, encode_api_keys, normalize_metadata_source, normalize_metadata_tokens,
-    normalize_metadata_ttl, normalize_reported_agent_label, MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
+    detect_state_from_api, encode_api_keys, encode_api_text, normalize_metadata_source,
+    normalize_metadata_tokens, normalize_metadata_ttl, normalize_reported_agent_label,
+    MAX_METADATA_TOKEN_KEYS_PER_RESOURCE,
 };
 #[cfg(test)]
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
+
+/// How long `pane.send_input` holds its keys behind its text. An agent TUI
+/// that reads the text and an Enter in one chunk takes the Enter as part of
+/// a paste instead of a submit.
+pub(crate) const SEND_INPUT_TEXT_KEY_PACING: std::time::Duration =
+    std::time::Duration::from_millis(30);
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
@@ -1843,16 +1850,35 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let bytes = match super::super::api_helpers::encode_api_input(
-            runtime,
-            &params.text,
-            &params.keys,
-        ) {
-            Ok(bytes) => bytes,
+        let encoded_keys = match encode_api_keys(runtime, &params.keys) {
+            Ok(keys) => keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-            return encode_error(id, "pane_send_failed", err.to_string());
+        if params.text.is_empty() {
+            for bytes in encoded_keys {
+                if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+                    return encode_error(id, "pane_send_failed", err.to_string());
+                }
+            }
+        } else if encoded_keys.is_empty() {
+            let text = encode_api_text(runtime, &params.text);
+            if let Err(err) = runtime.try_send_bytes(Bytes::from(text)) {
+                return encode_error(id, "pane_send_failed", err.to_string());
+            }
+        } else {
+            // One ordered submission on the pane's input queue: the keys
+            // follow the text after the pacing delay, and later writes to
+            // this pane wait behind both. The answer does not wait for the
+            // keys to land.
+            let text = encode_api_text(runtime, &params.text);
+            if let Err(err) = runtime.queue_user_input_submission(
+                Bytes::from(text),
+                Bytes::from(encoded_keys.concat()),
+                SEND_INPUT_TEXT_KEY_PACING,
+                None,
+            ) {
+                return encode_error(id, "pane_send_failed", err.to_string());
+            }
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -2832,9 +2858,12 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    // The bracketed paste wraps only the text; send_input deliberately paces
+    // its keys after the text (SEND_INPUT_TEXT_KEY_PACING), so the paste and
+    // the Enter arrive as separate writes.
     #[tokio::test]
-    async fn api_pane_send_input_brackets_text_and_enter_atomically() {
-        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+    async fn api_pane_send_input_brackets_text_and_paces_enter() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
         let internal_pane_id = app.state.workspaces[0].tabs[0].root_pane;
         app.lookup_runtime_sender(0, internal_pane_id)
             .unwrap()
@@ -2851,11 +2880,21 @@ mod tests {
 
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(success.result, ResponseResult::Ok {});
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut writes = Vec::new();
+        while writes.len() < 2 && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(bytes) => writes.push(bytes),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
         assert_eq!(
-            rx.try_recv().unwrap(),
-            bytes::Bytes::from_static(b"\x1b[200~A != B\x1b[201~\r")
+            writes,
+            vec![
+                bytes::Bytes::from_static(b"\x1b[200~A != B\x1b[201~"),
+                bytes::Bytes::from_static(b"\r"),
+            ]
         );
-        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2875,6 +2914,79 @@ mod tests {
         assert_eq!(success.id, "req");
         assert_eq!(success.result, ResponseResult::Ok {});
         assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![0x0a]));
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn assert_ok_response(response: &str, id: &str) {
+        let success: SuccessResponse = serde_json::from_str(response).unwrap();
+        assert_eq!(success.id, id);
+        assert_eq!(success.result, ResponseResult::Ok {});
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_text_only_is_undelayed() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(1);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: "hello".into(),
+                keys: Vec::new(),
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"hello"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_paces_keys_after_text() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
+
+        let sent = std::time::Instant::now();
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: "hello".into(),
+                keys: vec!["Enter".into()],
+            }),
+        });
+        assert_ok_response(&response, "req");
+
+        let recv = |rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if let Ok(bytes) = rx.try_recv() {
+                    return bytes;
+                }
+                assert!(std::time::Instant::now() < deadline, "pane write never arrived");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        assert_eq!(recv(&mut rx), bytes::Bytes::from_static(b"hello"));
+        assert_eq!(recv(&mut rx), bytes::Bytes::from_static(b"\r"));
+        assert!(sent.elapsed() >= SEND_INPUT_TEXT_KEY_PACING);
+    }
+
+    #[tokio::test]
+    async fn api_pane_send_input_keys_only_are_undelayed() {
+        let (mut app, pane_id, mut rx) = app_with_send_key_runtime(2);
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                pane_id,
+                text: String::new(),
+                keys: vec!["Escape".into(), "Enter".into()],
+            }),
+        });
+
+        assert_ok_response(&response, "req");
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\x1b"));
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from_static(b"\r"));
         assert!(rx.try_recv().is_err());
     }
 
