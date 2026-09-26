@@ -332,6 +332,11 @@ impl Drop for WebSocketServerHandle {
 
 /// Start the WebSocket API listener if — and only if — it is configured.
 /// Never binds anything when `websocket_api.bind` is unset.
+///
+/// `server.stop` arriving here is served through the app channel like any
+/// other request, deliberately without the Unix socket's priority stop
+/// control, which exists only to stop a server whose app thread is wedged —
+/// a local operator's recovery path, not something a remote client needs.
 pub fn start_websocket_server(
     config: &WebSocketApiConfig,
     api_tx: ApiRequestSender,

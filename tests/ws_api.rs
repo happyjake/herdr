@@ -2330,6 +2330,34 @@ fn record_attachment_fixture(fixture_path: &Path) {
 }
 
 #[test]
+fn server_stop_over_websocket_stops_the_server() {
+    let _lock = test_lock();
+    let mut server = start_ws_test_server();
+
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let stopped = ws.request(r#"{"id":"req_stop","method":"server.stop","params":{}}"#);
+    assert_eq!(stopped["result"]["type"], "ok", "{stopped}");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if server.child.child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "server.stop over the websocket did not stop the server"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        TcpStream::connect(server.ws_addr).is_err(),
+        "the websocket listener outlived the stopped server"
+    );
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
 fn websocket_handshake_is_rejected_without_a_valid_token() {
     let _lock = test_lock();
     let server = start_ws_test_server();
