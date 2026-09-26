@@ -2815,3 +2815,73 @@ fn live_handoff_failure_keeps_reloaded_websocket_token() {
     drop(spawned);
     cleanup_test_base(&base);
 }
+
+#[test]
+fn live_handoff_moves_websocket_listener_to_replacement_server() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let port = unused_local_port();
+    let ws_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let token = "handoff-token";
+
+    let spawned = spawn_server_with_config_and_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &websocket_config(port, token),
+        &[],
+    );
+    let old_pid = spawned.child.process_id().expect("old server pid");
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    wait_for_websocket_listener(ws_addr, Duration::from_secs(10));
+
+    let mut old_websocket = websocket_connect(ws_addr, token);
+    let pong = websocket_ping(&mut old_websocket);
+    assert_eq!(pong["result"]["type"], "pong", "{pong}");
+
+    // The replacement can bind the port only if the old server released it.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    let replacement_pid =
+        wait_for_replacement_server_pid(&runtime_dir, old_pid, Duration::from_secs(10));
+    assert_ne!(replacement_pid, old_pid);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    // The old server's websocket connection ends with the old listener.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match old_websocket.read() {
+            Ok(Message::Close(_)) => continue,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+            Ok(other) => panic!("unexpected message on the old websocket: {other:?}"),
+            Err(tungstenite::Error::Io(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the old websocket stayed open after the handoff"
+                );
+            }
+            Err(_) => break,
+        }
+    }
+
+    wait_for_websocket_listener(ws_addr, Duration::from_secs(10));
+    assert_websocket_pong(ws_addr, token);
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
