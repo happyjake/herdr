@@ -1,4 +1,4 @@
-› let's go
+let's go
 
 • Ran set -e …
   └ Service: running / healthy; image: web:1.0.0
@@ -23,6 +23,10 @@
   └ npm warn install-scripts   fsevents@2.3.3 (install: (install scripts present))
     npm warn install-scripts
     npm warn install-scripts Run `npm install-scripts ls` to review, or `npm install-scripts approve <pkg>` to allow.
+    + Show details
+
+• Ran tool remember -n ingress-notes -d 'Proxy rewrites local clients to the gateway address' - <<'EOF' …
+  └ saved ~/repo/notes/ingress-notes.md
     + Show details
 
 • Ran git status --short --branch …

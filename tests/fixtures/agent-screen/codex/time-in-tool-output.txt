@@ -1,0 +1,11 @@
+› when did the nightly job last run?
+
+
+• Ran tool jobs last-run nightly
+  └ nightly: succeeded
+    9:41 AM
+
+› Ask Codex to do anything
+
+  ~/repo · main · No changes · Context 27% used · model-name high
+  ? for shortcuts

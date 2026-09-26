@@ -1,0 +1,12 @@
+• The retry loop now backs off exponentially and stops after five attempts. The new test covers the give-up path, and the full fetch suite passes.
+
+  Worked for 12m 34s · 9:41 AM
+
+› now update the changelog
+
+◦ Working (3s • esc to interrupt)
+
+›⠂Ask Codex to do anything
+
+  ~/repo · main · No changes · Context 27% used · model-name high
+  ? for shortcuts

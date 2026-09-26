@@ -41,7 +41,8 @@ fn assert_turn_complete(screen: &str) {
 
     assert_eq!(detected.state, AgentState::Idle);
     assert!(supplement_matched(&detected));
-    assert!(detected.visible_idle);
+    // Idle from the separator still passes through the working-to-idle hold.
+    assert!(!detected.visible_idle);
 }
 
 fn assert_not_turn_complete(screen: &str, state: AgentState) {
@@ -56,9 +57,39 @@ fn assert_not_turn_complete(screen: &str, state: AgentState) {
 fn codex_finished_turn_separator_reads_idle() {
     assert_turn_complete(fixture!("idle-turn-complete.txt"));
     assert_turn_complete(fixture!("idle-same-day.txt"));
-    // The bare-time separator of a turn under a minute is inferred from
-    // codex's own time format strings; it has not yet been observed on screen.
-    assert_turn_complete(fixture!("idle-short-turn.txt"));
+}
+
+#[test]
+fn codex_time_without_a_turn_duration_is_not_a_separator() {
+    // Codex's time format strings suggest a turn under a minute may end with
+    // a bare time, but that shape has not been observed on screen, and a time
+    // alone is ordinary output; such a turn stays unknown.
+    assert_not_turn_complete(fixture!("bare-time-short-turn.txt"), AgentState::Unknown);
+    assert_not_turn_complete(fixture!("time-in-tool-output.txt"), AgentState::Unknown);
+    assert_not_turn_complete(fixture!("date-time-in-prose.txt"), AgentState::Unknown);
+    assert_not_turn_complete(fixture!("time-between-rules.txt"), AgentState::Unknown);
+}
+
+#[test]
+fn codex_turn_started_below_a_separator_is_not_idle() {
+    // While a turn runs, a braille dot replaces the space after the composer
+    // glyph, so the submitted prompt is the last plain prompt line and the
+    // previous turn's separator sits directly above it.
+    assert_not_turn_complete(
+        fixture!("sparkle-composer-bullet-working.txt"),
+        AgentState::Working,
+    );
+    for screen in [
+        fixture!("sparkle-composer-no-status.txt"),
+        fixture!("sparkle-composer-hollow-working.txt"),
+        fixture!("sparkle-composer-plain-working.txt"),
+        fixture!("sparkle-composer-indented-prose.txt"),
+        fixture!("sparkle-composer-under-separator.txt"),
+    ] {
+        let detected = explain_bundled(screen);
+        assert_ne!(detected.state, AgentState::Idle);
+        assert!(!supplement_matched(&detected));
+    }
 }
 
 #[test]
@@ -110,7 +141,6 @@ fn codex_supplement_applies_only_when_the_active_remote_manifest_has_no_match() 
         assert!(matches!(idle.source, Some(ManifestSource::Remote { .. })));
         assert_eq!(idle.manifest_version.as_deref(), Some("9999.01.01.1"));
         assert_eq!(idle.state, AgentState::Idle);
-        assert!(idle.visible_idle);
         assert!(supplement_matched(&idle));
 
         // A matching rule in the active manifest wins over the supplement.

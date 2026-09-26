@@ -5,18 +5,23 @@ min_engine_version = 3
 # (remote or bundled) matched nothing, so an updated remote manifest cannot
 # shadow them and any rule it adds still wins.
 
-# Codex closes every finished turn with a separator that carries the local
-# time, prefixed by the turn duration once a turn runs a minute or longer:
+# Codex closes a finished turn with a separator carrying the turn duration and
+# the local time, dated unless the turn ended the day it started:
 #   Worked for 2h 48m 24s · Sep 23 at 8:01 PM
-#   8:01 PM
-# Only blank lines and a right-aligned tip may follow it before the composer.
+#   Worked for 12m 34s · 9:41 AM
 # The composer and footer stay visible while a turn runs, so they are not
-# evidence; a separator followed by anything else (a newly submitted prompt,
-# a notice, more output) is not either.
+# evidence on their own. The rule anchors to the physical end of the screen:
+# the separator, then only blank or tip lines, then exactly one composer line,
+# then only blank or indented footer lines. Anything else below the separator
+# (a submitted prompt, a status line, output, a notice) is a later turn.
+# While a turn runs the composer glyph animates (a braille dot replaces the
+# space after ›), so a sparkling composer anywhere rules the screen out.
+# The rule sets no visible_idle, so a working pane still passes through the
+# idle confirmation hold before it publishes idle.
 [[rules]]
 id = "turn_complete_separator"
 state = "idle"
 priority = 200
-region = "before_current_prompt_marker"
-visible_idle = true
-regex = ['(?m)^[ \t─]*(?:Worked for (?:[0-9]+[dhm] )*[0-9]+[dhms] · )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)[ \t─]*(?:\r?\n[ \t]*(?:Tip: [^\r\n]*)?)*\z']
+region = "whole_recent"
+regex = ['(?m)^[ \t]*Worked for (?:[0-9]+[dhm] )*[0-9]+[dhms] · (?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)[ \t]*(?:\r?\n[ \t]*(?:Tip: [^\r\n]*)?)*\r?\n›[^\r\n]*(?:\r?\n(?:[ \t][^\r\n]*)?)*\z']
+not = [{ regex = ['(?m)^›[⠁⠂⠄⠈⠐⠠⡀⢀]'] }]

@@ -1,0 +1,11 @@
+› show the schedule
+
+
+• The next maintenance window opens today.
+
+  ──────────────────── 9:41 AM ────────────────────
+
+› Ask Codex to do anything
+
+  ~/repo · main · No changes · Context 27% used · model-name high
+  ? for shortcuts

@@ -1,0 +1,10 @@
+› when did the nightly job last run?
+
+
+• The nightly job last succeeded without warnings; its most recent run finished on
+  Sep 23 at 8:01 PM
+
+› Ask Codex to do anything
+
+  ~/repo · main · No changes · Context 27% used · model-name high
+  ? for shortcuts

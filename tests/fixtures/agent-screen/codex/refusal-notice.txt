@@ -18,31 +18,31 @@ Independent review of the sandboxed shell, which shipped with only one review �
 • I reproduced the guard issue with a /tmp fixture: a scratch link to a nonexistent outside file passes the check, and the write tool follows it and
   creates that file. I invoked
 
-ⓘ This content can't be shown
-  This request isn't available for this model. Some requests may still be limited.
+ⓘ This content can’t be shown
+  This request isn’t available for this model. Some requests may still be limited.
   Learn more: https://example.com/help
 
 • Completed `/root/standards_guard`
 
 
-• Note from the supervisor: this worktree had no node_modules, so the 'tsc: command not found' and any odd test failures were missing deps. Dependencies are installed
+› Note from the supervisor: this worktree had no node_modules, so the 'tsc: command not found' and any odd test failures were missing deps. Dependencies are installed
   now — npm test and npm run typecheck work. Carry on.
 
 
 • Thanks—I'll rerun typecheck. I confirmed a concrete case in a /tmp fixture: the guard accepts a dangling link inside scratch, then the write tool
   follows it and creates a file outside scratch. I'm preparing a probe to check the remaining step.
 
-ⓘ This content can't be shown
-  This request isn't available for this model. Some requests may still be limited.
+ⓘ This content can’t be shown
+  This request isn’t available for this model. Some requests may still be limited.
   Learn more: https://example.com/help
 
 
-• Supervisor: your finding is confirmed end to end. Please continue the review: any further path-resolution holes of the same family, and your probe list
+› Supervisor: your finding is confirmed end to end. Please continue the review: any further path-resolution holes of the same family, and your probe list
   for anything you still cannot run. Finish with the verdict line as briefed.
 
 
-ⓘ This content can't be shown
-  This request isn't available for this model. Some requests may still be limited.
+ⓘ This content can’t be shown
+  This request isn’t available for this model. Some requests may still be limited.
   Learn more: https://example.com/help
                                                                                      Tip: Moving from Claude Code? Use /import to bring over your setup, project, and recent chats.
 
