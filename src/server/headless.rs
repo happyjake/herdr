@@ -74,6 +74,7 @@ use crate::server::terminal_attach::paste_payload_for_runtime;
 
 mod bootstrap;
 mod client_views;
+mod detach_floor;
 mod endpoint_requests;
 mod lifecycle;
 mod native_graphics;
@@ -979,6 +980,11 @@ impl HeadlessServer {
     }
 
     fn remove_client_and_resize_if_needed(&mut self, client_id: u64) {
+        let detached_shell_size = self
+            .clients
+            .get(&client_id)
+            .filter(|client| client.is_active_shell_client())
+            .map(|client| client.terminal_size);
         let restore_shell_controller = self.clients.get(&client_id).and_then(|client| {
             let ClientConnectionMode::TerminalAttach { terminal_id } = &client.mode else {
                 return None;
@@ -990,6 +996,9 @@ impl HeadlessServer {
             self.restore_shell_tab_geometry(controller_id, target);
         } else {
             self.resize_tabs_for_only_shell_client(true);
+        }
+        if let Some(size) = detached_shell_size {
+            self.raise_tabs_to_headless_size_after_last_detach(size);
         }
     }
 

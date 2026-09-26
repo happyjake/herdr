@@ -681,6 +681,80 @@ fn pane_created_after_detach_uses_configured_headless_size() {
     cleanup_spawned_herdr(spawned, base);
 }
 
+/// Attach one client shell at `cols`x`rows` under the custom headless size
+/// (132x41), create a pane, detach, and return the pane's tty size (rows,
+/// cols) while attached and after the detach.
+fn pane_size_across_detach(cols: u16, rows: u16) -> ((u16, u16), (u16, u16)) {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        CUSTOM_HEADLESS_SIZE_CONFIG,
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let mut stream = UnixStream::connect(&client_socket).expect("client should connect");
+    let (version, error) = client_shell_handshake(&mut stream, CURRENT_PROTOCOL, cols, rows)
+        .expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
+    assert!(error.is_none(), "{error:?}");
+    support::wait_for_client_shell_bootstrap(&mut stream, Duration::from_secs(5))
+        .expect("client shell bootstrap");
+
+    let created = workspace_create(&api_socket, "small-client");
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("root pane id")
+        .to_string();
+    let attached_size = read_pane_tty_size_after_marker(
+        &api_socket,
+        &pane_id,
+        "ATTACHED_SIZE",
+        Duration::from_secs(5),
+    );
+
+    send_detach(&mut stream).expect("send detach");
+    assert!(
+        wait_for_disconnect(&mut stream, Duration::from_secs(2)).expect("wait for detach"),
+        "detached client connection should close"
+    );
+    drop(stream);
+
+    let detached_size = read_pane_tty_size_after_marker(
+        &api_socket,
+        &pane_id,
+        "SIZE_AFTER_DETACH",
+        Duration::from_secs(5),
+    );
+
+    cleanup_spawned_herdr(spawned, base);
+    (attached_size, detached_size)
+}
+
+#[test]
+fn small_client_detach_grows_panes_to_configured_headless_size() {
+    let _lock = test_lock();
+    let (attached, detached) = pane_size_across_detach(100, 30);
+    assert_eq!(attached, (30, 100));
+    assert_eq!(detached, (41, 132));
+}
+
+#[test]
+fn short_client_detach_grows_only_the_dimension_below_headless_size() {
+    let _lock = test_lock();
+    let (attached, detached) = pane_size_across_detach(160, 30);
+    assert_eq!(attached, (30, 160));
+    assert_eq!(detached, (41, 160));
+}
+
 #[test]
 fn detached_output_preserves_last_attached_pty_size() {
     let _lock = test_lock();
