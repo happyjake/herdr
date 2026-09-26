@@ -2066,6 +2066,65 @@ fn queued_copy_keys_preserve_prefix_order() {
     );
 }
 
+/// A client whose focused pane shows rows 20..=21 of a 22-row buffer, scrolled
+/// back `offset_from_bottom` rows.
+fn state_viewing_rows(offset_from_bottom: u64) -> ClientShellState {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom,
+        max_offset_from_bottom: 20,
+        viewport_rows: 2,
+    });
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+    state
+}
+
+fn edit_scrollback_line(state: &mut ClientShellState) -> Option<u64> {
+    let mut input = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::EditScrollback),
+        &mut input,
+    );
+    match &input.actions[..] {
+        [ClientShellAction::Endpoint { request, .. }] => match &request.method {
+            crate::api::schema::Method::PaneEditScrollback(params) => params.line,
+            other => panic!("unexpected method {other:?}"),
+        },
+        other => panic!("unexpected actions {other:?}"),
+    }
+}
+
+#[test]
+fn edit_scrollback_opens_at_the_line_in_view() {
+    // Live view with no visible cursor: the bottom row of the view.
+    let mut live = state_viewing_rows(0);
+    assert_eq!(edit_scrollback_line(&mut live), Some(22));
+
+    // Scrolled back five rows without copy mode: the bottom of that view.
+    let mut scrolled = state_viewing_rows(5);
+    assert_eq!(edit_scrollback_line(&mut scrolled), Some(17));
+
+    // Copy mode: its cursor, wherever it was moved to.
+    let mut copying = state_viewing_rows(0);
+    let mut enter = ClientShellInput::default();
+    copying.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
+        &mut enter,
+    );
+    copying.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::PageUp,
+        KeyModifiers::empty(),
+    ))]);
+    assert_eq!(
+        copying.copy_mode.as_ref().map(|mode| mode.cursor.row),
+        Some(20)
+    );
+    assert_eq!(edit_scrollback_line(&mut copying), Some(21));
+}
+
 #[test]
 fn reentering_copy_mode_on_the_same_pane_is_a_no_op() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
