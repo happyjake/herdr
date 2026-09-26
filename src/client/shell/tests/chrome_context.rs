@@ -378,6 +378,55 @@ fn context_menus_capture_stable_targets_and_route_actions() {
 }
 
 #[test]
+fn clear_pane_name_publishes_a_cleared_label() {
+    let mut snapshot = snapshot();
+    snapshot.panes[0].label = Some("build".into());
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("composed frame");
+
+    let pane = state.hits.panes[0].rect;
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Right),
+        column: pane.x + 1,
+        row: pane.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    state.compose(106, 20).expect("pane context menu");
+    let clear_index = match state.overlay.as_ref() {
+        Some(ClientShellOverlay::ContextMenu(menu)) => menu
+            .items()
+            .iter()
+            .position(|item| item.action == ClientContextMenuAction::ClearPaneName)
+            .expect("a labelled pane offers clear pane name"),
+        _ => panic!("pane context menu"),
+    };
+    let clear = state.hits.context_menu_rows[clear_index].0;
+    let outcome =
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: clear.x + 1,
+            row: clear.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+    let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
+        panic!(
+            "clear pane name should send exactly one endpoint request: {:?}",
+            outcome.actions
+        );
+    };
+    assert_eq!(
+        request.method,
+        crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+            pane_id: "pane_1".into(),
+            label: None,
+            source: None,
+        })
+    );
+}
+
+#[test]
 fn global_menu_opens_from_sidebar_and_routes_client_actions() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
