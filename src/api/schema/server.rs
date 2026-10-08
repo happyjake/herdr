@@ -163,4 +163,11 @@ pub struct ServerCapabilities {
     /// in pongs of servers that predate it, which take photos only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_attachments: Option<FileAttachmentsCapability>,
+    /// Whether `pane.report_agent` honors `cancelled`: an idle report for a
+    /// run the user cancelled, which settles without a completion. Additive:
+    /// absent (false) in pongs of servers that predate it, which ignore the
+    /// field and read the report as a finished run, so an integration sends
+    /// `cancelled` only to a server that declares this.
+    #[serde(default)]
+    pub agent_report_cancelled: bool,
 }

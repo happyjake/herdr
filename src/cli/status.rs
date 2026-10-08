@@ -429,6 +429,7 @@ mod tests {
                 stream_multiplex: false,
                 credential_registry: false,
                 file_attachments: None,
+                agent_report_cancelled: false,
             }),
         }
     }

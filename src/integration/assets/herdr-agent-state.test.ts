@@ -104,7 +104,10 @@ function captureConnectionEndpoint() {
   return () => connectedEndpoint;
 }
 
-async function startRecordingServer(name: string): Promise<unknown[]> {
+async function startRecordingServer(
+  name: string,
+  respond: (request: unknown) => unknown = () => ({}),
+): Promise<unknown[]> {
   const recordingSocketPath = join(tmpdir(), `herdr-${name}-${process.pid}.sock`);
   socketPath = recordingSocketPath;
   await rm(recordingSocketPath, { force: true });
@@ -119,8 +122,9 @@ async function startRecordingServer(name: string): Promise<unknown[]> {
       if (newline === -1) {
         return;
       }
-      requests.push(JSON.parse(input.slice(0, newline)));
-      socket.end("{}\n");
+      const request = JSON.parse(input.slice(0, newline));
+      requests.push(request);
+      socket.end(`${JSON.stringify(respond(request))}\n`);
     });
   });
   server = recordingServer;
@@ -323,6 +327,80 @@ test("Pi reports idle only after the agent settles", async () => {
   handlers.get("agent_settled")?.({}, context);
   await waitFor(() => requestStates(requests).length === 3);
   expect(requestStates(requests)).toEqual(["idle", "working", "idle"]);
+});
+
+function pongWithCapabilities(capabilities: Record<string, unknown>) {
+  return (request: unknown) =>
+    isRecord(request) && request.method === "ping"
+      ? { id: request.id, result: { type: "pong", version: "test", protocol: 1, capabilities } }
+      : { id: isRecord(request) ? request.id : "", result: { type: "ok" } };
+}
+
+async function settleRun(
+  name: string,
+  respond: (request: unknown) => unknown,
+  settledEvent: Record<string, unknown>,
+): Promise<unknown[]> {
+  const requests = await startRecordingServer(name, respond);
+  const { handlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+
+  let idle = true;
+  const context = piContext(() => idle);
+  await handlers.get("session_start")?.({ reason: "startup" }, context);
+  idle = false;
+  handlers.get("agent_start")?.({}, context);
+  await waitFor(() => requestStates(requests).length === 2);
+  idle = true;
+  handlers.get("agent_settled")?.(settledEvent, context);
+  await waitFor(() => requestStates(requests).length === 3);
+  return requests;
+}
+
+function stateReports(requests: unknown[]): Record<string, unknown>[] {
+  return requests
+    .filter((request) => isRecord(request) && request.method === "pane.report_agent")
+    .map((request) => (request as { params: Record<string, unknown> }).params);
+}
+
+test("Pi reports a cancelled run when the server advertises cancelled reports", async () => {
+  const requests = await settleRun(
+    "pi-cancelled",
+    pongWithCapabilities({ live_handoff: true, agent_report_cancelled: true }),
+    { aborted: true },
+  );
+
+  const reports = stateReports(requests);
+  expect(reports.map((report) => report.state)).toEqual(["idle", "working", "idle"]);
+  expect(reports.map((report) => report.cancelled)).toEqual([undefined, undefined, true]);
+});
+
+test("Pi reports a cancelled run as plain idle to a server without cancelled reports", async () => {
+  for (const [name, respond] of [
+    ["pi-cancelled-old-pong", pongWithCapabilities({ live_handoff: true })],
+    ["pi-cancelled-no-pong", () => ({})],
+  ] as const) {
+    const requests = await settleRun(name, respond, { aborted: true });
+
+    const reports = stateReports(requests);
+    expect(reports.map((report) => report.state)).toEqual(["idle", "working", "idle"]);
+    expect(reports.every((report) => !("cancelled" in report))).toBe(true);
+    await new Promise<void>((resolve) => server!.close(() => resolve()));
+    server = undefined;
+  }
+});
+
+test("Pi reports a finished run as plain idle even when the server advertises cancelled reports", async () => {
+  const requests = await settleRun(
+    "pi-finished",
+    pongWithCapabilities({ agent_report_cancelled: true }),
+    { aborted: false },
+  );
+
+  const reports = stateReports(requests);
+  expect(reports.map((report) => report.state)).toEqual(["idle", "working", "idle"]);
+  expect(reports.every((report) => !("cancelled" in report))).toBe(true);
 });
 
 test("Pi ignores RPC sessions even when UI APIs are available", async () => {

@@ -5660,6 +5660,7 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
             message: None,
             seq: None,
             session_ref: None,
+            cancelled: false,
         })
     );
     assert!(
@@ -7308,6 +7309,7 @@ fn completion_guard_api_startup_blocker_respects_suppression() {
                 seq: Some(seq as u64 + 1),
                 agent_session_id: None,
                 agent_session_path: None,
+                cancelled: false,
             }),
         );
     }
@@ -7383,6 +7385,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 seq: Some(12),
                 agent_session_id: None,
                 agent_session_path: Some(new_session.clone()),
+                cancelled: false,
             };
             completion_guard_api_report(&mut server, Method::PaneReportAgent(report.clone()));
             let terminal = &server.app.state.terminals[&terminal_id];
@@ -7575,6 +7578,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                 seq: Some(19),
                 agent_session_id: None,
                 agent_session_path: None,
+                cancelled: false,
             }),
         },
         respond_to,
@@ -7593,6 +7597,124 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
             .is_err(),
         "stale idle report must not forward a done sound"
     );
+}
+
+/// Runs one pi turn in a background pane through the API, settling with the
+/// given `cancelled`, and returns the pane's status with every completion
+/// signal the foreground client received: semantic notifications, toasts,
+/// and sounds.
+fn background_pi_turn_settled(
+    cancelled: bool,
+) -> (
+    api::schema::AgentStatus,
+    Vec<protocol::SemanticNotificationKind>,
+    Vec<protocol::NotifyKind>,
+) {
+    use api::schema::{Method, PaneAgentState, PaneReportAgentParams};
+
+    let (writer, control_rx, _render_rx) = test_client_writer();
+    let (mut server, pane_id) = completion_guard_server(writer);
+    server.app.state.toast_config.delivery = crate::config::ToastDelivery::System;
+    server.app.state.sound.enabled = true;
+    server.foreground_client_id = Some(1);
+    server.sync_foreground_client_state();
+    let terminal_id = server.app.state.workspaces[0].panes[&pane_id]
+        .attached_terminal_id
+        .clone();
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Idle,
+        );
+    let public_pane_id = server.app.public_pane_id(0, pane_id).unwrap();
+    let session_path = std::env::current_dir()
+        .unwrap()
+        .join("cancelled-pi.jsonl")
+        .display()
+        .to_string();
+    completion_guard_api_report(
+        &mut server,
+        Method::PaneReportAgentSession(api::schema::PaneReportAgentSessionParams {
+            pane_id: public_pane_id.clone(),
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            seq: Some(0),
+            agent_session_id: None,
+            agent_session_path: Some(session_path.clone()),
+            session_start_source: Some("startup".into()),
+        }),
+    );
+    for (seq, state, cancelled) in [
+        (1, PaneAgentState::Idle, false),
+        (2, PaneAgentState::Working, false),
+        (3, PaneAgentState::Idle, cancelled),
+    ] {
+        completion_guard_api_report(
+            &mut server,
+            Method::PaneReportAgent(PaneReportAgentParams {
+                pane_id: public_pane_id.clone(),
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                state,
+                message: None,
+                seq: Some(seq),
+                agent_session_id: None,
+                agent_session_path: Some(session_path.clone()),
+                cancelled,
+            }),
+        );
+    }
+
+    server.send_to_client(
+        1,
+        ServerMessage::EndpointControl {
+            kind: "test.completion-barrier".into(),
+            data: String::new(),
+        },
+    );
+    let (mut semantic, mut notify) = (Vec::new(), Vec::new());
+    loop {
+        match read_server_message(
+            control_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("notification barrier"),
+        ) {
+            ServerMessage::EndpointControl { kind, .. } if kind == "test.completion-barrier" => {
+                break;
+            }
+            ServerMessage::SemanticNotification(notification) => semantic.push(notification.kind),
+            ServerMessage::Notify { kind, .. } => notify.push(kind),
+            _ => {}
+        }
+    }
+    let status = crate::app::api_helpers::pane_agent_status(
+        server.app.state.terminals[&terminal_id].state,
+        server.app.state.workspaces[0].panes[&pane_id].seen,
+    );
+    (status, semantic, notify)
+}
+
+#[test]
+fn api_finished_report_marks_a_background_pane_done_and_notifies() {
+    let (status, semantic, notify) = background_pi_turn_settled(false);
+
+    assert_eq!(status, api::schema::AgentStatus::Done);
+    assert!(semantic.contains(&protocol::SemanticNotificationKind::Finished));
+    assert!(notify.contains(&protocol::NotifyKind::Sound), "{notify:?}");
+}
+
+#[test]
+fn api_cancelled_report_settles_a_background_pane_idle_without_completion() {
+    let (status, semantic, notify) = background_pi_turn_settled(true);
+
+    assert_eq!(status, api::schema::AgentStatus::Idle);
+    assert!(semantic.is_empty(), "{semantic:?}");
+    assert!(notify.is_empty(), "{notify:?}");
 }
 
 /// Verify that calls to the app's internal-event methods only occur inside

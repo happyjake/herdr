@@ -1726,6 +1726,7 @@ impl App {
             state: detect_state_from_api(params.state),
             message: params.message,
             seq: params.seq,
+            cancelled: params.cancelled,
         });
 
         encode_success(id, ResponseResult::Ok {})
@@ -3127,6 +3128,7 @@ mod tests {
                 message: None,
                 seq: None,
                 session_ref: None,
+                cancelled: false,
             });
     }
 

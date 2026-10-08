@@ -60,6 +60,7 @@ pub fn server_capabilities() -> crate::api::schema::ServerCapabilities {
         stream_multiplex: true,
         credential_registry: true,
         file_attachments: Some(attachment::file_attachments_capability()),
+        agent_report_cancelled: true,
     }
 }
 
@@ -149,5 +150,6 @@ mod tests {
         assert!(capabilities.credential_registry);
         assert!(capabilities.send_affirm);
         assert!(capabilities.stream_multiplex);
+        assert!(capabilities.agent_report_cancelled);
     }
 }
