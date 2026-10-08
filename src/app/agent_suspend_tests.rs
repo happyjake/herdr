@@ -77,6 +77,7 @@ fn pi_report(app: &mut AppState, pane_id: PaneId, state: AgentState, seq: u64) {
         message: None,
         seq: Some(seq),
         session_ref: Some(pi_session()),
+        cancelled: false,
     });
 }
 

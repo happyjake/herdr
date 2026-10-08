@@ -911,6 +911,13 @@ Integrations report agent state with `pane.report_agent`.
 `state` carries semantic agent state and affects waits, notifications, and
 rollups. Report display-only values separately through metadata.
 
+When the user cancels a run, report `"state": "idle"` with `"cancelled": true`.
+The pane goes idle without being marked done and without a finished
+notification or sound. Servers that support this declare
+`agent_report_cancelled: true` in the `ping` capabilities; older servers ignore
+the field and treat the report as a finished run, so send `cancelled` only to a
+server that declares it.
+
 Session-only official integrations report native session references with `pane.report_agent_session`. State-reporting integrations can still include native session references in `pane.report_agent`. State-independent session reports do not affect waits, notifications, or rollups.
 
 ```json

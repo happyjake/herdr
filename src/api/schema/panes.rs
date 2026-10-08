@@ -501,6 +501,12 @@ crate::cli::projection::cli_params! {
         /// first element must be a plain command name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub resume_argv: Option<Vec<String>> => Field::new(None).input(binding::resume()),
+        /// With `state: idle`, the user cancelled the run rather than it
+        /// finishing: the pane goes idle with no completion, toast, or sound.
+        /// Ignored with any other state. Honored only by servers that declare
+        /// `agent_report_cancelled`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub cancelled: bool => Field::new(false),
     }
 }
 

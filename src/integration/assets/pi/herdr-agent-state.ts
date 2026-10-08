@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=9
+// HERDR_INTEGRATION_VERSION=10
 // @ts-nocheck
 
 import net from "node:net";
@@ -47,6 +47,53 @@ function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolea
   });
 }
 
+function queryAttempt(request: unknown, timeoutMs: number): Promise<unknown> {
+  return new Promise((resolve) => {
+    let done = false;
+    let input = "";
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const finish = (response: unknown) => {
+      if (done) return;
+      done = true;
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      socket.destroy();
+      resolve(response);
+    };
+
+    const socket = net.createConnection(socketEndpoint!);
+    socket.setEncoding("utf8");
+    socket.on("error", () => finish(undefined));
+    socket.on("connect", () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on("data", (chunk) => {
+      input += chunk;
+      const newline = input.indexOf("\n");
+      if (newline === -1) {
+        return;
+      }
+      try {
+        finish(JSON.parse(input.slice(0, newline)));
+      } catch {
+        finish(undefined);
+      }
+    });
+    socket.on("end", () => finish(undefined));
+    timeout = setTimeout(() => finish(undefined), timeoutMs);
+    timeout.unref?.();
+  });
+}
+
+// Asked at each cancellation rather than cached: a live handoff can swap the
+// server for an older one, which would silently read the report as finished.
+async function serverAcceptsCancelledReports(): Promise<boolean> {
+  const response: any = await queryAttempt(
+    { id: `${source}:ping:${Date.now()}:${Math.random().toString(36).slice(2)}`, method: "ping", params: {} },
+    500,
+  );
+  return response?.result?.capabilities?.agent_report_cancelled === true;
+}
+
 async function sendRequest(request: unknown): Promise<void> {
   if (await sendRequestAttempt(request, 500)) {
     return;
@@ -59,6 +106,7 @@ type AgentState = "working" | "blocked" | "idle";
 type QueuedState = {
   state: AgentState;
   message?: string;
+  cancelled: boolean;
   seq: number;
 };
 
@@ -131,7 +179,14 @@ function reportSession(sessionStartSource?: string): Promise<void> {
   });
 }
 
-function sendState(state: AgentState, message?: string, seq = nextReportSeq()): Promise<void> {
+async function sendState(
+  state: AgentState,
+  message?: string,
+  cancelled = false,
+  seq = nextReportSeq(),
+): Promise<void> {
+  // A server that predates cancelled reports gets the plain idle it always got.
+  const reportCancelled = cancelled && (await serverAcceptsCancelledReports());
   return sendRequest({
     id: `${source}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     method: "pane.report_agent",
@@ -141,6 +196,7 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq()): 
       agent: "pi",
       state,
       message,
+      ...(reportCancelled ? { cancelled: true } : {}),
       seq,
     }),
   });
@@ -149,8 +205,8 @@ function sendState(state: AgentState, message?: string, seq = nextReportSeq()): 
 let sendInFlight = false;
 let queuedState: QueuedState | undefined;
 
-function queueState(state: AgentState, message?: string): void {
-  queuedState = { state, message, seq: nextReportSeq() };
+function queueState(state: AgentState, message?: string, cancelled = false): void {
+  queuedState = { state, message, cancelled, seq: nextReportSeq() };
   if (!sendInFlight) {
     void drainStateQueue();
   }
@@ -166,7 +222,7 @@ async function drainStateQueue(): Promise<void> {
     while (queuedState) {
       const next = queuedState;
       queuedState = undefined;
-      await sendState(next.state, next.message, next.seq);
+      await sendState(next.state, next.message, next.cancelled, next.seq);
     }
   } finally {
     sendInFlight = false;
@@ -198,14 +254,14 @@ export default function (pi) {
     return { state: "idle" as const, message: undefined };
   }
 
-  function publishState(force = false) {
+  function publishState(force = false, cancelled = false) {
     const next = desiredState();
     if (!force && next.state === lastState && next.message === lastMessage) {
       return;
     }
     lastState = next.state;
     lastMessage = next.message;
-    queueState(next.state, next.message);
+    queueState(next.state, next.message, cancelled && next.state === "idle");
   }
 
   pi.events.on("herdr:blocked", (data) => {
@@ -250,12 +306,13 @@ export default function (pi) {
     publishState();
   });
 
-  pi.on("agent_settled", (_event, ctx) => {
+  pi.on("agent_settled", (event, ctx) => {
     if (!rootSession || ctx?.isIdle?.() !== true) {
       return;
     }
 
     agentActive = false;
-    publishState();
+    // pi >= 1.1.0 sets `aborted` when the user cancelled the run (e.g. Esc).
+    publishState(false, event?.aborted === true);
   });
 }

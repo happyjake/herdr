@@ -3221,6 +3221,10 @@
                 "null"
               ]
             },
+            "cancelled": {
+              "description": "With `state: idle`, the user cancelled the run rather than it\nfinishing: the pane goes idle with no completion, toast, or sound.\nIgnored with any other state. Honored only by servers that declare\n`agent_report_cancelled`.",
+              "type": "boolean"
+            },
             "message": {
               "type": [
                 "string",
@@ -11642,6 +11646,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_report_cancelled": {
+              "default": false,
+              "description": "Whether `pane.report_agent` honors `cancelled`: an idle report for a\nrun the user cancelled, which settles without a completion. Additive:\nabsent (false) in pongs of servers that predate it, which ignore the\nfield and read the report as a finished run, so an integration sends\n`cancelled` only to a server that declares this.",
+              "type": "boolean"
+            },
             "credential_registry": {
               "default": false,
               "description": "Whether this server keeps a credential registry: the\npairing's managing credential plus any minted limited credentials,\nwith `credential.mint`, `credential.list`, `credential.revoke`, and\n`credential.revoke_all`. Additive: absent (false) in pongs of servers\nthat predate it, which refuse the verbs as unparseable methods.",

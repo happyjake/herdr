@@ -1716,6 +1716,7 @@ impl AppState {
                 message,
                 seq,
                 session_ref,
+                cancelled,
             } => {
                 if crate::agent_resume::is_reserved_native_state_source(&source, &agent_label) {
                     self.update_terminal_state(
@@ -1728,9 +1729,12 @@ impl AppState {
                     .into_iter()
                     .collect()
                 } else {
-                    self.update_terminal_state(
+                    // A cancelled run settles like a process exit: idle, but
+                    // not a completion the user has yet to see.
+                    self.update_terminal_state_with_completion_policy(
                         pane_id,
                         crate::events::StatusReading::Verdict,
+                        cancelled && state == AgentState::Idle,
                         |terminal| {
                             terminal.set_hook_authority_with_session_ref(
                                 source,
@@ -3602,6 +3606,7 @@ mod tests {
                 message: None,
                 seq: Some(seq),
                 session_ref: None,
+                cancelled: false,
             });
             if seq == 2 {
                 assert!(!app.workspaces[1].panes[&pane_id].seen);
@@ -3984,6 +3989,7 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: None,
+            cancelled: false,
         });
         state.handle_app_event(AppEvent::AgentResumeReported {
             pane_id,
@@ -4075,6 +4081,7 @@ mod tests {
             message: None,
             seq: None,
             session_ref: None,
+            cancelled: false,
         });
 
         assert!(state.terminals[&terminal_id].reported_resume().is_none());
@@ -4191,6 +4198,7 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: None,
+            cancelled: false,
         });
         assert!(!state.terminals[&terminal_id].self_reported_agent_active());
 
@@ -4202,6 +4210,123 @@ mod tests {
         assert_eq!(
             state.terminals[&terminal_id].effective_agent_label(),
             Some("pi")
+        );
+    }
+
+    fn pi_session_ref() -> Option<crate::agent_resume::AgentSessionRef> {
+        let path = std::env::current_dir().unwrap().join("cancelled-pi.jsonl");
+        crate::agent_resume::AgentSessionRef::path(path.display().to_string())
+    }
+
+    /// A running pi as the integration presents it: the process detected and
+    /// its session reported before any state.
+    fn detect_pi_process(state: &mut AppState, pane_id: PaneId) {
+        let terminal_id = state
+            .workspaces
+            .iter()
+            .find_map(|ws| ws.pane_state(pane_id))
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        state.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            seq: Some(0),
+            session_ref: pi_session_ref(),
+            session_start_source: crate::agent_resume::normalize_session_start_source(Some(
+                "startup".into(),
+            )),
+        });
+    }
+
+    /// Settles one hook-reported pi turn in a background pane, with a toast
+    /// delay so a completion would wait as a pending notification.
+    fn settle_background_hook_turn(cancelled: bool) -> (AppState, PaneId, Vec<PaneStateUpdate>) {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        state.toast_config.delay_seconds = 1;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        detect_pi_process(&mut state, bg_pane_id);
+        let mut updates = Vec::new();
+        for (seq, agent_state, cancelled) in [
+            (1, AgentState::Working, false),
+            (2, AgentState::Idle, cancelled),
+        ] {
+            updates = state.handle_app_event(AppEvent::HookStateReported {
+                pane_id: bg_pane_id,
+                source: "herdr:pi".into(),
+                agent_label: "pi".into(),
+                state: agent_state,
+                message: None,
+                seq: Some(seq),
+                session_ref: pi_session_ref(),
+                cancelled,
+            });
+        }
+        (state, bg_pane_id, updates)
+    }
+
+    #[test]
+    fn hook_reported_finished_turn_is_a_pending_completion() {
+        let (mut state, pane_id, updates) = settle_background_hook_turn(false);
+
+        let pane = &state.workspaces[1].panes[&pane_id];
+        assert_eq!(
+            state.terminals[&pane.attached_terminal_id].state,
+            AgentState::Idle
+        );
+        assert!(!pane.seen);
+        assert!(!updates[0].suppress_completion);
+        let deadline = state.next_pending_agent_notification_deadline().unwrap();
+        state.drain_due_agent_notifications(deadline);
+        assert_eq!(state.toast.as_ref().unwrap().kind, ToastKind::Finished);
+    }
+
+    #[test]
+    fn hook_reported_cancelled_turn_settles_idle_without_completion() {
+        let (state, pane_id, updates) = settle_background_hook_turn(true);
+
+        let pane = &state.workspaces[1].panes[&pane_id];
+        let terminal = &state.terminals[&pane.attached_terminal_id];
+        assert_eq!(terminal.state, AgentState::Idle);
+        assert!(terminal.last_agent_completion_seq.is_none());
+        assert!(pane.seen);
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].suppress_completion);
+        assert!(state.next_pending_agent_notification_deadline().is_none());
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn hook_reported_cancelled_flag_is_ignored_unless_idle() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        detect_pi_process(&mut state, bg_pane_id);
+
+        let updates = state.handle_app_event(AppEvent::HookStateReported {
+            pane_id: bg_pane_id,
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            state: AgentState::Blocked,
+            message: None,
+            seq: Some(1),
+            session_ref: pi_session_ref(),
+            cancelled: true,
+        });
+
+        assert!(!updates[0].suppress_completion);
+        assert_eq!(
+            state.toast.as_ref().unwrap().kind,
+            ToastKind::NeedsAttention
         );
     }
 
@@ -4220,6 +4345,7 @@ mod tests {
             message: None,
             seq: None,
             session_ref: None,
+            cancelled: false,
         });
 
         let toast = state.toast.as_ref().unwrap();
@@ -4259,6 +4385,7 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: None,
+            cancelled: false,
         });
         state.handle_app_event(AppEvent::StateChanged {
             pane_id: bg_pane_id,
@@ -4309,6 +4436,7 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("claude-session"),
+            cancelled: false,
         });
         let terminal = state.terminals.get(&terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Working);
@@ -4421,6 +4549,7 @@ mod tests {
             message: None,
             seq: Some(1),
             session_ref: crate::agent_resume::AgentSessionRef::id("devin-session"),
+            cancelled: false,
         });
 
         let terminal = state.terminals.get(&terminal_id).unwrap();
@@ -4445,6 +4574,7 @@ mod tests {
             message: None,
             seq: Some(20),
             session_ref: crate::agent_resume::AgentSessionRef::path(first_session),
+            cancelled: false,
         });
         assert_eq!(first_updates.len(), 1);
         state.session_dirty = false;
@@ -4457,6 +4587,7 @@ mod tests {
             message: None,
             seq: Some(21),
             session_ref: crate::agent_resume::AgentSessionRef::path(second_session),
+            cancelled: false,
         });
 
         assert!(second_updates.is_empty());

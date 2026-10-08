@@ -1307,6 +1307,32 @@ fn agent_status_request_values_remain_strict() {
 }
 
 #[test]
+fn pane_report_agent_cancelled_is_optional_and_omitted_when_false() {
+    let request: Request = serde_json::from_str(
+        r#"{"id":"r","method":"pane.report_agent","params":{"pane_id":"w1:p1","source":"herdr:pi","agent":"pi","state":"idle"}}"#,
+    )
+    .unwrap();
+    let Method::PaneReportAgent(mut params) = request.method else {
+        panic!("expected pane.report_agent");
+    };
+    assert!(!params.cancelled);
+    assert!(!serde_json::to_string(&params)
+        .unwrap()
+        .contains("cancelled"));
+
+    params.cancelled = true;
+    let json = serde_json::to_value(&params).unwrap();
+    assert_eq!(json["cancelled"], true);
+}
+
+#[test]
+fn server_advertises_cancelled_agent_reports() {
+    assert!(crate::api::server_capabilities().agent_report_cancelled);
+    let predating: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+    assert!(!predating.agent_report_cancelled);
+}
+
+#[test]
 fn success_response_round_trips() {
     let response = SuccessResponse {
         id: "req_1".into(),
@@ -1327,6 +1353,7 @@ fn success_response_round_trips() {
                     max_bytes: 67_108_864,
                     chunk_bytes: 783_360,
                 }),
+                agent_report_cancelled: false,
             }),
             name: Some("home-box".into()),
             reach: Some("home-box".into()),
