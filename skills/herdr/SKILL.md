@@ -60,7 +60,7 @@ Agent commands accept either a unique live agent name or the pane ID currently h
 
 Lifecycle state, not a pane read, is the oracle for whether input landed. A pane hosting an idle agent may not repaint for a long time, so a read can return a frame that predates everything you just sent — keys reported as delivered while the captured screen is unchanged. When a send appears to do nothing, compare the agent's state before and after rather than the frame: a status moving to `working` is proof the input arrived, and an unchanged frame is not proof it did not.
 
-A pane's composer may already hold text a person typed and never submitted. Submitting text to that pane appends to what is there rather than replacing it, so an unsent line and yours arrive as one message. Read the composer before sending into a pane you do not own, and treat anything you find as the pane owner's intent — preserve it, or say plainly that you cleared it and what it said. Pressing Enter on someone else's draft submits their instruction, which is theirs to send, not yours.
+A pane's composer may already hold text a person typed and never submitted. Submitting text to that pane appends to what is there rather than replacing it, so an unsent line and yours arrive as one message. Read the composer before sending into a pane you do not own. Text the agent's UI renders dim (SGR 2 in `agent read --format ansi`) is its own suggestion, and typing replaces it; treat any other text you find as the pane owner's intent — preserve it, or say plainly that you cleared it and what it said. Pressing Enter on someone else's draft submits their instruction, which is theirs to send, not yours.
 
 ## Use IDs and caller context
 
@@ -107,6 +107,8 @@ The selector must be an enabled saved profile ID or a unique, case-sensitive lab
 Both installations must support machine API forwarding, and the remote server must already be running and API-compatible. Forwarding never installs, starts, or restarts a server and never falls back to Local. Local configuration, session management, installation commands, and interactive attachment are not forwarded. Remote worktree paths must be absolute, `~`, or start with `~/`; plugin link paths must be absolute. A connection failure does not prove a mutation was not applied: inspect remote state before retrying.
 
 `herdr machine list` lists saved connection profiles, not a cross-machine pane inventory; add `--json` for scripts. Only add, remove, enable, or disable profiles when the user asks. Removing a profile disconnects the client but does not stop remote sessions. Interactive `machine add` discovers running remote sessions and may ask the user to pick one; non-interactive setup uses the remote default session unless `--remote-session` is explicitly supplied. Use `herdr machine status [<label-or-id>] --json` to diagnose a failing machine. `herdr machine reconnect` needs the user to complete SSH authentication in their terminal; do not run it for them. Setup asks before stopping an incompatible server and defaults to No; do not approve replacement without the user's consent. Experimental handoff is not part of `machine add`.
+
+Without a saved profile, run the CLI on the remote host itself and name its session: `ssh <host> 'herdr --session <name> status'` shows whether that server is running, and every later command carries the same `--session <name>`. The live server may run under a named session rather than the default. IDs and agent names are scoped to that server, as with `--machine`.
 
 ## Start and coordinate an agent
 
