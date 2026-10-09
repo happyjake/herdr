@@ -3011,6 +3011,13 @@ mod tests {
     /// An app whose one pane was rebuilt from a snapshot that recorded it
     /// working since `SNAPSHOT_AT`, with its terminal not yet re-read.
     fn app_with_restored_pane(restored_at: u64) -> (App, String, PaneId) {
+        app_with_restored_status(restored_at, crate::api::schema::AgentStatus::Working)
+    }
+
+    fn app_with_restored_status(
+        restored_at: u64,
+        captured: crate::api::schema::AgentStatus,
+    ) -> (App, String, PaneId) {
         let (mut app, public_pane_id, _rx) = app_with_mouse_runtime(b"", 1);
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let terminal_id = app.state.workspaces[0]
@@ -3020,13 +3027,12 @@ mod tests {
             .clone();
         app.state.workspaces[0].tabs[0].panes.insert(
             pane_id,
-            crate::pane::PaneState::restored(
-                terminal_id,
-                crate::api::schema::AgentStatus::Working,
-                SNAPSHOT_AT,
-                restored_at,
-            ),
+            crate::pane::PaneState::restored(terminal_id, captured, SNAPSHOT_AT, restored_at),
         );
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = captured != crate::api::schema::AgentStatus::Done;
         (app, public_pane_id, pane_id)
     }
 
@@ -3052,32 +3058,381 @@ mod tests {
         state: crate::detect::AgentState,
         reading: crate::events::StatusReading,
     ) {
-        app.state
-            .handle_app_event(crate::events::AppEvent::StateChanged {
+        app.handle_internal_event(crate::events::AppEvent::StateChanged {
+            pane_id,
+            agent: Some(crate::detect::Agent::Pi),
+            state,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+            reading,
+        });
+    }
+
+    fn reported_status_events(app: &App) -> Vec<crate::api::schema::AgentStatus> {
+        app.event_hub
+            .events_after(0)
+            .iter()
+            .filter_map(|(_, event)| match &event.data {
+                crate::api::schema::EventData::PaneAgentStatusChanged { agent_status, .. } => {
+                    Some(*agent_status)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn restore_placeholders_emit_no_status_event_and_a_differing_verdict_emits_one() {
+        use crate::api::schema::AgentStatus;
+        use crate::detect::AgentState;
+        use crate::events::StatusReading;
+        let (mut app, public_id, pane_id) = app_with_restored_pane(crate::pane::unix_now_secs());
+        for live in [AgentState::Idle, AgentState::Working, AgentState::Idle] {
+            publish_agent_state(&mut app, pane_id, live, StatusReading::Provisional);
+            app.emit_pane_updated(0, pane_id); // Incidental sync must not settle a placeholder.
+            let pane = requested_pane_info(&mut app, &public_id);
+            assert_eq!(pane["agent_status"], "working");
+            assert_eq!(pane["agent_status_changed_at"], SNAPSHOT_AT);
+            assert_eq!(
+                app.tab_info(0, 0).unwrap().agent_status,
+                AgentStatus::Working
+            );
+            assert_eq!(app.workspace_info(0).agent_status, AgentStatus::Working);
+            assert!(reported_status_events(&app).is_empty());
+        }
+        app.handle_internal_event(crate::events::AppEvent::HookMetadataReported {
+            pane_id,
+            source: "custom:pi".into(),
+            agent_label: Some("pi".into()),
+            applies_to_source: None,
+            title: Some("restoring".into()),
+            display_agent: None,
+            state_labels: Default::default(),
+            clear_title: false,
+            clear_display_agent: false,
+            clear_state_labels: false,
+            seq: None,
+            ttl: None,
+        });
+        assert!(reported_status_events(&app).is_empty());
+        // The live value does not change. The reported value does, exactly once.
+        publish_agent_state(&mut app, pane_id, AgentState::Idle, StatusReading::Verdict);
+        publish_agent_state(&mut app, pane_id, AgentState::Idle, StatusReading::Verdict);
+        assert_eq!(reported_status_events(&app), vec![AgentStatus::Done]);
+        let pane = requested_pane_info(&mut app, &public_id);
+        assert_eq!(pane["agent_status"], "done");
+        assert!(pane["agent_status_changed_at"].as_u64().unwrap() > SNAPSHOT_AT);
+    }
+
+    #[tokio::test]
+    async fn restore_confirming_verdict_emits_no_status_event_after_a_placeholder() {
+        let (mut app, public_id, pane_id) = app_with_restored_pane(crate::pane::unix_now_secs());
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Idle,
+            crate::events::StatusReading::Provisional,
+        );
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Verdict,
+        );
+        assert!(reported_status_events(&app).is_empty());
+        assert_eq!(
+            requested_pane_info(&mut app, &public_id)["agent_status_changed_at"],
+            SNAPSHOT_AT
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_verdict_finding_no_agent_emits_the_reported_transition_once() {
+        let (mut app, public_id, pane_id) = app_with_restored_status(
+            crate::pane::unix_now_secs(),
+            crate::api::schema::AgentStatus::Done,
+        );
+        for reading in [
+            crate::events::StatusReading::Provisional,
+            crate::events::StatusReading::Verdict,
+            crate::events::StatusReading::Verdict,
+        ] {
+            app.handle_internal_event(crate::events::AppEvent::StateChanged {
                 pane_id,
-                agent: Some(crate::detect::Agent::Pi),
-                state,
+                agent: None,
+                state: crate::detect::AgentState::Unknown,
                 visible_blocker: false,
                 visible_working: false,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
                 reading,
             });
+            if reading == crate::events::StatusReading::Provisional {
+                assert!(reported_status_events(&app).is_empty());
+                assert_eq!(
+                    requested_pane_info(&mut app, &public_id)["agent_status"],
+                    "done"
+                );
+            }
+        }
+        assert_eq!(
+            reported_status_events(&app),
+            vec![crate::api::schema::AgentStatus::Unknown]
+        );
+        assert_eq!(
+            requested_pane_info(&mut app, &public_id)["agent_status"],
+            "unknown"
+        );
     }
 
     #[tokio::test]
-    async fn api_pane_info_dates_a_restored_pane_to_the_restore_until_it_is_read_again() {
+    async fn restore_deadline_emits_one_status_event_only_when_the_reported_status_moves() {
+        use crate::api::schema::AgentStatus;
+        for matches_capture in [false, true] {
+            let restored_at = crate::pane::unix_now_secs() - 600;
+            let (mut app, public_id, pane_id) =
+                app_with_restored_status(restored_at, AgentStatus::Done);
+            let pane = app.state.workspaces[0].pane_state(pane_id).unwrap();
+            let due_at = pane.agent_status_resolution_due_at().unwrap();
+            let terminal_id = pane.attached_terminal_id.clone();
+            if matches_capture {
+                let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+                terminal.state = crate::detect::AgentState::Idle;
+            }
+            assert!(app.resolve_due_agent_status_windows(std::time::Instant::now()));
+            assert!(!app.resolve_due_agent_status_windows(std::time::Instant::now()));
+            let expected = if matches_capture {
+                vec![]
+            } else {
+                vec![AgentStatus::Unknown]
+            };
+            assert_eq!(reported_status_events(&app), expected);
+            let pane = requested_pane_info(&mut app, &public_id);
+            assert_eq!(
+                pane["agent_status"],
+                if matches_capture { "done" } else { "unknown" }
+            );
+            assert_eq!(
+                pane["agent_status_changed_at"],
+                if matches_capture { SNAPSHOT_AT } else { due_at }
+            );
+            let dated_events: Vec<_> = app
+                .event_hub
+                .events_after(0)
+                .into_iter()
+                .filter_map(|(_, event)| match event.data {
+                    crate::api::schema::EventData::PaneUpdated { pane } => Some(pane),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(dated_events.len(), 1);
+            assert_eq!(
+                dated_events[0].agent_status_changed_at,
+                Some(if matches_capture { SNAPSHOT_AT } else { due_at })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kept_presentation_events_report_the_captured_status() {
+        let (mut app, _, pane_id) = app_with_restored_status(
+            crate::pane::unix_now_secs(),
+            crate::api::schema::AgentStatus::Done,
+        );
+        app.emit_pane_kept_presentation_changed(0, pane_id);
+        assert_eq!(
+            reported_status_events(&app),
+            vec![crate::api::schema::AgentStatus::Done]
+        );
+        assert!(app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .awaits_agent_status_resolution());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_cannot_silently_consume_a_bystanders_restore_deadline() {
+        use crate::api::schema::AgentStatus;
+        for trigger in 0..4 {
+            let (mut app, public_id, pane_id) =
+                app_with_restored_status(crate::pane::unix_now_secs() - 600, AgentStatus::Done);
+            let due_at = app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .agent_status_resolution_due_at()
+                .unwrap();
+            let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+            app.state.ensure_test_terminals();
+            match trigger {
+                0 => {
+                    requested_pane_info(&mut app, &public_id);
+                }
+                1 => app.emit_pane_updated(0, other),
+                2 => publish_agent_state(
+                    &mut app,
+                    other,
+                    crate::detect::AgentState::Working,
+                    crate::events::StatusReading::Verdict,
+                ),
+                _ => {
+                    app.state.sync_agent_status_clocks();
+                }
+            }
+            app.resolve_due_agent_status_windows(std::time::Instant::now());
+            app.resolve_due_agent_status_windows(std::time::Instant::now());
+            let statuses: Vec<_> = app
+                .event_hub
+                .events_after(0)
+                .into_iter()
+                .filter_map(|(_, event)| match event.data {
+                    crate::api::schema::EventData::PaneAgentStatusChanged {
+                        pane_id,
+                        agent_status,
+                        ..
+                    } if pane_id == public_id => Some(agent_status),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(statuses, vec![AgentStatus::Unknown], "trigger {trigger}");
+            let pane = requested_pane_info(&mut app, &public_id);
+            assert_eq!(pane["agent_status"], "unknown");
+            assert_eq!(pane["agent_status_changed_at"], due_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_reports_captured_before_deadline_and_unknown_at_the_resolved_deadline() {
+        let (mut app, public_id, pane_id) = app_with_restored_status(
+            crate::pane::unix_now_secs(),
+            crate::api::schema::AgentStatus::Done,
+        );
+        let before = requested_pane_info(&mut app, &public_id);
+        assert_eq!(before["agent_status"], "done");
+        assert_eq!(before["agent_status_changed_at"], SNAPSHOT_AT);
+        let due = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .agent_status_resolution_due_at()
+            .unwrap();
+        let updates = app.state.resolve_due_agent_status_windows_at(due);
+        app.emit_agent_status_resolutions(updates);
+        let after = requested_pane_info(&mut app, &public_id);
+        assert_eq!(after["agent_status"], "unknown");
+        assert_eq!(after["agent_status_changed_at"], due);
+        assert_eq!(
+            reported_status_events(&app),
+            vec![crate::api::schema::AgentStatus::Unknown]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_deadline_is_published_before_a_later_classification() {
+        use crate::api::schema::AgentStatus;
+        let (mut app, _, pane_id) =
+            app_with_restored_status(crate::pane::unix_now_secs() - 600, AgentStatus::Done);
+        app.state.sync_agent_status_clocks();
+        assert!(reported_status_events(&app).is_empty());
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Working,
+            crate::events::StatusReading::Verdict,
+        );
+        assert_eq!(
+            reported_status_events(&app),
+            vec![AgentStatus::Unknown, AgentStatus::Working]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delayed_placeholder_cannot_republish_the_capture_after_its_deadline() {
+        use crate::api::schema::AgentStatus;
+        let (mut app, _, pane_id) =
+            app_with_restored_status(crate::pane::unix_now_secs(), AgentStatus::Working);
+        publish_agent_state(
+            &mut app,
+            pane_id,
+            crate::detect::AgentState::Idle,
+            crate::events::StatusReading::Provisional,
+        );
+        let due = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .agent_status_resolution_due_at()
+            .unwrap();
+        let updates = app
+            .state
+            .handle_app_event(crate::events::AppEvent::HookMetadataReported {
+                pane_id,
+                source: "custom:pi".into(),
+                agent_label: Some("pi".into()),
+                applies_to_source: None,
+                title: Some("restoring".into()),
+                display_agent: None,
+                state_labels: Default::default(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_state_labels: false,
+                seq: None,
+                ttl: None,
+            });
+        assert_eq!(updates.len(), 1);
+        assert_ne!(updates[0].previous_presentation, updates[0].presentation);
+        app.state.sync_agent_status_clocks_at(due);
+        app.emit_pane_state_update(&updates[0]);
+        assert_eq!(reported_status_events(&app), vec![AgentStatus::Idle]);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_terminal_targets_publish_the_captured_statuses() {
+        use crate::api::schema::AgentStatus;
+        let (mut app, _, pane_id) =
+            app_with_restored_status(crate::pane::unix_now_secs(), AgentStatus::Done);
+        let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0].terminal_id(other).unwrap().clone();
+        app.state.workspaces[0].tabs[0].panes.insert(
+            other,
+            crate::pane::PaneState::restored(
+                terminal_id,
+                AgentStatus::Working,
+                SNAPSHOT_AT,
+                crate::pane::unix_now_secs(),
+            ),
+        );
+        for id in [pane_id, other] {
+            let terminal_id = app.state.workspaces[0].terminal_id(id).unwrap();
+            app.state.terminals.get_mut(terminal_id).unwrap().agent_name = Some("reviewer".into());
+        }
+        let Err(crate::app::terminal_targets::TerminalTargetError::Ambiguous {
+            candidates, ..
+        }) = app.resolve_terminal_target("reviewer")
+        else {
+            panic!("two named panes must produce candidates");
+        };
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.agent_status == AgentStatus::Done));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.agent_status == AgentStatus::Working));
+    }
+
+    #[tokio::test]
+    async fn api_pane_info_reports_the_captured_pair_until_classification() {
         let restored_at = crate::pane::unix_now_secs();
         let (mut app, public_pane_id, _pane_id) = app_with_restored_pane(restored_at);
 
         let pane = requested_pane_info(&mut app, &public_pane_id);
 
-        // The snapshot said working, but the pane cannot see that yet, so it
-        // must not wear working's date while reporting something else.
-        assert_eq!(pane["agent_status"], "unknown");
+        // The live terminal is Unknown; clients keep the captured working pair.
+        assert_eq!(pane["agent_status"], "working");
         assert_eq!(
             pane["agent_status_changed_at"].as_u64(),
-            Some(restored_at),
+            Some(SNAPSHOT_AT),
             "the reported date must date the reported status: {pane}"
         );
     }
@@ -3127,12 +3482,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_pane_info_holds_a_matching_status_at_the_restore_until_it_is_classified() {
+    async fn api_pane_info_keeps_the_captured_pair_through_a_matching_placeholder() {
         let restored_at = crate::pane::unix_now_secs();
         let (mut app, public_pane_id, pane_id) = app_with_restored_pane(restored_at);
 
-        // The pane already reads as working, matching the snapshot, but
-        // nothing has classified it, so it cannot claim the older date yet.
+        // A provisional match leaves the reported captured pair unchanged.
         publish_agent_state(
             &mut app,
             pane_id,
@@ -3141,12 +3495,11 @@ mod tests {
         );
         let during = requested_pane_info(&mut app, &public_pane_id);
         assert_eq!(during["agent_status"], "working");
-        // From the restart, and after the restore's own Unknown: a client
-        // already holds that pair, so the working takes the next second.
+        // The placeholder does not publish another pair.
         assert_eq!(
             during["agent_status_changed_at"].as_u64(),
-            Some(restored_at + 1),
-            "an unclassified pane dates from the restart: {during}"
+            Some(SNAPSHOT_AT),
+            "an unclassified pane keeps the captured date: {during}"
         );
 
         publish_agent_state(
@@ -3166,7 +3519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_pane_info_will_not_claim_an_age_across_a_placeholder_a_client_could_have_seen() {
+    async fn api_pane_info_keeps_the_captured_date_across_an_unpublished_placeholder() {
         let (mut app, public_pane_id, pane_id) =
             app_with_restored_pane(crate::pane::unix_now_secs());
 
@@ -3179,16 +3532,14 @@ mod tests {
             crate::events::StatusReading::Provisional,
         );
         let placeholder = requested_pane_info(&mut app, &public_pane_id);
-        assert_eq!(placeholder["agent_status"], "idle");
+        assert_eq!(placeholder["agent_status"], "working");
+        assert_eq!(placeholder["agent_status_changed_at"], SNAPSHOT_AT);
         assert!(app.state.workspaces[0]
             .pane_state(app.state.workspaces[0].tabs[0].root_pane)
             .expect("root pane exists")
             .awaits_agent_status_resolution());
 
-        // ...but the pane reported idle, and a client could have read that, so
-        // claiming it has been working without interruption since the snapshot
-        // would span an interlude that was on the wire.
-        let before = crate::pane::unix_now_secs();
+        // ...and clients never saw it, so confirming working keeps its date.
         publish_agent_state(
             &mut app,
             pane_id,
@@ -3198,10 +3549,7 @@ mod tests {
 
         let pane = requested_pane_info(&mut app, &public_pane_id);
         assert_eq!(pane["agent_status"], "working");
-        assert!(
-            pane["agent_status_changed_at"].as_u64().unwrap() >= before,
-            "an age must not span a status the pane already reported: {pane}"
-        );
+        assert_eq!(pane["agent_status_changed_at"], SNAPSHOT_AT);
     }
 
     #[tokio::test]
@@ -3371,11 +3719,10 @@ mod tests {
             });
         let titled = requested_pane_info(&mut app, &public_pane_id);
         assert_eq!(titled["title"], "Refactor auth");
-        // Working inside the window is a move from the restore's own Unknown,
-        // so it dates the second after the restart; the title moves nothing.
+        // Neither the placeholder nor its title changes the captured pair.
         assert_eq!(
             titled["agent_status_changed_at"].as_u64(),
-            Some(restored_at + 1),
+            Some(SNAPSHOT_AT),
             "a title update must not stamp the status clock: {titled}"
         );
 
@@ -3446,7 +3793,8 @@ mod tests {
             crate::events::StatusReading::Provisional,
         );
         let done = requested_pane_info(&mut app, &public_pane_id);
-        assert_eq!(done["agent_status"], "done");
+        assert_eq!(done["agent_status"], "working");
+        assert_eq!(done["agent_status_changed_at"], SNAPSHOT_AT);
 
         // Being seen at the desk turns Done into Idle. That is not a statement
         // about the agent, but it is the pane moving.

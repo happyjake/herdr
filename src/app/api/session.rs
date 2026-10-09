@@ -1,5 +1,6 @@
 use crate::api::schema::{PaneInfo, ResponseResult, SessionSnapshot};
 use crate::app::App;
+use crate::pane::AgentStatusProjection;
 
 use super::responses::encode_success;
 
@@ -14,18 +15,30 @@ impl App {
     }
 
     pub(crate) fn session_snapshot(&self) -> SessionSnapshot {
-        self.session_snapshot_with_pane_info(Self::pane_info)
+        self.session_snapshot_with_pane_info(
+            AgentStatusProjection::Reported,
+            Self::pane_info_with_status,
+        )
     }
 
-    /// Internal client projection; runtime pane fields are placeholders.
-    /// Public API responses must use session_snapshot instead.
+    /// Internal desktop projection: live status, unpublished dates and
+    /// placeholder runtime fields. Never serialize this as a public response.
     pub(crate) fn session_metadata_snapshot(&self) -> SessionSnapshot {
-        self.session_snapshot_with_pane_info(Self::pane_metadata)
+        self.session_snapshot_with_pane_info(
+            AgentStatusProjection::Live,
+            Self::pane_metadata_with_status,
+        )
     }
 
     fn session_snapshot_with_pane_info(
         &self,
-        pane_info: fn(&Self, usize, crate::layout::PaneId) -> Option<PaneInfo>,
+        projection: AgentStatusProjection,
+        pane_info: fn(
+            &Self,
+            usize,
+            crate::layout::PaneId,
+            AgentStatusProjection,
+        ) -> Option<PaneInfo>,
     ) -> SessionSnapshot {
         let focused_workspace_id = self
             .state
@@ -45,9 +58,9 @@ impl App {
         let mut layouts = Vec::new();
         let mut panes = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
-            workspaces.push(self.workspace_info(ws_idx));
+            workspaces.push(self.workspace_info_with_status(ws_idx, projection));
             for tab_idx in 0..ws.tabs.len() {
-                if let Some(tab) = self.tab_info(ws_idx, tab_idx) {
+                if let Some(tab) = self.tab_info_with_status(ws_idx, tab_idx, projection) {
                     tabs.push(tab);
                 }
                 if let Some(layout) = self.pane_layout_snapshot(ws_idx, tab_idx) {
@@ -58,7 +71,7 @@ impl App {
                         .layout
                         .pane_ids()
                         .into_iter()
-                        .filter_map(|pane_id| pane_info(self, ws_idx, pane_id)),
+                        .filter_map(|pane_id| pane_info(self, ws_idx, pane_id, projection)),
                 );
             }
         }
@@ -73,7 +86,7 @@ impl App {
             tabs,
             panes,
             layouts,
-            agents: self.collect_agent_infos(),
+            agents: self.collect_agent_infos_with_status(projection),
         }
     }
 }

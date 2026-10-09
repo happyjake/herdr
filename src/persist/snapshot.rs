@@ -134,13 +134,9 @@ pub struct PaneSnapshot {
     /// reader has to remember to re-check anything the writer thought it knew.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status_resolve_by: Option<u64>,
-    /// Whether the pane had reported some other known status while this claim
-    /// was outstanding.
-    ///
-    /// Travels with the claim because it is part of what the claim asserts: a
-    /// claim that saw an interlude before a handoff is still a claim that saw
-    /// one after it, and a reader that reset this would let the next process
-    /// inherit an age across a status the previous one already reported.
+    /// Legacy inheritance guard. Current writers set it for every dated claim
+    /// so an older reader cannot publish a placeholder and then rewind to the
+    /// captured date. Current readers use `agent_status_captured_pair_reported`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_status_saw_other: bool,
     /// The latest status date the pane had published when this was captured.
@@ -152,6 +148,11 @@ pub struct PaneSnapshot {
     /// to `agent_status_changed_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status_reported_through: Option<u64>,
+    /// The captured pair remained the reported pair throughout this writer's
+    /// restore window. Missing in older snapshots: an unresolved legacy claim
+    /// must be rebased past its published date before it can be reported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_status_captured_pair_reported: bool,
     /// Whether the user had pinned this pane's terminal.
     ///
     /// Defaulted rather than required, so a snapshot written before the pin
@@ -436,8 +437,10 @@ fn capture_tab(
             durable_agent_status.map(|claim| agent_status_snapshot_name(claim.status).to_string());
         let agent_status_changed_at = durable_agent_status.map(|claim| claim.changed_at);
         let agent_status_resolve_by = durable_agent_status.and_then(|claim| claim.resolve_by);
-        let agent_status_saw_other =
-            durable_agent_status.is_some_and(|claim| claim.saw_other_status);
+        let agent_status_saw_other = durable_agent_status
+            .is_some_and(|claim| claim.saw_other_status || claim.captured_pair_reported);
+        let agent_status_captured_pair_reported =
+            durable_agent_status.is_some_and(|claim| claim.captured_pair_reported);
         let agent_status_reported_through =
             durable_agent_status.and_then(|claim| claim.reported_through);
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
@@ -501,6 +504,7 @@ fn capture_tab(
                 agent_status_resolve_by,
                 agent_status_saw_other,
                 agent_status_reported_through,
+                agent_status_captured_pair_reported,
                 pinned,
                 label_source,
                 label_at,
@@ -641,6 +645,79 @@ mod tests {
     use crate::app::{AppState, Mode};
     use crate::layout::NavDirection;
     use crate::workspace::Workspace;
+
+    #[allow(dead_code)] // The deployed serde models must read the actual new snapshot.
+    mod legacy_snapshot {
+        include!("../../tests/fixtures/session-snapshot-52294cb5.rs");
+    }
+
+    #[allow(dead_code)] // Verify rollback using the deployed transition implementation.
+    mod legacy_state {
+        include!("../../tests/fixtures/agent-status-52294cb5.rs");
+    }
+
+    #[test]
+    fn legacy_readers_accept_the_marker_and_cannot_inherit_a_rewound_date() {
+        use crate::api::schema::AgentStatus;
+        use crate::terminal::TerminalId;
+        let now = crate::pane::unix_now_secs();
+        for settled in [false, true] {
+            let mut workspace = Workspace::test_new("rollback");
+            let root = workspace.tabs[0].root_pane;
+            let terminal = workspace.terminal_id(root).unwrap().clone();
+            let mut pane = PaneState::restored(terminal, AgentStatus::Working, 1_000, now);
+            if settled {
+                pane.resolve_agent_status_at(AgentStatus::Working, now);
+            }
+            assert!(!pane.durable_agent_status().saw_other_status);
+            workspace.tabs[0].panes.insert(root, pane);
+            let snapshot = capture(
+                &[workspace],
+                &HashMap::new(),
+                &Default::default(),
+                Some(0),
+                0,
+            );
+            let json = serde_json::to_string(&snapshot).unwrap();
+            let current: SessionSnapshot = serde_json::from_str(&json).unwrap();
+            let current = current.workspaces[0].tabs[0].panes.values().next().unwrap();
+            assert!(current.agent_status_captured_pair_reported);
+            assert!(
+                current.agent_status_saw_other,
+                "rollback must disable old inheritance even for settled claims"
+            );
+
+            // Real old serde definitions: the added field is accepted and
+            // disappears if that reader saves the snapshot again.
+            let old: legacy_snapshot::SessionSnapshot = serde_json::from_str(&json).unwrap();
+            assert!(!serde_json::to_string(&old)
+                .unwrap()
+                .contains("agent_status_captured_pair_reported"));
+            let old = old.workspaces[0].tabs[0].panes.values().next().unwrap();
+            let mut pane = legacy_state::PaneState::restored_from(
+                TerminalId::alloc(),
+                legacy_state::AgentStatusClaim {
+                    status: agent_status_from_snapshot_name(old.agent_status.as_deref().unwrap())
+                        .unwrap(),
+                    changed_at: old.agent_status_changed_at.unwrap(),
+                    resolve_by: old.agent_status_resolve_by,
+                    saw_other_status: old.agent_status_saw_other,
+                    reported_through: old.agent_status_reported_through,
+                },
+                now + 1,
+            );
+            let placeholder_date = pane.agent_status_changed_at();
+            assert!(placeholder_date > current.agent_status_changed_at.unwrap());
+            pane.resolve_agent_status_at(AgentStatus::Working, now + 2);
+            assert!(pane.agent_status_changed_at() > placeholder_date);
+        }
+    }
+
+    #[test]
+    fn a_legacy_snapshot_defaults_the_captured_pair_marker_to_false() {
+        let pane: PaneSnapshot = serde_json::from_str(r#"{"cwd":"/tmp","agent_status":"working","agent_status_changed_at":1000,"agent_status_resolve_by":5015,"agent_status_saw_other":true,"agent_status_reported_through":5001}"#).unwrap();
+        assert!(!pane.agent_status_captured_pair_reported);
+    }
 
     fn session_fixture(name: &str) -> &'static str {
         match name {
@@ -898,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn a_capture_racing_the_deadline_does_not_carry_a_dead_pair_onward() {
+    fn a_capture_racing_the_deadline_preserves_the_pair_and_its_expired_deadline() {
         let mut workspace = Workspace::test_new("one");
         let root = workspace.tabs[0].root_pane;
         let terminal_id = workspace
@@ -935,10 +1012,31 @@ mod tests {
             .expect("captured pane");
         assert_eq!(
             pane_snapshot.agent_status.as_deref(),
-            Some("unknown"),
-            "a dead pair must not reach the replacement process"
+            Some("working"),
+            "capture does not publish an unobserved transition"
         );
-        assert_ne!(pane_snapshot.agent_status_changed_at, Some(1_700));
+        assert_eq!(pane_snapshot.agent_status_changed_at, Some(1_700));
+        let due = pane_snapshot
+            .agent_status_resolve_by
+            .expect("original deadline travels");
+        assert!(due < crate::pane::unix_now_secs());
+        let adopted = PaneState::restored_from(
+            crate::terminal::TerminalId::alloc(),
+            crate::pane::AgentStatusClaim {
+                status: crate::api::schema::AgentStatus::Working,
+                changed_at: pane_snapshot.agent_status_changed_at.unwrap(),
+                resolve_by: Some(due),
+                saw_other_status: pane_snapshot.agent_status_saw_other,
+                reported_through: pane_snapshot.agent_status_reported_through,
+                captured_pair_reported: pane_snapshot.agent_status_captured_pair_reported,
+            },
+            crate::pane::unix_now_secs(),
+        );
+        assert!(!adopted.awaits_agent_status_resolution());
+        assert_eq!(
+            adopted.agent_status(),
+            crate::api::schema::AgentStatus::Unknown
+        );
     }
 
     #[test]
@@ -1101,6 +1199,7 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 agent_status_reported_through: None,
+                agent_status_captured_pair_reported: true,
                 pinned: false,
                 label_source: None,
                 label_at: None,
@@ -1121,6 +1220,7 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 agent_status_reported_through: None,
+                agent_status_captured_pair_reported: true,
                 pinned: false,
                 label_source: None,
                 label_at: None,
@@ -1881,6 +1981,7 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 agent_status_reported_through: None,
+                agent_status_captured_pair_reported: true,
                 pinned: false,
                 label_source: None,
                 label_at: None,
@@ -1903,6 +2004,7 @@ mod tests {
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
                 agent_status_reported_through: None,
+                agent_status_captured_pair_reported: true,
                 pinned: false,
                 label_source: None,
                 label_at: None,

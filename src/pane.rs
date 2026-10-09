@@ -42,6 +42,7 @@ use self::agent_detection::{
     ScreenDetectionPublishInput, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
 use self::background_agent::{AgentJobStatus, AgentJobTracker};
+pub(crate) use self::state::AgentStatusProjection;
 #[cfg(test)]
 pub(crate) use self::state::RESTORE_DEADLINE_PROBE_SECS;
 #[cfg(test)]

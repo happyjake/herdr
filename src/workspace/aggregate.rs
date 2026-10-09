@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+use crate::api::schema::AgentStatus;
 use crate::detect::AgentState;
 use crate::layout::PaneId;
+use crate::pane::AgentStatusProjection;
 use crate::terminal::{TerminalId, TerminalState};
 
 use super::{Tab, Workspace};
@@ -18,6 +20,15 @@ pub struct PaneDetail {
 }
 
 impl Tab {
+    /// Aggregate the selected status fact; desktop pane details below stay live.
+    pub fn agent_status_from(
+        &self,
+        terminals: &HashMap<TerminalId, TerminalState>,
+        projection: AgentStatusProjection,
+    ) -> AgentStatus {
+        aggregate_status(self.panes.values(), terminals, projection)
+    }
+
     fn pane_details(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
@@ -47,31 +58,46 @@ impl Tab {
     }
 }
 
-fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
-    match (state, seen) {
-        (AgentState::Blocked, _) => 4,
-        (AgentState::Idle, false) => 3,
-        (AgentState::Working, _) => 2,
-        (AgentState::Idle, true) => 1,
-        (AgentState::Unknown, _) => 0,
-    }
+/// Aggregate using the same projection as the individual panes.
+fn aggregate_status<'a>(
+    panes: impl Iterator<Item = &'a crate::pane::PaneState>,
+    terminals: &HashMap<TerminalId, TerminalState>,
+    projection: AgentStatusProjection,
+) -> AgentStatus {
+    let now = crate::pane::unix_now_secs();
+    panes
+        .filter_map(|pane| {
+            let terminal = terminals.get(&pane.attached_terminal_id)?;
+            let live = match (terminal.state, pane.seen) {
+                (AgentState::Working, _) => AgentStatus::Working,
+                (AgentState::Blocked, _) => AgentStatus::Blocked,
+                (AgentState::Idle, false) => AgentStatus::Done,
+                (AgentState::Idle, true) => AgentStatus::Idle,
+                (AgentState::Unknown, _) => AgentStatus::Unknown,
+            };
+            Some(projection.pair(pane, live, now).0)
+        })
+        .max_by_key(|status| match status {
+            AgentStatus::Blocked => 4,
+            AgentStatus::Done => 3,
+            AgentStatus::Working => 2,
+            AgentStatus::Idle => 1,
+            AgentStatus::Unknown => 0,
+        })
+        .unwrap_or(AgentStatus::Unknown)
 }
 
 impl Workspace {
-    pub fn aggregate_state(
+    pub fn agent_status_from(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
-    ) -> (AgentState, bool) {
-        self.tabs
-            .iter()
-            .flat_map(|tab| tab.panes.values())
-            .filter_map(|pane| {
-                terminals
-                    .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
-            })
-            .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
-            .unwrap_or((AgentState::Unknown, true))
+        projection: AgentStatusProjection,
+    ) -> AgentStatus {
+        aggregate_status(
+            self.tabs.iter().flat_map(|tab| tab.panes.values()),
+            terminals,
+            projection,
+        )
     }
 
     pub fn pane_details(&self, terminals: &HashMap<TerminalId, TerminalState>) -> Vec<PaneDetail> {
@@ -101,9 +127,8 @@ mod tests {
         let root = ws.tabs[0].root_pane;
         let terminal = terminal_for_pane(&ws, root);
         terminals.insert(terminal.id.clone(), terminal);
-        let (state, seen) = ws.aggregate_state(&terminals);
-        assert_eq!(state, AgentState::Unknown);
-        assert!(seen);
+        let status = ws.agent_status_from(&terminals, AgentStatusProjection::Reported);
+        assert_eq!(status, AgentStatus::Unknown);
     }
 
     #[test]
@@ -124,10 +149,9 @@ mod tests {
         second_terminal.state = AgentState::Working;
         terminals.insert(second_terminal.id.clone(), second_terminal);
 
-        let (state, seen) = ws.aggregate_state(&terminals);
+        let status = ws.agent_status_from(&terminals, AgentStatusProjection::Reported);
 
-        assert_eq!(state, AgentState::Working);
-        assert!(seen);
+        assert_eq!(status, AgentStatus::Working);
     }
 
     #[test]
@@ -150,10 +174,52 @@ mod tests {
         let root = ws.tabs[0].panes.get_mut(&root_id).unwrap();
         root.seen = false;
 
-        let (state, seen) = ws.aggregate_state(&terminals);
+        let status = ws.agent_status_from(&terminals, AgentStatusProjection::Reported);
 
-        assert_eq!(state, AgentState::Idle);
-        assert!(!seen);
+        assert_eq!(status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn reported_aggregates_keep_captured_attention_while_desktop_details_stay_live() {
+        let mut ws = Workspace::test_new("restored");
+        let other = ws.test_split(Direction::Horizontal);
+        let root = ws.tabs[0].root_pane;
+        let mut terminals = HashMap::new();
+        for (pane_id, status) in [(root, AgentStatus::Done), (other, AgentStatus::Working)] {
+            let mut terminal = terminal_for_pane(&ws, pane_id);
+            terminal.agent_name = Some("restored-agent".into());
+            let pane = crate::pane::PaneState::restored(
+                terminal.id.clone(),
+                status,
+                1_000,
+                crate::pane::unix_now_secs(),
+            );
+            ws.tabs[0].panes.insert(pane_id, pane);
+            terminals.insert(terminal.id.clone(), terminal);
+        }
+        assert_eq!(
+            ws.agent_status_from(&terminals, AgentStatusProjection::Reported),
+            AgentStatus::Done
+        );
+        assert_eq!(
+            ws.tabs[0].agent_status_from(&terminals, AgentStatusProjection::Reported),
+            AgentStatus::Done
+        );
+        assert!(ws
+            .pane_details(&terminals)
+            .iter()
+            .all(|pane| pane.state == AgentState::Unknown));
+        ws.pane_state_mut(other)
+            .unwrap()
+            .resolve_agent_status_at(AgentStatus::Blocked, crate::pane::unix_now_secs());
+        terminals
+            .get_mut(ws.terminal_id(other).unwrap())
+            .unwrap()
+            .state = AgentState::Blocked;
+        assert_eq!(
+            ws.agent_status_from(&terminals, AgentStatusProjection::Reported),
+            AgentStatus::Blocked
+        );
     }
 
     #[test]

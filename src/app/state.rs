@@ -816,6 +816,8 @@ pub struct AppState {
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
     pub pending_agent_notifications: std::collections::HashMap<PaneId, PendingAgentNotification>,
+    /// Restore settlements observed by global reconciliation, awaiting API events.
+    pub pending_agent_status_resolutions: Vec<super::actions::PaneStateUpdate>,
     /// Last reported focus state for the outer terminal hosting herdr.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
     pub outer_terminal_focus: Option<bool>,
@@ -1060,6 +1062,7 @@ impl AppState {
             config_diagnostic: None,
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
+            pending_agent_status_resolutions: Vec::new(),
             outer_terminal_focus: None,
             prefix_keys: vec![(KeyCode::Char('b'), KeyModifiers::CONTROL)],
             headless_size: (

@@ -4,6 +4,7 @@ use bytes::Bytes;
 
 use super::{terminal_targets::TerminalTargetError, App};
 use crate::api::schema::AgentStartParams;
+use crate::pane::AgentStatusProjection;
 
 const DEFAULT_AGENT_START_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const MAX_AGENT_START_TIMEOUT: Duration = Duration::from_secs(300);
@@ -21,6 +22,13 @@ fn valid_agent_name(name: &str) -> bool {
 
 impl App {
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
+        self.collect_agent_infos_with_status(AgentStatusProjection::Reported)
+    }
+
+    pub(super) fn collect_agent_infos_with_status(
+        &self,
+        projection: AgentStatusProjection,
+    ) -> Vec<crate::api::schema::AgentInfo> {
         self.state
             .workspaces
             .iter()
@@ -30,7 +38,9 @@ impl App {
                     tab.layout
                         .pane_ids()
                         .into_iter()
-                        .filter_map(move |pane_id| self.agent_info(ws_idx, pane_id))
+                        .filter_map(move |pane_id| {
+                            self.agent_info_with_status(ws_idx, pane_id, projection)
+                        })
                 })
             })
             .collect()
@@ -372,13 +382,22 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::api::schema::AgentInfo> {
+        self.agent_info_with_status(ws_idx, pane_id, AgentStatusProjection::Reported)
+    }
+
+    fn agent_info_with_status(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        projection: AgentStatusProjection,
+    ) -> Option<crate::api::schema::AgentInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_state = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let pane = self.pane_metadata(ws_idx, pane_id)?;
+        let pane = self.pane_metadata_with_status(ws_idx, pane_id, projection)?;
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),

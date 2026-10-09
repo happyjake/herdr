@@ -342,35 +342,49 @@ The date is captured with the session, so it survives a server restart and a
 live handoff: a pane that has been working for an hour still reads as an hour
 old to a client that connects to the new process.
 
-Getting that date back takes a moment. Until the new server has classified a
-pane, what the pane reports is dated to the restart. A pane is classified by
+Until the new server has classified a restored pane, the API keeps reporting
+the captured status and its captured date together. Detector placeholders and
+display-only updates are not published as status transitions. A pane is classified by
 the first of: the detector finishing its startup grace and saying what the
 pane is doing, an agent reporting for itself — including a report that
 confirms what the pane already showed — a deferred agent resume finishing or
-failing, or any other change that moves what the pane reports. Changes that
+failing, or any other change that moves the last observed live status. Changes that
 say nothing about status, such as a title or a display label, never classify
-a pane and never move its date. Once classified, a pane found doing what the session recorded gets
-that older date back — but only if it reported no other known status in the
-meantime. `unknown` does not count, because it is the absence of a reading
-rather than a competing one: a client may well watch a pane go from `unknown`
-to `working` and see the `working` dated to before the restart, and that is
-correct, since the server never claimed the pane was doing something else. A
-pane found doing anything else, or one that reported some other known status
-on the way, is dated at the classification, because as far as this server
-witnessed, that is when it started. A pane whose session recorded nothing running is classified the
-moment it is rebuilt, and one that nothing classifies is classified on a
-timer, so no pane stays undated. A session captured before this field existed
+a pane and never move its date. Classification matching the captured status
+keeps the captured date, even after provisional readings of another status:
+those readings were never published. Classification of any other status emits
+one status change, dated after every date previously published for this pane
+and no earlier than the classification. There is no inheritance exception to
+the increasing-date rule above: confirming the captured pair is not a transition.
+
+A pane nothing classifies resolves after 15 seconds, using the live status.
+If that differs from the captured status, it emits one transition dated at the
+deadline (or after the pane's published date if that has run ahead). Matching
+the captured status emits no status change and keeps its date. A snapshot taken
+while the window is unresolved carries the captured pair and the original
+deadline; another handoff cannot renew it. An expired claim is rejected when
+adopted. The published date floor also travels with the snapshot.
+A snapshot marks claims whose captured pair stayed published throughout the
+window (`agent_status_captured_pair_reported`). An unresolved claim without
+that marker came from a server that could publish newer placeholders. Its
+captured date is rebased once past the published floor on import, so upgrading
+mid-window cannot rewind clients. Further handoffs preserve the rebased pair.
+A settled legacy claim already carries its current reported pair and keeps it.
+
+The snapshot writer also sets the legacy `agent_status_saw_other` inheritance
+guard on every dated claim. A 52294cb5 reader ignores the new marker and accepts
+the snapshot, but cannot inherit an older date after publishing its startup
+placeholder. Rolling back still exposes that old server's placeholder; the
+guard prevents a timestamp rewind when it confirms the captured status.
+A session captured before this field existed
 has no date to restore, and those panes date themselves to the restart.
 
-A status the server watches change is always dated at the change, never back
-at the restart. The guarantee this gives a client is precise: an age never
-spans an observed transition between known statuses. Leaving `unknown` is not
-such a transition.
-
-The practical consequence for a client: for a few seconds after a server
-restart, ages are short and then some of them jump back to their true values.
-Ages during that window are never older than the restart, so a client that
-sorts or filters on age will under-state rather than invent.
+API workspace and tab aggregates use these reported pane statuses, with the
+usual attention priority, so their status agrees with their panes. The desktop
+TUI and its agent list continue to use live detector state: for up to 15 seconds
+they may show `unknown` while the API reports the captured status. A handoff of
+a marked claim that rediscovers the captured status leaves its API status and age
+unchanged throughout.
 
 The two values are always read together, so the date describes exactly the
 `agent_status` in the same payload and never some other status the pane held

@@ -196,7 +196,7 @@ impl App {
             cwd: ws.tabs[tab_idx]
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
-            agent_status: pane_agent_status(terminal.state, pane.seen),
+            agent_status: pane.reported_agent_status(pane_agent_status(terminal.state, pane.seen)),
         })
     }
 }
