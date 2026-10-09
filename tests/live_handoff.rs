@@ -2560,8 +2560,8 @@ fn live_handoff_keeps_a_screen_detected_unseen_completion_done() {
     let stop_file = base.join("pi-stop");
     fs::create_dir_all(&bin).unwrap();
     // No hooks: the agent is recognised by its process and classified from
-    // its screen alone, so the handoff carries no status for it and the new
-    // server has to find it idle again.
+    // its screen alone. The captured pair must stand while the new server
+    // finds it idle again.
     let fake_pi = bin.join("pi");
     fs::write(
         &fake_pi,
@@ -2657,24 +2657,31 @@ fn live_handoff_keeps_a_screen_detected_unseen_completion_done() {
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
 
-    // The new server classifies the pane from its screen again; wait until it
-    // has, then require the completion to still be unread and still dated.
+    // Poll throughout startup and reclassification, not just until the first
+    // captured Done. Every successful pane.get must carry the identical pair.
     let deadline = Instant::now() + Duration::from_secs(10);
-    let (status, changed_at, response) = loop {
-        let observed = pane_status("after");
-        if observed.0 == "done" || observed.0 == "idle" || Instant::now() >= deadline {
-            break observed;
+    let mut samples = 0;
+    loop {
+        let (status, changed_at, response) = pane_status("after");
+        assert_eq!(
+            status, "done",
+            "handoff published a placeholder: {response}"
+        );
+        assert_eq!(
+            changed_at,
+            Some(done_since),
+            "handoff re-dated the captured completion: {response}"
+        );
+        samples += 1;
+        if Instant::now() >= deadline {
+            assert_eq!(response["result"]["pane"]["agent"], "pi");
+            break;
         }
         thread::sleep(Duration::from_millis(50));
-    };
-    assert_eq!(
-        status, "done",
-        "a completion nobody saw must survive the handoff unread: {response}"
-    );
-    assert_eq!(
-        changed_at,
-        Some(done_since),
-        "the completion keeps the age it had before the handoff: {response}"
+    }
+    assert!(
+        samples > 20,
+        "must observe the interval, not just its endpoints"
     );
 
     fs::write(&stop_file, "stop").unwrap();

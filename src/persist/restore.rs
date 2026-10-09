@@ -563,11 +563,8 @@ fn restore_tab(
         // classified where it is rebuilt.
         let awaits_agent_resolution = saved_agent_status_claim
             .is_some_and(|claim| claim.status != crate::api::schema::AgentStatus::Unknown);
-        // The restore builds a pane and its terminal together, so whatever the
-        // pane ends up reporting, it has reported it since the restore. That
-        // includes a status the restore itself produced, such as the Idle
-        // pre-seeded for an agent about to be resumed: it is dated here, not
-        // left for whichever request first notices it.
+        // Build the observed live status alongside the reported captured pair.
+        // A resume pre-seed is provisional and must not become an API transition.
         let restored_pane_state = |terminal: &TerminalState, imported: bool| {
             let now_unix = crate::pane::unix_now_secs();
             let mut pane = match saved_agent_status_claim {
@@ -589,9 +586,8 @@ fn restore_tab(
             let restored_status =
                 crate::app::api_helpers::pane_agent_status(terminal.state, pane.seen);
             if awaits_agent_resolution {
-                // The restore placing a pane's starting status is not this
-                // process watching the pane move, so it dates from the restore
-                // and leaves the window open for whatever classifies it.
+                // A starting placeholder updates the observation while the
+                // captured pair waits for classification or its deadline.
                 pane.record_agent_status_at(
                     restored_status,
                     now_unix,
@@ -1804,7 +1800,6 @@ mod tests {
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let before = crate::pane::unix_now_secs();
         let (workspaces, _terminals, _runtimes) = restore(
             &snapshot,
             None,
@@ -1823,19 +1818,15 @@ mod tests {
         let pane_id = workspace.tabs[0].root_pane;
         let pane = workspace.pane_state(pane_id).expect("restored pane");
 
-        // The pane reports what it can actually see, dated to the restore, so
-        // the pair a client receives never dates one status with another's.
+        // Restoration publishes the captured pair even before detection.
         assert_eq!(
             pane.agent_status(),
-            crate::api::schema::AgentStatus::Unknown
+            crate::api::schema::AgentStatus::Working
         );
-        assert!(pane.agent_status_changed_at() >= before);
-        // Any other status reported inside the window dates from the restart
-        // too, in the second after the Unknown a client already holds.
+        assert_eq!(pane.agent_status_changed_at(), 1_000);
         assert_eq!(
             pane.agent_status_changed_at_for(crate::api::schema::AgentStatus::Idle),
-            pane.agent_status_changed_at() + 1,
-            "every status reported inside the window dates from the restart"
+            1_000
         );
         // An agent to find means something will classify this pane.
         assert!(pane.awaits_agent_status_resolution());
@@ -2194,7 +2185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_claim_that_saw_an_interlude_does_not_inherit_after_a_handoff() {
+    async fn a_claim_that_saw_an_interlude_keeps_its_captured_date_after_a_handoff() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -2266,17 +2257,13 @@ mod tests {
             .expect("restored pane");
         assert!(pane.awaits_agent_status_resolution());
 
-        // The interlude travelled with the claim, so confirming working here
-        // still cannot claim the pane has been working since the session said.
-        let resolved_at = crate::pane::unix_now_secs();
-        pane.resolve_agent_status_at(crate::api::schema::AgentStatus::Working, resolved_at);
-
-        // A fresh date, never the captured 1_000 (it may land a second past
-        // the clock, after the restore's own Unknown inside the same second).
-        assert!(
-            pane.agent_status_changed_at() >= resolved_at,
-            "an interlude seen before the handoff still counts after it"
+        // The bit still travels for rollback, but no interlude was published.
+        assert!(pane.durable_agent_status().saw_other_status);
+        pane.resolve_agent_status_at(
+            crate::api::schema::AgentStatus::Working,
+            crate::pane::unix_now_secs(),
         );
+        assert_eq!(pane.agent_status_changed_at(), 1_000);
     }
 
     #[tokio::test]
@@ -2442,7 +2429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_dates_a_pane_awaiting_agent_resume_to_the_restore() {
+    async fn restore_keeps_the_captured_pair_while_awaiting_agent_resume() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -2497,7 +2484,6 @@ mod tests {
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let before = crate::pane::unix_now_secs();
         // Resume enabled, so this pane is pre-seeded Idle for an agent that is
         // about to be relaunched.
         let (workspaces, _terminals, _runtimes) = restore(
@@ -2518,10 +2504,13 @@ mod tests {
         let pane_id = workspace.tabs[0].root_pane;
         let pane = workspace.pane_state(pane_id).expect("restored pane");
 
-        // The pre-seed is dated at the restore, not deferred to whenever the
-        // first client request happens to arrive.
+        // The pre-seed is observed without publishing another pair.
         assert!(pane.awaits_agent_status_resolution());
-        assert!(pane.agent_status_changed_at() >= before);
+        assert_eq!(
+            pane.agent_status(),
+            crate::api::schema::AgentStatus::Working
+        );
+        assert_eq!(pane.agent_status_changed_at(), 1_000);
         assert_eq!(
             pane.agent_status_changed_at_for(crate::api::schema::AgentStatus::Idle),
             pane.agent_status_changed_at()

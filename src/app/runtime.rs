@@ -43,20 +43,19 @@ impl App {
     /// Classify every pane whose restored status claim has run out, dating
     /// each at its own deadline. Returns whether any pane changed.
     pub(crate) fn resolve_due_agent_status_windows(&mut self, now: Instant) -> bool {
+        let pending_changed = self.flush_agent_status_resolutions();
         if self
             .state
             .next_agent_status_resolution_deadline(now)
             .is_none_or(|deadline| now < deadline)
         {
-            return false;
+            return pending_changed;
         }
         let resolved = self
             .state
             .resolve_due_agent_status_windows_at(crate::pane::unix_now_secs());
-        let changed = !resolved.is_empty();
-        for (ws_idx, pane_id) in resolved {
-            self.emit_pane_updated(ws_idx, pane_id);
-        }
+        let changed = pending_changed || !resolved.is_empty();
+        self.emit_agent_status_resolutions(resolved);
         changed
     }
 

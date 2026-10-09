@@ -171,6 +171,12 @@ pub struct PaneStateUpdate {
     pub previous_known_agent: Option<Agent>,
     pub previous_state: AgentState,
     pub previous_seen: bool,
+    /// Captured before recording the live reading can close a restore window.
+    pub previous_reported_status: crate::api::schema::AgentStatus,
+    pub reported_status: crate::api::schema::AgentStatus,
+    /// Freeze this with the pair: a delayed placeholder must stay unpublished
+    /// even if another update resolves its window before event delivery.
+    pub status_unresolved: bool,
     pub previous_presentation: crate::terminal::EffectivePresentation,
     pub agent_label: Option<String>,
     pub known_agent: Option<Agent>,
@@ -181,6 +187,39 @@ pub struct PaneStateUpdate {
     pub agent_released: bool,
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
     pub suppress_completion: bool,
+}
+
+impl PaneStateUpdate {
+    fn status_resolution(
+        ws_idx: usize,
+        pane_id: PaneId,
+        previous_reported_status: crate::api::schema::AgentStatus,
+        pane: &crate::pane::PaneState,
+        terminal: &crate::terminal::TerminalState,
+    ) -> Self {
+        let presentation = terminal.effective_presentation();
+        Self {
+            pane_id,
+            ws_idx,
+            previous_agent_label: terminal.effective_agent_label().map(str::to_string),
+            previous_known_agent: terminal.effective_known_agent(),
+            previous_state: terminal.state,
+            previous_seen: pane.seen,
+            previous_reported_status,
+            reported_status: pane.agent_status(),
+            status_unresolved: pane.agent_status_resolution_due_at().is_some(),
+            previous_presentation: presentation.clone(),
+            agent_label: terminal.effective_agent_label().map(str::to_string),
+            known_agent: terminal.effective_known_agent(),
+            state: terminal.state,
+            seen: pane.seen,
+            presentation,
+            agent_name_changed: false,
+            agent_released: false,
+            agent_release_status: None,
+            suppress_completion: true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +340,8 @@ impl AppState {
             .into_iter()
             .filter_map(|(ws_idx, pane_id, terminal_id)| {
                 let previous_seen = self.workspaces[ws_idx].pane_state(pane_id)?.seen;
+                let previous_reported_status =
+                    self.workspaces[ws_idx].pane_state(pane_id)?.agent_status();
                 let mutation = self
                     .terminals
                     .get_mut(&terminal_id)?
@@ -320,6 +361,12 @@ impl AppState {
                     previous_known_agent: change.previous_known_agent,
                     previous_state: change.previous_state,
                     previous_seen,
+                    previous_reported_status,
+                    reported_status: self.workspaces[ws_idx].pane_state(pane_id)?.agent_status(),
+                    status_unresolved: self.workspaces[ws_idx]
+                        .pane_state(pane_id)?
+                        .agent_status_resolution_due_at()
+                        .is_some(),
                     previous_presentation: change.previous_presentation.clone(),
                     agent_label: change.agent_label.clone(),
                     known_agent: change.known_agent,
@@ -540,7 +587,7 @@ impl AppState {
     pub(crate) fn resolve_due_agent_status_windows_at(
         &mut self,
         now_unix: u64,
-    ) -> Vec<(usize, PaneId)> {
+    ) -> Vec<PaneStateUpdate> {
         let due: Vec<(usize, PaneId, u64)> = self
             .workspaces
             .iter()
@@ -555,11 +602,10 @@ impl AppState {
                 })
             })
             .collect();
-        for (_, pane_id, resolve_by) in &due {
-            self.resolve_agent_status_for_pane_at(*pane_id, *resolve_by);
-        }
         due.into_iter()
-            .map(|(ws_idx, pane_id, _)| (ws_idx, pane_id))
+            .filter_map(|(_, pane_id, resolve_by)| {
+                self.resolve_agent_status_for_pane_at(pane_id, resolve_by)
+            })
             .collect()
     }
 
@@ -570,27 +616,43 @@ impl AppState {
     /// resume completing, and a deferred agent resume failing. Everything else
     /// that touches a pane's status goes through the reconciliation, which
     /// settles nothing.
-    pub(crate) fn resolve_agent_status_for_pane(&mut self, pane_id: PaneId) {
-        self.resolve_agent_status_for_pane_at(pane_id, crate::pane::unix_now_secs());
+    pub(crate) fn resolve_agent_status_for_pane(
+        &mut self,
+        pane_id: PaneId,
+    ) -> Option<PaneStateUpdate> {
+        self.resolve_agent_status_for_pane_at(pane_id, crate::pane::unix_now_secs())
     }
 
     /// Same as [`AppState::resolve_agent_status_for_pane`] with an explicit
     /// clock.
-    pub(crate) fn resolve_agent_status_for_pane_at(&mut self, pane_id: PaneId, now_unix: u64) {
+    pub(crate) fn resolve_agent_status_for_pane_at(
+        &mut self,
+        pane_id: PaneId,
+        now_unix: u64,
+    ) -> Option<PaneStateUpdate> {
         let terminals = &self.terminals;
-        for ws in &mut self.workspaces {
+        for (ws_idx, ws) in self.workspaces.iter_mut().enumerate() {
             for tab in &mut ws.tabs {
                 let Some(pane) = tab.panes.get_mut(&pane_id) else {
                     continue;
                 };
-                let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
-                    return;
-                };
+                let terminal = terminals.get(&pane.attached_terminal_id)?;
+                let previous_reported_status = pane.agent_status();
+                let had_window = pane.agent_status_resolution_due_at().is_some();
                 let status = pane_agent_status(terminal.state, pane.seen);
-                pane.resolve_agent_status_at(status, now_unix);
-                return;
+                if !pane.resolve_agent_status_at(status, now_unix) && !had_window {
+                    return None;
+                }
+                return Some(PaneStateUpdate::status_resolution(
+                    ws_idx,
+                    pane_id,
+                    previous_reported_status,
+                    pane,
+                    terminal,
+                ));
             }
         }
+        None
     }
 
     /// Classify every pane attached to a terminal. Used where the event is
@@ -599,7 +661,7 @@ impl AppState {
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
         now_unix: u64,
-    ) {
+    ) -> Vec<PaneStateUpdate> {
         let pane_ids: Vec<PaneId> = self
             .workspaces
             .iter()
@@ -608,9 +670,10 @@ impl AppState {
             .filter(|(_, pane)| &pane.attached_terminal_id == terminal_id)
             .map(|(pane_id, _)| *pane_id)
             .collect();
-        for pane_id in pane_ids {
-            self.resolve_agent_status_for_pane_at(pane_id, now_unix);
-        }
+        pane_ids
+            .into_iter()
+            .filter_map(|pane_id| self.resolve_agent_status_for_pane_at(pane_id, now_unix))
+            .collect()
     }
 
     /// Drop a respawned terminal's agent identity.
@@ -622,8 +685,8 @@ impl AppState {
     pub(crate) fn clear_agent_identity_after_respawn(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
-    ) {
-        self.clear_agent_identity_after_respawn_at(terminal_id, crate::pane::unix_now_secs());
+    ) -> Vec<PaneStateUpdate> {
+        self.clear_agent_identity_after_respawn_at(terminal_id, crate::pane::unix_now_secs())
     }
 
     /// Same as [`AppState::clear_agent_identity_after_respawn`] with an
@@ -632,15 +695,14 @@ impl AppState {
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
         now_unix: u64,
-    ) {
+    ) -> Vec<PaneStateUpdate> {
         let Some(terminal) = self.terminals.get_mut(terminal_id) else {
-            return;
+            return Vec::new();
         };
         terminal.clear_agent_runtime_identity_after_respawn();
-        self.sync_agent_status_clocks_at(now_unix);
         // A respawn is a classification: whatever the snapshot claimed about
         // this pane, the agent it claimed it about is gone.
-        self.resolve_agent_status_for_terminal_at(terminal_id, now_unix);
+        self.resolve_agent_status_for_terminal_at(terminal_id, now_unix)
     }
 
     /// Same as [`AppState::sync_agent_status_clocks`] with an explicit clock.
@@ -660,7 +722,7 @@ impl AppState {
     ) -> bool {
         let terminals = &self.terminals;
         let mut changed = false;
-        for ws in &mut self.workspaces {
+        for (ws_idx, ws) in self.workspaces.iter_mut().enumerate() {
             for tab in &mut ws.tabs {
                 for (pane_id, pane) in tab.panes.iter_mut() {
                     let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
@@ -671,7 +733,21 @@ impl AppState {
                         _ => crate::events::StatusReading::Incidental,
                     };
                     let status = pane_agent_status(terminal.state, pane.seen);
+                    let had_window = pane.agent_status_resolution_due_at().is_some();
+                    let previous = pane.agent_status();
                     changed |= pane.record_agent_status_at(status, now_unix, reading);
+                    // Reconciliation can settle a bystander before its timer
+                    // runs. Retain its transition for the API event publisher.
+                    if had_window
+                        && pane.agent_status_resolution_due_at().is_none()
+                        && about.is_none_or(|(subject, _)| subject != *pane_id)
+                    {
+                        self.pending_agent_status_resolutions.push(
+                            PaneStateUpdate::status_resolution(
+                                ws_idx, *pane_id, previous, pane, terminal,
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -1683,11 +1759,6 @@ impl AppState {
                     })
                     .into_iter()
                     .collect();
-                if reading == crate::events::StatusReading::Verdict {
-                    // The detector has classified this pane, so a snapshot's
-                    // claim about it can finally be settled either way.
-                    self.resolve_agent_status_for_pane(pane_id);
-                }
                 updates
             }
             AppEvent::HookStateReported {
@@ -1898,6 +1969,7 @@ impl AppState {
             .attached_terminal_id
             .clone();
         let previous_seen = self.workspaces[ws_idx].pane_state(pane_id)?.seen;
+        let previous_reported_status = self.workspaces[ws_idx].pane_state(pane_id)?.agent_status();
         let now = Instant::now();
         let (
             mutation,
@@ -1955,10 +2027,10 @@ impl AppState {
         }
         let agent_released = mutation.agent_released;
         let Some(change) = mutation.effective_state_change.or(unchanged_change) else {
-            // A verdict that confirms what the pane already reports changes
-            // nothing here, and still settles what a session claimed about it.
+            // An unchanged live reading may still move the reported status
+            // when it settles a restore window (captured Done -> live Unknown).
             if reading == crate::events::StatusReading::Verdict {
-                self.resolve_agent_status_for_pane(pane_id);
+                return self.resolve_agent_status_for_pane(pane_id);
             }
             return None;
         };
@@ -1975,6 +2047,9 @@ impl AppState {
         }
         let seen =
             self.apply_pane_state_change(ws_idx, pane_id, &change, suppress_completion, reading)?;
+        let pane = self.workspaces[ws_idx].pane_state(pane_id)?;
+        let reported_status = pane.agent_status();
+        let status_unresolved = pane.agent_status_resolution_due_at().is_some();
         let update = PaneStateUpdate {
             pane_id,
             ws_idx,
@@ -1982,6 +2057,9 @@ impl AppState {
             previous_known_agent: change.previous_known_agent,
             previous_state: change.previous_state,
             previous_seen,
+            previous_reported_status,
+            reported_status,
+            status_unresolved,
             previous_presentation: change.previous_presentation.clone(),
             agent_label: if agent_released {
                 change.previous_agent_label.clone()
@@ -1998,7 +2076,7 @@ impl AppState {
             presentation: change.presentation.clone(),
             agent_name_changed,
             agent_released,
-            agent_release_status: agent_released.then(|| pane_agent_status(change.state, seen)),
+            agent_release_status: agent_released.then_some(reported_status),
             suppress_completion,
         };
         Some(update)
@@ -5123,15 +5201,60 @@ mod tests {
         let root = state.workspaces[0].tabs[0].root_pane;
         insert_restored_pane(&mut state, 0, root, 5_000);
 
-        // The reconciliation the first API request runs must not date the
-        // status the pane actually reports with the snapshot's time.
+        // Global reconciliation must keep the captured pair while live Unknown is unchanged.
         assert!(!state.sync_agent_status_clocks_at(5_002));
 
         assert_eq!(
             pane_status(&state, 0, root),
-            crate::api::schema::AgentStatus::Unknown
+            crate::api::schema::AgentStatus::Working
         );
-        assert_eq!(pane_status_changed_at(&state, 0, root), 5_000);
+        assert_eq!(pane_status_changed_at(&state, 0, root), 1_000);
+    }
+
+    #[test]
+    fn restore_settlement_preserves_adversarial_pane_identity() {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        state.assert_invariants_for_test();
+        let mut expected = Vec::new();
+        for (ws_idx, ws) in state.workspaces.iter_mut().enumerate() {
+            for tab in &mut ws.tabs {
+                for (pane_id, pane) in &mut tab.panes {
+                    *pane = crate::pane::PaneState::restored(
+                        pane.attached_terminal_id.clone(),
+                        crate::api::schema::AgentStatus::Done,
+                        1_000,
+                        5_000,
+                    );
+                    expected.push((ws_idx, *pane_id));
+                }
+            }
+        }
+        assert!(!state.sync_agent_status_clocks_at(5_001));
+        state.assert_invariants_for_test();
+        let due = state.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .agent_status_resolution_due_at()
+            .unwrap();
+        let updates = state.resolve_due_agent_status_windows_at(due);
+        state.assert_invariants_for_test();
+        assert_eq!(updates.len(), expected.len());
+        for (ws_idx, pane_id) in expected {
+            assert_eq!(
+                updates
+                    .iter()
+                    .filter(|update| update.ws_idx == ws_idx && update.pane_id == pane_id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                pane_status(&state, ws_idx, pane_id),
+                crate::api::schema::AgentStatus::Unknown
+            );
+            assert_eq!(pane_status_changed_at(&state, ws_idx, pane_id), due);
+        }
     }
 
     #[test]

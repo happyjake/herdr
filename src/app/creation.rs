@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 
-use super::{
-    api_helpers::{pane_agent_status, tab_attention_priority},
-    App, Mode,
-};
+use super::{api_helpers::pane_agent_status, App, Mode};
 use crate::api::schema::{EventData, EventEnvelope, EventKind};
 use crate::{config::NewTerminalCwdConfig, workspace::Workspace};
 
@@ -206,17 +203,7 @@ impl App {
     ) -> Option<crate::api::schema::TabInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
-        let (agg_state, seen) = tab
-            .panes
-            .values()
-            .filter_map(|pane| {
-                self.state
-                    .terminals
-                    .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
-            })
-            .max_by_key(|(state, seen)| tab_attention_priority(*state, *seen))
-            .unwrap_or((crate::detect::AgentState::Unknown, true));
+        let agent_status = tab.reported_agent_status(&self.state.terminals);
         Some(crate::api::schema::TabInfo {
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,
             workspace_id: self.public_workspace_id(ws_idx),
@@ -224,7 +211,7 @@ impl App {
             label: ws.tab_display_name(tab_idx)?,
             focused: self.state.active == Some(ws_idx) && ws.active_tab == tab_idx,
             pane_count: tab.panes.len(),
-            agent_status: pane_agent_status(agg_state, seen),
+            agent_status,
         })
     }
 
@@ -333,7 +320,10 @@ impl App {
         let presentation = terminal.effective_presentation();
         // Read the status and its date together so the reported pair can never
         // date one status with another one's time.
-        let agent_status = pane_agent_status(terminal.state, pane.seen);
+        let (agent_status, agent_status_changed_at) = pane.reported_agent_status_pair_at(
+            pane_agent_status(terminal.state, pane.seen),
+            crate::pane::unix_now_secs(),
+        );
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
             terminal_id: terminal.id.to_string(),
@@ -360,7 +350,7 @@ impl App {
             scroll,
             mouse_tracking,
             alternate_screen,
-            agent_status_changed_at: Some(pane.agent_status_changed_at_for(agent_status)),
+            agent_status_changed_at: Some(agent_status_changed_at),
             pinned: terminal.pinned,
             label_source: terminal.label_source,
             label_at: terminal.label_at,
@@ -390,7 +380,7 @@ impl App {
 
     pub(super) fn workspace_info(&self, index: usize) -> crate::api::schema::WorkspaceInfo {
         let ws = &self.state.workspaces[index];
-        let (agg_state, seen) = ws.aggregate_state(&self.state.terminals);
+        let agent_status = ws.reported_agent_status(&self.state.terminals);
         crate::api::schema::WorkspaceInfo {
             workspace_id: self.public_workspace_id(index),
             number: index + 1,
@@ -401,7 +391,7 @@ impl App {
             active_tab_id: self.public_tab_id(index, ws.active_tab).unwrap_or_else(|| {
                 crate::workspace::public_tab_id_for_number(&ws.id, ws.active_tab + 1)
             }),
-            agent_status: pane_agent_status(agg_state, seen),
+            agent_status,
             tokens: ws.metadata_tokens.values(),
             worktree: ws
                 .worktree_space()

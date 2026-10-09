@@ -262,8 +262,10 @@ impl App {
             }
             // The resume is over and it failed, which classifies the pane just
             // as completing it would.
-            self.state
+            let updates = self
+                .state
                 .resolve_agent_status_for_terminal_at(&terminal_id, crate::pane::unix_now_secs());
+            self.emit_agent_status_resolutions(updates);
             return true;
         }
 
@@ -297,10 +299,11 @@ impl App {
                 }
                 // The resume is over and it failed, which classifies the pane
                 // just as completing it would.
-                self.state.resolve_agent_status_for_terminal_at(
+                let updates = self.state.resolve_agent_status_for_terminal_at(
                     &terminal_id,
                     crate::pane::unix_now_secs(),
                 );
+                self.emit_agent_status_resolutions(updates);
                 return true;
             }
         };
@@ -318,7 +321,8 @@ impl App {
             runtime.shutdown();
             // The resume is over and it failed, which classifies the pane just
             // as completing it would.
-            self.state.clear_agent_identity_after_respawn(&terminal_id);
+            let updates = self.state.clear_agent_identity_after_respawn(&terminal_id);
+            self.emit_agent_status_resolutions(updates);
             return false;
         }
 
@@ -329,8 +333,10 @@ impl App {
         }
         // The resume finished. Whatever the snapshot said this pane was doing,
         // it was a different agent process; this one starts now.
-        self.state
+        let updates = self
+            .state
             .resolve_agent_status_for_terminal_at(&terminal_id, crate::pane::unix_now_secs());
+        self.emit_agent_status_resolutions(updates);
         true
     }
 }

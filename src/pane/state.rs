@@ -6,8 +6,7 @@ use crate::terminal::TerminalId;
 ///
 /// The detector's own startup grace is a few seconds, so this only comes into
 /// play for panes nothing ever classifies — a hook-driven agent that never
-/// reports, say. Without it a pane could sit unresolved forever and its age
-/// would be pinned to the restore for the rest of the session.
+/// reports, say. Without it a pane could report its captured status forever.
 const RESTORE_RESOLUTION_DEADLINE_SECS: u64 = 15;
 
 /// How far back a test has to place a restore for its window to be past the
@@ -27,15 +26,14 @@ pub fn unix_now_secs() -> u64 {
 
 /// What a pane rebuilt from a snapshot knows before anything has classified it.
 ///
-/// A restored pane reports whatever its terminal says, but nothing it says in
-/// this window is a verdict on what the pane was doing before the restart, so
-/// the whole window is reported as dating from the restart and the captured
-/// pair waits to one side. Exactly one resolution ends the window.
+/// The captured pair remains the reported pair until classification or the
+/// deadline. Provisional live readings are observed without being published.
+/// Exactly one resolution ends the window.
 #[derive(Debug, Clone, Copy)]
 pub struct RestoreWindow {
     /// What the snapshot recorded, and since when.
     captured: (AgentStatus, u64),
-    /// The restart. Every status reported inside the window dates from here.
+    /// The restart, a floor for the date of a differing classification.
     restored_at: u64,
     /// When the window ends even if nothing has classified the pane.
     ///
@@ -43,14 +41,9 @@ pub struct RestoreWindow {
     /// manifest that takes half a minute to reach the new process arrives with
     /// a claim its reader can see has already expired.
     resolve_by: u64,
-    /// Whether this pane has reported a status other than the captured one
-    /// since the restart.
-    ///
-    /// Inheriting the captured date claims the pane has been doing one thing
-    /// without interruption since the session recorded it. That claim is only
-    /// safe if nothing else was reported in between, whatever reported it.
-    /// Unknown does not count: it says the server cannot see what the pane is
-    /// doing, which contradicts nothing.
+    /// Whether another known status was observed. Retained in snapshots for
+    /// rollback to older processes; unpublished readings no longer re-date a
+    /// confirmation of the captured status.
     saw_other_status: bool,
 }
 
@@ -61,10 +54,9 @@ impl RestoreWindow {
 
     /// The date this window leaves behind when it closes on `status`.
     ///
-    /// Confirming what the session recorded, with nothing else reported in
-    /// between, means the pane has been doing that since the session said so.
-    /// Anything else is this process's own reading, and a window closed by its
-    /// own deadline dates from the deadline.
+    /// Confirming the captured status keeps its date: no other pair was
+    /// published inside the window. A differing deadline resolution dates
+    /// from the deadline.
     fn closed_changed_at(&self, status: AgentStatus, now_unix: u64) -> u64 {
         if self.inherits(status) {
             self.captured.1
@@ -76,7 +68,7 @@ impl RestoreWindow {
     /// Whether closing on `status` re-publishes the captured pair rather than
     /// dating a new one.
     fn inherits(&self, status: AgentStatus) -> bool {
-        self.captured.0 == status && !self.saw_other_status
+        self.captured.0 == status
     }
 }
 
@@ -94,9 +86,8 @@ pub struct AgentStatusClaim {
     /// claim is not waiting on anything, which is the ordinary case for a
     /// session saved while its panes were settled.
     pub resolve_by: Option<u64>,
-    /// Whether the pane reported some other known status while this claim was
-    /// outstanding. A claim that saw an interlude before a handoff is still a
-    /// claim that saw one after it, so this travels rather than resetting.
+    /// Whether another known status was observed while this claim was
+    /// outstanding. Preserved for readers predating captured-pair reporting.
     pub saw_other_status: bool,
     /// The latest date the pane had published for any status. The process
     /// that adopts the claim dates everything after it, so no pair it
@@ -124,6 +115,9 @@ pub struct PaneState {
     /// to clients as one pair and a client cannot tell a torn pair from a true
     /// one.
     agent_status: AgentStatus,
+    /// The last live reading, including unpublished restore placeholders.
+    /// Incidental reconciliation settles a window only if this value moves.
+    observed_agent_status: AgentStatus,
     /// Unix seconds at which the pane started reporting `agent_status`.
     ///
     /// Clients name a transition by this date, so it is a name before it is a
@@ -132,9 +126,8 @@ pub struct PaneState {
     /// inside one second. A burst of moves can run it a few seconds ahead of
     /// the wall clock; the clock takes over again once it passes.
     agent_status_changed_at: u64,
-    /// The latest date this pane has published for any status. Usually the
-    /// current date, but an inheritance can re-publish an older captured date
-    /// after the window already published newer ones.
+    /// The floor for every fresh date: all dates published by this pane or
+    /// its predecessor, and the restore time even though it publishes no pair.
     reported_through: u64,
     /// Present only between a restore and the one resolution that ends it.
     restore_window: Option<RestoreWindow>,
@@ -154,6 +147,7 @@ impl PaneState {
             // A pane with no detected agent reports Unknown, and it has
             // reported it since the moment it existed.
             agent_status: AgentStatus::Unknown,
+            observed_agent_status: AgentStatus::Unknown,
             agent_status_changed_at: now_unix,
             reported_through: now_unix,
             restore_window: None,
@@ -192,12 +186,11 @@ impl PaneState {
     /// between the check and the use in which the claim can die.
     ///
     /// A claim that is adopted keeps what it already knew about itself: its
-    /// deadline is honoured rather than replaced, and an interlude it saw
-    /// before the handoff still counts against it after.
+    /// deadline is honoured rather than replaced, and its captured pair is
+    /// reported immediately. The live observation starts at Unknown.
     ///
-    /// Either way the rebuilt pane dates its first pair after everything the
-    /// claim says was published, so a handoff inside the second of a
-    /// transition still gives clients a new name for the restart.
+    /// Every later fresh date must exceed everything the claim says was
+    /// published, even when the predecessor's clock ran ahead.
     pub fn restored_from(
         attached_terminal_id: TerminalId,
         claim: AgentStatusClaim,
@@ -206,29 +199,35 @@ impl PaneState {
         let resolve_by = claim
             .resolve_by
             .unwrap_or_else(|| now_unix.saturating_add(RESTORE_RESOLUTION_DEADLINE_SECS));
-        let published = claim.reported_through.unwrap_or(claim.changed_at);
-        let restored_at = now_unix.max(published.saturating_add(1));
+        let published = claim
+            .reported_through
+            .unwrap_or(claim.changed_at)
+            .max(claim.changed_at);
         if now_unix >= resolve_by {
-            return Self::new_at(attached_terminal_id, restored_at);
+            return Self::new_at(
+                attached_terminal_id,
+                now_unix.max(published.saturating_add(1)),
+            );
         }
         Self {
             attached_terminal_id,
             seen: true,
             right_click_passthrough: false,
-            agent_status: AgentStatus::Unknown,
-            agent_status_changed_at: restored_at,
-            reported_through: restored_at,
+            agent_status: claim.status,
+            observed_agent_status: AgentStatus::Unknown,
+            agent_status_changed_at: claim.changed_at,
+            reported_through: published.max(now_unix),
             restore_window: Some(RestoreWindow {
                 captured: (claim.status, claim.changed_at),
-                restored_at,
+                restored_at: now_unix,
                 resolve_by,
                 saw_other_status: claim.saw_other_status,
             }),
         }
     }
 
-    /// The effective agent status this pane last reported.
-    #[cfg(test)]
+    /// The last recorded reported status, including before deadline resolution.
+    /// Event writers capture this before recording the next reading.
     pub fn agent_status(&self) -> AgentStatus {
         self.agent_status
     }
@@ -281,38 +280,38 @@ impl PaneState {
             })
     }
 
-    /// The date to report alongside `status`.
-    ///
-    /// Callers report the status derived live from the terminal, so this
-    /// answers for that status and not for whatever was recorded earlier. The
-    /// two are read together so the pair a client receives can never date one
-    /// status with another one's time.
-    pub fn agent_status_changed_at_for(&self, status: AgentStatus) -> u64 {
-        self.agent_status_changed_at_for_at(status, unix_now_secs())
+    /// The API status for a live terminal reading. Desktop views stay live.
+    pub fn reported_agent_status(&self, live: AgentStatus) -> AgentStatus {
+        self.reported_agent_status_pair_at(live, unix_now_secs()).0
+    }
+
+    /// Read the API pair with one clock sample, including at the deadline.
+    pub fn reported_agent_status_pair_at(
+        &self,
+        live: AgentStatus,
+        now_unix: u64,
+    ) -> (AgentStatus, u64) {
+        let changed_at = match self.restore_window {
+            Some(window) if window.live_at(now_unix) => return window.captured,
+            Some(window) => self.closing_date(window, live, now_unix),
+            None if self.agent_status == live => self.agent_status_changed_at,
+            None => self.fresh_date(now_unix),
+        };
+        (live, changed_at)
+    }
+
+    /// The date for the reported status corresponding to the original live
+    /// reading. Use the pair accessor when publishing both fields together.
+    #[cfg(test)]
+    pub fn agent_status_changed_at_for(&self, live: AgentStatus) -> u64 {
+        self.agent_status_changed_at_for_at(live, unix_now_secs())
     }
 
     /// Same as [`PaneState::agent_status_changed_at_for`] with an explicit
     /// clock.
-    pub fn agent_status_changed_at_for_at(&self, status: AgentStatus, now_unix: u64) -> u64 {
-        // A read answers what recording `status` would store, so a client never
-        // holds a date for the pair that differs from the one it is given next.
-        match self.restore_window {
-            // Nothing inside a live window is older than the restart, whatever
-            // shape the pane has: a bare shell, a placeholder Idle from the
-            // detector, or an Idle pre-seeded for an agent about to resume.
-            Some(window) if window.live_at(now_unix) => {
-                if self.agent_status == status {
-                    self.agent_status_changed_at
-                } else {
-                    self.fresh_date(window.restored_at)
-                }
-            }
-            // Past its deadline the window is over whether or not anything has
-            // got around to closing it, so answer exactly as closing it would.
-            Some(window) => self.closing_date(window, status, now_unix),
-            None if self.agent_status == status => self.agent_status_changed_at,
-            None => self.fresh_date(now_unix),
-        }
+    #[cfg(test)]
+    pub fn agent_status_changed_at_for_at(&self, live: AgentStatus, now_unix: u64) -> u64 {
+        self.reported_agent_status_pair_at(live, now_unix).1
     }
 
     /// A date for a new pair: `candidate`, unless the pane has already
@@ -353,28 +352,17 @@ impl PaneState {
     }
 
     /// Same as [`PaneState::durable_agent_status`] with an explicit clock.
-    pub fn durable_agent_status_at(&self, now_unix: u64) -> AgentStatusClaim {
+    /// Until resolution, even an expired window keeps its pair and original
+    /// deadline. A later adopter rejects it instead of renewing its lifetime.
+    pub fn durable_agent_status_at(&self, _now_unix: u64) -> AgentStatusClaim {
         match self.restore_window {
-            Some(window) if window.live_at(now_unix) => AgentStatusClaim {
+            Some(window) => AgentStatusClaim {
                 status: window.captured.0,
                 changed_at: window.captured.1,
                 resolve_by: Some(window.resolve_by),
                 saw_other_status: window.saw_other_status,
                 reported_through: Some(self.reported_through),
             },
-            // A dead window must not be written into a snapshot as if it were
-            // alive. The reader checks the deadline too, so this is the
-            // writer agreeing with what the reader would decide anyway.
-            Some(window) => {
-                let changed_at = self.closing_date(window, self.agent_status, now_unix);
-                AgentStatusClaim {
-                    status: self.agent_status,
-                    changed_at,
-                    resolve_by: None,
-                    saw_other_status: false,
-                    reported_through: Some(self.reported_through.max(changed_at)),
-                }
-            }
             None => AgentStatusClaim {
                 status: self.agent_status,
                 changed_at: self.agent_status_changed_at,
@@ -400,12 +388,11 @@ impl PaneState {
         now_unix: u64,
         reading: StatusReading,
     ) -> bool {
-        let moved = self.agent_status != status;
+        let observed_moved = self.observed_agent_status != status;
+        self.observed_agent_status = status;
 
         if let Some(window) = self.restore_window.as_mut() {
-            // Anything reported that is not what the session recorded breaks
-            // the continuity inheriting its date would claim. Unknown is not a
-            // competing claim, so it does not break anything.
+            // Older readers use this bit; keep carrying it for rollback.
             if status != window.captured.0 && status != AgentStatus::Unknown {
                 window.saw_other_status = true;
             }
@@ -416,26 +403,20 @@ impl PaneState {
             // whichever way the two compare and whether or not the value moved.
             StatusReading::Verdict => true,
             // Not a statement, but this process watched the pane move.
-            StatusReading::Incidental => moved,
+            StatusReading::Incidental => observed_moved,
             // A placeholder may still be revised, and a title says nothing
             // about status at all.
             StatusReading::Provisional | StatusReading::DisplayOnly => false,
         };
         if settles {
-            return self.close_window_on(status, now_unix, moved);
+            return self.close_window_on(status, now_unix);
         }
 
         match self.restore_window {
-            Some(window) if window.live_at(now_unix) => {
-                if moved {
-                    let changed_at = self.fresh_date(window.restored_at);
-                    self.set_pair(status, changed_at);
-                }
-                moved
-            }
+            Some(window) if window.live_at(now_unix) => false,
             // The deadline is a resolution of its own, dated at the deadline.
-            Some(window) => self.close_window_on(status, window.resolve_by, moved),
-            None if !moved => false,
+            Some(window) => self.close_window_on(status, window.resolve_by),
+            None if self.agent_status == status => false,
             None => {
                 let changed_at = self.fresh_date(now_unix);
                 self.set_pair(status, changed_at);
@@ -453,7 +434,8 @@ impl PaneState {
         self.record_agent_status_at(status, now_unix, StatusReading::Verdict)
     }
 
-    fn close_window_on(&mut self, status: AgentStatus, now_unix: u64, moved: bool) -> bool {
+    fn close_window_on(&mut self, status: AgentStatus, now_unix: u64) -> bool {
+        let moved = self.agent_status != status;
         let changed_at = match self.restore_window.take() {
             Some(window) => self.closing_date(window, status, now_unix),
             None if !moved => self.agent_status_changed_at,
@@ -488,6 +470,21 @@ mod tests {
 
     fn incidental(pane: &mut PaneState, status: AgentStatus, now: u64) -> bool {
         pane.record_agent_status_at(status, now, StatusReading::Incidental)
+    }
+
+    #[test]
+    fn restore_and_incidental_unknown_keep_the_captured_pair() {
+        let mut pane = restored_working();
+        assert_eq!(pane.agent_status(), AgentStatus::Working);
+        assert_eq!(pane.agent_status_changed_at(), CAPTURED_AT);
+        assert_eq!(
+            pane.agent_status_changed_at_for_at(AgentStatus::Unknown, IN_WINDOW),
+            CAPTURED_AT
+        );
+        assert!(!incidental(&mut pane, AgentStatus::Unknown, IN_WINDOW));
+        assert!(pane.awaits_agent_status_resolution());
+        assert_eq!(pane.agent_status(), AgentStatus::Working);
+        assert_eq!(pane.agent_status_changed_at(), CAPTURED_AT);
     }
 
     #[test]
@@ -577,53 +574,152 @@ mod tests {
     }
 
     #[test]
-    fn the_window_never_dates_two_moves_alike() {
+    fn non_settling_readings_update_only_the_observed_status() {
         let mut pane = restored_working();
-        let mut published = vec![pane.agent_status_changed_at()];
-
-        for status in [
-            AgentStatus::Idle,
-            AgentStatus::Working,
-            AgentStatus::Done,
-            AgentStatus::Working,
-        ] {
-            observe(&mut pane, status, IN_WINDOW);
-            assert!(pane.awaits_agent_status_resolution());
-            published.push(pane.agent_status_changed_at());
+        for reading in [StatusReading::Provisional, StatusReading::DisplayOnly] {
+            for status in STATUSES {
+                assert!(!pane.record_agent_status_at(status, IN_WINDOW, reading));
+                assert_eq!(pane.observed_agent_status, status);
+                assert_eq!(
+                    pane.reported_agent_status_pair_at(status, IN_WINDOW),
+                    (AgentStatus::Working, CAPTURED_AT)
+                );
+                // Global clock sync must not mistake a placeholder for movement.
+                assert!(!incidental(&mut pane, status, IN_WINDOW));
+                assert!(pane.awaits_agent_status_resolution());
+            }
         }
-
-        assert_eq!(
-            published,
-            vec![
-                RESTORED_AT,
-                RESTORED_AT + 1,
-                RESTORED_AT + 2,
-                RESTORED_AT + 3,
-                RESTORED_AT + 4
-            ],
-            "nothing inside the window predates the restart, and no two moves share a date"
-        );
     }
 
     #[test]
-    fn a_date_published_before_an_inheritance_still_floors_the_next_move() {
-        let mut pane = restored_working();
-        // Working inside the window is a move from the restore's Unknown, so it
-        // publishes a date of its own...
-        observe(&mut pane, AgentStatus::Working, RESTORED_AT);
-        assert_eq!(pane.agent_status_changed_at(), RESTORED_AT + 1);
-        // ...and the classification that confirms the snapshot then inherits
-        // the captured date, which is older than what was just published.
-        pane.resolve_agent_status_at(AgentStatus::Working, RESTORED_AT);
+    fn a_predecessors_published_date_floors_the_next_move() {
+        let claim = AgentStatusClaim {
+            reported_through: Some(RESTORED_AT + 20),
+            ..restored_working().durable_agent_status_at(IN_WINDOW)
+        };
+        let mut pane = PaneState::restored_from(TerminalId::alloc(), claim, RESTORED_AT);
+        observe(&mut pane, AgentStatus::Idle, IN_WINDOW);
+        assert!(!pane.resolve_agent_status_at(AgentStatus::Working, IN_WINDOW));
         assert_eq!(pane.agent_status_changed_at(), CAPTURED_AT);
+        assert!(incidental(&mut pane, AgentStatus::Done, IN_WINDOW));
+        assert_eq!(pane.agent_status_changed_at(), RESTORED_AT + 21);
+    }
 
-        incidental(&mut pane, AgentStatus::Done, RESTORED_AT + 1);
+    #[test]
+    fn reported_pairs_remain_monotone_through_restore_readings_and_deadline() {
+        // Integer wrapping arithmetic gives deterministic, distinct sequences.
+        let mut rng = 0x91ac_571du64;
+        let mut next = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng >> 32) as usize
+        };
+        let mut matching_deadlines = 0;
+        let mut differing_deadlines = 0;
+        for captured in STATUSES {
+            for trial in 0..256 {
+                let claim = AgentStatusClaim {
+                    status: captured,
+                    changed_at: CAPTURED_AT,
+                    resolve_by: None,
+                    saw_other_status: trial % 2 == 0,
+                    reported_through: Some(RESTORED_AT + (trial % 20)),
+                };
+                let mut pane = PaneState::restored_from(TerminalId::alloc(), claim, RESTORED_AT);
+                let due = pane.agent_status_resolution_due_at().unwrap();
+                let mut before = (captured, CAPTURED_AT);
+                let mut dates = std::collections::BTreeMap::new();
+                dates.insert(before.1, before.0);
+                for step in 0..40 {
+                    let status = STATUSES[next() % STATUSES.len()];
+                    let reading = [
+                        StatusReading::Provisional,
+                        StatusReading::DisplayOnly,
+                        StatusReading::Incidental,
+                        StatusReading::Verdict,
+                    ][next() % if trial % 2 == 0 { 2 } else { 4 }];
+                    let now = RESTORED_AT + step / 4;
+                    pane.record_agent_status_at(status, now, reading);
+                    let pair = pane.reported_agent_status_pair_at(status, now);
+                    assert!(pair.1 >= before.1, "{before:?} -> {pair:?}");
+                    if pair != before {
+                        assert!(pair.1 > before.1);
+                    }
+                    if let Some(old) = dates.insert(pair.1, pair.0) {
+                        assert_eq!(old, pair.0);
+                    }
+                    before = pair;
+                    if trial % 2 == 0 {
+                        assert!(!incidental(&mut pane, status, now));
+                        assert!(pane.awaits_agent_status_resolution());
+                    }
+                }
+                let live = pane.observed_agent_status;
+                if trial % 2 == 0 {
+                    if live == captured {
+                        matching_deadlines += 1;
+                    } else {
+                        differing_deadlines += 1;
+                    }
+                }
+                let at_deadline = pane.reported_agent_status_pair_at(live, due);
+                pane.resolve_agent_status_at(live, due);
+                assert_eq!(pane.reported_agent_status_pair_at(live, due), at_deadline);
+                assert!(at_deadline.1 >= before.1);
+                if let Some(old) = dates.insert(at_deadline.1, at_deadline.0) {
+                    assert_eq!(old, at_deadline.0);
+                }
+            }
+        }
+        assert!(matching_deadlines > 0 && differing_deadlines > 0);
+    }
 
-        assert_eq!(
-            pane.agent_status_changed_at(),
-            RESTORED_AT + 2,
-            "the done must not share the date the window already gave working"
-        );
+    #[test]
+    fn a_deadline_changes_only_a_differing_reported_status() {
+        for live in STATUSES {
+            let mut pane = restored_working();
+            observe(&mut pane, live, IN_WINDOW);
+            let due = pane.agent_status_resolution_due_at().unwrap();
+            let expected = if live == AgentStatus::Working {
+                (live, CAPTURED_AT)
+            } else {
+                (live, due)
+            };
+            assert_eq!(
+                pane.reported_agent_status_pair_at(live, due - 1),
+                (AgentStatus::Working, CAPTURED_AT)
+            );
+            assert_eq!(pane.reported_agent_status_pair_at(live, due), expected);
+            assert_eq!(
+                pane.resolve_agent_status_at(live, due),
+                live != AgentStatus::Working
+            );
+            assert_eq!(pane.reported_agent_status_pair_at(live, due), expected);
+            assert!(!pane.resolve_agent_status_at(live, due + 1));
+        }
+    }
+
+    #[test]
+    fn a_differing_verdict_exceeds_the_claims_published_floor() {
+        let claim = AgentStatusClaim {
+            reported_through: Some(RESTORED_AT + 30),
+            ..restored_working().durable_agent_status_at(IN_WINDOW)
+        };
+        let mut pane = PaneState::restored_from(TerminalId::alloc(), claim, RESTORED_AT);
+        assert!(pane.resolve_agent_status_at(AgentStatus::Unknown, IN_WINDOW));
+        assert_eq!(pane.agent_status_changed_at(), RESTORED_AT + 31);
+    }
+
+    #[test]
+    fn a_durable_claim_is_unchanged_between_deadline_and_resolution() {
+        let mut pane = restored_working();
+        observe(&mut pane, AgentStatus::Idle, IN_WINDOW);
+        let claim = pane.durable_agent_status_at(IN_WINDOW);
+        let due = claim.resolve_by.unwrap();
+        assert_eq!(pane.durable_agent_status_at(due + 1), claim);
+        let adopted = PaneState::restored_from(TerminalId::alloc(), claim, due + 1);
+        assert!(!adopted.awaits_agent_status_resolution());
+        assert_eq!(adopted.agent_status(), AgentStatus::Unknown);
+        assert!(adopted.agent_status_changed_at() > claim.reported_through.unwrap());
     }
 
     #[test]
@@ -637,19 +733,19 @@ mod tests {
         );
 
         // A pane captured inside its window hands on the captured pair, and
-        // the dates the window published travel beside it.
+        // the reserved date floor travels beside it.
         let mut restored = restored_working();
         observe(&mut restored, AgentStatus::Idle, IN_WINDOW);
         observe(&mut restored, AgentStatus::Working, IN_WINDOW);
         let claim = restored.durable_agent_status_at(IN_WINDOW);
         assert_eq!(
             (claim.status, claim.changed_at, claim.reported_through),
-            (AgentStatus::Working, CAPTURED_AT, Some(RESTORED_AT + 2))
+            (AgentStatus::Working, CAPTURED_AT, Some(RESTORED_AT))
         );
     }
 
     #[test]
-    fn a_restore_starts_past_everything_the_claim_reported() {
+    fn a_restore_keeps_the_pair_and_reserves_everything_the_claim_reported() {
         let ran_ahead = AgentStatusClaim {
             status: AgentStatus::Working,
             changed_at: RESTORED_AT - 1,
@@ -659,7 +755,8 @@ mod tests {
         };
         let adopted = PaneState::restored_from(TerminalId::alloc(), ran_ahead, RESTORED_AT);
         assert!(adopted.awaits_agent_status_resolution());
-        assert_eq!(adopted.agent_status_changed_at(), RESTORED_AT + 4);
+        assert_eq!(adopted.agent_status_changed_at(), RESTORED_AT - 1);
+        assert_eq!(adopted.reported_through, RESTORED_AT + 3);
 
         let expired = AgentStatusClaim {
             resolve_by: Some(RESTORED_AT),
@@ -670,14 +767,14 @@ mod tests {
         assert_eq!(unadopted.agent_status_changed_at(), RESTORED_AT + 4);
 
         // A claim from a process that predates the floor: its own date is the
-        // best floor known, so a handoff inside that second still moves on.
+        // best floor known; adopting it does not publish a new pair.
         let legacy = AgentStatusClaim {
             changed_at: RESTORED_AT,
             reported_through: None,
             ..ran_ahead
         };
         let rebuilt = PaneState::restored_from(TerminalId::alloc(), legacy, RESTORED_AT);
-        assert_eq!(rebuilt.agent_status_changed_at(), RESTORED_AT + 1);
+        assert_eq!(rebuilt.agent_status_changed_at(), RESTORED_AT);
     }
 
     #[test]
@@ -689,30 +786,23 @@ mod tests {
             pane.agent_status_changed_at_for_at(AgentStatus::Idle, IN_WINDOW),
             pane.agent_status_changed_at()
         );
-        // A read that runs ahead of the recording answers what recording will
-        // store, never a date the pane already published.
+        // Read-ahead placeholders still report the same captured date.
         let read = pane.agent_status_changed_at_for_at(AgentStatus::Working, IN_WINDOW);
         observe(&mut pane, AgentStatus::Working, IN_WINDOW);
         assert_eq!(read, pane.agent_status_changed_at());
     }
 
     #[test]
-    fn everything_reported_inside_the_window_dates_from_the_restart() {
-        let mut pane = restored_working();
-
-        assert_eq!(pane.agent_status(), AgentStatus::Unknown);
-        assert_eq!(pane.agent_status_changed_at(), RESTORED_AT);
-
-        // A placeholder Idle from the detector, or an Idle pre-seeded for an
-        // agent about to resume, reads the same way: since the restart, never
-        // since the clock. It is a move from the restore's own Unknown, so it
-        // takes the second after it.
-        observe(&mut pane, AgentStatus::Idle, IN_WINDOW);
-        assert_eq!(pane.agent_status(), AgentStatus::Idle);
-        assert_eq!(pane.agent_status_changed_at(), RESTORED_AT + 1);
+    fn the_status_and_date_accessors_agree_at_restore() {
+        let now = unix_now_secs();
+        let pane = PaneState::restored(TerminalId::alloc(), AgentStatus::Done, CAPTURED_AT, now);
         assert_eq!(
-            pane.agent_status_changed_at_for_at(AgentStatus::Idle, IN_WINDOW),
-            RESTORED_AT + 1
+            pane.reported_agent_status(AgentStatus::Unknown),
+            AgentStatus::Done
+        );
+        assert_eq!(
+            pane.agent_status_changed_at_for(AgentStatus::Unknown),
+            CAPTURED_AT
         );
     }
 
@@ -741,19 +831,17 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmation_across_an_interlude_stamps_fresh() {
+    fn a_confirmation_across_a_provisional_interlude_keeps_the_captured_date() {
         let mut pane = restored_working();
 
-        // Something else was reported in between, so claiming the pane has
-        // been working since the snapshot would span an interlude a client
-        // could have seen.
+        // The provisional interlude was observed, but never published.
         observe(&mut pane, AgentStatus::Idle, IN_WINDOW);
         pane.resolve_agent_status_at(AgentStatus::Working, LATER_IN_WINDOW);
 
         assert_eq!(
             pane.agent_status_changed_at(),
-            LATER_IN_WINDOW,
-            "an interrupted window cannot claim continuity"
+            CAPTURED_AT,
+            "unpublished readings must not re-date the captured status"
         );
     }
 
@@ -768,11 +856,11 @@ mod tests {
     }
 
     #[test]
-    fn a_classification_that_moves_nothing_still_spends_the_captured_pair() {
+    fn a_classification_that_matches_the_observation_can_move_the_reported_pair() {
         let mut pane = restored_working();
         observe(&mut pane, AgentStatus::Idle, IN_WINDOW);
 
-        assert!(!pane.resolve_agent_status_at(AgentStatus::Idle, LATER_IN_WINDOW));
+        assert!(pane.resolve_agent_status_at(AgentStatus::Idle, LATER_IN_WINDOW));
         assert!(!pane.awaits_agent_status_resolution());
 
         assert!(incidental(&mut pane, AgentStatus::Working, 6_000));
@@ -799,7 +887,7 @@ mod tests {
     fn a_classification_finding_no_agent_spends_the_pair_too() {
         let mut pane = restored_working();
 
-        assert!(!pane.resolve_agent_status_at(AgentStatus::Unknown, IN_WINDOW));
+        assert!(pane.resolve_agent_status_at(AgentStatus::Unknown, IN_WINDOW));
 
         assert!(!pane.awaits_agent_status_resolution());
         assert!(incidental(&mut pane, AgentStatus::Working, 6_000));
@@ -822,7 +910,7 @@ mod tests {
             .agent_status_resolution_due_at()
             .expect("an unresolved pane has a deadline");
 
-        assert!(observe(&mut pane, AgentStatus::Working, due_at));
+        assert!(!observe(&mut pane, AgentStatus::Working, due_at));
 
         assert!(!pane.awaits_agent_status_resolution());
         assert_eq!(pane.agent_status_changed_at(), CAPTURED_AT);
@@ -845,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_read_after_its_deadline_is_dead_on_arrival() {
+    fn a_read_after_the_deadline_agrees_with_resolution_but_preserves_the_pending_claim() {
         // A snapshot written while the claim was alive, read after it expired.
         let pane = PaneState::restored_from(
             TerminalId::alloc(),
@@ -867,15 +955,15 @@ mod tests {
         );
         assert_eq!(
             pane.durable_agent_status_at(RESTORED_AT + 30).resolve_by,
-            None,
-            "an expired claim carries no deadline onward"
+            Some(RESTORED_AT + 1),
+            "an unresolved claim must carry its expired deadline onward"
         );
     }
 
     #[test]
-    fn an_interlude_seen_before_a_handoff_still_counts_after_it() {
+    fn an_interlude_survives_a_handoff_for_rollback_but_does_not_redate() {
         let mut pane = restored_working();
-        // Something else was reported, then the pane was captured and rebuilt
+        // Something else was observed, then the pane was captured and rebuilt
         // in another process before anything classified it.
         observe(&mut pane, AgentStatus::Idle, IN_WINDOW);
         let claim = pane.durable_agent_status_at(LATER_IN_WINDOW);
@@ -891,8 +979,8 @@ mod tests {
 
         assert_eq!(
             rebuilt.agent_status_changed_at(),
-            RESTORED_AT + 8,
-            "a claim that saw an interlude cannot inherit after a handoff either"
+            CAPTURED_AT,
+            "the interlude was never published, including across a handoff"
         );
     }
 

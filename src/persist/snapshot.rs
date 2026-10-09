@@ -132,13 +132,9 @@ pub struct PaneSnapshot {
     /// reader has to remember to re-check anything the writer thought it knew.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status_resolve_by: Option<u64>,
-    /// Whether the pane had reported some other known status while this claim
-    /// was outstanding.
-    ///
-    /// Travels with the claim because it is part of what the claim asserts: a
-    /// claim that saw an interlude before a handoff is still a claim that saw
-    /// one after it, and a reader that reset this would let the next process
-    /// inherit an age across a status the previous one already reported.
+    /// Whether another known status was observed while this claim was
+    /// outstanding. Retained for rollback to readers that published those
+    /// provisional readings; current readers keep the captured pair instead.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_status_saw_other: bool,
     /// The latest status date the pane had published when this was captured.
@@ -881,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn a_capture_racing_the_deadline_does_not_carry_a_dead_pair_onward() {
+    fn a_capture_racing_the_deadline_preserves_the_pair_and_its_expired_deadline() {
         let mut workspace = Workspace::test_new("one");
         let root = workspace.tabs[0].root_pane;
         let terminal_id = workspace
@@ -918,10 +914,30 @@ mod tests {
             .expect("captured pane");
         assert_eq!(
             pane_snapshot.agent_status.as_deref(),
-            Some("unknown"),
-            "a dead pair must not reach the replacement process"
+            Some("working"),
+            "capture does not publish an unobserved transition"
         );
-        assert_ne!(pane_snapshot.agent_status_changed_at, Some(1_700));
+        assert_eq!(pane_snapshot.agent_status_changed_at, Some(1_700));
+        let due = pane_snapshot
+            .agent_status_resolve_by
+            .expect("original deadline travels");
+        assert!(due < crate::pane::unix_now_secs());
+        let adopted = PaneState::restored_from(
+            crate::terminal::TerminalId::alloc(),
+            crate::pane::AgentStatusClaim {
+                status: crate::api::schema::AgentStatus::Working,
+                changed_at: pane_snapshot.agent_status_changed_at.unwrap(),
+                resolve_by: Some(due),
+                saw_other_status: pane_snapshot.agent_status_saw_other,
+                reported_through: pane_snapshot.agent_status_reported_through,
+            },
+            crate::pane::unix_now_secs(),
+        );
+        assert!(!adopted.awaits_agent_status_resolution());
+        assert_eq!(
+            adopted.agent_status(),
+            crate::api::schema::AgentStatus::Unknown
+        );
     }
 
     #[test]

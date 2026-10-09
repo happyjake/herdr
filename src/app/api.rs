@@ -695,7 +695,8 @@ impl App {
         };
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
-        self.state.clear_agent_identity_after_respawn(&terminal_id);
+        let updates = self.state.clear_agent_identity_after_respawn(&terminal_id);
+        self.emit_agent_status_resolutions(updates);
         if focus_pane {
             self.state.focus_pane_in_workspace(ws_idx, pane_id);
         }
@@ -749,6 +750,7 @@ impl App {
     }
 
     pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
+        self.flush_agent_status_resolutions();
         let Some(pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
             return;
         };
@@ -771,17 +773,9 @@ impl App {
             });
         }
 
-        let previous_agent_status = pane_agent_status(update.previous_state, update.previous_seen);
-        let agent_status = self
-            .state
-            .workspaces
-            .get(update.ws_idx)
-            .and_then(|ws| ws.pane_state(update.pane_id))
-            .map(|pane| pane_agent_status(update.state, pane.seen))
-            .unwrap_or_else(|| pane_agent_status(update.state, update.seen));
-
-        if previous_agent_status != agent_status
-            || update.previous_presentation != update.presentation
+        let agent_status = update.reported_status;
+        if update.previous_reported_status != agent_status
+            || (!update.status_unresolved && update.previous_presentation != update.presentation)
         {
             let event = pane_agent_status_changed_event(
                 pane_id,
@@ -824,7 +818,7 @@ impl App {
         Some(pane_agent_status_changed_event(
             public_pane_id,
             self.public_workspace_id(ws_idx),
-            pane_agent_status(terminal.state, pane.seen),
+            pane.reported_agent_status(pane_agent_status(terminal.state, pane.seen)),
             terminal.effective_agent_label().map(str::to_string),
             terminal.effective_presentation(),
             KeptPanePresentation::of(terminal),
@@ -909,11 +903,31 @@ impl App {
 
     pub(crate) fn emit_pane_updated(&mut self, ws_idx: usize, pane_id: crate::layout::PaneId) {
         self.state.sync_agent_status_clocks();
+        self.flush_agent_status_resolutions();
         if let Some(pane) = self.pane_info(ws_idx, pane_id) {
             self.emit_event(crate::api::schema::EventEnvelope {
                 event: crate::api::schema::EventKind::PaneUpdated,
                 data: crate::api::schema::EventData::PaneUpdated { pane },
             });
+        }
+    }
+
+    pub(crate) fn flush_agent_status_resolutions(&mut self) -> bool {
+        let updates = std::mem::take(&mut self.state.pending_agent_status_resolutions);
+        let changed = !updates.is_empty();
+        self.emit_agent_status_resolutions(updates);
+        changed
+    }
+
+    /// Settlements without a terminal mutation still publish a status change
+    /// when the reported status moved, followed by its dated pane snapshot.
+    pub(crate) fn emit_agent_status_resolutions(
+        &mut self,
+        updates: Vec<crate::app::actions::PaneStateUpdate>,
+    ) {
+        for update in updates {
+            self.emit_pane_state_update(&update);
+            self.emit_pane_updated(update.ws_idx, update.pane_id);
         }
     }
 
@@ -929,6 +943,7 @@ impl App {
     }
 
     pub(crate) fn sync_focus_events(&mut self) {
+        self.flush_agent_status_resolutions();
         self.sync_focus_events_with_outer_event(None);
     }
 
@@ -1048,6 +1063,7 @@ impl App {
         // Catch any status move that reached a pane through a path with no
         // event of its own, so a snapshot never reports a stale transition.
         self.state.sync_agent_status_clocks();
+        self.flush_agent_status_resolutions();
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
