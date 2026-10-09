@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use super::{api_helpers::pane_agent_status, App, Mode};
 use crate::api::schema::{EventData, EventEnvelope, EventKind};
+use crate::pane::AgentStatusProjection;
 use crate::{config::NewTerminalCwdConfig, workspace::Workspace};
 
 pub(crate) fn resolve_new_terminal_cwd(
@@ -161,6 +162,14 @@ impl App {
         &self,
         workspace_id: Option<&str>,
     ) -> Result<Vec<crate::api::schema::PaneInfo>, (String, String)> {
+        self.collect_panes_for_workspace_with_status(workspace_id, AgentStatusProjection::Reported)
+    }
+
+    pub(super) fn collect_panes_for_workspace_with_status(
+        &self,
+        workspace_id: Option<&str>,
+        projection: AgentStatusProjection,
+    ) -> Result<Vec<crate::api::schema::PaneInfo>, (String, String)> {
         if let Some(workspace_id) = workspace_id {
             let Some(ws_idx) = self.parse_workspace_id(workspace_id) else {
                 return Err((
@@ -178,7 +187,7 @@ impl App {
                 .tabs
                 .iter()
                 .flat_map(|tab| tab.layout.pane_ids().into_iter())
-                .filter_map(|pane_id| self.pane_info(ws_idx, pane_id))
+                .filter_map(|pane_id| self.pane_info_with_status(ws_idx, pane_id, projection))
                 .collect())
         } else {
             Ok(self
@@ -190,7 +199,9 @@ impl App {
                     ws.tabs
                         .iter()
                         .flat_map(|tab| tab.layout.pane_ids().into_iter())
-                        .filter_map(move |pane_id| self.pane_info(ws_idx, pane_id))
+                        .filter_map(move |pane_id| {
+                            self.pane_info_with_status(ws_idx, pane_id, projection)
+                        })
                 })
                 .collect())
         }
@@ -201,9 +212,18 @@ impl App {
         ws_idx: usize,
         tab_idx: usize,
     ) -> Option<crate::api::schema::TabInfo> {
+        self.tab_info_with_status(ws_idx, tab_idx, AgentStatusProjection::Reported)
+    }
+
+    pub(super) fn tab_info_with_status(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        projection: AgentStatusProjection,
+    ) -> Option<crate::api::schema::TabInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
-        let agent_status = tab.reported_agent_status(&self.state.terminals);
+        let agent_status = tab.agent_status_from(&self.state.terminals, projection);
         Some(crate::api::schema::TabInfo {
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,
             workspace_id: self.public_workspace_id(ws_idx),
@@ -296,6 +316,15 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::api::schema::PaneInfo> {
+        self.pane_info_with_status(ws_idx, pane_id, AgentStatusProjection::Reported)
+    }
+
+    pub(super) fn pane_info_with_status(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        projection: AgentStatusProjection,
+    ) -> Option<crate::api::schema::PaneInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
@@ -320,7 +349,8 @@ impl App {
         let presentation = terminal.effective_presentation();
         // Read the status and its date together so the reported pair can never
         // date one status with another one's time.
-        let (agent_status, agent_status_changed_at) = pane.reported_agent_status_pair_at(
+        let (agent_status, agent_status_changed_at) = projection.pair(
+            pane,
             pane_agent_status(terminal.state, pane.seen),
             crate::pane::unix_now_secs(),
         );
@@ -350,7 +380,7 @@ impl App {
             scroll,
             mouse_tracking,
             alternate_screen,
-            agent_status_changed_at: Some(agent_status_changed_at),
+            agent_status_changed_at,
             pinned: terminal.pinned,
             label_source: terminal.label_source,
             label_at: terminal.label_at,
@@ -379,8 +409,16 @@ impl App {
     }
 
     pub(super) fn workspace_info(&self, index: usize) -> crate::api::schema::WorkspaceInfo {
+        self.workspace_info_with_status(index, AgentStatusProjection::Reported)
+    }
+
+    pub(super) fn workspace_info_with_status(
+        &self,
+        index: usize,
+        projection: AgentStatusProjection,
+    ) -> crate::api::schema::WorkspaceInfo {
         let ws = &self.state.workspaces[index];
-        let agent_status = ws.reported_agent_status(&self.state.terminals);
+        let agent_status = ws.agent_status_from(&self.state.terminals, projection);
         crate::api::schema::WorkspaceInfo {
             workspace_id: self.public_workspace_id(index),
             number: index + 1,

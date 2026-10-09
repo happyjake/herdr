@@ -682,6 +682,7 @@ mod tests {
                         agent_status_resolve_by: None,
                         agent_status_saw_other: false,
                         agent_status_reported_through: None,
+                        agent_status_captured_pair_reported: true,
                         pinned: false,
                         label_source: None,
                         label_at: None,

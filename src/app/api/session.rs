@@ -1,5 +1,6 @@
 use crate::api::schema::{ResponseResult, SessionSnapshot};
 use crate::app::App;
+use crate::pane::AgentStatusProjection;
 
 use super::responses::encode_success;
 
@@ -14,6 +15,15 @@ impl App {
     }
 
     pub(crate) fn session_snapshot(&self) -> SessionSnapshot {
+        self.session_snapshot_with_status(AgentStatusProjection::Reported)
+    }
+
+    /// Desktop input is live detector state; JSON clients use session_snapshot.
+    pub(crate) fn live_session_snapshot(&self) -> SessionSnapshot {
+        self.session_snapshot_with_status(AgentStatusProjection::Live)
+    }
+
+    fn session_snapshot_with_status(&self, projection: AgentStatusProjection) -> SessionSnapshot {
         let focused_workspace_id = self
             .state
             .active
@@ -31,9 +41,9 @@ impl App {
         let mut tabs = Vec::new();
         let mut layouts = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
-            workspaces.push(self.workspace_info(ws_idx));
+            workspaces.push(self.workspace_info_with_status(ws_idx, projection));
             for tab_idx in 0..ws.tabs.len() {
-                if let Some(tab) = self.tab_info(ws_idx, tab_idx) {
+                if let Some(tab) = self.tab_info_with_status(ws_idx, tab_idx, projection) {
                     tabs.push(tab);
                 }
                 if let Some(layout) = self.pane_layout_snapshot(ws_idx, tab_idx) {
@@ -50,9 +60,11 @@ impl App {
             focused_pane_id,
             workspaces,
             tabs,
-            panes: self.collect_panes_for_workspace(None).unwrap_or_default(),
+            panes: self
+                .collect_panes_for_workspace_with_status(None, projection)
+                .unwrap_or_default(),
             layouts,
-            agents: self.collect_agent_infos(),
+            agents: self.collect_agent_infos_with_status(projection),
         }
     }
 }

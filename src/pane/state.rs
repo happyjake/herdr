@@ -79,21 +79,51 @@ impl RestoreWindow {
 /// context it does not have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentStatusClaim {
-    /// What the pane was reporting, and since when.
+    /// The captured status and date; `captured_pair_reported` says whether a
+    /// pending window kept this pair published.
     pub status: AgentStatus,
     pub changed_at: u64,
     /// Past this second the claim is not worth honouring. Absent when the
     /// claim is not waiting on anything, which is the ordinary case for a
     /// session saved while its panes were settled.
     pub resolve_by: Option<u64>,
-    /// Whether another known status was observed while this claim was
-    /// outstanding. Preserved for readers predating captured-pair reporting.
+    /// Legacy continuity guard. A snapshot writer may set this conservatively
+    /// for rollback even when no other known status was observed.
     pub saw_other_status: bool,
     /// The latest date the pane had published for any status. The process
     /// that adopts the claim dates everything after it, so no pair it
     /// publishes reuses a date a client already holds. Absent in a claim
     /// written before this existed, when `changed_at` is the best floor known.
     pub reported_through: Option<u64>,
+    /// This writer kept the captured pair published throughout its window.
+    /// Absent/false in legacy claims, whose window may have published newer pairs.
+    pub captured_pair_reported: bool,
+}
+
+/// Select the status fact while building a snapshot, before aggregation.
+/// This is internal projection policy, not part of any endpoint codec.
+#[derive(Clone, Copy)]
+pub(crate) enum AgentStatusProjection {
+    Reported,
+    Live,
+}
+
+impl AgentStatusProjection {
+    pub fn pair(
+        self,
+        pane: &PaneState,
+        live: AgentStatus,
+        now_unix: u64,
+    ) -> (AgentStatus, Option<u64>) {
+        match self {
+            Self::Reported => {
+                let (status, date) = pane.reported_agent_status_pair_at(live, now_unix);
+                (status, Some(date))
+            }
+            // The reported date does not date an unpublished live reading.
+            Self::Live => (live, None),
+        }
+    }
 }
 
 /// Viewport state for a pane.
@@ -171,6 +201,7 @@ impl PaneState {
                 resolve_by: None,
                 saw_other_status: false,
                 reported_through: None,
+                captured_pair_reported: true,
             },
             now_unix,
         )
@@ -185,9 +216,9 @@ impl PaneState {
     /// unchecked claim, because a check anywhere else leaves an interval
     /// between the check and the use in which the claim can die.
     ///
-    /// A claim that is adopted keeps what it already knew about itself: its
-    /// deadline is honoured rather than replaced, and its captured pair is
-    /// reported immediately. The live observation starts at Unknown.
+    /// The original deadline is honoured. Marked and settled claims keep
+    /// their pair; a legacy pending claim is rebased past its published floor
+    /// once. The live observation starts at Unknown.
     ///
     /// Every later fresh date must exceed everything the claim says was
     /// published, even when the predecessor's clock ran ahead.
@@ -209,16 +240,24 @@ impl PaneState {
                 now_unix.max(published.saturating_add(1)),
             );
         }
+        // A legacy window published placeholders after its captured pair.
+        // Rebase that pair once rather than replaying a date clients have
+        // already passed. Settled legacy claims are the pair actually reported.
+        let changed_at = if claim.resolve_by.is_some() && !claim.captured_pair_reported {
+            now_unix.max(published.saturating_add(1))
+        } else {
+            claim.changed_at
+        };
         Self {
             attached_terminal_id,
             seen: true,
             right_click_passthrough: false,
             agent_status: claim.status,
             observed_agent_status: AgentStatus::Unknown,
-            agent_status_changed_at: claim.changed_at,
-            reported_through: published.max(now_unix),
+            agent_status_changed_at: changed_at,
+            reported_through: published.max(now_unix).max(changed_at),
             restore_window: Some(RestoreWindow {
-                captured: (claim.status, claim.changed_at),
+                captured: (claim.status, changed_at),
                 restored_at: now_unix,
                 resolve_by,
                 saw_other_status: claim.saw_other_status,
@@ -362,6 +401,7 @@ impl PaneState {
                 resolve_by: Some(window.resolve_by),
                 saw_other_status: window.saw_other_status,
                 reported_through: Some(self.reported_through),
+                captured_pair_reported: true,
             },
             None => AgentStatusClaim {
                 status: self.agent_status,
@@ -369,6 +409,7 @@ impl PaneState {
                 resolve_by: None,
                 saw_other_status: false,
                 reported_through: Some(self.reported_through),
+                captured_pair_reported: true,
             },
         }
     }
@@ -449,6 +490,126 @@ impl PaneState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(dead_code)] // Frozen deployed recorder exercises real cross-version behavior.
+    mod legacy {
+        include!("../../tests/fixtures/agent-status-52294cb5.rs");
+    }
+
+    #[test]
+    fn upgrading_a_legacy_window_never_rewinds_its_published_pair() {
+        let mut old =
+            legacy::PaneState::restored(TerminalId::alloc(), AgentStatus::Working, 1_000, 5_000);
+        old.record_agent_status_at(AgentStatus::Idle, 5_001, StatusReading::Provisional);
+        let claim = old.durable_agent_status_at(5_001);
+        let pane = PaneState::restored_from(
+            TerminalId::alloc(),
+            AgentStatusClaim {
+                status: claim.status,
+                changed_at: claim.changed_at,
+                resolve_by: claim.resolve_by,
+                saw_other_status: claim.saw_other_status,
+                reported_through: claim.reported_through,
+                captured_pair_reported: false,
+            },
+            5_002,
+        );
+        let after = pane.reported_agent_status_pair_at(AgentStatus::Unknown, 5_002);
+        assert!(
+            after.1 > old.agent_status_changed_at(),
+            "legacy Idle@5001 -> {after:?}"
+        );
+    }
+
+    fn legacy_claim(claim: legacy::AgentStatusClaim) -> AgentStatusClaim {
+        AgentStatusClaim {
+            status: claim.status,
+            changed_at: claim.changed_at,
+            resolve_by: claim.resolve_by,
+            saw_other_status: claim.saw_other_status,
+            reported_through: claim.reported_through,
+            captured_pair_reported: false,
+        }
+    }
+
+    #[test]
+    fn a_legacy_window_without_an_interlude_is_rebased_once() {
+        let old =
+            legacy::PaneState::restored(TerminalId::alloc(), AgentStatus::Working, 1_000, 5_000);
+        let saved = legacy_claim(old.durable_agent_status_at(5_001));
+        assert!(!saved.saw_other_status);
+        let mut pane = PaneState::restored_from(TerminalId::alloc(), saved, 5_002);
+        let pair = pane.reported_agent_status_pair_at(AgentStatus::Unknown, 5_002);
+        assert_eq!(pair, (AgentStatus::Working, 5_002));
+        assert!(pair.1 > old.agent_status_changed_at());
+        let claim = pane.durable_agent_status_at(5_003);
+        assert!(claim.captured_pair_reported);
+        assert_eq!(claim.resolve_by, saved.resolve_by);
+        let rebuilt = PaneState::restored_from(TerminalId::alloc(), claim, 5_004);
+        assert_eq!(
+            rebuilt.reported_agent_status_pair_at(AgentStatus::Unknown, 5_004),
+            pair
+        );
+        assert!(!pane.resolve_agent_status_at(AgentStatus::Working, 5_004));
+        assert_eq!(pane.agent_status_changed_at(), pair.1);
+    }
+
+    #[test]
+    fn a_marked_window_preserves_its_pair_despite_a_newer_reserved_floor() {
+        let old = restored_working();
+        let claim = old.durable_agent_status_at(IN_WINDOW);
+        assert!(claim.captured_pair_reported);
+        assert!(claim.reported_through.unwrap() > claim.changed_at);
+        let rebuilt = PaneState::restored_from(TerminalId::alloc(), claim, LATER_IN_WINDOW);
+        assert_eq!(
+            rebuilt.reported_agent_status_pair_at(AgentStatus::Unknown, LATER_IN_WINDOW),
+            (AgentStatus::Working, CAPTURED_AT)
+        );
+    }
+
+    #[test]
+    fn a_settled_legacy_claim_keeps_the_pair_its_process_was_reporting() {
+        let mut old =
+            legacy::PaneState::restored(TerminalId::alloc(), AgentStatus::Working, 1_000, 5_000);
+        old.resolve_agent_status_at(AgentStatus::Working, 5_001);
+        let claim = legacy_claim(old.durable_agent_status_at(5_001));
+        assert_eq!(claim.resolve_by, None);
+        let pane = PaneState::restored_from(TerminalId::alloc(), claim, 5_002);
+        assert_eq!(
+            pane.reported_agent_status_pair_at(AgentStatus::Unknown, 5_002),
+            (old.agent_status(), old.agent_status_changed_at())
+        );
+    }
+
+    #[test]
+    fn a_legacy_rebase_reserves_its_new_date_and_never_renews_the_deadline() {
+        let claim = AgentStatusClaim {
+            status: AgentStatus::Working,
+            changed_at: 1_000,
+            resolve_by: Some(5_015),
+            saw_other_status: true,
+            reported_through: Some(5_030),
+            captured_pair_reported: false,
+        };
+        for live in [AgentStatus::Working, AgentStatus::Unknown] {
+            let mut pane = PaneState::restored_from(TerminalId::alloc(), claim, 5_014);
+            assert_eq!(pane.agent_status_changed_at(), 5_031);
+            assert_eq!(pane.agent_status_resolution_due_at(), Some(5_015));
+            pane.resolve_agent_status_at(live, 5_015);
+            assert_eq!(
+                pane.agent_status_changed_at(),
+                if live == AgentStatus::Working {
+                    5_031
+                } else {
+                    5_032
+                }
+            );
+        }
+        let expired = PaneState::restored_from(TerminalId::alloc(), claim, 5_015);
+        assert!(!expired.awaits_agent_status_resolution());
+        assert_eq!(expired.agent_status(), AgentStatus::Unknown);
+        assert!(expired.agent_status_changed_at() > 5_030);
+    }
 
     const RESTORED_AT: u64 = 5_000;
     const CAPTURED_AT: u64 = 1_000;
@@ -623,6 +784,7 @@ mod tests {
                     resolve_by: None,
                     saw_other_status: trial % 2 == 0,
                     reported_through: Some(RESTORED_AT + (trial % 20)),
+                    captured_pair_reported: true,
                 };
                 let mut pane = PaneState::restored_from(TerminalId::alloc(), claim, RESTORED_AT);
                 let due = pane.agent_status_resolution_due_at().unwrap();
@@ -752,6 +914,7 @@ mod tests {
             resolve_by: None,
             saw_other_status: false,
             reported_through: Some(RESTORED_AT + 3),
+            captured_pair_reported: true,
         };
         let adopted = PaneState::restored_from(TerminalId::alloc(), ran_ahead, RESTORED_AT);
         assert!(adopted.awaits_agent_status_resolution());
@@ -943,6 +1106,7 @@ mod tests {
                 resolve_by: Some(RESTORED_AT + 1),
                 saw_other_status: false,
                 reported_through: None,
+                captured_pair_reported: true,
             },
             RESTORED_AT,
         );
@@ -994,6 +1158,7 @@ mod tests {
             resolve_by: Some(RESTORED_AT),
             saw_other_status: false,
             reported_through: None,
+            captured_pair_reported: true,
         };
 
         let mut pane = PaneState::restored_from(TerminalId::alloc(), claim, RESTORED_AT);
@@ -1021,6 +1186,7 @@ mod tests {
             resolve_by: Some(RESTORED_AT + 1),
             saw_other_status: false,
             reported_through: None,
+            captured_pair_reported: true,
         };
 
         let mut pane = PaneState::restored_from(TerminalId::alloc(), claim, RESTORED_AT);

@@ -586,17 +586,20 @@ pub struct PaneInfo {
     /// handoff back to a server that predates it may reuse a date inside that
     /// run-ahead.
     ///
-    /// The date is captured with the session, so it survives a server restart
-    /// and a live handoff. Until the new server has classified a pane, though,
-    /// what it reports is dated from the restart; a pane then found doing what
-    /// the session recorded gets its older date back, provided it reported no
-    /// other KNOWN status in between; Unknown does not count, being the
-    /// absence of a reading rather than a competing one, so a client may see
-    /// Unknown give way to a status dated before the restart. A pane found
-    /// doing anything else is dated at the classification. The guarantee is
-    /// precise: an age never spans an observed transition between known
-    /// statuses. A change that says nothing about status, such as a title,
-    /// never moves this at all.
+    /// The captured status and date remain the reported pair during a restore
+    /// window, until classification or its 15-second deadline. Provisional
+    /// readings and display-only changes do not publish another pair. A
+    /// classification matching the captured status keeps its date, including
+    /// after provisional readings of another status; this is not a transition.
+    /// A differing classification publishes one new pair with a date past the
+    /// published floor. A differing deadline resolution uses the deadline or
+    /// the next date past that floor, whichever is later.
+    ///
+    /// An unresolved legacy window may already have published newer
+    /// placeholders. Importing it rebases the captured pair once past that
+    /// published floor. A marked window from this server preserves its pair
+    /// across further handoffs; a settled legacy claim preserves its current
+    /// reported pair. Desktop TUI snapshots independently use live detection.
     ///
     /// Every change of the reported status restamps this, including a Done to
     /// Idle change caused by the pane being seen at the desk rather than by

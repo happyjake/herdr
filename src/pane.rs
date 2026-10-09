@@ -40,6 +40,7 @@ use self::agent_detection::{
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
+pub(crate) use self::state::AgentStatusProjection;
 #[cfg(test)]
 pub(crate) use self::state::RESTORE_DEADLINE_PROBE_SECS;
 #[cfg(unix)]

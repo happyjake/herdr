@@ -24,7 +24,7 @@ pub(super) fn snapshot_with_completions(
     protocol::ClientShellSnapshot,
     protocol::endpoint::EndpointAgentCompletions,
 ) {
-    let snapshot = app.session_snapshot();
+    let snapshot = app.live_session_snapshot();
     let completions = protocol::endpoint::EndpointAgentCompletions {
         boot_id: boot_id.to_owned(),
         revision,
@@ -743,5 +743,113 @@ mod tests {
             split_hit_rect(&horizontal, false, true, &[Rect::new(19, 3, 1, 12)]),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod restore_projection_tests {
+    use super::*;
+    #[test]
+    fn desktop_snapshot_keeps_live_status_while_json_keeps_capture() {
+        use crate::api::schema::AgentStatus;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let ws = crate::workspace::Workspace::test_new("restored");
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_name = Some("restored-agent".into());
+        assert_eq!(
+            app.state.terminals[&terminal_id].state,
+            crate::detect::AgentState::Unknown
+        );
+        app.state.workspaces[0].tabs[0].panes.insert(
+            pane_id,
+            crate::pane::PaneState::restored(
+                terminal_id,
+                AgentStatus::Working,
+                1000,
+                crate::pane::unix_now_secs(),
+            ),
+        );
+        let api = app.session_snapshot();
+        assert_eq!(api.panes[0].agent_status, AgentStatus::Working);
+        assert_eq!(api.panes[0].agent_status_changed_at, Some(1000));
+        assert_eq!(api.tabs[0].agent_status, AgentStatus::Working);
+        assert_eq!(api.workspaces[0].agent_status, AgentStatus::Working);
+        let live = app.live_session_snapshot();
+        assert_eq!(live.panes[0].agent_status, AgentStatus::Unknown);
+        assert_eq!(live.panes[0].agent_status_changed_at, None);
+        let desktop = snapshot(&app, "new-boot", 1, None, None);
+        assert_eq!(
+            desktop.agents[0].agent_status,
+            AgentStatus::Unknown,
+            "desktop must still reflect live detection"
+        );
+        assert_eq!(desktop.workspaces[0].agent_status, AgentStatus::Unknown);
+        assert_eq!(desktop.tabs[0].agent_status, AgentStatus::Unknown);
+
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        app.state.workspaces[0].tabs[0].panes.insert(
+            pane_id,
+            crate::pane::PaneState::restored(
+                terminal_id,
+                AgentStatus::Done,
+                1000,
+                crate::pane::unix_now_secs(),
+            ),
+        );
+        let other = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let other_terminal = app.state.workspaces[0].terminal_id(other).unwrap();
+        let terminal = app.state.terminals.get_mut(other_terminal).unwrap();
+        terminal.state = crate::detect::AgentState::Working;
+        terminal.agent_name = Some("live-agent".into());
+        let api = app.session_snapshot();
+        assert_eq!(api.workspaces[0].agent_status, AgentStatus::Done);
+        assert_eq!(api.tabs[0].agent_status, AgentStatus::Done);
+        let desktop = snapshot(&app, "new-boot", 2, None, None);
+        assert_eq!(desktop.workspaces[0].agent_status, AgentStatus::Working);
+        assert_eq!(desktop.tabs[0].agent_status, AgentStatus::Working);
+        let restored_id = app.public_pane_id(0, pane_id).unwrap();
+        let other_id = app.public_pane_id(0, other).unwrap();
+        assert_eq!(
+            desktop
+                .agents
+                .iter()
+                .find(|agent| agent.pane_id == restored_id)
+                .unwrap()
+                .agent_status,
+            AgentStatus::Unknown
+        );
+        assert_eq!(
+            desktop
+                .agents
+                .iter()
+                .find(|agent| agent.pane_id == other_id)
+                .unwrap()
+                .agent_status,
+            AgentStatus::Working
+        );
+        app.state.assert_invariants_for_test();
     }
 }
