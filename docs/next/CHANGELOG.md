@@ -9,6 +9,9 @@
 - Added `PaneInfo.agent_status_changed_at`, the unix second at which a pane's `agent_status` last changed, so a client that connects after the fact can still show how long a pane has held its status. The date is captured with the session and survives a server restart or live handoff. The field is additive and the protocol version is unchanged; clients reading older servers must treat an absent field as "age unknown" rather than as a timestamp.
 - The websocket API now keeps a credential registry per server: the pairing's managing credential plus limited credentials minted through `credential.mint`, listed with `credential.list`, and ended with `credential.revoke` / `credential.revoke_all`. Limited credentials drive the whole API but cannot manage the registry, and may revoke only themselves. Servers declare `credential_registry` in their `ping` capabilities; the protocol version is unchanged. Revocation is reported to the affected client as a terminal `credential_revoked` error on an established connection, so a browser can tell revocation from transient trouble.
 
+### Changed
+- `PaneInfo.agent_status_changed_at` now dates every change of a pane's reported status later than anything that pane reported before, so two changes inside one second (an agent finishing a turn and starting the next) no longer share a date, and a client that names transitions by their date can tell them apart. A burst of changes can run the date a few seconds ahead of the wall clock until the clock passes it. A live handoff carries the latest reported date (`agent_status_reported_through` in the session snapshot), so the new process dates after it; older servers ignore the field.
+
 ## [0.9.1] - 2026-09-16
 
 ### Added

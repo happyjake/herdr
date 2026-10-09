@@ -4946,6 +4946,19 @@ mod tests {
         });
     }
 
+    /// The fixture creates panes on the wall clock, and a pane never dates a
+    /// move before a date it already published, so a test driving a synthetic
+    /// clock starts every pane's status clock at the epoch.
+    fn start_status_clocks_at_epoch(state: &mut AppState) {
+        for workspace in &mut state.workspaces {
+            for tab in &mut workspace.tabs {
+                for pane in tab.panes.values_mut() {
+                    pane.backdate_agent_status_for_test(0);
+                }
+            }
+        }
+    }
+
     fn terminal_id_for(
         state: &AppState,
         ws_idx: usize,
@@ -4962,6 +4975,7 @@ mod tests {
     fn agent_status_clock_dates_the_first_detected_status() {
         let mut state = app_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
+        start_status_clocks_at_epoch(&mut state);
         set_agent_state(&mut state, 0, 0, root, AgentState::Working);
 
         assert!(state.sync_agent_status_clocks_at(500));
@@ -4973,6 +4987,7 @@ mod tests {
     fn agent_status_clock_holds_still_while_the_status_holds_still() {
         let mut state = app_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
+        start_status_clocks_at_epoch(&mut state);
         set_agent_state(&mut state, 0, 0, root, AgentState::Working);
         state.sync_agent_status_clocks_at(500);
 
@@ -4985,6 +5000,7 @@ mod tests {
     fn agent_status_clock_restamps_on_every_transition() {
         let mut state = app_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
+        start_status_clocks_at_epoch(&mut state);
         set_agent_state(&mut state, 0, 0, root, AgentState::Working);
         state.sync_agent_status_clocks_at(500);
 
@@ -5213,6 +5229,7 @@ mod tests {
     fn a_seen_flip_that_moves_the_reported_status_restamps() {
         let mut state = app_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
+        start_status_clocks_at_epoch(&mut state);
         set_agent_state(&mut state, 0, 0, root, AgentState::Idle);
         set_pane_seen(&mut state, 0, root, false);
         state.sync_agent_status_clocks_at(500);
@@ -5229,6 +5246,7 @@ mod tests {
     fn a_seen_flip_that_leaves_the_reported_status_alone_does_not_restamp() {
         let mut state = app_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
+        start_status_clocks_at_epoch(&mut state);
         set_agent_state(&mut state, 0, 0, root, AgentState::Working);
         set_pane_seen(&mut state, 0, root, false);
         state.sync_agent_status_clocks_at(500);
@@ -5245,6 +5263,7 @@ mod tests {
         let root = state.workspaces[0].tabs[0].root_pane;
         let second = state.workspaces[0].test_split(Direction::Horizontal);
         state.ensure_test_terminals();
+        start_status_clocks_at_epoch(&mut state);
         set_agent_state(&mut state, 0, 0, root, AgentState::Working);
         set_agent_state(&mut state, 0, 0, second, AgentState::Working);
         state.sync_agent_status_clocks_at(500);

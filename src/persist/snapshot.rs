@@ -141,6 +141,15 @@ pub struct PaneSnapshot {
     /// inherit an age across a status the previous one already reported.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_status_saw_other: bool,
+    /// The latest status date the pane had published when this was captured.
+    ///
+    /// Clients name a transition by its date, so the process that restores
+    /// the pane dates everything after this and never hands a client a date it
+    /// already holds for another status. Absent from a snapshot written before
+    /// it existed, and ignored by a process that predates it: both fall back
+    /// to `agent_status_changed_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status_reported_through: Option<u64>,
     /// Whether the user had pinned this pane's terminal.
     ///
     /// Defaulted rather than required, so a snapshot written before the pin
@@ -420,6 +429,8 @@ fn capture_tab(
         let agent_status_resolve_by = durable_agent_status.and_then(|claim| claim.resolve_by);
         let agent_status_saw_other =
             durable_agent_status.is_some_and(|claim| claim.saw_other_status);
+        let agent_status_reported_through =
+            durable_agent_status.and_then(|claim| claim.reported_through);
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
         let label_source = terminal.and_then(|terminal| terminal.label_source);
         let label_at = terminal.and_then(|terminal| terminal.label_at);
@@ -472,6 +483,7 @@ fn capture_tab(
                 agent_status_changed_at,
                 agent_status_resolve_by,
                 agent_status_saw_other,
+                agent_status_reported_through,
                 pinned,
                 label_source,
                 label_at,
@@ -828,6 +840,47 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_pane_carries_the_latest_date_it_published() {
+        let mut workspace = Workspace::test_new("one");
+        let root = workspace.tabs[0].root_pane;
+        let pane = workspace.tabs[0]
+            .panes
+            .get_mut(&root)
+            .expect("root pane exists");
+        pane.backdate_agent_status_for_test(0);
+        // Two moves inside one second: the second is dated a second later,
+        // and the next process has to start past it.
+        pane.record_agent_status_at(
+            crate::api::schema::AgentStatus::Done,
+            2_000,
+            crate::events::StatusReading::Verdict,
+        );
+        pane.record_agent_status_at(
+            crate::api::schema::AgentStatus::Working,
+            2_000,
+            crate::events::StatusReading::Verdict,
+        );
+
+        let snapshot = capture(
+            std::slice::from_ref(&workspace),
+            &std::collections::HashMap::new(),
+            &Default::default(),
+            Some(0),
+            0,
+        );
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        let pane = restored.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("captured pane");
+        assert_eq!(pane.agent_status_changed_at, Some(2_001));
+        assert_eq!(pane.agent_status_reported_through, Some(2_001));
+    }
+
+    #[test]
     fn a_capture_racing_the_deadline_does_not_carry_a_dead_pair_onward() {
         let mut workspace = Workspace::test_new("one");
         let root = workspace.tabs[0].root_pane;
@@ -988,6 +1041,7 @@ mod tests {
 
         assert_eq!(pane.agent_status, None);
         assert_eq!(pane.agent_status_changed_at, None);
+        assert_eq!(pane.agent_status_reported_through, None);
     }
 
     #[test]
@@ -1028,6 +1082,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                agent_status_reported_through: None,
                 pinned: false,
                 label_source: None,
                 label_at: None,
@@ -1046,6 +1101,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                agent_status_reported_through: None,
                 pinned: false,
                 label_source: None,
                 label_at: None,
@@ -1770,6 +1826,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                agent_status_reported_through: None,
                 pinned: false,
                 label_source: None,
                 label_at: None,
@@ -1790,6 +1847,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                agent_status_reported_through: None,
                 pinned: false,
                 label_source: None,
                 label_at: None,

@@ -3025,9 +3025,11 @@ mod tests {
         );
         let during = requested_pane_info(&mut app, &public_pane_id);
         assert_eq!(during["agent_status"], "working");
+        // From the restart, and after the restore's own Unknown: a client
+        // already holds that pair, so the working takes the next second.
         assert_eq!(
             during["agent_status_changed_at"].as_u64(),
-            Some(restored_at),
+            Some(restored_at + 1),
             "an unclassified pane dates from the restart: {during}"
         );
 
@@ -3133,6 +3135,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_pane_info_never_dates_two_hook_transitions_alike() {
+        let (mut app, public_pane_id, _rx) = app_with_mouse_runtime(b"", 1);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+
+        // An agent that blocks, is answered and blocks again faster than the
+        // clock ticks: a client names each transition by its date, so every
+        // move must carry a date of its own, later than the one before.
+        let mut dates = Vec::new();
+        for state in [
+            crate::detect::AgentState::Blocked,
+            crate::detect::AgentState::Working,
+            crate::detect::AgentState::Blocked,
+        ] {
+            report_hook_state(&mut app, pane_id, state);
+            let pane = requested_pane_info(&mut app, &public_pane_id);
+            dates.push(pane["agent_status_changed_at"].as_u64().unwrap());
+        }
+
+        assert!(
+            dates.windows(2).all(|pair| pair[1] > pair[0]),
+            "each move needs a later date than the last: {dates:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn api_pane_info_dates_a_mid_window_hook_transition_at_the_transition() {
         let restored_at = crate::pane::unix_now_secs();
         let (mut app, public_pane_id, pane_id) = app_with_restored_pane(restored_at);
@@ -3228,9 +3255,11 @@ mod tests {
             });
         let titled = requested_pane_info(&mut app, &public_pane_id);
         assert_eq!(titled["title"], "Refactor auth");
+        // Working inside the window is a move from the restore's own Unknown,
+        // so it dates the second after the restart; the title moves nothing.
         assert_eq!(
             titled["agent_status_changed_at"].as_u64(),
-            Some(restored_at),
+            Some(restored_at + 1),
             "a title update must not stamp the status clock: {titled}"
         );
 

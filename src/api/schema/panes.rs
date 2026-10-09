@@ -577,9 +577,18 @@ pub struct PaneInfo {
     /// This always dates exactly the `agent_status` in the same payload, never
     /// some other status the pane held earlier.
     ///
+    /// A pane's dates also name its transitions: every change of the reported
+    /// status is dated later than anything the pane reported before, even when
+    /// two changes fall inside one second, so a client can tell two
+    /// transitions apart by their dates alone. A burst of changes can run the
+    /// date a few seconds ahead of the wall clock until the clock passes it.
+    /// The guarantee crosses a live handoff between servers that keep it; a
+    /// handoff back to a server that predates it may reuse a date inside that
+    /// run-ahead.
+    ///
     /// The date is captured with the session, so it survives a server restart
     /// and a live handoff. Until the new server has classified a pane, though,
-    /// what it reports is dated to the restart; a pane then found doing what
+    /// what it reports is dated from the restart; a pane then found doing what
     /// the session recorded gets its older date back, provided it reported no
     /// other KNOWN status in between; Unknown does not count, being the
     /// absence of a reading rather than a competing one, so a client may see

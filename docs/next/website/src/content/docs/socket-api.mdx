@@ -330,6 +330,12 @@ Supporting servers always include this field; clients reading responses from
 older servers must treat an absent field as "age unknown" rather than as a
 timestamp, and show no age at all.
 
+The date also names the transition: every change of a pane's reported status
+is dated later than anything that pane reported before, even when two changes
+fall inside one second, so a client can tell two transitions apart by their
+dates alone. A burst of changes can run the date a few seconds ahead of the
+wall clock until the clock passes it.
+
 The date is captured with the session, so it survives a server restart and a
 live handoff: a pane that has been working for an hour still reads as an hour
 old to a client that connects to the new process.
