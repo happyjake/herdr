@@ -66,11 +66,17 @@ impl RestoreWindow {
     /// Anything else is this process's own reading, and a window closed by its
     /// own deadline dates from the deadline.
     fn closed_changed_at(&self, status: AgentStatus, now_unix: u64) -> u64 {
-        if self.captured.0 == status && !self.saw_other_status {
+        if self.inherits(status) {
             self.captured.1
         } else {
             now_unix.min(self.resolve_by).max(self.restored_at)
         }
+    }
+
+    /// Whether closing on `status` re-publishes the captured pair rather than
+    /// dating a new one.
+    fn inherits(&self, status: AgentStatus) -> bool {
+        self.captured.0 == status && !self.saw_other_status
     }
 }
 
@@ -92,6 +98,11 @@ pub struct AgentStatusClaim {
     /// outstanding. A claim that saw an interlude before a handoff is still a
     /// claim that saw one after it, so this travels rather than resetting.
     pub saw_other_status: bool,
+    /// The latest date the pane had published for any status. The process
+    /// that adopts the claim dates everything after it, so no pair it
+    /// publishes reuses a date a client already holds. Absent in a claim
+    /// written before this existed, when `changed_at` is the best floor known.
+    pub reported_through: Option<u64>,
 }
 
 /// Viewport state for a pane.
@@ -107,13 +118,24 @@ pub struct PaneState {
     /// Effective agent status this pane last reported.
     ///
     /// This and `agent_status_changed_at` are written together and only
-    /// together, by [`PaneState::record_agent_status_at`] and nothing else:
+    /// together, by [`PaneState::set_pair`] on behalf of
+    /// [`PaneState::record_agent_status_at`] and nothing else:
     /// the date always dates exactly this status, because the two are reported
     /// to clients as one pair and a client cannot tell a torn pair from a true
     /// one.
     agent_status: AgentStatus,
     /// Unix seconds at which the pane started reporting `agent_status`.
+    ///
+    /// Clients name a transition by this date, so it is a name before it is a
+    /// clock reading: every new pair is dated after everything the pane has
+    /// already published ([`PaneState::fresh_date`]), even when two moves fall
+    /// inside one second. A burst of moves can run it a few seconds ahead of
+    /// the wall clock; the clock takes over again once it passes.
     agent_status_changed_at: u64,
+    /// The latest date this pane has published for any status. Usually the
+    /// current date, but an inheritance can re-publish an older captured date
+    /// after the window already published newer ones.
+    reported_through: u64,
     /// Present only between a restore and the one resolution that ends it.
     restore_window: Option<RestoreWindow>,
 }
@@ -133,6 +155,7 @@ impl PaneState {
             // reported it since the moment it existed.
             agent_status: AgentStatus::Unknown,
             agent_status_changed_at: now_unix,
+            reported_through: now_unix,
             restore_window: None,
         }
     }
@@ -153,6 +176,7 @@ impl PaneState {
                 changed_at: agent_status_changed_at,
                 resolve_by: None,
                 saw_other_status: false,
+                reported_through: None,
             },
             now_unix,
         )
@@ -170,6 +194,10 @@ impl PaneState {
     /// A claim that is adopted keeps what it already knew about itself: its
     /// deadline is honoured rather than replaced, and an interlude it saw
     /// before the handoff still counts against it after.
+    ///
+    /// Either way the rebuilt pane dates its first pair after everything the
+    /// claim says was published, so a handoff inside the second of a
+    /// transition still gives clients a new name for the restart.
     pub fn restored_from(
         attached_terminal_id: TerminalId,
         claim: AgentStatusClaim,
@@ -178,18 +206,21 @@ impl PaneState {
         let resolve_by = claim
             .resolve_by
             .unwrap_or_else(|| now_unix.saturating_add(RESTORE_RESOLUTION_DEADLINE_SECS));
+        let published = claim.reported_through.unwrap_or(claim.changed_at);
+        let restored_at = now_unix.max(published.saturating_add(1));
         if now_unix >= resolve_by {
-            return Self::new_at(attached_terminal_id, now_unix);
+            return Self::new_at(attached_terminal_id, restored_at);
         }
         Self {
             attached_terminal_id,
             seen: true,
             right_click_passthrough: false,
             agent_status: AgentStatus::Unknown,
-            agent_status_changed_at: now_unix,
+            agent_status_changed_at: restored_at,
+            reported_through: restored_at,
             restore_window: Some(RestoreWindow {
                 captured: (claim.status, claim.changed_at),
-                restored_at: now_unix,
+                restored_at,
                 resolve_by,
                 saw_other_status: claim.saw_other_status,
             }),
@@ -219,6 +250,7 @@ impl PaneState {
     #[cfg(test)]
     pub fn backdate_agent_status_for_test(&mut self, at_unix: u64) {
         self.agent_status_changed_at = at_unix;
+        self.reported_through = at_unix;
     }
 
     /// When this pane's restore window ends even if nothing classifies it.
@@ -262,17 +294,51 @@ impl PaneState {
     /// Same as [`PaneState::agent_status_changed_at_for`] with an explicit
     /// clock.
     pub fn agent_status_changed_at_for_at(&self, status: AgentStatus, now_unix: u64) -> u64 {
+        // A read answers what recording `status` would store, so a client never
+        // holds a date for the pair that differs from the one it is given next.
         match self.restore_window {
             // Nothing inside a live window is older than the restart, whatever
             // shape the pane has: a bare shell, a placeholder Idle from the
             // detector, or an Idle pre-seeded for an agent about to resume.
-            Some(window) if window.live_at(now_unix) => window.restored_at,
+            Some(window) if window.live_at(now_unix) => {
+                if self.agent_status == status {
+                    self.agent_status_changed_at
+                } else {
+                    self.fresh_date(window.restored_at)
+                }
+            }
             // Past its deadline the window is over whether or not anything has
             // got around to closing it, so answer exactly as closing it would.
-            Some(window) => window.closed_changed_at(status, now_unix),
+            Some(window) => self.closing_date(window, status, now_unix),
             None if self.agent_status == status => self.agent_status_changed_at,
-            None => now_unix,
+            None => self.fresh_date(now_unix),
         }
+    }
+
+    /// A date for a new pair: `candidate`, unless the pane has already
+    /// published that date or a later one, in which case the second after the
+    /// latest. Two transitions a client could tell apart never share a date.
+    fn fresh_date(&self, candidate: u64) -> u64 {
+        candidate.max(self.reported_through.saturating_add(1))
+    }
+
+    /// The date closing `window` on `status` leaves behind: the captured date
+    /// when the close inherits it (a name clients already hold), otherwise a
+    /// fresh one.
+    fn closing_date(&self, window: RestoreWindow, status: AgentStatus, now_unix: u64) -> u64 {
+        if window.inherits(status) {
+            window.closed_changed_at(status, now_unix)
+        } else {
+            self.fresh_date(window.closed_changed_at(status, now_unix))
+        }
+    }
+
+    /// Write the reported pair, keeping the high-water mark of what was
+    /// published.
+    fn set_pair(&mut self, status: AgentStatus, changed_at: u64) {
+        self.agent_status = status;
+        self.agent_status_changed_at = changed_at;
+        self.reported_through = self.reported_through.max(changed_at);
     }
 
     /// The status and date to write to a snapshot, and the deadline that
@@ -294,21 +360,27 @@ impl PaneState {
                 changed_at: window.captured.1,
                 resolve_by: Some(window.resolve_by),
                 saw_other_status: window.saw_other_status,
+                reported_through: Some(self.reported_through),
             },
             // A dead window must not be written into a snapshot as if it were
             // alive. The reader checks the deadline too, so this is the
             // writer agreeing with what the reader would decide anyway.
-            Some(window) => AgentStatusClaim {
-                status: self.agent_status,
-                changed_at: window.closed_changed_at(self.agent_status, now_unix),
-                resolve_by: None,
-                saw_other_status: false,
-            },
+            Some(window) => {
+                let changed_at = self.closing_date(window, self.agent_status, now_unix);
+                AgentStatusClaim {
+                    status: self.agent_status,
+                    changed_at,
+                    resolve_by: None,
+                    saw_other_status: false,
+                    reported_through: Some(self.reported_through.max(changed_at)),
+                }
+            }
             None => AgentStatusClaim {
                 status: self.agent_status,
                 changed_at: self.agent_status_changed_at,
                 resolve_by: None,
                 saw_other_status: false,
+                reported_through: Some(self.reported_through),
             },
         }
     }
@@ -355,16 +427,18 @@ impl PaneState {
 
         match self.restore_window {
             Some(window) if window.live_at(now_unix) => {
-                self.agent_status = status;
-                self.agent_status_changed_at = window.restored_at;
+                if moved {
+                    let changed_at = self.fresh_date(window.restored_at);
+                    self.set_pair(status, changed_at);
+                }
                 moved
             }
             // The deadline is a resolution of its own, dated at the deadline.
             Some(window) => self.close_window_on(status, window.resolve_by, moved),
             None if !moved => false,
             None => {
-                self.agent_status = status;
-                self.agent_status_changed_at = now_unix;
+                let changed_at = self.fresh_date(now_unix);
+                self.set_pair(status, changed_at);
                 true
             }
         }
@@ -380,12 +454,12 @@ impl PaneState {
     }
 
     fn close_window_on(&mut self, status: AgentStatus, now_unix: u64, moved: bool) -> bool {
-        self.agent_status = status;
-        self.agent_status_changed_at = match self.restore_window.take() {
-            Some(window) => window.closed_changed_at(status, now_unix),
+        let changed_at = match self.restore_window.take() {
+            Some(window) => self.closing_date(window, status, now_unix),
             None if !moved => self.agent_status_changed_at,
-            None => now_unix,
+            None => self.fresh_date(now_unix),
         };
+        self.set_pair(status, changed_at);
         moved
     }
 }
@@ -452,6 +526,176 @@ mod tests {
         assert_eq!(pane.agent_status_changed_at(), 2_400);
     }
 
+    const STATUSES: [AgentStatus; 5] = [
+        AgentStatus::Unknown,
+        AgentStatus::Idle,
+        AgentStatus::Working,
+        AgentStatus::Blocked,
+        AgentStatus::Done,
+    ];
+
+    #[test]
+    fn two_moves_inside_one_second_get_two_dates() {
+        let mut pane = PaneState::new_at(TerminalId::alloc(), 1_000);
+        incidental(&mut pane, AgentStatus::Done, 2_000);
+
+        // An agent that finishes a turn and starts the next inside one second:
+        // a client names each transition by its date, so the two must differ,
+        // and the later one must be the later name.
+        assert!(incidental(&mut pane, AgentStatus::Working, 2_000));
+        assert_eq!(pane.agent_status_changed_at(), 2_001);
+    }
+
+    #[test]
+    fn a_move_never_dates_at_or_before_the_pair_it_replaces() {
+        for from in STATUSES {
+            for to in STATUSES.into_iter().filter(|to| *to != from) {
+                let mut pane = PaneState::new_at(TerminalId::alloc(), 1_000);
+                incidental(&mut pane, from, 2_000);
+                let before = pane.agent_status_changed_at();
+
+                incidental(&mut pane, to, 2_000);
+
+                assert!(
+                    pane.agent_status_changed_at() > before,
+                    "{from:?} -> {to:?} inside one second reused or rewound its date"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_clock_takes_over_once_it_passes_the_floor() {
+        let mut pane = PaneState::new_at(TerminalId::alloc(), 1_000);
+        incidental(&mut pane, AgentStatus::Done, 2_000);
+        incidental(&mut pane, AgentStatus::Working, 2_000);
+        incidental(&mut pane, AgentStatus::Idle, 2_000);
+        assert_eq!(pane.agent_status_changed_at(), 2_002);
+
+        incidental(&mut pane, AgentStatus::Done, 5_000);
+        assert_eq!(pane.agent_status_changed_at(), 5_000);
+    }
+
+    #[test]
+    fn the_window_never_dates_two_moves_alike() {
+        let mut pane = restored_working();
+        let mut published = vec![pane.agent_status_changed_at()];
+
+        for status in [
+            AgentStatus::Idle,
+            AgentStatus::Working,
+            AgentStatus::Done,
+            AgentStatus::Working,
+        ] {
+            observe(&mut pane, status, IN_WINDOW);
+            assert!(pane.awaits_agent_status_resolution());
+            published.push(pane.agent_status_changed_at());
+        }
+
+        assert_eq!(
+            published,
+            vec![
+                RESTORED_AT,
+                RESTORED_AT + 1,
+                RESTORED_AT + 2,
+                RESTORED_AT + 3,
+                RESTORED_AT + 4
+            ],
+            "nothing inside the window predates the restart, and no two moves share a date"
+        );
+    }
+
+    #[test]
+    fn a_date_published_before_an_inheritance_still_floors_the_next_move() {
+        let mut pane = restored_working();
+        // Working inside the window is a move from the restore's Unknown, so it
+        // publishes a date of its own...
+        observe(&mut pane, AgentStatus::Working, RESTORED_AT);
+        assert_eq!(pane.agent_status_changed_at(), RESTORED_AT + 1);
+        // ...and the classification that confirms the snapshot then inherits
+        // the captured date, which is older than what was just published.
+        pane.resolve_agent_status_at(AgentStatus::Working, RESTORED_AT);
+        assert_eq!(pane.agent_status_changed_at(), CAPTURED_AT);
+
+        incidental(&mut pane, AgentStatus::Done, RESTORED_AT + 1);
+
+        assert_eq!(
+            pane.agent_status_changed_at(),
+            RESTORED_AT + 2,
+            "the done must not share the date the window already gave working"
+        );
+    }
+
+    #[test]
+    fn a_claim_carries_the_latest_date_it_reported() {
+        let mut pane = PaneState::new_at(TerminalId::alloc(), 1_000);
+        incidental(&mut pane, AgentStatus::Done, 2_000);
+        incidental(&mut pane, AgentStatus::Working, 2_000);
+        assert_eq!(
+            pane.durable_agent_status_at(2_000).reported_through,
+            Some(2_001)
+        );
+
+        // A pane captured inside its window hands on the captured pair, and
+        // the dates the window published travel beside it.
+        let mut restored = restored_working();
+        observe(&mut restored, AgentStatus::Idle, IN_WINDOW);
+        observe(&mut restored, AgentStatus::Working, IN_WINDOW);
+        let claim = restored.durable_agent_status_at(IN_WINDOW);
+        assert_eq!(
+            (claim.status, claim.changed_at, claim.reported_through),
+            (AgentStatus::Working, CAPTURED_AT, Some(RESTORED_AT + 2))
+        );
+    }
+
+    #[test]
+    fn a_restore_starts_past_everything_the_claim_reported() {
+        let ran_ahead = AgentStatusClaim {
+            status: AgentStatus::Working,
+            changed_at: RESTORED_AT - 1,
+            resolve_by: None,
+            saw_other_status: false,
+            reported_through: Some(RESTORED_AT + 3),
+        };
+        let adopted = PaneState::restored_from(TerminalId::alloc(), ran_ahead, RESTORED_AT);
+        assert!(adopted.awaits_agent_status_resolution());
+        assert_eq!(adopted.agent_status_changed_at(), RESTORED_AT + 4);
+
+        let expired = AgentStatusClaim {
+            resolve_by: Some(RESTORED_AT),
+            ..ran_ahead
+        };
+        let unadopted = PaneState::restored_from(TerminalId::alloc(), expired, RESTORED_AT);
+        assert!(!unadopted.awaits_agent_status_resolution());
+        assert_eq!(unadopted.agent_status_changed_at(), RESTORED_AT + 4);
+
+        // A claim from a process that predates the floor: its own date is the
+        // best floor known, so a handoff inside that second still moves on.
+        let legacy = AgentStatusClaim {
+            changed_at: RESTORED_AT,
+            reported_through: None,
+            ..ran_ahead
+        };
+        let rebuilt = PaneState::restored_from(TerminalId::alloc(), legacy, RESTORED_AT);
+        assert_eq!(rebuilt.agent_status_changed_at(), RESTORED_AT + 1);
+    }
+
+    #[test]
+    fn a_read_in_the_window_answers_the_recorded_date() {
+        let mut pane = restored_working();
+        observe(&mut pane, AgentStatus::Idle, IN_WINDOW);
+
+        assert_eq!(
+            pane.agent_status_changed_at_for_at(AgentStatus::Idle, IN_WINDOW),
+            pane.agent_status_changed_at()
+        );
+        // A read that runs ahead of the recording answers what recording will
+        // store, never a date the pane already published.
+        let read = pane.agent_status_changed_at_for_at(AgentStatus::Working, IN_WINDOW);
+        observe(&mut pane, AgentStatus::Working, IN_WINDOW);
+        assert_eq!(read, pane.agent_status_changed_at());
+    }
+
     #[test]
     fn everything_reported_inside_the_window_dates_from_the_restart() {
         let mut pane = restored_working();
@@ -460,13 +704,15 @@ mod tests {
         assert_eq!(pane.agent_status_changed_at(), RESTORED_AT);
 
         // A placeholder Idle from the detector, or an Idle pre-seeded for an
-        // agent about to resume, reads the same way: since the restart.
+        // agent about to resume, reads the same way: since the restart, never
+        // since the clock. It is a move from the restore's own Unknown, so it
+        // takes the second after it.
         observe(&mut pane, AgentStatus::Idle, IN_WINDOW);
         assert_eq!(pane.agent_status(), AgentStatus::Idle);
-        assert_eq!(pane.agent_status_changed_at(), RESTORED_AT);
+        assert_eq!(pane.agent_status_changed_at(), RESTORED_AT + 1);
         assert_eq!(
             pane.agent_status_changed_at_for_at(AgentStatus::Idle, IN_WINDOW),
-            RESTORED_AT
+            RESTORED_AT + 1
         );
     }
 
@@ -608,6 +854,7 @@ mod tests {
                 changed_at: CAPTURED_AT,
                 resolve_by: Some(RESTORED_AT + 1),
                 saw_other_status: false,
+                reported_through: None,
             },
             RESTORED_AT,
         );
@@ -658,6 +905,7 @@ mod tests {
             changed_at: CAPTURED_AT,
             resolve_by: Some(RESTORED_AT),
             saw_other_status: false,
+            reported_through: None,
         };
 
         let mut pane = PaneState::restored_from(TerminalId::alloc(), claim, RESTORED_AT);
@@ -667,11 +915,12 @@ mod tests {
             "the acceptor judges the claim, so no interval can hide its death"
         );
         // The pre-seed matches what the dead claim recorded, and still cannot
-        // reach its date.
+        // reach its date: it is a move from the rebuilt pane's own Unknown, so
+        // it takes the second after that.
         pane.resolve_agent_status_at(AgentStatus::Idle, RESTORED_AT);
         assert_eq!(
             pane.agent_status_changed_at(),
-            RESTORED_AT,
+            RESTORED_AT + 1,
             "a matching pre-seed must not confirm a claim that was never adopted"
         );
     }
@@ -683,6 +932,7 @@ mod tests {
             changed_at: CAPTURED_AT,
             resolve_by: Some(RESTORED_AT + 1),
             saw_other_status: false,
+            reported_through: None,
         };
 
         let mut pane = PaneState::restored_from(TerminalId::alloc(), claim, RESTORED_AT);

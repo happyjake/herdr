@@ -560,6 +560,7 @@ fn restore_tab(
                 changed_at: p.agent_status_changed_at?,
                 resolve_by: p.agent_status_resolve_by,
                 saw_other_status: p.agent_status_saw_other,
+                reported_through: p.agent_status_reported_through,
             })
         });
         // Whether a pane has something to wait for is decided by what the
@@ -1698,6 +1699,7 @@ mod tests {
                             agent_status_changed_at: None,
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -1783,6 +1785,7 @@ mod tests {
                             agent_status_changed_at: None,
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: true,
                             label_source: None,
                             label_at: None,
@@ -1886,6 +1889,7 @@ mod tests {
                             agent_status_changed_at: None,
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: Some(crate::api::schema::LabelSource::Editor),
                             label_at: Some(1_700_000_000),
@@ -2005,6 +2009,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2050,9 +2055,11 @@ mod tests {
             crate::api::schema::AgentStatus::Unknown
         );
         assert!(pane.agent_status_changed_at() >= before);
+        // Any other status reported inside the window dates from the restart
+        // too, in the second after the Unknown a client already holds.
         assert_eq!(
             pane.agent_status_changed_at_for(crate::api::schema::AgentStatus::Idle),
-            pane.agent_status_changed_at(),
+            pane.agent_status_changed_at() + 1,
             "every status reported inside the window dates from the restart"
         );
         // An agent to find means something will classify this pane.
@@ -2103,6 +2110,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2223,6 +2231,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2350,6 +2359,7 @@ mod tests {
                             // that the deadline passed on the way here.
                             agent_status_resolve_by: Some(now - 5),
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2442,6 +2452,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: Some(crate::pane::unix_now_secs() + 60),
                             agent_status_saw_other: true,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2489,9 +2500,10 @@ mod tests {
         let resolved_at = crate::pane::unix_now_secs();
         pane.resolve_agent_status_at(crate::api::schema::AgentStatus::Working, resolved_at);
 
-        assert_eq!(
-            pane.agent_status_changed_at(),
-            resolved_at,
+        // A fresh date, never the captured 1_000 (it may land a second past
+        // the clock, after the restore's own Unknown inside the same second).
+        assert!(
+            pane.agent_status_changed_at() >= resolved_at,
             "an interlude seen before the handoff still counts after it"
         );
     }
@@ -2533,6 +2545,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: Some(crate::pane::unix_now_secs() - 5),
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2614,6 +2627,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2695,6 +2709,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2776,6 +2791,7 @@ mod tests {
                             agent_status_changed_at: Some(1_000),
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2862,6 +2878,7 @@ mod tests {
                             agent_status_changed_at: None,
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -2948,6 +2965,7 @@ mod tests {
                                 agent_status_changed_at: None,
                                 agent_status_resolve_by: None,
                                 agent_status_saw_other: false,
+                                agent_status_reported_through: None,
                                 pinned: false,
                                 label_source: None,
                                 label_at: None,
@@ -2967,6 +2985,7 @@ mod tests {
                                 agent_status_changed_at: None,
                                 agent_status_resolve_by: None,
                                 agent_status_saw_other: false,
+                                agent_status_reported_through: None,
                                 pinned: false,
                                 label_source: None,
                                 label_at: None,
@@ -3028,6 +3047,7 @@ mod tests {
                     agent_status_changed_at: None,
                     agent_status_resolve_by: None,
                     agent_status_saw_other: false,
+                    agent_status_reported_through: None,
                     pinned: false,
                     label_source: None,
                     label_at: None,
@@ -3052,6 +3072,7 @@ mod tests {
             agent_status_changed_at: None,
             agent_status_resolve_by: None,
             agent_status_saw_other: false,
+            agent_status_reported_through: None,
             pinned: false,
             label_source: None,
             label_at: None,
@@ -3212,6 +3233,7 @@ mod tests {
                             agent_status_changed_at: None,
                             agent_status_resolve_by: None,
                             agent_status_saw_other: false,
+                            agent_status_reported_through: None,
                             pinned: false,
                             label_source: None,
                             label_at: None,
@@ -3764,6 +3786,7 @@ mod tests {
                 agent_status_changed_at: None,
                 agent_status_resolve_by: None,
                 agent_status_saw_other: false,
+                agent_status_reported_through: None,
                 pinned: false,
                 label_source: None,
                 label_at: None,

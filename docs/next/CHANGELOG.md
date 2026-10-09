@@ -132,6 +132,9 @@ This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature r
 - Windows panes pick up the host terminal's light or dark colors from the start, so apps no longer default to dark mode inside a light terminal. (#1530, #4369)
 - After `herdr update`, Herdr lists which running servers are still on the old version, with the exact commands to restart each one, and reminds you to update your saved SSH machines.
 
+### Changed
+- `PaneInfo.agent_status_changed_at` now dates every change of a pane's reported status later than anything that pane reported before, so two changes inside one second (an agent finishing a turn and starting the next) no longer share a date, and a client that names transitions by their date can tell them apart. A burst of changes can run the date a few seconds ahead of the wall clock until the clock passes it. A live handoff carries the latest reported date (`agent_status_reported_through` in the session snapshot), so the new process dates after it; older servers ignore the field.
+
 ## [0.9.1] - 2026-09-16
 
 ### Added
