@@ -107,6 +107,7 @@ pub enum SessionResumeBlocked {
     Outside,
     RecordGone,
     FolderGone,
+    Subagent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

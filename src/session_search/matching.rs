@@ -33,12 +33,8 @@ impl<'a> Query<'a> {
         }
     }
 
-    pub fn matches(
-        &self,
-        session: &Session,
-        has_time: &dyn Fn() -> bool,
-    ) -> Option<(f64, Option<SessionWhy>)> {
-        if self
+    pub fn accepts(&self, session: &Session) -> bool {
+        !(self
             .params
             .agent
             .as_ref()
@@ -61,10 +57,14 @@ impl<'a> Query<'a> {
                     .cwd
                     .as_ref()
                     .is_some_and(|cwd| cwd.to_lowercase().contains(place))
-            })
-        {
-            return None;
-        }
+            }))
+    }
+
+    pub fn matches(
+        &self,
+        session: &Session,
+        has_time: &dyn Fn() -> bool,
+    ) -> Option<(f64, Option<SessionWhy>)> {
         if self.terms.is_empty() {
             return Some((0.0, None));
         }

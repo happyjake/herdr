@@ -2,6 +2,53 @@ use super::*;
 use crate::platform::SessionProcess;
 
 #[test]
+fn folded_descendant_matches_preserve_the_parents_outside_or_live_state() {
+    let home = running_claude();
+    let cwd = home.dir("project");
+    home.write(
+        ".claude/projects/project/session-a/subagents/agent-child.jsonl",
+        &[claude_prompt(
+            "session-a",
+            &cwd,
+            "Descendant needle",
+            "2026-10-12T11:40:00Z",
+        )],
+    );
+    home.write(
+        "logbook.jsonl",
+        &[super::folding::reported(
+            "claude",
+            "session-a",
+            "w1:p1",
+            &cwd,
+            1791805151000,
+        )],
+    );
+    home.catalog.refresh();
+    let response = home.search(json!({"terms": ["needle"]}), vec![]);
+    assert_eq!(response["result"]["sessions"].as_array().unwrap().len(), 1);
+    let row = by_key(&response, "session-a");
+    assert_eq!(row["state"], "outside");
+    assert_eq!(row["resume"], Value::Null);
+    assert_eq!(row["resume_blocked"], "outside");
+    assert_eq!(
+        row["outside"],
+        json!({"pid": 241, "detail": "claude pid 241"})
+    );
+    assert_eq!(row["why"]["line"], "Subagent: Descendant needle");
+
+    let response = home.search(
+        json!({"terms": ["needle"]}),
+        vec![live_pane("claude", "id", "session-a")],
+    );
+    let row = by_key(&response, "session-a");
+    assert_eq!(row["state"], "live");
+    assert_eq!(row["resume_blocked"], "live");
+    assert!(row.get("outside").is_none());
+    assert_eq!(row["why"]["line"], "Subagent: Descendant needle");
+}
+
+#[test]
 fn logbook_merge_retains_pi_id_for_outside_detection() {
     let home = FixtureHome::new();
     let cwd = home.dir("project");

@@ -12072,7 +12072,8 @@
             "live",
             "outside",
             "record_gone",
-            "folder_gone"
+            "folder_gone",
+            "subagent"
           ],
           "type": "string"
         },

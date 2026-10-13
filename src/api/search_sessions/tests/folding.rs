@@ -140,6 +140,18 @@ fn structural_subagents_keep_distinct_records_and_fold_under_their_parents() {
     );
     let limited = home.search(json!({"terms": ["Parent question"], "limit": 1}), vec![]);
     assert_eq!(by_key(&limited, "claude-parent")["subagent_count"], 2);
+    let child_match = home.search(json!({"terms": ["Child question"]}), vec![]);
+    assert_eq!(
+        child_match["result"]["sessions"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(by_key(&child_match, "claude-parent")["score"], 1.0);
+    assert_eq!(
+        by_key(&child_match, "claude-parent")["why"],
+        json!({
+            "field": "first_prompt", "line": "Subagent: Child question", "terms": ["Child question"]
+        })
+    );
 }
 
 #[test]
@@ -396,4 +408,197 @@ fn overlapping_host_windows_include_boundaries_and_expire_independently() {
         assert!(by_key(&all, id).get("parent").is_none());
         assert_eq!(by_key(&all, id)["headless"], true);
     }
+}
+
+#[test]
+fn claude_subagent_transcripts_have_no_standalone_resume() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".claude/projects/project/parent.jsonl",
+        &[claude_prompt(
+            "parent",
+            &cwd,
+            "Parent work",
+            "2026-10-03T00:00:00Z",
+        )],
+    );
+    home.write(
+        ".claude/projects/project/parent/subagents/agent-child.jsonl",
+        &[claude_prompt(
+            "parent",
+            &cwd,
+            "Child work",
+            "2026-10-03T00:01:00Z",
+        )],
+    );
+    home.write(
+        ".claude/projects/project/fork.jsonl",
+        &[claude_prompt(
+            "fork",
+            &cwd,
+            "Fork work",
+            "2026-10-03T00:02:00Z",
+        )],
+    );
+    home.write("logbook.jsonl", &[
+        reported("claude", "parent", "w1:p1", &cwd, 1790985600000),
+        reported("claude", "agent-child", "w1:p2", &cwd, 1790985660000),
+        json!({"type": "parent", "child": session_key("claude", "fork"), "parent": session_key("claude", "parent")}),
+    ]);
+    home.catalog.refresh();
+    let all = home.search(json!({"include_headless": true}), vec![]);
+    let child = by_key(&all, "agent-child");
+    assert_eq!(child["state"], "ended");
+    assert_eq!(child["resume"], Value::Null);
+    assert_eq!(child["resume_blocked"], "subagent");
+    assert_eq!(
+        by_key(&all, "parent")["resume"]["command"],
+        "claude --resume parent"
+    );
+    assert_eq!(
+        by_key(&all, "fork")["resume"]["command"],
+        "claude --resume fork"
+    );
+}
+
+fn assert_invalid_parent_component(older_parent: &str) {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    for (id, parent, at) in [
+        ("older", older_parent, "2026-10-03T00:00:00Z"),
+        ("newer", "older", "2026-10-03T01:00:00Z"),
+    ] {
+        let source = if older_parent == "newer" {
+            // Cycle edges come only from the logbook; orphan edges come from rollouts.
+            json!("cli")
+        } else {
+            json!({"subagent": {"thread_spawn": {"parent_thread_id": parent}}})
+        };
+        home.write(
+            &format!(".codex/sessions/2026/10/03/{id}.jsonl"),
+            &[
+                json!({"type": "session_meta", "timestamp": at, "payload": {
+                    "id": id, "cwd": cwd,
+                "source": source
+                }}),
+                codex_prompt(&format!("Work in {id}"), at),
+            ],
+        );
+    }
+    home.write("logbook.jsonl", &[
+        reported("codex", "older", "w1:p1", &cwd, 1790985600000),
+        reported("codex", "newer", "w1:p2", &cwd, 1790989200000),
+        json!({"type": "parent", "child": session_key("codex", "older"), "parent": session_key("codex", older_parent)}),
+        json!({"type": "parent", "child": session_key("codex", "newer"), "parent": session_key("codex", "older")}),
+    ]);
+    home.catalog.refresh();
+
+    let visible = home.search(json!({}), vec![]);
+    assert_eq!(visible["result"]["sessions"].as_array().unwrap().len(), 1);
+    let representative = by_key(&visible, "newer");
+    assert_eq!(representative["headless"], false);
+    assert!(representative.get("parent").is_none());
+    assert_eq!(representative["subagent_count"], 1);
+    let all = home.search(json!({"include_headless": true}), vec![]);
+    assert_eq!(all["result"]["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        by_key(&all, "older")["parent"],
+        session_key("codex", "newer")
+    );
+    assert_eq!(by_key(&all, "older")["headless"], false);
+    assert!(by_key(&all, "newer").get("parent").is_none());
+    let recovered = home.search(json!({"terms": ["Work in older"]}), vec![]);
+    assert_eq!(recovered["result"]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        by_key(&recovered, "newer")["why"]["line"],
+        "Subagent: Work in older"
+    );
+}
+
+#[test]
+fn invalid_parent_orphans_keep_the_latest_hosted_representative() {
+    assert_invalid_parent_component("absent");
+}
+
+#[test]
+fn invalid_parent_cycles_keep_the_latest_hosted_representative() {
+    assert_invalid_parent_component("newer");
+}
+
+#[test]
+fn descendant_matches_reach_ancestors_with_the_best_score_and_source_explanation() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    let child_cwd = home.dir("worker");
+    for (id, prompt, at) in [
+        ("root", "needle root", "2026-10-03T00:00:00Z"),
+        ("middle", "needle middle", "2026-10-03T00:01:00Z"),
+        ("competitor", "needle latest", "2026-10-04T00:00:00Z"),
+    ] {
+        home.write(
+            &format!(".claude/projects/project/{id}.jsonl"),
+            &[claude_prompt(id, &cwd, prompt, at)],
+        );
+    }
+    home.write(
+        ".claude/projects/project/leaf.jsonl",
+        &[
+            claude_prompt("leaf", &child_cwd, "Leaf start", "2026-10-03T00:02:00Z"),
+            claude_prompt(
+                "leaf",
+                &child_cwd,
+                "needle depth unique",
+                "2026-10-03T00:03:00Z",
+            ),
+            json!({"type": "ai-title", "aiTitle": "Leaf architecture", "sessionId": "leaf"}),
+        ],
+    );
+    home.write("logbook.jsonl", &[
+        reported("claude", "root", "w1:p1", &cwd, 1790985600000),
+        reported("claude", "middle", "w1:p2", &cwd, 1790985660000),
+        reported("claude", "leaf", "w1:p3", &child_cwd, 1790985720000),
+        reported("claude", "competitor", "w1:p4", &cwd, 1791072000000),
+        json!({"type": "parent", "child": session_key("claude", "middle"), "parent": session_key("claude", "root")}),
+        json!({"type": "parent", "child": session_key("claude", "leaf"), "parent": session_key("claude", "middle")}),
+        json!({"type": "label_worn", "key": session_key("claude", "leaf"), "pane": "w1:p3", "label": "Hidden label", "source": "editor", "at": 1790985780000_u64}),
+    ]);
+    home.catalog.refresh();
+
+    for (term, field, line) in [
+        ("unique", "prompt", "Subagent: needle depth unique"),
+        ("architecture", "title", "Subagent: Leaf architecture"),
+        ("Hidden label", "label", "Subagent: Hidden label"),
+    ] {
+        let found = home.search(json!({"terms": [term], "place": "project"}), vec![]);
+        assert_eq!(found["result"]["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            by_key(&found, "root")["why"],
+            json!({"field": field, "line": line, "terms": [term]})
+        );
+    }
+    let ranked = home.search(json!({"terms": ["needle", "depth"], "limit": 1}), vec![]);
+    assert_eq!(ranked["result"]["sessions"].as_array().unwrap().len(), 1);
+    let root = by_key(&ranked, "root");
+    assert_eq!(root["score"], 2.0);
+    assert_eq!(root["first_prompt"], "needle root");
+    assert_eq!(
+        root["why"],
+        json!({"field": "prompt", "line": "Subagent: needle depth unique", "terms": ["needle", "depth"]})
+    );
+    let all = home.search(
+        json!({"terms": ["needle", "depth"], "include_headless": true}),
+        vec![],
+    );
+    assert_eq!(all["result"]["sessions"].as_array().unwrap().len(), 4);
+    for id in ["root", "middle", "leaf"] {
+        assert_eq!(by_key(&all, id)["score"], 2.0);
+    }
+    assert_eq!(by_key(&all, "leaf")["why"]["line"], "needle depth unique");
+    assert_eq!(
+        by_key(&all, "middle")["why"]["line"],
+        "Subagent: needle depth unique"
+    );
+    let own = home.search(json!({"terms": ["needle"]}), vec![]);
+    assert_eq!(by_key(&own, "root")["why"]["line"], "needle root");
 }

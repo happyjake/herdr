@@ -251,9 +251,11 @@ Claude ids remain the same when records move between project directories.
 `state` is `live`, `outside`, `ended`, or `record_gone`. A live row carries
 `live_pane_id` for this server. `place_state` is `present` or `gone`; a gone place includes
 `nearest_existing` when an ancestor exists. `resume` contains the planner's
-`command` and `cwd`, or is null with `resume_blocked` (`live`, `outside`, `record_gone`, or
-`folder_gone`). Claude/Codex ids and pi paths can resume from the nearest existing
+`command` and `cwd`, or is null with `resume_blocked` (`live`, `outside`, `record_gone`,
+`folder_gone`, or `subagent`). Claude/Codex ids and pi paths can resume from the nearest existing
 ancestor. Unknown places and project-day rows cannot resume.
+Nested Claude subagent transcripts always return `resume: null` and
+`resume_blocked: "subagent"`; their file ids do not identify resumable conversations.
 
 `labels` retains logbook labels in time order, newest last. Each has `label`,
 `source` (`editor` or `person`), `pane_id`, `from_ms`, and an optional `to_ms`
@@ -271,6 +273,9 @@ runs use this rule because their source carries no parent. Where host windows
 overlap, the latest start wins, with key order breaking ties. Folded rows carry
 `parent`; each parent's `subagent_count` includes children before query filters
 and limits. Folded and headless rows are hidden unless `include_headless` is true.
+Parent links must reach an available root. Orphaned or cyclic components retain
+their most recently active available member as a standalone representative,
+preserving whether it actually had a pane.
 
 On macOS and Linux, a session found running outside this server carries
 `state: "outside"`, `outside: {"pid": ..., "detail": ...}`, `resume: null`, and
@@ -288,7 +293,9 @@ Running-session evidence is read afresh for each query.
 
 A matching row's `why` gives the `field`, matching `line`, and matching `terms`;
 browse rows have `why: null`. Full prompts remain searchable beyond their clipped
-previews. Prompt extraction and title judgement follow `pane.prompt_trail`,
+previews. Matches in folded descendants propagate through every ancestor, using
+the strongest score. Inherited explanations keep their `field` and prefix the
+`line` with `Subagent:`. Hard filters apply to the returned ancestor. Prompt extraction and title judgement follow `pane.prompt_trail`,
 including the exclusions for assistant output, tool traffic, and injected text.
 Codex names come from its session index, latest entry first in precedence; archived
 `.jsonl.zst` rollouts support skippable metadata frames; decoder windows over

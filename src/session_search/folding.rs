@@ -91,6 +91,7 @@ impl<'a> Folding<'a> {
                 }
             }
         }
+        folded.validate_parents(sessions, has_time)?;
         for parent in folded.parents.values() {
             if !has_time() {
                 return None;
@@ -99,5 +100,72 @@ impl<'a> Folding<'a> {
             *count = count.saturating_add(1);
         }
         Some(folded)
+    }
+
+    fn validate_parents(
+        &mut self,
+        sessions: &'a [Arc<Session>],
+        has_time: &dyn Fn() -> bool,
+    ) -> Option<()> {
+        let available: HashMap<_, _> = sessions
+            .iter()
+            .map(|session| (&session.key, session))
+            .collect();
+        // None denotes an available root. Broken paths share the missing key
+        // or a cycle member, so branches entering the same component stay together.
+        let mut resolved: HashMap<_, Option<&SearchSessionKey>> = HashMap::new();
+        let mut broken: HashMap<_, Vec<&SearchSessionKey>> = HashMap::new();
+        for session in sessions {
+            if !self.parents.contains_key(&session.key) || resolved.contains_key(&session.key) {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut seen = HashSet::new();
+            let mut key = &session.key;
+            let component = loop {
+                if !has_time() {
+                    return None;
+                }
+                if let Some(component) = resolved.get(key) {
+                    break *component;
+                }
+                if !available.contains_key(key) || !seen.insert(key) {
+                    break Some(key);
+                }
+                path.push(key);
+                let Some(parent) = self.parents.get(key) else {
+                    break None;
+                };
+                key = parent;
+            };
+            for key in path {
+                resolved.insert(key, component);
+                if let Some(component) = component {
+                    broken.entry(component).or_default().push(key);
+                }
+            }
+        }
+        for members in broken.into_values() {
+            let representative =
+                members
+                    .iter()
+                    .filter_map(|key| available.get(key))
+                    .max_by(|a, b| {
+                        a.last_active_at_ms
+                            .cmp(&b.last_active_at_ms)
+                            .then_with(|| b.key.cmp(&a.key))
+                    })?;
+            for key in members {
+                if !has_time() {
+                    return None;
+                }
+                if *key == representative.key {
+                    self.parents.remove(key);
+                } else {
+                    self.parents.insert(key, &representative.key);
+                }
+            }
+        }
+        Some(())
     }
 }

@@ -434,7 +434,7 @@ fn search_excludes_injected_material_and_judges_both_harness_titles() {
         &[claude_prompt(
             "claude-child",
             &cwd,
-            "excluded-child",
+            "delegated-child",
             "2026-10-03T00:00:00Z",
         )],
     );
@@ -455,7 +455,7 @@ fn search_excludes_injected_material_and_judges_both_harness_titles() {
     ] {
         home.write(&format!(".codex/sessions/2026/10/03/rollout-{id}.jsonl"), &[
             json!({"type": "session_meta", "payload": {"id": id, "cwd": cwd, "source": source, "parent_thread_id": "codex-a"}}),
-            codex_prompt("excluded-subagent", "2026-10-03T00:00:00Z"),
+            codex_prompt("delegated-subagent", "2026-10-03T00:00:00Z"),
         ]);
     }
     home.write(
@@ -466,7 +466,7 @@ fn search_excludes_injected_material_and_judges_both_harness_titles() {
         ],
     );
     home.write(".codex/history.jsonl", &[
-        json!({"session_id": "review-child", "ts": 1790985600, "text": "excluded-child-history"}),
+        json!({"session_id": "review-child", "ts": 1790985600, "text": "delegated-child-history"}),
         json!({"session_id": "codex-a", "ts": 1790985600, "text": "<user_instructions>excluded-history</user_instructions>"}),
     ]);
     home.write(".claude/history.jsonl", &[
@@ -499,6 +499,11 @@ fn search_excludes_injected_material_and_judges_both_harness_titles() {
     );
     assert_eq!(
         home.search(json!({"terms": ["excluded", "command-name"]}), vec![])["result"]["sessions"],
+        json!([])
+    );
+    assert_eq!(
+        home.search_all(json!({"terms": ["excluded", "command-name"]}), vec![])["result"]
+            ["sessions"],
         json!([])
     );
 

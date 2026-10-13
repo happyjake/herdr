@@ -62,6 +62,7 @@ pub(super) struct Session {
     pub labels: Vec<SessionLabel>,
     pub parent: Option<SearchSessionKey>,
     pub reported: bool,
+    pub claude_subagent: bool,
 }
 
 impl Session {
@@ -79,6 +80,7 @@ impl Session {
             labels: Vec::new(),
             parent: None,
             reported: false,
+            claude_subagent: false,
         }
     }
 
@@ -120,6 +122,7 @@ pub(super) fn read(
                     Some(path.into()),
                 );
                 if matches!(kind, FileKind::ClaudeSubagent) {
+                    session.claude_subagent = true;
                     session.parent = path
                         .parent()
                         .and_then(Path::parent)
