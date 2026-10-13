@@ -65,6 +65,9 @@ pub(super) struct Sources {
     pub persisted: Option<PathBuf>,
     /// Whether tmux is worth asking.
     pub consult_tmux: bool,
+    /// The session history, read for the project a directory that is gone
+    /// was forked from.
+    pub logbook: Option<PathBuf>,
 }
 
 /// Answer `server.lookup_place` for one request.
@@ -90,6 +93,7 @@ pub(super) fn handle_lookup(
         home: crate::worktree::home_dir(),
         persisted: Some(crate::persist::session_path()),
         consult_tmux: true,
+        logbook: Some(crate::persist::logbook::path()),
     };
 
     respond(request_id, query, limit, sources)
@@ -267,6 +271,7 @@ async fn scan(
             workspaces,
             home: sources.home,
             tmux,
+            logbook: sources.logbook,
         };
         place_lookup::lookup(&desk, &query, limit)
     })
@@ -358,6 +363,7 @@ mod tests {
                 home: Some(self.root.clone()),
                 persisted: Some(self.root.join("session.json")),
                 consult_tmux: false,
+                logbook: Some(self.root.join("logbook.jsonl")),
             }
         }
     }
@@ -583,6 +589,47 @@ mod tests {
             response,
             format!(
                 r#"{{"id":"req_place","result":{{"type":"server_lookup_place","places":[{{"path":"{live}","source":"workspace"}}]}}}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_path_that_is_gone_answers_its_project_on_the_wire() {
+        let fixture = Fixture::new();
+        let project = fixture.dir("code/launchpad");
+        let gone = fixture
+            .root
+            .join("code/rocket-ship")
+            .to_str()
+            .expect("utf-8 fixture path")
+            .to_string();
+        fixture.write(
+            "logbook.jsonl",
+            &format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session_reported",
+                    "pane": "w1:p1",
+                    "terminal": "t1",
+                    "key": {"agent": "pi", "kind": "id", "value": "s1"},
+                    "cwd": gone,
+                    "project": project,
+                    "at": 1_700_000_000_000u64,
+                })
+            ),
+        );
+
+        let response = respond(
+            "req_gone".into(),
+            &gone,
+            MAX_PLACES,
+            fixture.sources(vec![]),
+        );
+
+        assert_eq!(
+            response,
+            format!(
+                r#"{{"id":"req_gone","result":{{"type":"server_lookup_place","places":[{{"path":"{project}","source":"project"}}]}}}}"#
             )
         );
     }

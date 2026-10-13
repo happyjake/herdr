@@ -118,7 +118,7 @@ Raw socket method names use dot notation:
 server has already been to. It takes `query` and an optional `limit` (capped at
 eight, and the default), and returns `places`: ranked `{ path, source }`
 records for directories that still exist, where `source` is `workspace`, `z`,
-`claude`, `tmux`, or `session`. The answer comes from memory alone — the
+`claude`, `tmux`, `session`, or `project`. The answer comes from memory alone — the
 server's own live and persisted workspaces, the z frecency database, the Claude
 Code project list, live tmux pane directories, and the working directories
 recent agent sessions started in — and never from a disk search, so a directory
@@ -131,8 +131,11 @@ typo (edit distance up to two on the folder name for queries of five or more
 characters, one below that), and matches still level stay in source order. A
 query starting with `/` or `~` is a literal path instead: it is answered as
 itself when it exists, and otherwise its folder name is run through the matcher
-so the near miss comes back as a candidate. A blank query or a `limit` of zero
-is refused with `invalid_params`.
+so the near miss comes back as a candidate. When a literal path is gone but an
+agent session that stood there recorded the checkout it belonged to — the
+repository a removed worktree was added from — and that checkout still exists,
+it leads the answer with source `project`, ahead of the near misses. A blank
+query or a `limit` of zero is refused with `invalid_params`.
 
 The lookup is bounded rather than best-effort: it is answered off the app
 thread, tmux gets two seconds before it is skipped, the whole request gives up

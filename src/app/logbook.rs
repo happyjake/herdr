@@ -78,6 +78,7 @@ impl AppState {
             terminal: terminal.id.clone(),
             key,
             cwd: terminal.cwd.clone(),
+            project: crate::workspace::git_project_dir(&terminal.cwd),
             at: logbook::now_ms(),
         };
         let mut events = vec![event];
@@ -406,6 +407,46 @@ mod tests {
             session_start_source: Some(reason.into()),
         });
         settle(app);
+    }
+
+    #[test]
+    fn a_session_in_a_linked_worktree_records_the_checkout_it_came_from() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let root = ConfigRoot::new();
+        let before = crate::pane::unix_now_secs() * 1000;
+        let (base, repo, checkout) =
+            crate::workspace::git_test_support::create_repo_with_linked_worktree("logbook-project");
+        let mut app = app_with_policy(AppPolicy::TEST);
+        app.state.workspaces[0].id = "wproject".into();
+        app.state.workspaces[0].test_add_tab(None);
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.pane_ids_for_workspace(0)[0];
+        let pane = app.public_pane_id(0, pane_id).unwrap();
+        let terminal_id = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.cwd = checkout.clone();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("in-worktree").unwrap(),
+        });
+        app.policy.persist_session = true;
+        app.initialize_logbook();
+        settle(&mut app);
+
+        let project = std::fs::canonicalize(&repo).unwrap();
+        assert_eq!(
+            rows(&mut app, &root.path(), before),
+            vec![json!({
+                "type": "session_reported",
+                "pane": pane,
+                "terminal": terminal_id,
+                "key": {"agent": "pi", "kind": "id", "value": "in-worktree"},
+                "cwd": checkout,
+                "project": project,
+            })]
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     fn rows(app: &mut App, path: &std::path::Path, before: u64) -> Vec<Value> {

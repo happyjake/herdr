@@ -73,6 +73,11 @@ pub enum PlaceSource {
     Tmux,
     /// The working directory a recent agent session started in.
     Session,
+    /// The checkout a directory that is gone belonged to, as an agent
+    /// session there recorded it: the repository a removed worktree was
+    /// added from. Only ever the first answer to a literal path that no
+    /// longer exists.
+    Project,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

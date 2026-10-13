@@ -9547,6 +9547,11 @@
               "const": "session",
               "description": "The working directory a recent agent session started in.",
               "type": "string"
+            },
+            {
+              "const": "project",
+              "description": "The checkout a directory that is gone belonged to, as an agent\nsession there recorded it: the repository a removed worktree was\nadded from. Only ever the first answer to a literal path that no\nlonger exists.",
+              "type": "string"
             }
           ]
         },

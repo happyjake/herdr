@@ -58,6 +58,28 @@ pub fn git_worktree_info(cwd: &Path) -> Option<GitWorktreeInfo> {
     })
 }
 
+/// The checkout the work in `cwd` belongs to, when that is somewhere else:
+/// the main working tree of the repository a linked worktree was added
+/// from, or the root above a subdirectory of a checkout.
+///
+/// `None` outside a repository, for a bare repository or any layout whose
+/// common directory is not a `.git` inside its working tree, and at a main
+/// checkout's own root, where there is nothing further to name. Read from
+/// the filesystem alone, like every other answer in this module.
+pub(crate) fn git_project_dir(cwd: &Path) -> Option<PathBuf> {
+    // A relative directory would be read against this process's own working
+    // directory, which says nothing about where a session stood.
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let info = git_worktree_info(cwd)?;
+    if info.is_bare || info.git_common_dir.file_name()? != ".git" {
+        return None;
+    }
+    let project = info.git_common_dir.parent()?.to_path_buf();
+    (canonicalize_best_effort_path(cwd) != project).then_some(project)
+}
+
 pub fn git_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
     let info = git_worktree_info(cwd)?;
     Some(git_space_metadata_from_info(&info))
@@ -371,6 +393,53 @@ mod tests {
 
     use super::*;
     use crate::workspace::git::test_support::run_git;
+
+    #[test]
+    fn a_linked_worktree_names_the_checkout_it_was_added_from() {
+        let (base, repo, checkout) =
+            crate::workspace::git::test_support::create_repo_with_linked_worktree("project-linked");
+        let repo = std::fs::canonicalize(&repo).unwrap();
+
+        assert_eq!(git_project_dir(&checkout), Some(repo.clone()));
+        // Anywhere inside the worktree names the same checkout.
+        let nested = checkout.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(git_project_dir(&nested), Some(repo));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_subdirectory_names_its_checkout_and_the_checkout_names_nothing() {
+        let (base, repo, _checkout) =
+            crate::workspace::git::test_support::create_repo_with_linked_worktree("project-main");
+        let canonical = std::fs::canonicalize(&repo).unwrap();
+        let nested = repo.join("docs");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(git_project_dir(&nested), Some(canonical));
+        // The checkout's own root has nothing further to name.
+        assert_eq!(git_project_dir(&repo), None);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn outside_a_repository_and_in_a_bare_layout_there_is_no_project() {
+        let outside = temp_test_dir("project-outside");
+        assert_eq!(git_project_dir(&outside), None);
+        let _ = std::fs::remove_dir_all(outside);
+        // Nor for a relative directory, even when this process stands in a
+        // repository it would otherwise resolve against.
+        assert_eq!(git_project_dir(Path::new("src")), None);
+
+        let (base, _bare, checkout) =
+            crate::workspace::git::test_support::create_bare_repo_with_linked_worktree(
+                "project-bare",
+            );
+        assert_eq!(git_project_dir(&checkout), None);
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let unique = format!(

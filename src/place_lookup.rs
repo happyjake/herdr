@@ -55,6 +55,9 @@ pub(crate) struct Desk {
     pub home: Option<PathBuf>,
     /// Working directories of live tmux panes. Empty when tmux is absent.
     pub tmux: Vec<PathBuf>,
+    /// The server's session history, read for the project a directory that
+    /// is gone was forked from. None when there is no history to read.
+    pub logbook: Option<PathBuf>,
 }
 
 /// One answered directory and the memory that held it.
@@ -95,11 +98,58 @@ pub(crate) fn lookup(desk: &Desk, query: &str, limit: usize) -> Vec<Place> {
                 source,
             }];
         }
+        // Gone. When an agent session here once recorded the checkout this
+        // directory belonged to — a worktree removed after its work landed,
+        // most often — and that checkout is still here, it leads: it is where
+        // the work went, and the near misses follow.
         let name = folder_name(&literal);
-        return rank(&name, candidates, limit);
+        let project = desk
+            .logbook
+            .as_deref()
+            .and_then(|logbook| project_of_gone(logbook, &literal));
+        let Some(project) = project else {
+            return rank(&name, candidates, limit);
+        };
+        let near = rank(&name, candidates, limit)
+            .into_iter()
+            .filter(|place| place.path != project);
+        let mut places = vec![Place {
+            path: project.clone(),
+            source: PlaceSource::Project,
+        }];
+        places.extend(near);
+        places.truncate(limit);
+        return places;
     }
 
     rank(query, candidates, limit)
+}
+
+/// The project the newest agent session in `directory` recorded, when that
+/// project is a directory now. Read from the session history, never from
+/// the disk around `directory`, which is gone.
+fn project_of_gone(logbook: &Path, directory: &str) -> Option<String> {
+    let mut newest = None;
+    let read = crate::persist::logbook::for_each_event(logbook, |event| {
+        if let crate::persist::logbook::Event::SessionReported {
+            cwd,
+            project: Some(project),
+            ..
+        } = event
+        {
+            if cwd.to_str().and_then(normalize).as_deref() == Some(directory) {
+                newest = Some(project);
+            }
+        }
+    });
+    if read.is_err() {
+        return None;
+    }
+    let project = newest?;
+    if !project.is_dir() {
+        return None;
+    }
+    project.to_str().and_then(normalize)
 }
 
 /// How long tmux gets to answer before the lookup goes on without it.
@@ -645,9 +695,33 @@ mod tests {
             );
         }
 
+        /// Append agent sessions to the fixture's session history: where
+        /// each one stood, and the project it recorded, if any.
+        fn logbook(&self, sessions: &[(&str, Option<&str>)]) {
+            let path = self.root.join("logbook.jsonl");
+            let mut lines = std::fs::read_to_string(&path).unwrap_or_default();
+            for (index, (cwd, project)) in sessions.iter().enumerate() {
+                let mut line = serde_json::json!({
+                    "type": "session_reported",
+                    "pane": format!("w1:p{index}"),
+                    "terminal": format!("t{index}"),
+                    "key": {"agent": "pi", "kind": "id", "value": format!("s{index}")},
+                    "cwd": cwd,
+                    "at": 1_700_000_000_000u64 + index as u64,
+                });
+                if let Some(project) = project {
+                    line["project"] = serde_json::json!(project);
+                }
+                lines.push_str(&line.to_string());
+                lines.push('\n');
+            }
+            std::fs::write(path, lines).expect("fixture logbook");
+        }
+
         fn desk(&self) -> Desk {
             Desk {
                 home: Some(self.root.clone()),
+                logbook: Some(self.root.join("logbook.jsonl")),
                 ..Desk::default()
             }
         }
@@ -907,6 +981,81 @@ mod tests {
         let typo = home.absent("code/rocket-ap");
         let places = lookup(&home.desk(), &typo, MAX_PLACES);
         assert_eq!(paths(&places), vec![real]);
+    }
+
+    #[test]
+    fn a_literal_path_that_is_gone_leads_with_the_project_it_was_forked_from() {
+        let home = FixtureHome::new();
+        // The worktree's name says nothing about its repository's.
+        let project = home.dir("code/launchpad");
+        let near = home.dir("code/rocket-shop");
+        home.z(&[(near.as_str(), 10.0)]);
+        let gone = home.absent("code/rocket-ship");
+        home.logbook(&[(gone.as_str(), Some(project.as_str()))]);
+
+        let places = lookup(&home.desk(), &gone, MAX_PLACES);
+        assert_eq!(paths(&places), vec![project.as_str(), near.as_str()]);
+        assert_eq!(sources(&places), vec![PlaceSource::Project, PlaceSource::Z]);
+    }
+
+    #[test]
+    fn the_newest_session_s_project_leads_and_is_answered_once() {
+        let home = FixtureHome::new();
+        let older = home.dir("code/rocket");
+        // One letter off the gone folder's name, so it is a near miss too.
+        let newer = home.dir("code/rocket-shi");
+        home.z(&[(newer.as_str(), 10.0), (older.as_str(), 5.0)]);
+        let gone = home.absent("code/rocket-ship");
+        home.logbook(&[
+            (gone.as_str(), Some(older.as_str())),
+            (gone.as_str(), Some(newer.as_str())),
+        ]);
+
+        let places = lookup(&home.desk(), &gone, MAX_PLACES);
+        assert_eq!(places[0].path, newer);
+        assert_eq!(places[0].source, PlaceSource::Project);
+        assert_eq!(
+            paths(&places).iter().filter(|path| **path == newer).count(),
+            1
+        );
+        // The limit still holds with the project in front.
+        assert_eq!(lookup(&home.desk(), &gone, 1).len(), 1);
+    }
+
+    #[test]
+    fn a_gone_path_answers_no_project_it_cannot_stand_behind() {
+        let home = FixtureHome::new();
+        let near = home.dir("code/rocket-shop");
+        home.z(&[(near.as_str(), 10.0)]);
+        let gone = home.absent("code/rocket-ship");
+        let elsewhere = home.dir("code/elsewhere");
+        let archived = home.absent("code/launchpad");
+        home.logbook(&[
+            // A project that has gone too.
+            (gone.as_str(), Some(archived.as_str())),
+            // A project another directory recorded.
+            (
+                home.absent("code/other-ship").as_str(),
+                Some(elsewhere.as_str()),
+            ),
+            // A line written before projects were recorded.
+            (home.absent("code/rocket-ship/").as_str(), None),
+        ]);
+
+        let places = lookup(&home.desk(), &gone, MAX_PLACES);
+        assert_eq!(paths(&places), vec![near.as_str()]);
+        assert_eq!(sources(&places), vec![PlaceSource::Z]);
+    }
+
+    #[test]
+    fn a_literal_path_that_exists_is_its_own_answer_whatever_it_recorded() {
+        let home = FixtureHome::new();
+        let project = home.dir("code/launchpad");
+        let here = home.dir("code/rocket-ship");
+        home.logbook(&[(here.as_str(), Some(project.as_str()))]);
+
+        let places = lookup(&home.desk(), &here, MAX_PLACES);
+        assert_eq!(paths(&places), vec![here.as_str()]);
     }
 
     #[test]
