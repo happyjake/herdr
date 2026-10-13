@@ -96,7 +96,7 @@ Raw socket method names use dot notation:
 
 | Area | Methods |
 | --- | --- |
-| Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests`, `server.lookup_place` |
+| Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests`, `server.lookup_place`, `server.search_sessions` |
 | Notification | `notification.show` |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
@@ -118,7 +118,7 @@ Raw socket method names use dot notation:
 server has already been to. It takes `query` and an optional `limit` (capped at
 eight, and the default), and returns `places`: ranked `{ path, source }`
 records for directories that still exist, where `source` is `workspace`, `z`,
-`claude`, `tmux`, or `session`. The answer comes from memory alone — the
+`claude`, `tmux`, `session`, or `project`. The answer comes from memory alone — the
 server's own live and persisted workspaces, the z frecency database, the Claude
 Code project list, live tmux pane directories, and the working directories
 recent agent sessions started in — and never from a disk search, so a directory
@@ -131,8 +131,11 @@ typo (edit distance up to two on the folder name for queries of five or more
 characters, one below that), and matches still level stay in source order. A
 query starting with `/` or `~` is a literal path instead: it is answered as
 itself when it exists, and otherwise its folder name is run through the matcher
-so the near miss comes back as a candidate. A blank query or a `limit` of zero
-is refused with `invalid_params`.
+so the near miss comes back as a candidate. When a literal path is gone but an
+agent session that stood there recorded the checkout it belonged to — the
+repository a removed worktree was added from — and that checkout still exists,
+it leads the answer with source `project`, ahead of the near misses. A blank
+query or a `limit` of zero is refused with `invalid_params`.
 
 The lookup is bounded rather than best-effort: it is answered off the app
 thread, tmux gets two seconds before it is skipped, the whole request gives up
@@ -222,6 +225,101 @@ abandoned upload is swept like any other scratch file. Refusals carry
 one `attachment.create` or `attachment.append` may carry; size chunks from it
 rather than from a hard-coded number. A server without the capability takes
 photos through `attachment.create` only.
+
+`server.search_sessions` searches saved Claude, Codex, and pi sessions on this
+server, including Claude and Codex prompt histories. All parameters are optional:
+
+```json
+{"id":"req_search","method":"server.search_sessions","params":{"terms":["keyboard","layout"],"agent":"claude","limit":50}}
+```
+
+`terms` uses case-insensitive literal substrings across labels, title, prompts, cwd,
+and branch. Each distinct matching term adds one to `score`, so all-term matches
+rank above partial matches; ties use newest activity first. No terms means browse,
+newest first. `since_ms` and `until_ms` are inclusive hard filters on overlap with
+`[started_at_ms, last_active_at_ms]`. `place` is a case-insensitive cwd substring;
+`agent` is an exact name. `limit` defaults to 50 and is capped at 200. `embedding`
+is reserved and ignored. `include_headless` defaults to false; set it to true to
+also return folded children and headless records.
+
+The `server_search_sessions` result carries `sessions`, `scanned` (session rows
+considered before filtering), and `partial`. Each row includes its `key`
+(`agent`, `kind`, `value`), `cwd` (null when unknown), optional `branch` and judged
+`title`, `first_prompt` (about 400 characters), up to three `recent_prompts`
+(about 240 characters each, newest last), and activity times in milliseconds.
+Claude and Codex use id keys; pi uses a path key. Claude history without a session
+id groups by project and UTC day with kind `day` and value `<cwd>|<YYYY-MM-DD>`.
+Claude ids remain the same when records move between project directories.
+
+`state` is `live`, `outside`, `ended`, or `record_gone`. A live row carries
+`live_pane_id` for this server. `place_state` is `present` or `gone`; a gone place includes
+`nearest_existing` when an ancestor exists. `resume` contains the planner's
+`command` and `cwd`, or is null with `resume_blocked` (`live`, `outside`, `record_gone`,
+`folder_gone`, or `subagent`). Claude/Codex ids and pi paths can resume from the nearest existing
+ancestor. Unknown places and project-day rows cannot resume.
+Nested Claude subagent transcripts always return `resume: null` and
+`resume_blocked: "subagent"`; their file ids do not identify resumable conversations.
+
+`labels` retains logbook labels in time order, newest last. Each has `label`,
+`source` (`editor` or `person`), `pane_id`, `from_ms`, and an optional `to_ms`
+when the label stopped being worn. A rename, label clear, replacement session,
+or pane close ends the previous label. Labels survive closed panes and deleted
+records, and label matches return `why.field: "label"`.
+
+Claude records under `<project>/<sessionId>/subagents/agent-*.jsonl`, Codex
+`session_meta.source.subagent.thread_spawn.parent_thread_id`, and logbook parent
+events supply structural parentage. A record is `headless` only when its harness
+marks it non-interactive: Claude transcript lines with `entrypoint: "sdk-cli"`, or
+Codex `session_meta.source` equal to `"exec"` or an object containing `subagent`.
+Pi has no such marker. Interactive sessions remain visible without pane history.
+A session live in one of this server's panes or reported in its logbook is never
+headless. A headless record without a structural parent folds under an interactive
+or pane-hosted session with the same cwd whose inclusive activity window contains
+its start; without such a host it stands alone. Codex review
+runs use this rule because their source carries no parent. Where host windows
+overlap, the latest start wins, with key order breaking ties. Folded rows carry
+`parent`; each parent's `subagent_count` includes children before query filters
+and limits. Folded and headless rows are hidden unless `include_headless` is true.
+Parent links must reach an available root. Orphaned or cyclic components retain
+their most recently active available member as a standalone representative,
+preserving its headless classification.
+
+On macOS and Linux, a session found running outside this server carries
+`state: "outside"`, `outside: {"pid": ..., "detail": ...}`, `resume: null`, and
+`resume_blocked: "outside"`. Claude checks the running-session registry against
+live pids and process start times. A torn entry for a live pid is read up to three
+times, about 20 ms apart, then falls back to that Claude process's `--resume`,
+`-r`, or `--session-id` operand. If neither source identifies the session, that
+entry is skipped with a debug log; the saved session can still appear `ended`
+and resumable. Codex and pi use best-effort matches of session-owning operands
+in an agent process's argv; fork source operands do not count. Path operands are
+normalized, using the process cwd for relative paths when available. Ids remain
+exact matches.
+A matching pane on this server always takes precedence and remains `live`.
+Running-session evidence is read afresh for each query.
+
+A matching row's `why` gives the `field`, matching `line`, and matching `terms`;
+browse rows have `why: null`. Full prompts remain searchable beyond their clipped
+previews. Matches in folded descendants propagate through every ancestor, using
+the strongest score. Inherited explanations keep their `field` and prefix the
+`line` with `Subagent:`. Hard filters apply to the returned ancestor. Prompt extraction and title judgement follow `pane.prompt_trail`,
+including the exclusions for assistant output, tool traffic, and injected text.
+Codex names come from its session index, latest entry first in precedence; archived
+`.jsonl.zst` rollouts support skippable metadata frames; decoder windows over
+16 MiB are rejected. Harness files are only read.
+
+A background catalog reuses records by path, modification time, and size and
+refreshes every 30 seconds. The worker streams changed logbooks through the typed
+reader and caches the folded metadata. Queries use cached snapshots, with a two-second budget
+including the wait for one of two permits and the app's active-session snapshot. An unfinished
+catalog or an expired scan returns rows found so far with `partial: true`.
+Unreadable records are skipped individually and mark the result partial;
+unrelated history rows remain available without waiting for another refresh.
+Timed-out work retains its permit until it finishes. If the app cannot supply
+pane identity, or running-session evidence cannot be read, the method returns
+`server_unavailable`. Older servers refuse the
+unknown method with `invalid_request`; no capability flag or protocol bump is
+required.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 

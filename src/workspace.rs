@@ -20,13 +20,18 @@ mod git;
 mod tab;
 
 use self::git::git_status_cache_key_for_space;
-pub(crate) use self::{git::git_status_snapshot_for_cwd_with_demand, tab::MovedPane};
+#[cfg(test)]
+pub(crate) use self::git::test_support as git_test_support;
 pub use self::{
     git::{
         derive_label_from_cwd, fallback_label_from_cwd, git_branch, git_space_metadata,
         git_status_cache_key, GitSpaceMetadata, GitStatusCacheEntry, GitStatusRefreshDemand,
     },
     tab::{NewPane, Tab},
+};
+pub(crate) use self::{
+    git::{git_project_dir, git_status_snapshot_for_cwd_with_demand},
+    tab::MovedPane,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

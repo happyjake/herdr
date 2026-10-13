@@ -8,7 +8,13 @@ pub(crate) struct Operation {
 }
 
 macro_rules! define_operations {
-    ($( $variant:ident($params:ty) => $name:literal, $changes_ui:literal, $client_shell:literal; )*) => {
+    (
+        $( $variant:ident($params:ty) => $name:literal, $changes_ui:literal, $client_shell:literal; )*
+        $(@internal {
+            $( $internal_variant:ident { $( $field:ident: $field_type:ty ),* $(,)? }
+                => $internal_name:literal; )*
+        })?
+    ) => {
         #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
         #[serde(tag = "method", content = "params")]
         // Request enums are short-lived wire values; keeping variants direct preserves
@@ -16,6 +22,11 @@ macro_rules! define_operations {
         #[allow(clippy::large_enum_variant)]
         pub enum Method {
             $(#[serde(rename = $name)] $variant($params),)*
+            $($(
+                #[serde(skip)]
+                #[schemars(skip)]
+                $internal_variant { $( $field: $field_type ),* },
+            )*)?
         }
 
         impl Method {
@@ -34,6 +45,11 @@ macro_rules! define_operations {
                         changes_ui: $changes_ui,
                         client_shell: $client_shell,
                     },)*
+                    $($(Self::$internal_variant { .. } => operations::Operation {
+                        name: $internal_name,
+                        changes_ui: false,
+                        client_shell: false,
+                    },)*)?
                 }
             }
         }
@@ -145,6 +161,31 @@ mod tests {
                 operation.client_shell
             );
         }
+    }
+
+    #[test]
+    fn internal_dispatch_is_not_advertised_or_admitted_to_client_shells() {
+        let method = Method::InternalActiveSessions {
+            deadline: std::time::Instant::now(),
+        };
+        let operation = method.operation();
+        assert_eq!(operation.name, "internal.active_sessions");
+        assert!(!operation.changes_ui);
+        assert!(!operation.client_shell);
+        assert!(!Method::OPERATIONS
+            .iter()
+            .any(|candidate| candidate.name == operation.name));
+        assert!(!super::client_shell_method_names().contains(&operation.name));
+        assert!(!crate::server::client_commands::supports_client_shell_method(
+            &method
+        ));
+        assert!(!crate::server::client_commands::supports_client_shell_method_name(
+            operation.name
+        ));
+        assert!(!crate::api::request_changes_ui(&Request {
+            id: "internal".into(),
+            method,
+        }));
     }
 
     #[test]

@@ -59,6 +59,12 @@ fn monitor_host_power(
     None
 }
 
+// The Linux procfs policy has no OS calls; keep its snapshot contract testable
+// on other build hosts with injected process observations.
+#[cfg(any(target_os = "linux", test))]
+#[path = "linux/session_snapshot.rs"]
+mod linux_session_snapshot;
+
 pub(crate) struct HostShutdownMonitor {
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -143,6 +149,57 @@ pub struct ForegroundProcess {
     pub argv0: Option<String>,
     pub argv: Option<Vec<String>>,
     pub cmdline: Option<String>,
+}
+
+/// One living process in a session-search snapshot. Start time uses UTC
+/// `ps lstart` text, matching the Claude running-session registry.
+#[derive(Clone)]
+pub(crate) struct SessionProcess {
+    pub pid: u32,
+    pub started_at: String,
+    pub argv: Vec<String>,
+    pub cwd: Option<std::path::PathBuf>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn session_process_snapshot_from_output(
+    output: &str,
+    mut argv: impl FnMut(u32) -> Option<Vec<String>>,
+) -> Vec<SessionProcess> {
+    let mut processes = Vec::new();
+    for line in output.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(pid) = fields
+            .next()
+            .and_then(|pid| pid.parse().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        let Some(state) = fields.next().and_then(|state| state.chars().next()) else {
+            continue;
+        };
+        if matches!(state, 'Z' | 'X' | 'x') {
+            continue;
+        }
+        let start: Vec<_> = fields.collect();
+        if start.len() != 5 {
+            continue;
+        }
+        processes.push(SessionProcess {
+            pid,
+            started_at: start.join(" "),
+            argv: argv(pid).unwrap_or_default(),
+            cwd: None,
+        });
+    }
+    processes.sort_by_key(|process| process.pid);
+    processes
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn session_process_snapshot() -> std::io::Result<Vec<SessionProcess>> {
+    Ok(Vec::new())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

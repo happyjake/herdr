@@ -3950,6 +3950,24 @@ impl PaneRuntime {
 
 #[cfg(test)]
 impl PaneRuntime {
+    /// Hold the real terminal core while a test exercises another reader.
+    pub(crate) fn test_hold_core(
+        &self,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let terminal = self.terminal.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = std::thread::spawn(move || {
+            let _core = terminal.ghostty.core.lock().unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        (release_tx, held)
+    }
+
     #[cfg(unix)]
     pub(crate) fn test_enable_kitty_source_forwarding(&self) {
         let mut core = self.terminal.ghostty.core.lock().unwrap();

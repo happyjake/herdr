@@ -4,9 +4,9 @@ mod config_tests;
 mod discovery;
 mod status;
 #[cfg(test)]
-pub(super) mod test_support;
+pub(crate) mod test_support;
 
-pub(crate) use self::discovery::automatic_workspace_label;
+pub(crate) use self::discovery::{automatic_workspace_label, git_project_dir};
 
 pub use self::{
     discovery::{

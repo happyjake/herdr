@@ -52,6 +52,30 @@ pub struct ServerLookupPlaceParams {
     pub limit: Option<u32>,
 }
 
+/// Search cached agent sessions. All filters are optional; an empty query browses.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServerSearchSessionsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Include folded children and records never hosted by this server. Defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_headless: Option<bool>,
+    /// Defaults to 50 and is capped at 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Reserved; accepted and ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f64>>,
+}
+
 /// Which of the server's memories held a place. Never a disk search: a
 /// directory nobody has opened here is not a place this server can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -68,6 +92,11 @@ pub enum PlaceSource {
     Tmux,
     /// The working directory a recent agent session started in.
     Session,
+    /// The checkout a directory that is gone belonged to, as an agent
+    /// session there recorded it: the repository a removed worktree was
+    /// added from. Only ever the first answer to a literal path that no
+    /// longer exists.
+    Project,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

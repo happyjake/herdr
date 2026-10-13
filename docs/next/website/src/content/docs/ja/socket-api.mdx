@@ -92,7 +92,7 @@ herdr pane read w1:p2 --source recent --lines 50
 
 | 領域 | メソッド |
 | --- | --- |
-| サーバー | `ping`、`server.stop`、`server.reload_config`、`server.agent_manifests`、`server.reload_agent_manifests`、`server.lookup_place` |
+| サーバー | `ping`、`server.stop`、`server.reload_config`、`server.agent_manifests`、`server.reload_agent_manifests`、`server.lookup_place`、`server.search_sessions` |
 | 通知 | `notification.show` |
 | クライアント | `client.window_title.set`、`client.window_title.clear` |
 | セッション | `session.snapshot` |
@@ -108,6 +108,26 @@ herdr pane read w1:p2 --source recent --lines 50
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
 `agent.wait` はサーバー所有でイベント駆動です。解決したペイン占有者に固定されるため、置換されたエージェントが待機を満たすことはありません。`agent.prompt` は `until` と `timeout_ms` を持つ省略可能な `wait` オブジェクトを受け付けます。これにより、プロンプト送信と待機開始を 1 つのリクエストで行い、別々の呼び出し間の競合を避けられます。解決したエージェントがすでに `blocked` の場合、`agent.prompt` は入力を送信せず、待機も開始せずに `agent_blocked` を返します。
+
+`server.search_sessions` は、このサーバーに保存された Claude、Codex、pi のセッションと、Claude/Codex のプロンプト履歴を検索します。パラメーターはすべて省略可能です。
+
+```json
+{"id":"req_search","method":"server.search_sessions","params":{"terms":["keyboard","layout"],"agent":"claude","limit":50}}
+```
+
+`terms` はラベル、タイトル、プロンプト、cwd、ブランチへの大文字小文字を区別しないリテラル部分一致です。異なる検索語の一致ごとに `score` が 1 増え、全語一致が一部一致より上位になります。同点は最終活動が新しい順です。検索語なしの場合も新しい順に表示します。`since_ms` と `until_ms` は `[started_at_ms, last_active_at_ms]` との重なりを調べる、両端を含む必須条件です。`place` は cwd の大文字小文字を区別しない部分一致、`agent` は名前の完全一致です。`limit` は既定 50、上限 200。`embedding` は予約済みで無視され、`include_headless` の既定値は false です。true にすると、親にまとめられた子と headless の記録も返します。
+
+`server_search_sessions` の結果は `sessions`、絞り込み前に調べた行数の `scanned`、`partial` を含みます。各行は `key`（`agent`、`kind`、`value`）、`cwd`（不明なら null）、任意の `branch` と有用性を判定した `title`、約 400 文字の `first_prompt`、各約 240 文字で最大 3 件の `recent_prompts`（新しいものが最後）、ミリ秒単位の活動時刻を持ちます。Claude/Codex は id、pi は path をキーに使います。id のない古い Claude 履歴はプロジェクトと UTC 日付でまとめ、kind は `day`、value は `<cwd>|<YYYY-MM-DD>` です。Claude の記録が別のプロジェクトディレクトリへ移動してもキーは変わりません。
+
+`state` は `live`、`outside`、`ended`、`record_gone` のいずれかです。live 行にはこのサーバーの `live_pane_id` があります。`place_state` は `present` または `gone` で、gone の場合は存在する祖先があれば `nearest_existing` を返します。`resume` は再開プランナーの `command` と `cwd`、または null と理由の `resume_blocked`（`live`、`outside`、`record_gone`、`folder_gone`、`subagent`）です。Claude/Codex の id と pi のパスは最も近い既存の祖先から再開できます。場所不明とプロジェクト日別の行は再開できません。入れ子の Claude サブエージェント記録は単独では再開できず、常に `resume: null` と `resume_blocked: "subagent"` を返します。`labels` はログブックのラベルを古い順に保持します。各要素は `label`、`source`（`editor` または `person`）、`pane_id`、`from_ms`、着用終了時の任意の `to_ms` を持ちます。名前変更、ラベル解除、セッション交代、ペイン終了で前のラベル期間が終わります。ペインや記録がなくなってもラベルは残り、一致時は `why.field: "label"` を返します。
+
+Claude の `<project>/<sessionId>/subagents/agent-*.jsonl`、Codex の `session_meta.source.subagent.thread_spawn.parent_thread_id`、ログブックの parent イベントから親を判定します。`headless` はハーネスが非対話型と示した記録だけです。Claude では記録行の `entrypoint: "sdk-cli"`、Codex では `session_meta.source` が `"exec"` または `subagent` を含むオブジェクトの場合です。pi にはこのマーカーがありません。対話型セッションはペインの利用履歴がなくても表示します。このサーバーのペインで現在動作中、またはログブックに報告済みのセッションは headless になりません。構造上の親を持たない headless 記録は、同じ cwd で、その開始時刻を含む活動期間（両端を含む）を持つ対話型またはペイン利用済みセッションがあれば、その親にまとめます。なければ単独です。親を持たない Codex review 記録にもこの規則を使います。期間が重なる場合は開始が最も新しい親を選び、同時刻はキー順で決めます。子は `parent` を持ち、親の `subagent_count` は検索条件と件数制限を適用する前の子の数です。子と headless 行は `include_headless` が true の場合だけ返します。親リンクは存在するルートに到達する必要があります。親が欠落する場合や循環する場合は、その構成要素で最後の活動が最も新しい記録を単独の代表として残し、headless の判定は変更しません。
+
+macOS と Linux では、このサーバーの外で実行中と判定されたセッションに `state: "outside"`、`outside: {"pid": ..., "detail": ...}`、`resume: null`、`resume_blocked: "outside"` を返します。Claude は実行中セッションのレジストリを、生存する pid とプロセス開始時刻に照合します。生存する pid の項目が書き込み途中なら、約 20 ms 間隔で最大 3 回読み直し、なお解析できなければ、その Claude プロセスの `--resume`、`-r`、`--session-id` 引数を確認します。どちらからもセッションを特定できない場合は、その項目だけをスキップして debug ログを記録します。この場合、保存済みセッションが `ended` と表示され、再開可能なままになることがあります。Codex と pi は argv の現在のセッションを指定する引数を可能な範囲で照合し、fork 元の引数は対象にしません。パスを正規化し、相対パスには取得できたプロセス cwd を使います。id は完全一致のままです。このサーバー上の一致するペインが常に優先され、状態は `live` のままです。実行中セッションの情報はクエリごとに読み直します。
+
+一致した行の `why` は `field`、一致した `line`、一致語の `terms` を返し、閲覧時は `why: null` です。省略表示より後ろのプロンプトも検索できます。折りたたまれた子孫の一致はすべての祖先に伝わり、最も高いスコアを採用します。継承した説明は `field` を保持し、`line` に `Subagent:` を付けます。必須条件は返す祖先に適用します。プロンプト抽出とタイトル判定は `pane.prompt_trail` と共通で、アシスタント出力、ツール通信、注入テキストを除外します。Codex 名はセッション索引の最後の項目を優先し、`.jsonl.zst` の記録とスキップ可能なメタデータフレームも読めます。デコーダーのウィンドウが 16 MiB を超える記録は拒否します。ハーネスのファイルには書き込みません。
+
+バックグラウンドカタログはパス、更新時刻、サイズで記録を再利用し、30 秒ごとに更新します。ワーカーは変更されたログブックを型付きリーダーで順次読み、集約したメタデータをキャッシュします。検索はキャッシュを使い、2 つの許可枠の待機とアプリへのアクティブセッション情報の要求を含めて約 2 秒以内に返します。未完成のカタログや期限切れの走査は、見つかった行と `partial: true` を返します。読めない記録は個別にスキップし、結果を部分的とします。無関係な履歴の行は次の更新を待たずに返します。期限を過ぎた処理も完了するまでは許可枠を保持します。アプリからペイン識別情報を取得できない場合や、実行中セッションの情報を読み取れない場合は `server_unavailable`。古いサーバーは未知のメソッドとして `invalid_request` を返し、能力フラグやプロトコル番号の変更は不要です。
 
 `workspace.move_block` は、順序付きの `workspace_ids` を `before_workspace_id` の前へアトミックに移動します。アンカーを省略するとブロックを末尾へ移動します。id は一意である必要があり、アンカーをブロックに含めることはできません。レスポンスにはサーバーが確定した順序付きワークスペース一覧が含まれます。
 

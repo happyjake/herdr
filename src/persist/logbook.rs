@@ -51,6 +51,14 @@ pub enum Event {
         terminal: crate::terminal::TerminalId,
         key: SessionKey,
         cwd: PathBuf,
+        /// The checkout `cwd` belongs to when it is not that checkout's own
+        /// root — above all, the repository a linked worktree was added
+        /// from. Kept because removing a worktree removes every trace of
+        /// that link from both sides, and a directory that is gone should
+        /// still be able to say where its work came from. Absent outside a
+        /// repository and on lines written before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<PathBuf>,
         at: u64,
     },
     LabelWorn {
@@ -85,7 +93,7 @@ pub fn read(path: &Path) -> io::Result<Vec<Event>> {
     Ok(events)
 }
 
-fn for_each_event(path: &Path, mut visit: impl FnMut(Event)) -> io::Result<()> {
+pub(crate) fn for_each_event(path: &Path, mut visit: impl FnMut(Event)) -> io::Result<()> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),

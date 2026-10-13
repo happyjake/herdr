@@ -51,6 +51,33 @@ impl std::io::Write for ChildPipe {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn session_process_snapshot(
+    argv: impl Fn(u32) -> Option<Vec<String>>,
+    cwd: impl Fn(u32) -> Option<PathBuf>,
+) -> std::io::Result<Vec<super::SessionProcess>> {
+    use std::process::{Command, Stdio};
+
+    // Both BSD and procps ps expose lstart. Pin the locale and timezone to
+    // the harness registry, without changing the server's own environment.
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "stat=", "-o", "lstart="])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("process snapshot failed"));
+    }
+    let mut processes =
+        super::session_process_snapshot_from_output(&String::from_utf8_lossy(&output.stdout), argv);
+    for process in &mut processes {
+        process.cwd = cwd(process.pid);
+    }
+    Ok(processes)
+}
+
 pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
     if status.signal().is_some() {
         super::ChildExitReason::Interrupted

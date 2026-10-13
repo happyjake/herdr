@@ -621,6 +621,12 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    pub(crate) fn test_hold_core(
+        &self,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        self.0.test_hold_core()
+    }
+
     #[cfg(unix)]
     pub(crate) fn test_start_basic_detection(&mut self) -> mpsc::Receiver<crate::events::AppEvent> {
         self.0.test_start_basic_detection()

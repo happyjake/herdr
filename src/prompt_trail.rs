@@ -38,7 +38,7 @@ pub(crate) const MAX_RECORD_BYTES: u64 = 64 * 1024 * 1024;
 /// bound here would quietly drop real prompts. A line past even this is
 /// not stepped over — the record is answered as unreadable, because a
 /// record whose prompts this cannot read is not a record it can speak for.
-const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Code points the first prompt is cut to.
 const FIRST_PROMPT_CHARS: usize = 400;
@@ -63,6 +63,7 @@ const CLAUDE_FALLBACK_TITLE: &str = "Claude Code";
 
 /// Texts a claude record carries as a user turn that no person typed.
 const CLAUDE_SKIPPED_PREFIXES: &[&str] = &[
+    "<local-command-caveat>",
     "<local-command-stdout>",
     "<system-reminder>",
     "<bash-input>",
@@ -82,6 +83,11 @@ const CODEX_SKIPPED_PREFIXES: &[&str] = &[
     "<permissions",
     "<turn_aborted",
     "<collaboration_mode",
+    "<subagent_notification",
+    "<recommended_plugins>",
+    "<codex_internal_context",
+    "<skill>",
+    "<user_action>",
 ];
 
 /// The harness a session belongs to, when its records are ones this reads.
@@ -265,10 +271,7 @@ fn read_lines(
 
     // A title that is the harness's own name, or the first prompt said
     // again, tells a reader nothing the trail does not already carry.
-    let title = title.filter(|title| {
-        !title.eq_ignore_ascii_case(CLAUDE_FALLBACK_TITLE)
-            && !first_whole.eq_ignore_ascii_case(title)
-    });
+    let title = judged_title(title, &first_whole);
 
     Ok(PromptTrail {
         agent,
@@ -281,7 +284,7 @@ fn read_lines(
 }
 
 /// What one line of a record says was asked, when it says anything.
-fn prompt_text(agent: PromptTrailAgent, line: &Value) -> Option<String> {
+pub(crate) fn prompt_text(agent: PromptTrailAgent, line: &Value) -> Option<String> {
     match agent {
         PromptTrailAgent::Claude => claude_prompt(line),
         PromptTrailAgent::Codex => codex_prompt(line),
@@ -320,7 +323,7 @@ fn claude_prompt(line: &Value) -> Option<String> {
     };
     let text = clean(&text);
 
-    if text.starts_with("<command-message>") {
+    if text.starts_with("<command-message>") || text.starts_with("<command-name>") {
         return claude_command_prompt(&text);
     }
     if CLAUDE_SKIPPED_PREFIXES
@@ -390,12 +393,21 @@ fn pi_prompt(line: &Value) -> Option<String> {
 }
 
 /// The title a claude record carries, before it is judged.
-fn claude_title(agent: PromptTrailAgent, line: &Value) -> Option<String> {
+pub(crate) fn claude_title(agent: PromptTrailAgent, line: &Value) -> Option<String> {
     if agent != PromptTrailAgent::Claude || line.get("type")?.as_str()? != "ai-title" {
         return None;
     }
     let title = clean(line.get("aiTitle")?.as_str()?);
     (!title.is_empty()).then_some(title)
+}
+
+/// Shared judgement for harness titles and session-index names.
+pub(crate) fn judged_title(title: Option<String>, first: &str) -> Option<String> {
+    title.map(|title| clean(&title)).filter(|title| {
+        !title.is_empty()
+            && !title.eq_ignore_ascii_case(CLAUDE_FALLBACK_TITLE)
+            && !first.eq_ignore_ascii_case(title)
+    })
 }
 
 fn flag(line: &Value, key: &str) -> bool {
@@ -511,7 +523,7 @@ fn clean(text: &str) -> String {
 
 /// Cut to a length, at a word boundary when one is near enough the end
 /// that keeping it still leaves most of the cut standing.
-fn cut(text: &str, limit: usize) -> String {
+pub(crate) fn cut(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
     }
@@ -523,7 +535,7 @@ fn cut(text: &str, limit: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
-enum LineRead {
+pub(crate) enum LineRead {
     Line,
     TooLong,
     End,
@@ -535,7 +547,7 @@ enum LineRead {
 /// `TooLong` ends the read rather than skipping a line: the reader is
 /// deliberately left where it stands, unadvanced, because a record whose
 /// prompts cannot be read is refused whole. Nothing may carry on past it.
-fn read_line_bounded(
+pub(crate) fn read_line_bounded(
     reader: &mut impl BufRead,
     line: &mut Vec<u8>,
     consumed: &mut u64,
@@ -1033,6 +1045,45 @@ mod tests {
         // none of a trail's business.
         assert_eq!(trail.title, None);
         assert_eq!(trail.newest_at, Some(1772698320));
+    }
+
+    #[test]
+    fn prompt_trail_excludes_injected_codex_turns() {
+        let home = FixtureHome::new();
+        let mut turns: Vec<_> = [
+            "<subagent_notification>{\"agent_id\":\"child\",\"status\":{\"completed\":\"generated result\"}}</subagent_notification>",
+            "<recommended_plugins>Generated plugin suggestions</recommended_plugins>",
+            "<codex_internal_context source=\"goal\">Continue the task</codex_internal_context>",
+            "<skill><name>example</name><path>/workspace/skill.md</path>Injected instructions</skill>",
+            "<user_action><context>User initiated a review</context><action>review</action><results>Generated review</results></user_action>",
+        ].into_iter().map(|text| serde_json::json!({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]
+        }})).collect();
+        turns.push(serde_json::json!({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "The actual request"}]
+        }}));
+        let record = home.write("records/codex.jsonl", &lines(&turns));
+        let trail = read(&record, PromptTrailAgent::Codex).unwrap();
+        assert_eq!(trail.count, 1);
+        assert_eq!(trail.first.unwrap().text, "The actual request");
+        assert_eq!(texts(&trail.recent), vec!["The actual request"]);
+    }
+
+    #[test]
+    fn prompt_trail_normalizes_both_claude_command_orders() {
+        let home = FixtureHome::new();
+        let record = home.write("records/claude.jsonl", &lines(&[
+            claude_user("<local-command-caveat>Generated local-command warning</local-command-caveat>", "2026-03-04T09:00:00Z"),
+            claude_user("<command-name>/inspect</command-name><command-message>inspect</command-message><command-args>the parser</command-args>", "2026-03-04T09:01:00Z"),
+            claude_user("<command-message>inspect</command-message><command-name>/inspect</command-name><command-args>the cache</command-args>", "2026-03-04T09:02:00Z"),
+        ]));
+        let trail = read(&record, PromptTrailAgent::Claude).unwrap();
+        assert_eq!(trail.count, 2);
+        assert_eq!(trail.first.unwrap().text, "/inspect the parser");
+        assert_eq!(
+            texts(&trail.recent),
+            vec!["/inspect the parser", "/inspect the cache"]
+        );
     }
 
     #[test]

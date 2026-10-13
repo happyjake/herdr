@@ -267,6 +267,32 @@ fn headless_pane_list(server: &mut HeadlessServer) -> Vec<api::schema::PaneInfo>
     panes
 }
 
+#[tokio::test]
+async fn search_sessions_snapshot_requests_do_not_create_or_project_runtime() {
+    let mut server = test_headless_server();
+    for (deadline, expected) in [
+        (Instant::now() + Duration::from_secs(2), "[]"),
+        (Instant::now() - Duration::from_secs(1), "null"),
+    ] {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "snapshot".into(),
+                method: api::schema::Method::InternalActiveSessions { deadline },
+            },
+            respond_to,
+            response_write_complete: None,
+        });
+        assert_eq!(
+            response_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            expected
+        );
+        assert!(!changed);
+        assert!(server.app.state.workspaces.is_empty());
+        assert!(server.app.state.terminals.is_empty());
+    }
+}
+
 fn pane_updated_events(event_hub: &api::EventHub) -> usize {
     event_hub
         .events_after(0)

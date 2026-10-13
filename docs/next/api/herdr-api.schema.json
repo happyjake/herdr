@@ -4286,6 +4286,76 @@
           ],
           "type": "object"
         },
+        "ServerSearchSessionsParams": {
+          "description": "Search cached agent sessions. All filters are optional; an empty query browses.",
+          "properties": {
+            "agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "embedding": {
+              "description": "Reserved; accepted and ignored.",
+              "items": {
+                "format": "double",
+                "type": "number"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "include_headless": {
+              "description": "Include folded children and records never hosted by this server. Defaults to false.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "limit": {
+              "description": "Defaults to 50 and is capped at 200.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "place": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "since_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "terms": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "until_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "ServerSshAgentRegisterParams": {
           "properties": {
             "socket_path": {
@@ -5206,6 +5276,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/ServerLookupPlaceParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.search_sessions",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerSearchSessionsParams"
             }
           },
           "required": [
@@ -9481,6 +9567,11 @@
               "const": "session",
               "description": "The working directory a recent agent session started in.",
               "type": "string"
+            },
+            {
+              "const": "project",
+              "description": "The checkout a directory that is gone belonged to, as an agent\nsession there recorded it: the repository a removed worktree was\nadded from. Only ever the first answer to a literal path that no\nlonger exists.",
+              "type": "string"
             }
           ]
         },
@@ -10258,6 +10349,35 @@
               "required": [
                 "type",
                 "places"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "partial": {
+                  "type": "boolean"
+                },
+                "scanned": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "sessions": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/SessionHit"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "server_search_sessions",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "sessions",
+                "scanned",
+                "partial"
               ],
               "type": "object"
             },
@@ -11644,6 +11764,34 @@
             }
           ]
         },
+        "SearchSessionKey": {
+          "description": "Resume identity without the reporting source. Paths identify pi sessions;\nold Claude history without session ids uses a project-day key.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/SearchSessionKeyKind"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "agent",
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "SearchSessionKeyKind": {
+          "enum": [
+            "id",
+            "path",
+            "day"
+          ],
+          "type": "string"
+        },
         "ServerCapabilities": {
           "properties": {
             "agent_report_cancelled": {
@@ -11714,6 +11862,246 @@
           ],
           "type": "object"
         },
+        "SessionHit": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "first_prompt": {
+              "type": "string"
+            },
+            "headless": {
+              "type": "boolean"
+            },
+            "key": {
+              "$ref": "#/schemas/success_response/$defs/SearchSessionKey"
+            },
+            "labels": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/SessionLabel"
+              },
+              "type": "array"
+            },
+            "last_active_at_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "live_pane_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "nearest_existing": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "outside": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/SessionOutside"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "parent": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/SearchSessionKey"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "place_state": {
+              "$ref": "#/schemas/success_response/$defs/SessionPlaceState"
+            },
+            "recent_prompts": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "resume": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/SessionResume"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "resume_blocked": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/SessionResumeBlocked"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "score": {
+              "format": "double",
+              "type": "number"
+            },
+            "started_at_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/SessionState"
+            },
+            "subagent_count": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "why": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/SessionWhy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "key",
+            "agent",
+            "cwd",
+            "place_state",
+            "first_prompt",
+            "recent_prompts",
+            "started_at_ms",
+            "last_active_at_ms",
+            "labels",
+            "state",
+            "resume",
+            "headless",
+            "subagent_count",
+            "why",
+            "score"
+          ],
+          "type": "object"
+        },
+        "SessionLabel": {
+          "properties": {
+            "from_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "label": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/schemas/success_response/$defs/SessionLabelSource"
+            },
+            "to_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "label",
+            "source",
+            "pane_id",
+            "from_ms"
+          ],
+          "type": "object"
+        },
+        "SessionLabelSource": {
+          "enum": [
+            "editor",
+            "person"
+          ],
+          "type": "string"
+        },
+        "SessionOutside": {
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pid",
+            "detail"
+          ],
+          "type": "object"
+        },
+        "SessionPlaceState": {
+          "enum": [
+            "present",
+            "gone"
+          ],
+          "type": "string"
+        },
+        "SessionResume": {
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "cwd"
+          ],
+          "type": "object"
+        },
+        "SessionResumeBlocked": {
+          "enum": [
+            "live",
+            "outside",
+            "record_gone",
+            "folder_gone",
+            "subagent"
+          ],
+          "type": "string"
+        },
         "SessionSnapshot": {
           "properties": {
             "agents": {
@@ -11783,6 +12171,48 @@
             "agents"
           ],
           "type": "object"
+        },
+        "SessionState": {
+          "enum": [
+            "live",
+            "outside",
+            "ended",
+            "record_gone"
+          ],
+          "type": "string"
+        },
+        "SessionWhy": {
+          "properties": {
+            "field": {
+              "$ref": "#/schemas/success_response/$defs/SessionWhyField"
+            },
+            "line": {
+              "type": "string"
+            },
+            "terms": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "field",
+            "line",
+            "terms"
+          ],
+          "type": "object"
+        },
+        "SessionWhyField": {
+          "enum": [
+            "label",
+            "title",
+            "first_prompt",
+            "prompt",
+            "cwd",
+            "branch"
+          ],
+          "type": "string"
         },
         "SplitDirection": {
           "enum": [

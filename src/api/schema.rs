@@ -10,6 +10,7 @@ pub(crate) mod operations;
 pub mod panes;
 pub mod plugins;
 pub mod response;
+pub mod search_sessions;
 pub mod server;
 pub mod session;
 pub mod tabs;
@@ -25,6 +26,7 @@ pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
+pub use search_sessions::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
@@ -159,6 +161,11 @@ operations::define_operations! {
     AttachmentAppend(AttachmentAppendParams) => "attachment.append", false, false;
     AttachmentCommit(AttachmentCommitParams) => "attachment.commit", false, false;
     PanePromptTrail(PaneTarget) => "pane.prompt_trail", false, false;
+    ServerSearchSessions(ServerSearchSessionsParams) => "server.search_sessions", false, false;
+    @internal {
+        // In-process only; absent from wire schemas and advertised operations.
+        InternalActiveSessions { deadline: std::time::Instant } => "internal.active_sessions";
+    }
 }
 
 #[cfg(test)]

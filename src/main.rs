@@ -54,6 +54,7 @@ mod render_signal;
 mod selection;
 mod server;
 mod session;
+mod session_search;
 mod sound;
 mod terminal;
 mod terminal_effects;
@@ -435,7 +436,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Route another machine uses to open a shell on this server, typically an
 # exact SSH alias. Never guessed from the name or hostname; unset or empty
 # means undeclared. Applies on config reload.
-# reach = "home-box"
+# reach = "test-server"
 # URL clients should dial when something fronts the listener, such as a TLS
 # terminating proxy: a ws:// or wss:// URL with host, optional port, and
 # optional path only. Published in the ping response and used by the pairing
