@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::records::{self, FileData, FileKind, Session};
 
@@ -11,6 +11,7 @@ pub(crate) struct Desk {
     pub home: Option<PathBuf>,
     pub processes:
         Box<dyn Fn() -> std::io::Result<Vec<crate::platform::SessionProcess>> + Send + Sync>,
+    pub registry_retry_sleep: Box<dyn Fn(Duration) + Send + Sync>,
 }
 
 pub(crate) struct Catalog {
@@ -50,7 +51,11 @@ impl Catalog {
     }
 
     pub(super) fn outside_sessions(&self) -> std::io::Result<super::outside::OutsideSessions> {
-        super::outside::read(self.desk.home.as_deref(), &(self.desk.processes)()?)
+        super::outside::read(
+            self.desk.home.as_deref(),
+            &(self.desk.processes)()?,
+            self.desk.registry_retry_sleep.as_ref(),
+        )
     }
 
     /// One maintenance pass. The server runs this on its single catalog worker;

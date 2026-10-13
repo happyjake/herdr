@@ -25,6 +25,7 @@ impl FixtureHome {
         let catalog = Arc::new(Catalog::new(Desk {
             home: Some(root.clone()),
             processes: Box::new(move || Ok(view.lock().unwrap().clone())),
+            registry_retry_sleep: Box::new(|_| {}),
         }));
         Self {
             root,

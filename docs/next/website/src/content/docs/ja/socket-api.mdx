@@ -121,7 +121,7 @@ herdr pane read w1:p2 --source recent --lines 50
 
 `state` は `live`、`outside`、`ended`、`record_gone` のいずれかです。live 行にはこのサーバーの `live_pane_id` があります。`place_state` は `present` または `gone` で、gone の場合は存在する祖先があれば `nearest_existing` を返します。`resume` は再開プランナーの `command` と `cwd`、または null と理由の `resume_blocked`（`live`、`outside`、`record_gone`、`folder_gone`）です。Claude/Codex の id と pi のパスは最も近い既存の祖先から再開できます。場所不明とプロジェクト日別の行は再開できません。`labels` は空、`headless` は false、`subagent_count` は 0、`parent` は省略します。Claude のサブエージェントファイルと、source がオブジェクトの Codex 記録は除外します。
 
-macOS と Linux では、このサーバーの外で実行中と判定されたセッションに `state: "outside"`、`outside: {"pid": ..., "detail": ...}`、`resume: null`、`resume_blocked: "outside"` を返します。Claude は実行中セッションのレジストリにある pid が生存し、プロセス開始時刻も一致する必要があります。Codex と pi はエージェントプロセスの argv にあるセッション id または記録パスとの一致を可能な範囲で確認します。このサーバー上の一致するペインが常に優先され、状態は `live` のままです。実行中セッションの情報はクエリごとに読み直します。
+macOS と Linux では、このサーバーの外で実行中と判定されたセッションに `state: "outside"`、`outside: {"pid": ..., "detail": ...}`、`resume: null`、`resume_blocked: "outside"` を返します。Claude は実行中セッションのレジストリを、生存する pid とプロセス開始時刻に照合します。生存する pid の項目が書き込み途中なら、約 20 ms 間隔で最大 3 回読み直し、なお解析できなければ、その Claude プロセスの `--resume`、`-r`、`--session-id` 引数を確認します。どちらからもセッションを特定できない場合は、その項目だけをスキップして debug ログを記録します。この場合、保存済みセッションが `ended` と表示され、再開可能なままになることがあります。Codex と pi は argv の現在のセッションを指定する引数を可能な範囲で照合し、fork 元の引数は対象にしません。パスを正規化し、相対パスには取得できたプロセス cwd を使います。id は完全一致のままです。このサーバー上の一致するペインが常に優先され、状態は `live` のままです。実行中セッションの情報はクエリごとに読み直します。
 
 一致した行の `why` は `field`、一致した `line`、一致語の `terms` を返し、閲覧時は `why: null` です。省略表示より後ろのプロンプトも検索できます。プロンプト抽出とタイトル判定は `pane.prompt_trail` と共通で、アシスタント出力、ツール通信、注入テキストを除外します。Codex 名はセッション索引の最後の項目を優先し、`.jsonl.zst` の記録とスキップ可能なメタデータフレームも読めます。デコーダーのウィンドウが 16 MiB を超える記録は拒否します。ハーネスのファイルには書き込みません。
 

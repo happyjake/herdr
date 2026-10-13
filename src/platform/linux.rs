@@ -1,6 +1,10 @@
 mod native_image_sources;
 pub(crate) use native_image_sources::clone_native_image_source;
 
+use super::linux_session_snapshot::process_allows_remote_memory_read;
+#[cfg(test)]
+use super::linux_session_snapshot::process_state_allows_remote_memory_read;
+
 use std::{
     collections::{HashSet, VecDeque},
     io::{Read, Write},
@@ -705,15 +709,6 @@ fn process_pgrp_comm_and_state_from_stat(stat: &str) -> Option<(i32, String, cha
     Some((pgrp, comm, state))
 }
 
-fn process_state_allows_remote_memory_read(state: char) -> bool {
-    !matches!(state, 'D' | 'Z' | 'X' | 'x')
-}
-
-fn process_allows_remote_memory_read(state: char, comm: &str, running_inside_wsl: bool) -> bool {
-    process_state_allows_remote_memory_read(state)
-        && (!running_inside_wsl || crate::detect::identify_agent(comm).is_none())
-}
-
 pub(crate) fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     process_ppid_and_comm_from_stat(&stat)
@@ -759,7 +754,18 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
 }
 
 pub(crate) fn session_process_snapshot() -> std::io::Result<Vec<super::SessionProcess>> {
-    super::unix_common::session_process_snapshot(process_argv)
+    let inside_wsl = running_inside_wsl();
+    super::unix_common::session_process_snapshot(
+        |pid| {
+            super::linux_session_snapshot::read_argv(
+                pid,
+                inside_wsl,
+                process_pgrp_comm_and_state,
+                process_argv,
+            )
+        },
+        process_cwd,
+    )
 }
 
 /// Get the current working directory of a process.

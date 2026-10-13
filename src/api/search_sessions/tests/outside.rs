@@ -1,6 +1,82 @@
 use super::*;
 use crate::platform::SessionProcess;
 
+#[test]
+fn a_torn_live_registry_entry_is_retried_before_returning_a_resume() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut home = running_claude();
+    let path = home.root.join(".claude/sessions/241.json");
+    let complete = std::fs::read(&path).unwrap();
+    std::fs::write(&path, []).unwrap();
+    let sleeps = Arc::new(AtomicUsize::new(0));
+    let observed_sleeps = Arc::clone(&sleeps);
+    let processes = Arc::clone(&home.processes);
+    home.catalog = Arc::new(Catalog::new(Desk {
+        home: Some(home.root.clone()),
+        processes: Box::new(move || Ok(processes.lock().unwrap().clone())),
+        registry_retry_sleep: Box::new(move |delay| {
+            assert_eq!(delay, Duration::from_millis(20));
+            // Keep the first two reads torn; only the third can identify the session.
+            if observed_sleeps.fetch_add(1, Ordering::SeqCst) == 1 {
+                std::fs::write(&path, &complete).unwrap();
+            }
+        }),
+    }));
+    home.catalog.refresh();
+
+    let response = home.search(json!({}), vec![]);
+    let row = by_key(&response, "session-a");
+    assert_eq!(row["state"], "outside");
+    assert_eq!(row["resume"], Value::Null);
+    assert_eq!(row["resume_blocked"], "outside");
+    assert_eq!(sleeps.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_persistently_torn_registry_entry_uses_the_live_claude_resume_operand() {
+    let home = running_claude();
+    std::fs::write(home.root.join(".claude/sessions/241.json"), []).unwrap();
+    for flag in ["--resume", "-r", "--session-id"] {
+        home.processes.lock().unwrap()[0].argv =
+            vec!["claude".into(), flag.into(), "session-a".into()];
+        let response = home.search(json!({}), vec![]);
+        let row = by_key(&response, "session-a");
+        assert_eq!(row["state"], "outside", "{flag}");
+        assert_eq!(
+            row["outside"],
+            json!({"pid": 241, "detail": "claude pid 241"})
+        );
+        assert_eq!(row["resume"], Value::Null);
+        assert_eq!(row["resume_blocked"], "outside");
+    }
+}
+
+#[test]
+fn a_persistently_torn_registry_without_an_argv_identity_leaves_resume_available() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut home = running_claude();
+    std::fs::write(home.root.join(".claude/sessions/241.json"), []).unwrap();
+    let sleeps = Arc::new(AtomicUsize::new(0));
+    let observed_sleeps = Arc::clone(&sleeps);
+    let processes = Arc::clone(&home.processes);
+    home.catalog = Arc::new(Catalog::new(Desk {
+        home: Some(home.root.clone()),
+        processes: Box::new(move || Ok(processes.lock().unwrap().clone())),
+        registry_retry_sleep: Box::new(move |_| {
+            observed_sleeps.fetch_add(1, Ordering::SeqCst);
+        }),
+    }));
+    home.catalog.refresh();
+    let response = home.search(json!({}), vec![]);
+    let row = by_key(&response, "session-a");
+    assert_eq!(row["state"], "ended");
+    assert_eq!(row["resume"]["command"], "claude --resume session-a");
+    assert!(row.get("outside").is_none());
+    assert_eq!(sleeps.load(Ordering::SeqCst), 2);
+}
+
 fn running_claude() -> FixtureHome {
     let home = FixtureHome::new();
     let cwd = home.dir("project");
@@ -21,6 +97,7 @@ fn running_claude() -> FixtureHome {
             "procStart": "Mon Oct 12 11:39:11 2026", "kind": "interactive", "status": "idle"})],
     );
     home.processes.lock().unwrap().push(SessionProcess {
+        cwd: None,
         pid: 241,
         started_at: "Mon Oct 12 11:39:11 2026".into(),
         argv: vec!["claude".into()],
@@ -102,6 +179,7 @@ fn a_codex_resume_process_marks_its_saved_session_outside() {
     );
     home.catalog.refresh();
     home.processes.lock().unwrap().push(SessionProcess {
+        cwd: None,
         pid: 242,
         started_at: "Mon Oct 12 11:39:11 2026".into(),
         argv: vec!["/usr/bin/codex".into(), "resume".into(), "session-a".into()],
@@ -140,6 +218,7 @@ fn pi_process_arguments_match_session_paths_and_record_ids() {
         vec!["pi", "--session", "pi-a"],
     ] {
         *home.processes.lock().unwrap() = vec![SessionProcess {
+            cwd: None,
             pid: 243,
             started_at: "Mon Oct 12 11:39:11 2026".into(),
             argv: argv.iter().map(|arg| (*arg).into()).collect(),
@@ -150,6 +229,155 @@ fn pi_process_arguments_match_session_paths_and_record_ids() {
         assert_eq!(row["outside"], json!({"pid": 243, "detail": "pi pid 243"}));
         assert_eq!(row["resume"], Value::Null);
         assert_eq!(row["resume_blocked"], "outside");
+    }
+}
+
+#[test]
+fn pi_session_paths_resolve_dot_components_and_relative_paths_from_process_cwd() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    let path = home.write(
+        ".pi/agent/sessions/project/record with spaces.jsonl",
+        &[json!({"type": "session", "id": "pi-a", "cwd": cwd})],
+    );
+    home.catalog.refresh();
+    let parent = path.parent().unwrap();
+    let key = path.to_str().unwrap();
+    let absolute_dot = format!("{}/./record with spaces.jsonl", parent.display());
+    let absolute_parent = format!("{}/unused/../record with spaces.jsonl", parent.display());
+    for (operand, process_cwd, outside) in [
+        (absolute_dot.as_str(), None, true),
+        (absolute_parent.as_str(), None, true),
+        (
+            "./record with spaces.jsonl",
+            Some(parent.to_path_buf()),
+            true,
+        ),
+        (
+            "unused/../record with spaces.jsonl",
+            Some(parent.to_path_buf()),
+            true,
+        ),
+        ("record with spaces.jsonl", Some(parent.to_path_buf()), true),
+        ("record with spaces.jsonl", None, false),
+        ("record with spaces.jsonl", Some(home.root.clone()), false),
+        ("pi-a", None, true),
+        ("./pi-a", Some(parent.to_path_buf()), false),
+    ] {
+        *home.processes.lock().unwrap() = vec![SessionProcess {
+            pid: 243,
+            started_at: "Mon Oct 12 11:39:11 2026".into(),
+            argv: vec!["pi".into(), "--session".into(), operand.into()],
+            cwd: process_cwd,
+        }];
+        let response = home.search(json!({}), vec![]);
+        let row = by_key(&response, key);
+        assert_eq!(
+            row["state"],
+            if outside { "outside" } else { "ended" },
+            "{operand}"
+        );
+        assert_eq!(row["resume"].is_null(), outside, "{operand}");
+    }
+
+    for identity in ["pi-a", "PI-A", "./pi-a", key, "record with spaces.jsonl"] {
+        *home.processes.lock().unwrap() = vec![SessionProcess {
+            pid: 243,
+            started_at: "Mon Oct 12 11:39:11 2026".into(),
+            argv: vec!["pi".into(), "--session-id".into(), identity.into()],
+            cwd: Some(parent.to_path_buf()),
+        }];
+        let response = home.search(json!({}), vec![]);
+        assert_eq!(
+            by_key(&response, key)["state"],
+            if identity == "pi-a" {
+                "outside"
+            } else {
+                "ended"
+            },
+            "{identity}"
+        );
+    }
+}
+
+#[test]
+fn pi_fork_sources_and_other_operands_do_not_own_the_saved_session() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    let path = home.write(
+        ".pi/agent/sessions/project/session-a.jsonl",
+        &[json!({"type": "session", "id": "pi-a", "cwd": cwd})],
+    );
+    home.catalog.refresh();
+    let key = path.to_str().unwrap();
+    for (args, outside) in [
+        (vec!["--session", key], true),
+        (vec!["--resume", "--session", key], true),
+        (vec!["--session-id", "pi-a"], true),
+        (vec!["--fork", key], false),
+        (vec!["--session", key, "--fork", key], false),
+        (vec![key], false),
+        (vec!["--system-prompt", key], false),
+        (vec!["--session", "another-session", key], false),
+        (vec!["--resume", key], false),
+        (vec!["-r", key], false),
+        (vec!["--", "--session", key], false),
+    ] {
+        *home.processes.lock().unwrap() = vec![SessionProcess {
+            cwd: None,
+            pid: 243,
+            started_at: "Mon Oct 12 11:39:11 2026".into(),
+            argv: std::iter::once("pi")
+                .chain(args.iter().copied())
+                .map(str::to_string)
+                .collect(),
+        }];
+        let response = home.search(json!({}), vec![]);
+        let row = by_key(&response, key);
+        assert_eq!(
+            row["state"],
+            if outside { "outside" } else { "ended" },
+            "{args:?}"
+        );
+        assert_eq!(row["resume"].is_null(), outside, "{args:?}");
+        assert_eq!(row.get("outside").is_some(), outside, "{args:?}");
+    }
+}
+
+#[test]
+fn codex_only_the_resume_operand_owns_the_saved_session() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".codex/sessions/2026/10/12/rollout-session-a.jsonl",
+        &[json!({"type": "session_meta", "payload": {"id": "session-a", "cwd": cwd, "source": "cli"}})],
+    );
+    home.catalog.refresh();
+    for (args, outside) in [
+        (vec!["resume", "session-a"], true),
+        (vec!["fork", "session-a"], false),
+        (vec!["exec", "session-a"], false),
+        (vec!["resume", "another-session", "session-a"], false),
+        (vec!["resume", "--last", "session-a"], false),
+        (vec!["--", "resume", "session-a"], false),
+    ] {
+        *home.processes.lock().unwrap() = vec![SessionProcess {
+            cwd: None,
+            pid: 242,
+            started_at: "Mon Oct 12 11:39:11 2026".into(),
+            argv: std::iter::once("codex")
+                .chain(args.iter().copied())
+                .map(str::to_string)
+                .collect(),
+        }];
+        let response = home.search(json!({}), vec![]);
+        let row = by_key(&response, "session-a");
+        assert_eq!(
+            row["state"],
+            if outside { "outside" } else { "ended" },
+            "{args:?}"
+        );
+        assert_eq!(row["resume"].is_null(), outside, "{args:?}");
     }
 }
 
@@ -173,6 +401,7 @@ fn codex_process_matches_use_complete_arguments_and_the_correct_agent() {
         (vec!["pi", "--session", "session-a"], false),
     ] {
         *home.processes.lock().unwrap() = vec![SessionProcess {
+            cwd: None,
             pid: 242,
             started_at: "Mon Oct 12 11:39:11 2026".into(),
             argv: argv.iter().map(|arg| (*arg).into()).collect(),
@@ -206,11 +435,13 @@ fn this_servers_live_panes_win_over_codex_and_pi_process_matches() {
     let path = path.to_str().unwrap();
     *home.processes.lock().unwrap() = vec![
         SessionProcess {
+            cwd: None,
             pid: 242,
             started_at: String::new(),
             argv: vec!["codex".into(), "resume".into(), "session-a".into()],
         },
         SessionProcess {
+            cwd: None,
             pid: 243,
             started_at: String::new(),
             argv: vec!["pi".into(), "--session".into(), path.into()],
@@ -326,6 +557,7 @@ fn an_unavailable_process_view_does_not_offer_an_optimistic_resume() {
     home.catalog = Arc::new(Catalog::new(Desk {
         home: Some(home.root.clone()),
         processes: Box::new(|| Err(std::io::Error::other("process view unavailable"))),
+        registry_retry_sleep: Box::new(|_| {}),
     }));
     home.catalog.refresh();
     let response = home.search(json!({}), vec![]);
@@ -358,6 +590,7 @@ fn a_stalled_process_view_obeys_the_request_deadline() {
             let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(2));
             Ok(Vec::new())
         }),
+        registry_retry_sleep: Box::new(|_| {}),
     }));
     home.catalog.refresh();
     let began = Instant::now();

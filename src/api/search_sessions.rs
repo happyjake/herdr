@@ -26,6 +26,7 @@ fn catalog() -> Arc<Catalog> {
         let catalog = Arc::new(Catalog::new(Desk {
             home: crate::worktree::home_dir(),
             processes: Box::new(crate::platform::session_process_snapshot),
+            registry_retry_sleep: Box::new(std::thread::sleep),
         }));
         let worker = Arc::clone(&catalog);
         if let Err(error) = std::thread::Builder::new()

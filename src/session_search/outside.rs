@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -17,6 +18,7 @@ use super::records::Session;
 pub(super) struct OutsideSessions {
     claude: HashMap<String, u32>,
     arguments: HashMap<&'static str, HashMap<String, u32>>,
+    paths: HashMap<&'static str, HashMap<PathBuf, u32>>,
 }
 
 impl OutsideSessions {
@@ -26,10 +28,16 @@ impl OutsideSessions {
             *self.claude.get(&session.key.value)?
         } else {
             let arguments = self.arguments.get(agent)?;
-            *arguments
-                .get(&session.key.value)
-                .or_else(|| arguments.get(session.record_path.as_ref()?.to_str()?))
-                .or_else(|| arguments.get(session.record_id.as_ref()?))?
+            let id = match session.key.kind {
+                SearchSessionKeyKind::Id => arguments.get(&session.key.value),
+                _ => None,
+            };
+            *id.or_else(|| arguments.get(session.record_id.as_ref()?))
+                .or_else(|| {
+                    self.paths
+                        .get(agent)?
+                        .get(&normalize_path(session.record_path.as_ref()?, None)?)
+                })?
         };
         Some(SessionOutside {
             pid,
@@ -46,24 +54,71 @@ struct ClaudeSession {
     proc_start: String,
 }
 
+enum RegistryRead {
+    Complete(ClaudeSession),
+    Torn,
+    Invalid,
+}
+
+fn read_registry(path: &Path, retry_sleep: &dyn Fn(Duration)) -> io::Result<RegistryRead> {
+    for attempt in 0..3 {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(RegistryRead::Invalid)
+            }
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 16 * 1024 {
+            return Ok(RegistryRead::Invalid);
+        }
+        match serde_json::from_slice::<ClaudeSession>(&bytes) {
+            Ok(registry) => return Ok(RegistryRead::Complete(registry)),
+            // A complete JSON value with the wrong schema is not a torn write.
+            Err(error) if error.is_data() => return Ok(RegistryRead::Invalid),
+            Err(_) => {}
+        }
+        if attempt < 2 {
+            retry_sleep(Duration::from_millis(20));
+        }
+    }
+    Ok(RegistryRead::Torn)
+}
+
 pub(super) fn read(
     home: Option<&Path>,
     processes: &[SessionProcess],
+    retry_sleep: &dyn Fn(Duration),
 ) -> io::Result<OutsideSessions> {
     let mut outside = OutsideSessions::default();
     for process in processes.iter().filter(|process| process.pid > 0) {
         let Some(agent) = process_agent(process) else {
             continue;
         };
+        let Some((value, accepts_path)) = owning_argument(process, agent) else {
+            continue;
+        };
         let arguments = outside.arguments.entry(agent).or_default();
-        for argument in process.argv.iter().skip(1) {
-            let value = argument
-                .strip_prefix("--session=")
-                .or_else(|| argument.strip_prefix("--session-id="))
-                .unwrap_or(argument);
-            if !value.starts_with('-') {
-                arguments
-                    .entry(value.to_string())
+        arguments
+            .entry(value.to_string())
+            .and_modify(|pid| *pid = (*pid).min(process.pid))
+            .or_insert(process.pid);
+        let path = Path::new(value);
+        if accepts_path
+            && (path.is_absolute()
+                || path.components().count() > 1
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl"))
+        {
+            if let Some(path) = normalize_path(path, process.cwd.as_deref()) {
+                outside
+                    .paths
+                    .entry(agent)
+                    .or_default()
+                    .entry(path)
                     .and_modify(|pid| *pid = (*pid).min(process.pid))
                     .or_insert(process.pid);
             }
@@ -98,18 +153,32 @@ pub(super) fn read(
         let Some(process) = processes.get(&pid) else {
             continue;
         };
-        let file = match std::fs::File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let mut bytes = Vec::new();
-        file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > 16 * 1024 {
-            continue;
-        }
-        let Ok(registry) = serde_json::from_slice::<ClaudeSession>(&bytes) else {
-            continue;
+        let registry = match read_registry(&path, retry_sleep)? {
+            RegistryRead::Complete(registry) => registry,
+            RegistryRead::Invalid => continue,
+            RegistryRead::Torn => {
+                let reference = (process_agent(process) == Some("claude"))
+                    .then(|| {
+                        option_identity(&process.argv[1..], &["--resume", "-r", "--session-id"])
+                    })
+                    .flatten()
+                    .map(|(_, value)| value)
+                    .and_then(AgentSessionRef::id);
+                if let Some(reference) = reference {
+                    outside
+                        .claude
+                        .entry(reference.value)
+                        .and_modify(|previous| *previous = (*previous).min(pid))
+                        .or_insert(pid);
+                } else {
+                    // Emit one event after all retries, not one for each torn read.
+                    tracing::debug!(
+                        pid,
+                        "torn running-session registry has no argv session identity"
+                    );
+                }
+                continue;
+            }
         };
         if registry.pid != pid
             || registry.proc_start.trim().is_empty()
@@ -132,6 +201,80 @@ pub(super) fn read(
     Ok(outside)
 }
 
+fn normalize_path(path: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd?.join(path)
+    };
+    if !absolute.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+fn owning_argument<'a>(process: &'a SessionProcess, agent: &str) -> Option<(&'a str, bool)> {
+    let args = process.argv.get(1..)?;
+    match agent {
+        "pi" => {
+            if args
+                .iter()
+                .take_while(|arg| *arg != "--")
+                .any(|arg| arg == "--fork" || arg.starts_with("--fork=") || arg == "--no-session")
+            {
+                return None;
+            }
+            // --resume/-r select a session interactively; their following text
+            // is not a session identity. Only explicit session operands count.
+            option_identity(args, &["--session", "--session-id"])
+                .map(|(flag, value)| (value, flag == "--session"))
+        }
+        "codex" => {
+            let executable = Path::new(process.argv.first()?).file_name()?.to_str()?;
+            let args = if matches!(executable, "node" | "bun") {
+                args.get(1..)?
+            } else {
+                args
+            };
+            let [command, identity, ..] = args else {
+                return None;
+            };
+            (command == "resume" && !identity.starts_with('-')).then_some((identity.as_str(), true))
+        }
+        _ => None,
+    }
+}
+
+fn option_identity<'a>(args: &'a [String], flags: &[&str]) -> Option<(&'a str, &'a str)> {
+    let mut args = args.iter().peekable();
+    let mut identity = None;
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if flags.contains(&arg.as_str()) {
+            if args.peek().is_some_and(|value| !value.starts_with('-')) {
+                identity = args.next().map(|value| (arg.as_str(), value.as_str()));
+            }
+        } else if let Some((flag, value)) = arg.split_once('=') {
+            if flags.contains(&flag) && !value.is_empty() {
+                identity = Some((flag, value));
+            }
+        }
+    }
+    identity
+}
+
 fn process_agent(process: &SessionProcess) -> Option<&'static str> {
     let argv0 = process.argv.first()?;
     let job = ForegroundJob {
@@ -145,6 +288,7 @@ fn process_agent(process: &SessionProcess) -> Option<&'static str> {
         }],
     };
     match detect::identify_agent_in_job(&job)?.0 {
+        Agent::Claude => Some("claude"),
         Agent::Codex => Some("codex"),
         Agent::Pi => Some("pi"),
         _ => None,

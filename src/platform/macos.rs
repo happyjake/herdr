@@ -978,7 +978,7 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
 }
 
 pub(crate) fn session_process_snapshot() -> std::io::Result<Vec<super::SessionProcess>> {
-    super::unix_common::session_process_snapshot(process_argv)
+    super::unix_common::session_process_snapshot(process_argv, process_cwd)
 }
 
 /// Read a Herdr agent identity hint from a process environment.

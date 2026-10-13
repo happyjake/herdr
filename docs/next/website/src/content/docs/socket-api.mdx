@@ -258,9 +258,15 @@ subagent files and Codex rollouts with an object-valued source are skipped.
 
 On macOS and Linux, a session found running outside this server carries
 `state: "outside"`, `outside: {"pid": ..., "detail": ...}`, `resume: null`, and
-`resume_blocked: "outside"`. Claude requires a running-session registry entry
-whose pid is alive and whose process start time matches. Codex and pi use
-best-effort matches of a session id or record path in an agent process's argv.
+`resume_blocked: "outside"`. Claude checks the running-session registry against
+live pids and process start times. A torn entry for a live pid is read up to three
+times, about 20 ms apart, then falls back to that Claude process's `--resume`,
+`-r`, or `--session-id` operand. If neither source identifies the session, that
+entry is skipped with a debug log; the saved session can still appear `ended`
+and resumable. Codex and pi use best-effort matches of session-owning operands
+in an agent process's argv; fork source operands do not count. Path operands are
+normalized, using the process cwd for relative paths when available. Ids remain
+exact matches.
 A matching pane on this server always takes precedence and remains `live`.
 Running-session evidence is read afresh for each query.
 

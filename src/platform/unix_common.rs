@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn session_process_snapshot(
     argv: impl Fn(u32) -> Option<Vec<String>>,
+    cwd: impl Fn(u32) -> Option<PathBuf>,
 ) -> std::io::Result<Vec<super::SessionProcess>> {
     use std::process::{Command, Stdio};
 
@@ -18,33 +19,11 @@ pub(super) fn session_process_snapshot(
     if !output.status.success() {
         return Err(std::io::Error::other("process snapshot failed"));
     }
-    let mut processes = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let Some(pid) = fields
-            .next()
-            .and_then(|pid| pid.parse().ok())
-            .filter(|pid| *pid > 0)
-        else {
-            continue;
-        };
-        let Some(state) = fields.next().and_then(|state| state.chars().next()) else {
-            continue;
-        };
-        if matches!(state, 'Z' | 'X' | 'x') {
-            continue;
-        }
-        let start: Vec<_> = fields.collect();
-        if start.len() != 5 {
-            continue;
-        }
-        processes.push(super::SessionProcess {
-            pid,
-            started_at: start.join(" "),
-            argv: argv(pid).unwrap_or_default(),
-        });
+    let mut processes =
+        super::session_process_snapshot_from_output(&String::from_utf8_lossy(&output.stdout), argv);
+    for process in &mut processes {
+        process.cwd = cwd(process.pid);
     }
-    processes.sort_by_key(|process| process.pid);
     Ok(processes)
 }
 
