@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -24,12 +25,16 @@ pub(crate) struct BackgroundWriter {
 }
 
 impl BackgroundWriter {
-    pub(crate) fn start(path: PathBuf, seed: Vec<Event>) -> std::io::Result<Self> {
+    pub(crate) fn start(
+        path: PathBuf,
+        seed: Vec<Event>,
+        live_panes: HashSet<String>,
+    ) -> std::io::Result<Self> {
         let (sender, jobs) = mpsc::channel();
         let _ = std::thread::Builder::new()
             .name("herdr-logbook".into())
             .spawn(move || {
-                run(path, seed, jobs);
+                run(path, seed, live_panes, jobs);
             })?;
         Ok(Self { sender })
     }
@@ -75,8 +80,8 @@ impl Drop for BackgroundWriter {
     }
 }
 
-fn open(path: &std::path::Path, seed: &[Event]) -> Option<Writer> {
-    match Writer::open(path, seed) {
+fn open(path: &std::path::Path, seed: &[Event], live_panes: &HashSet<String>) -> Option<Writer> {
+    match Writer::open(path, seed, live_panes) {
         Ok(writer) => Some(writer),
         Err(err) => {
             tracing::warn!(%err, "failed to open session logbook");
@@ -85,13 +90,13 @@ fn open(path: &std::path::Path, seed: &[Event]) -> Option<Writer> {
     }
 }
 
-fn run(path: PathBuf, seed: Vec<Event>, jobs: Receiver<Job>) {
-    let mut writer = open(&path, &seed);
+fn run(path: PathBuf, seed: Vec<Event>, live_panes: HashSet<String>, jobs: Receiver<Job>) {
+    let mut writer = open(&path, &seed, &live_panes);
     for job in jobs {
         match job {
             Job::Append(events) => {
                 if writer.is_none() {
-                    writer = open(&path, &seed);
+                    writer = open(&path, &seed, &live_panes);
                 }
                 if let Some(writer) = &mut writer {
                     for event in events {

@@ -121,7 +121,11 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
-    pub(crate) fn open(path: &Path, seed: &[Event]) -> io::Result<Self> {
+    pub(crate) fn open(
+        path: &Path,
+        seed: &[Event],
+        live_panes: &HashSet<String>,
+    ) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -138,6 +142,15 @@ impl Writer {
             parents: HashSet::new(),
         };
         for_each_event(path, |event| writer.remember(&event))?;
+        // A predecessor may still be writing a close after a handoff timeout.
+        // The imported layout, not that delayed event, determines which pane
+        // identities can retain deduplication entries in the new writer.
+        writer
+            .sessions
+            .retain(|(pane, _)| live_panes.contains(pane));
+        writer
+            .labels
+            .retain(|(pane, _), _| live_panes.contains(pane));
         Ok(writer)
     }
 

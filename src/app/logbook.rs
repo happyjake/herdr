@@ -160,12 +160,16 @@ impl App {
         drop(self.logbook_writer.take());
         self.state.logbook_events.get_or_insert_with(Vec::new);
         let mut seed = Vec::new();
+        let mut live_panes = std::collections::HashSet::new();
         for ws_idx in 0..self.state.workspaces.len() {
             for pane_id in self.state.pane_ids_for_workspace(ws_idx) {
+                if let Some(pane) = self.public_pane_id(ws_idx, pane_id) {
+                    live_panes.insert(pane);
+                }
                 seed.extend(self.state.logbook_session_events(ws_idx, pane_id));
             }
         }
-        match logbook::BackgroundWriter::start(logbook::path(), seed) {
+        match logbook::BackgroundWriter::start(logbook::path(), seed, live_panes) {
             Ok(writer) => self.logbook_writer = Some(writer),
             Err(err) => tracing::warn!(%err, "failed to start session logbook writer"),
         }
@@ -986,5 +990,92 @@ mod tests {
                 json!({"type":"pane_closed","pane":pane}),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logbook_handoff_reconciles_absent_panes_before_late_close() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let root = ConfigRoot::new();
+        let before = crate::pane::unix_now_secs() * 1000;
+        let mut old = app();
+        old.state.workspaces[0].id = "wreuse".into();
+        let old_id = old.state.workspaces[0].tabs[0].root_pane;
+        let pane = old.public_pane_id(0, old_id).unwrap();
+        let old_terminal = old.state.terminal_id_for_pane(0, old_id).unwrap();
+        old.state.terminals.get_mut(&old_terminal).unwrap().cwd = "project".into();
+        rename(&mut old, &pane, Some("same label"), None);
+        report(&mut old, old_id, "same-session", 1, "startup");
+        let persisted = std::fs::read(root.path()).unwrap();
+
+        let paused = old.logbook_writer.as_ref().unwrap().pause_for_test();
+        let response = old.handle_api_request(Request {
+            id: "close".into(),
+            method: Method::PaneClose(PaneTarget {
+                pane_id: pane.clone(),
+            }),
+        });
+        assert!(
+            serde_json::from_str::<Value>(&response)
+                .unwrap()
+                .get("error")
+                .is_none(),
+            "{response}"
+        );
+        assert!(old.state.workspaces.is_empty());
+        old.drain_logbook();
+        assert_eq!(
+            std::fs::read(root.path()).unwrap(),
+            persisted,
+            "close is still stalled after the handoff drain deadline"
+        );
+
+        // Import the live layout, then replay while the predecessor's close is
+        // still absent from the file. Reconciliation must not edit the history.
+        let mut replacement = app_with_policy(AppPolicy::TEST);
+        replacement.state.workspaces = std::mem::take(&mut old.state.workspaces);
+        replacement.state.terminals.clear();
+        replacement.state.active = None;
+        replacement.policy.persist_session = true;
+        replacement.initialize_logbook();
+        settle(&mut replacement);
+        assert_eq!(std::fs::read(root.path()).unwrap(), persisted);
+
+        drop(paused);
+        settle(&mut old);
+        let key = json!({"agent":"claude","kind":"id","value":"same-session"});
+        let mut expected = vec![
+            json!({"type":"session_reported","pane":pane,"terminal":old_terminal,"key":key,"cwd":"project"}),
+            json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
+            json!({"type":"pane_closed","pane":pane}),
+        ];
+        assert_eq!(rows(&mut old, &root.path(), before), expected);
+
+        replacement.state.workspaces = vec![Workspace::test_new("recreated")];
+        replacement.state.workspaces[0].id = "wreuse".into();
+        replacement.state.ensure_test_terminals();
+        replacement.state.active = Some(0);
+        let next_id = replacement.state.workspaces[0].tabs[0].root_pane;
+        let next_terminal = replacement.state.terminal_id_for_pane(0, next_id).unwrap();
+        assert_eq!(
+            replacement.public_pane_id(0, next_id).as_deref(),
+            Some(pane.as_str())
+        );
+        assert_ne!(old_terminal, next_terminal);
+        replacement
+            .state
+            .terminals
+            .get_mut(&next_terminal)
+            .unwrap()
+            .cwd = "project".into();
+        rename(&mut replacement, &pane, Some("same label"), None);
+        report(&mut replacement, next_id, "same-session", 1, "resume");
+        report(&mut replacement, next_id, "same-session", 2, "resume");
+        expected.extend([
+            json!({"type":"session_reported","pane":pane,"terminal":next_terminal,"key":key,"cwd":"project"}),
+            json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
+        ]);
+        assert_eq!(rows(&mut replacement, &root.path(), before), expected);
+        assert!(std::fs::read(root.path()).unwrap().starts_with(&persisted));
     }
 }
