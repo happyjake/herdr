@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 mod folding;
+mod headless;
 mod outside;
 
 struct FixtureHome {
@@ -50,7 +51,7 @@ impl FixtureHome {
         path
     }
 
-    // Core search tests opt in to records with no pane history.
+    // Core search tests include headless records and folded children.
     fn search_all(&self, mut params: Value, panes: Vec<Value>) -> Value {
         params["include_headless"] = json!(true);
         self.search(params, panes)
@@ -144,7 +145,7 @@ fn browse_reads_a_claude_session_and_offers_resume() {
                 "first_prompt": "Fix the keyboard", "recent_prompts": ["Fix the keyboard", "Check focus"],
                 "started_at_ms": 1790985600123_u64, "last_active_at_ms": 1790989200456_u64,
                 "labels": [], "state": "ended", "resume": {"command": "claude --resume session-a", "cwd": cwd},
-                "headless": true, "subagent_count": 0, "why": null, "score": 0.0
+                "headless": false, "subagent_count": 0, "why": null, "score": 0.0
             }]
         })
     );

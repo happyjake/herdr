@@ -122,7 +122,7 @@ fn structural_subagents_keep_distinct_records_and_fold_under_their_parents() {
     assert_eq!(all["result"]["scanned"], 5);
     assert_eq!(all["result"]["sessions"].as_array().unwrap().len(), 5);
     for (child, agent, parent, headless) in [
-        ("agent-child", "claude", "claude-parent", true),
+        ("agent-child", "claude", "claude-parent", false),
         ("codex-child", "codex", "codex-parent", true),
         ("logged-child", "claude", "claude-parent", false),
     ] {
@@ -155,20 +155,22 @@ fn structural_subagents_keep_distinct_records_and_fold_under_their_parents() {
 }
 
 #[test]
-fn headless_records_fold_only_into_pane_hosted_windows_at_the_same_place() {
+fn headless_records_fold_into_pane_hosted_windows_at_the_same_place() {
     let home = FixtureHome::new();
     let cwd = home.dir("project");
     let elsewhere = home.dir("elsewhere");
     for (id, hour) in [("live-host", 0), ("logged-host", 1), ("unhosted", 2)] {
+        let mut first = claude_prompt(
+            id,
+            &cwd,
+            "Parent work",
+            &format!("2026-10-03T0{hour}:00:00Z"),
+        );
+        first["entrypoint"] = json!("sdk-cli");
         home.write(
             &format!(".claude/projects/project/{id}.jsonl"),
             &[
-                claude_prompt(
-                    id,
-                    &cwd,
-                    "Parent work",
-                    &format!("2026-10-03T0{hour}:00:00Z"),
-                ),
+                first,
                 claude_prompt(
                     id,
                     &cwd,

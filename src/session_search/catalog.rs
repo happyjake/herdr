@@ -309,6 +309,7 @@ fn merge(
             session.title = source.title.clone().or(session.title.take());
             session.record_path = source.record_path.clone().or(session.record_path.take());
             session.parent = source.parent.clone().or(session.parent.take());
+            session.non_interactive |= source.non_interactive;
             session.claude_subagent |= source.claude_subagent;
             session.started_at_ms = session.started_at_ms.min(source.started_at_ms);
             session.last_active_at_ms = session.last_active_at_ms.max(source.last_active_at_ms);

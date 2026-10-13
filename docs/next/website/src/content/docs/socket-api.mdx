@@ -237,7 +237,7 @@ newest first. `since_ms` and `until_ms` are inclusive hard filters on overlap wi
 `[started_at_ms, last_active_at_ms]`. `place` is a case-insensitive cwd substring;
 `agent` is an exact name. `limit` defaults to 50 and is capped at 200. `embedding`
 is reserved and ignored. `include_headless` defaults to false; set it to true to
-also return folded children and records that have never had a pane on this server.
+also return folded children and headless records.
 
 The `server_search_sessions` result carries `sessions`, `scanned` (session rows
 considered before filtering), and `partial`. Each row includes its `key`
@@ -265,17 +265,21 @@ records, and label matches return `why.field: "label"`.
 
 Claude records under `<project>/<sessionId>/subagents/agent-*.jsonl`, Codex
 `session_meta.source.subagent.thread_spawn.parent_thread_id`, and logbook parent
-events supply structural parentage. Otherwise, a record is `headless` if it is
-neither live in one of this server's panes nor ever reported in its logbook.
-It folds under a pane-hosted session with the same cwd whose inclusive activity
-window contains its start; without such a host it stands alone. Codex review
+events supply structural parentage. A record is `headless` only when its harness
+marks it non-interactive: Claude transcript lines with `entrypoint: "sdk-cli"`, or
+Codex `session_meta.source` equal to `"exec"` or an object containing `subagent`.
+Pi has no such marker. Interactive sessions remain visible without pane history.
+A session live in one of this server's panes or reported in its logbook is never
+headless. A headless record without a structural parent folds under an interactive
+or pane-hosted session with the same cwd whose inclusive activity window contains
+its start; without such a host it stands alone. Codex review
 runs use this rule because their source carries no parent. Where host windows
 overlap, the latest start wins, with key order breaking ties. Folded rows carry
 `parent`; each parent's `subagent_count` includes children before query filters
 and limits. Folded and headless rows are hidden unless `include_headless` is true.
 Parent links must reach an available root. Orphaned or cyclic components retain
 their most recently active available member as a standalone representative,
-preserving whether it actually had a pane.
+preserving its headless classification.
 
 On macOS and Linux, a session found running outside this server carries
 `state: "outside"`, `outside: {"pid": ..., "detail": ...}`, `resume: null`, and

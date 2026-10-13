@@ -26,7 +26,7 @@ impl<'a> Folding<'a> {
             if !has_time() {
                 return None;
             }
-            if !session.reported && !live.contains_key(&session.key) {
+            if session.non_interactive && !session.reported && !live.contains_key(&session.key) {
                 folded.headless.insert(&session.key);
             }
             if let Some(parent) = session
@@ -64,7 +64,7 @@ impl<'a> Folding<'a> {
                     continue;
                 }
                 // Sweep inclusive windows once per place, rather than comparing
-                // every headless record with every pane-hosted session.
+                // every headless record with every eligible host.
                 while hosts
                     .peek()
                     .is_some_and(|host| host.started_at_ms <= session.started_at_ms)

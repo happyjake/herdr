@@ -62,6 +62,7 @@ pub(super) struct Session {
     pub labels: Vec<SessionLabel>,
     pub parent: Option<SearchSessionKey>,
     pub reported: bool,
+    pub non_interactive: bool,
     pub claude_subagent: bool,
 }
 
@@ -80,6 +81,7 @@ impl Session {
             labels: Vec::new(),
             parent: None,
             reported: false,
+            non_interactive: false,
             claude_subagent: false,
         }
     }
@@ -241,6 +243,13 @@ fn read_metadata(session: &mut Session, kind: FileKind, line: &Value) {
         FileKind::Codex => &line["payload"],
         _ => line,
     };
+    if matches!(kind, FileKind::Claude | FileKind::ClaudeSubagent) {
+        session.non_interactive |= line["entrypoint"] == "sdk-cli";
+    }
+    if matches!(kind, FileKind::Codex) && line["type"] == "session_meta" {
+        let source = &metadata["source"];
+        session.non_interactive |= source == "exec" || source.get("subagent").is_some();
+    }
     // Nested Claude records can repeat the parent's sessionId; keep their file identity.
     if matches!(kind, FileKind::Claude) {
         if let Some(id) = line
