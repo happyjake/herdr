@@ -2,9 +2,12 @@ use super::*;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+mod outside;
+
 struct FixtureHome {
     root: PathBuf,
     catalog: Arc<Catalog>,
+    processes: Arc<Mutex<Vec<crate::platform::SessionProcess>>>,
 }
 
 impl FixtureHome {
@@ -17,10 +20,17 @@ impl FixtureHome {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&root).unwrap();
+        let processes = Arc::new(Mutex::new(Vec::new()));
+        let view = Arc::clone(&processes);
         let catalog = Arc::new(Catalog::new(Desk {
             home: Some(root.clone()),
+            processes: Box::new(move || Ok(view.lock().unwrap().clone())),
         }));
-        Self { root, catalog }
+        Self {
+            root,
+            catalog,
+            processes,
+        }
     }
 
     fn dir(&self, relative: &str) -> String {

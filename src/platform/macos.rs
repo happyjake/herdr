@@ -977,6 +977,10 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
     procargs2_argv(&buf)
 }
 
+pub(crate) fn session_process_snapshot() -> std::io::Result<Vec<super::SessionProcess>> {
+    super::unix_common::session_process_snapshot(process_argv)
+}
+
 /// Read a Herdr agent identity hint from a process environment.
 pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     if pid == 0 {

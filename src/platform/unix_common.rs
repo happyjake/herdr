@@ -1,5 +1,53 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn session_process_snapshot(
+    argv: impl Fn(u32) -> Option<Vec<String>>,
+) -> std::io::Result<Vec<super::SessionProcess>> {
+    use std::process::{Command, Stdio};
+
+    // Both BSD and procps ps expose lstart. Pin the locale and timezone to
+    // the harness registry, without changing the server's own environment.
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "stat=", "-o", "lstart="])
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("process snapshot failed"));
+    }
+    let mut processes = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(pid) = fields
+            .next()
+            .and_then(|pid| pid.parse().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        let Some(state) = fields.next().and_then(|state| state.chars().next()) else {
+            continue;
+        };
+        if matches!(state, 'Z' | 'X' | 'x') {
+            continue;
+        }
+        let start: Vec<_> = fields.collect();
+        if start.len() != 5 {
+            continue;
+        }
+        processes.push(super::SessionProcess {
+            pid,
+            started_at: start.join(" "),
+            argv: argv(pid).unwrap_or_default(),
+        });
+    }
+    processes.sort_by_key(|process| process.pid);
+    Ok(processes)
+}
+
 pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
     if status.signal().is_some() {
         super::ChildExitReason::Interrupted

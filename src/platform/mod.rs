@@ -45,6 +45,20 @@ pub struct ForegroundProcess {
     pub cmdline: Option<String>,
 }
 
+/// One living process in a session-search snapshot. Start time uses UTC
+/// `ps lstart` text, matching the Claude running-session registry.
+#[derive(Clone)]
+pub(crate) struct SessionProcess {
+    pub pid: u32,
+    pub started_at: String,
+    pub argv: Vec<String>,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn session_process_snapshot() -> std::io::Result<Vec<SessionProcess>> {
+    Ok(Vec::new())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundJob {
     pub process_group_id: u32,

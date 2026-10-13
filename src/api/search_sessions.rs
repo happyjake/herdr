@@ -25,6 +25,7 @@ fn catalog() -> Arc<Catalog> {
     Arc::clone(CATALOG.get_or_init(|| {
         let catalog = Arc::new(Catalog::new(Desk {
             home: crate::worktree::home_dir(),
+            processes: Box::new(crate::platform::session_process_snapshot),
         }));
         let worker = Arc::clone(&catalog);
         if let Err(error) = std::thread::Builder::new()
@@ -167,13 +168,19 @@ fn blocking_search(
                     Ok(panes) => panes,
                     _ => return Err("could not read live sessions"),
                 };
-                sources.catalog.search(
-                    &params,
-                    &panes,
-                    deadline,
-                    sources.now.as_ref(),
-                    &worker_progress,
-                );
+                sources
+                    .catalog
+                    .search(
+                        &params,
+                        &panes,
+                        deadline,
+                        sources.now.as_ref(),
+                        &worker_progress,
+                    )
+                    .map_err(|error| {
+                        tracing::warn!(%error, "could not read running sessions");
+                        "could not read running sessions"
+                    })?;
                 Ok(())
             })
             .await

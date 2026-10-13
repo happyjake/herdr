@@ -9,6 +9,8 @@ use super::records::{self, FileData, FileKind, Session};
 
 pub(crate) struct Desk {
     pub home: Option<PathBuf>,
+    pub processes:
+        Box<dyn Fn() -> std::io::Result<Vec<crate::platform::SessionProcess>> + Send + Sync>,
 }
 
 pub(crate) struct Catalog {
@@ -45,6 +47,10 @@ impl Catalog {
             snapshot: Mutex::new(Arc::new(Snapshot::default())),
             ready: Condvar::new(),
         }
+    }
+
+    pub(super) fn outside_sessions(&self) -> std::io::Result<super::outside::OutsideSessions> {
+        super::outside::read(self.desk.home.as_deref(), &(self.desk.processes)()?)
     }
 
     /// One maintenance pass. The server runs this on its single catalog worker;

@@ -758,6 +758,10 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
     (!parts.is_empty()).then_some(parts)
 }
 
+pub(crate) fn session_process_snapshot() -> std::io::Result<Vec<super::SessionProcess>> {
+    super::unix_common::session_process_snapshot(process_argv)
+}
+
 /// Get the current working directory of a process.
 /// Uses /proc/<pid>/cwd symlink.
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {

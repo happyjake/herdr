@@ -49,6 +49,8 @@ pub(super) struct Prompt {
 #[derive(Clone)]
 pub(super) struct Session {
     pub key: SearchSessionKey,
+    /// A path-keyed record may also be named by its harness id in process argv.
+    pub record_id: Option<String>,
     pub cwd: Option<String>,
     pub branch: Option<String>,
     pub title: Option<String>,
@@ -62,6 +64,7 @@ impl Session {
     fn new(key: SearchSessionKey, record_path: Option<PathBuf>) -> Self {
         Self {
             key,
+            record_id: None,
             cwd: None,
             branch: None,
             title: None,
@@ -225,6 +228,13 @@ fn read_metadata(session: &mut Session, kind: FileKind, line: &Value) {
         {
             session.key.value = id.value;
         }
+    }
+    if matches!(kind, FileKind::Pi) && line["type"] == "session" {
+        session.record_id = line
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(AgentSessionRef::id)
+            .map(|reference| reference.value);
     }
     if let Some(cwd) = metadata
         .get("cwd")

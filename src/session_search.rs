@@ -3,6 +3,7 @@
 mod catalog;
 mod live;
 mod matching;
+mod outside;
 mod records;
 mod zstd;
 
@@ -16,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use crate::agent_resume::{self, AgentSessionRef};
 use crate::api::schema::{
-    SearchSessionKeyKind, ServerSearchSessionsParams, SessionHit, SessionPlaceState, SessionResume,
-    SessionResumeBlocked, SessionState,
+    SearchSessionKeyKind, ServerSearchSessionsParams, SessionHit, SessionOutside,
+    SessionPlaceState, SessionResume, SessionResumeBlocked, SessionState,
 };
 use crate::prompt_trail;
 
@@ -36,7 +37,7 @@ impl Catalog {
         deadline: Instant,
         now: &dyn Fn() -> Instant,
         progress: &Mutex<SearchResult>,
-    ) {
+    ) -> std::io::Result<()> {
         let live: HashMap<_, _> = panes
             .iter()
             .map(|pane| (pane.key.clone(), pane.pane_id.clone()))
@@ -48,6 +49,7 @@ impl Catalog {
                 .checked_sub(Duration::from_millis(100))
                 .unwrap_or(deadline),
         );
+        let outside = self.outside_sessions()?;
         let query = matching::Query::new(params);
         let limit = params.limit.unwrap_or(50).min(200) as usize;
         for session in &snapshot.sessions {
@@ -79,7 +81,7 @@ impl Catalog {
             }
             // Existence checks and command rendering happen only for candidates
             // that can enter the bounded result set, outside the progress lock.
-            let mut row = hit(session, live.get(&session.key));
+            let mut row = hit(session, live.get(&session.key), outside.get(session));
             row.score = score;
             row.why = why;
             if let Ok(mut result) = progress.lock() {
@@ -93,6 +95,7 @@ impl Catalog {
         if let Ok(mut result) = progress.lock() {
             result.partial = !snapshot.complete || now() >= deadline;
         }
+        Ok(())
     }
 }
 
@@ -103,7 +106,11 @@ fn rank(a: &SessionHit, b: &SessionHit) -> std::cmp::Ordering {
         .then_with(|| a.key.cmp(&b.key))
 }
 
-fn hit(session: &records::Session, live_pane_id: Option<&String>) -> SessionHit {
+fn hit(
+    session: &records::Session,
+    live_pane_id: Option<&String>,
+    outside: Option<SessionOutside>,
+) -> SessionHit {
     let first = session
         .prompts
         .first()
@@ -126,6 +133,8 @@ fn hit(session: &records::Session, live_pane_id: Option<&String>) -> SessionHit 
     };
     let state = if live_pane_id.is_some() {
         SessionState::Live
+    } else if outside.is_some() {
+        SessionState::Outside
     } else if session.record_path.is_some() {
         SessionState::Ended
     } else {
@@ -161,6 +170,7 @@ fn hit(session: &records::Session, live_pane_id: Option<&String>) -> SessionHit 
     } else {
         Some(match state {
             SessionState::Live => SessionResumeBlocked::Live,
+            SessionState::Outside => SessionResumeBlocked::Outside,
             SessionState::RecordGone => SessionResumeBlocked::RecordGone,
             _ => SessionResumeBlocked::FolderGone,
         })
@@ -193,7 +203,7 @@ fn hit(session: &records::Session, live_pane_id: Option<&String>) -> SessionHit 
         labels: Vec::new(),
         state,
         live_pane_id: live_pane_id.cloned(),
-        outside: None,
+        outside: outside.filter(|_| state == SessionState::Outside),
         resume,
         resume_blocked,
         headless: false,
