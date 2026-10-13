@@ -1633,6 +1633,8 @@ impl App {
             );
         self.state.mark_session_dirty();
         if kept_changed {
+            self.state.record_logbook_label(ws_idx, pane_id);
+            self.flush_logbook();
             self.emit_pane_kept_presentation_changed(ws_idx, pane_id);
         }
         let pane = self.pane_info(ws_idx, pane_id).unwrap();
@@ -2237,6 +2239,9 @@ impl App {
         }
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
+        if !self.state.close_pane_would_close_workspace(ws_idx, pane_id) {
+            self.state.record_logbook_close(ws_idx, pane_id);
+        }
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return Err(pane_not_found(id, &target.pane_id));

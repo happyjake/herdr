@@ -19,6 +19,7 @@ mod creation;
 mod custom_commands;
 mod git_refresh;
 mod ids;
+mod logbook;
 mod popup;
 mod runtime;
 mod send_affirm;
@@ -149,6 +150,7 @@ pub struct App {
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
+    logbook_writer: Option<crate::persist::logbook::BackgroundWriter>,
     pane_exit_checkpoint_pending: bool,
     pub(crate) detached_process_children: Vec<std::process::Child>,
     tab_bar_status_generation: u64,
@@ -594,6 +596,7 @@ impl App {
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            logbook_events: None,
         };
 
         state.terminals = restored_terminals;
@@ -678,6 +681,7 @@ impl App {
             session_save_deadline: None,
             session_save_thread: None,
             session_writer,
+            logbook_writer: None,
             pane_exit_checkpoint_pending: false,
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,
@@ -707,6 +711,7 @@ impl App {
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
         app.refresh_restored_workspace_git_metadata();
+        app.initialize_logbook();
         Ok(app)
     }
 
@@ -724,7 +729,10 @@ impl App {
     ) -> io::Result<Self> {
         let mut app = Self::try_new(
             config,
-            AppPolicy::HANDOFF_REPLACEMENT,
+            AppPolicy {
+                persist_session: false,
+                ..AppPolicy::HANDOFF_REPLACEMENT
+            },
             config_diagnostic,
             api_rx,
             event_hub,
@@ -770,6 +778,8 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
         app.refresh_restored_workspace_git_metadata();
+        app.policy = AppPolicy::HANDOFF_REPLACEMENT;
+        app.initialize_logbook();
         Ok(app)
     }
 

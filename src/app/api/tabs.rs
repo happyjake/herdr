@@ -268,6 +268,7 @@ impl App {
             return encode_success(id, ResponseResult::Ok {});
         }
 
+        let logbook_events = self.state.logbook_tab_close_events(ws_idx, tab_idx);
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return tab_not_found(id, &target.tab_id);
         };
@@ -278,6 +279,7 @@ impl App {
                 format!("tab {} could not be closed", target.tab_id),
             );
         }
+        self.state.enqueue_logbook_events(logbook_events);
         self.state.remove_plugin_pane_records(pane_ids);
         self.state.remove_unattached_terminal_ids(terminal_ids);
         self.shutdown_detached_terminal_runtimes();

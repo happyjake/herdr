@@ -19,6 +19,7 @@ impl App {
     }
 
     pub(crate) fn sync_session_save_schedule(&mut self) {
+        self.flush_logbook();
         if self.state.session_dirty {
             self.state.session_dirty = false;
             self.schedule_session_save();
@@ -88,6 +89,7 @@ impl App {
     }
 
     pub(crate) fn save_session_now(&mut self) {
+        self.flush_logbook();
         if let Some(thread) = self.session_save_thread.take() {
             let _ = thread.join();
         }
@@ -121,6 +123,7 @@ impl App {
     }
 
     pub(crate) fn save_session_on_shutdown(&mut self) {
+        self.shutdown_logbook();
         if self.pane_exit_checkpoint_pending && !self.state.session_dirty {
             self.session_save_deadline = None;
             return;

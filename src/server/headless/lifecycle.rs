@@ -69,6 +69,8 @@ impl HeadlessServer {
             }
         }
 
+        // The replacement replays this file before accepting new reports.
+        self.app.drain_logbook();
         let snapshot = crate::persist::capture(
             &self.app.state.workspaces,
             &self.app.state.terminals,
@@ -234,6 +236,7 @@ impl HeadlessServer {
     }
 
     pub(super) fn finish_live_handoff_shutdown(&mut self) {
+        self.app.shutdown_logbook();
         self.shutting_down = true;
         self.app.state.should_quit = true;
         self.app.policy.persist_session = false;
