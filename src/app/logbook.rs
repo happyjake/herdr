@@ -2,6 +2,30 @@ use super::{App, AppState};
 use crate::layout::PaneId;
 use crate::persist::logbook::{self, Event, LabelSource, SessionKey};
 
+fn terminal_session_key(terminal: &crate::terminal::TerminalState) -> Option<SessionKey> {
+    // Match snapshot capture: accepting a hook moves the current session from
+    // persisted_agent_session into hook_authority.
+    terminal
+        .hook_authority
+        .as_ref()
+        .and_then(|authority| {
+            authority
+                .session_ref
+                .as_ref()
+                .map(|session_ref| SessionKey {
+                    agent: authority.agent_label.clone(),
+                    kind: session_ref.kind,
+                    value: session_ref.value.clone(),
+                })
+        })
+        .or_else(|| {
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(SessionKey::from)
+        })
+}
+
 impl AppState {
     pub(crate) fn logbook_key(&self, pane_id: PaneId) -> Option<SessionKey> {
         self.logbook_events.as_ref()?;
@@ -9,11 +33,7 @@ impl AppState {
             .workspaces
             .iter()
             .find_map(|ws| ws.terminal_id(pane_id))?;
-        self.terminals
-            .get(terminal_id)?
-            .persisted_agent_session
-            .as_ref()
-            .map(SessionKey::from)
+        terminal_session_key(self.terminals.get(terminal_id)?)
     }
 
     pub(crate) fn record_logbook_parent(&mut self, pane_id: PaneId, parent: SessionKey) {
@@ -50,13 +70,13 @@ impl AppState {
         let Some((pane, terminal)) = self.logbook_pane(ws_idx, pane_id) else {
             return Vec::new();
         };
-        let Some(session) = &terminal.persisted_agent_session else {
+        let Some(key) = terminal_session_key(terminal) else {
             return Vec::new();
         };
         let event = Event::SessionReported {
             pane,
             terminal: terminal.id.clone(),
-            key: SessionKey::from(session),
+            key,
             cwd: terminal.cwd.clone(),
             at: logbook::now_ms(),
         };
@@ -78,9 +98,9 @@ impl AppState {
 
     fn logbook_label_event(&self, ws_idx: usize, pane_id: PaneId) -> Option<Event> {
         let (pane, terminal) = self.logbook_pane(ws_idx, pane_id)?;
-        let session = terminal.persisted_agent_session.as_ref()?;
+        let key = terminal_session_key(terminal)?;
         Some(Event::LabelWorn {
-            key: SessionKey::from(session),
+            key,
             pane,
             label: terminal.manual_label.clone(),
             source: match terminal.label_source {
@@ -135,6 +155,9 @@ impl App {
         if !self.policy.persist_session {
             return;
         }
+        // Initialization also serves an explicit restart of this writer. Drain
+        // its predecessor before starting another writer for the same file.
+        drop(self.logbook_writer.take());
         self.state.logbook_events.get_or_insert_with(Vec::new);
         let mut seed = Vec::new();
         for ws_idx in 0..self.state.workspaces.len() {
@@ -142,9 +165,9 @@ impl App {
                 seed.extend(self.state.logbook_session_events(ws_idx, pane_id));
             }
         }
-        match logbook::Writer::open(&logbook::path(), &seed) {
+        match logbook::BackgroundWriter::start(logbook::path(), seed) {
             Ok(writer) => self.logbook_writer = Some(writer),
-            Err(err) => tracing::warn!(%err, "failed to open session logbook"),
+            Err(err) => tracing::warn!(%err, "failed to start session logbook writer"),
         }
     }
 
@@ -159,13 +182,24 @@ impl App {
         if self.logbook_writer.is_none() {
             self.initialize_logbook();
         }
-        if let Some(writer) = &mut self.logbook_writer {
-            for event in events {
-                if let Err(err) = writer.append(&event) {
-                    tracing::warn!(%err, "failed to append session logbook event");
-                }
+        if let Some(writer) = &self.logbook_writer {
+            writer.append(events);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn drain_logbook(&mut self) {
+        self.flush_logbook();
+        if let Some(writer) = &self.logbook_writer {
+            if !writer.drain_timeout(logbook::DRAIN_TIMEOUT) {
+                tracing::warn!("session logbook drain timed out or writer stopped");
             }
         }
+    }
+
+    pub(crate) fn shutdown_logbook(&mut self) {
+        self.flush_logbook();
+        drop(self.logbook_writer.take());
     }
 }
 
@@ -227,6 +261,16 @@ mod tests {
         }
     }
 
+    fn settle(app: &mut App) {
+        app.flush_logbook();
+        if let Some(writer) = &app.logbook_writer {
+            assert!(
+                writer.drain_timeout(std::time::Duration::from_secs(5)),
+                "logbook worker drained"
+            );
+        }
+    }
+
     fn app_with_policy(policy: AppPolicy) -> App {
         let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -239,6 +283,7 @@ mod tests {
         app.state.workspaces = vec![Workspace::test_new("workspace")];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
+        settle(&mut app);
         app
     }
 
@@ -292,7 +337,8 @@ mod tests {
         expected.push(json!({"type":"session_reported","pane":pane,"terminal":terminal_id,"key":{"agent":"claude","kind":"id","value":"unlabelled"},"cwd":"project"}));
         app.policy.persist_session = true;
         app.initialize_logbook();
-        assert_eq!(rows(&root.path(), before), expected);
+        settle(&mut app);
+        assert_eq!(rows(&mut app, &root.path(), before), expected);
         let seeded = std::fs::read(root.path()).unwrap();
         drop(app);
 
@@ -300,6 +346,7 @@ mod tests {
         restarted.state.workspaces[0].id = "wseed".into();
         restarted.policy.persist_session = true;
         restarted.initialize_logbook();
+        settle(&mut restarted);
         assert_eq!(std::fs::read(root.path()).unwrap(), seeded);
         let pane_id = restarted.state.workspaces[0].tabs[0].root_pane;
         let pane = restarted.public_pane_id(0, pane_id).unwrap();
@@ -314,7 +361,10 @@ mod tests {
         report(&mut restarted, pane_id, "new-session", 2, "clear");
         let appended = std::fs::read(root.path()).unwrap();
         assert!(appended.starts_with(&seeded));
-        assert_eq!(rows(&root.path(), before).len(), expected.len() + 2);
+        assert_eq!(
+            rows(&mut restarted, &root.path(), before).len(),
+            expected.len() + 2
+        );
     }
 
     fn rename(app: &mut App, pane: &str, label: Option<&str>, source: Option<LabelSource>) {
@@ -333,6 +383,7 @@ mod tests {
                 .is_none(),
             "{response}"
         );
+        settle(app);
     }
 
     fn report(
@@ -350,9 +401,11 @@ mod tests {
             session_ref: crate::agent_resume::AgentSessionRef::id(session),
             session_start_source: Some(reason.into()),
         });
+        settle(app);
     }
 
-    fn rows(path: &std::path::Path, before: u64) -> Vec<Value> {
+    fn rows(app: &mut App, path: &std::path::Path, before: u64) -> Vec<Value> {
+        settle(app);
         let text = std::fs::read_to_string(path).expect("logbook must be written");
         assert!(text.ends_with('\n'));
         text.lines()
@@ -413,7 +466,7 @@ mod tests {
         let parent = json!({"agent":"pi","kind":"path","value":parent_path});
         let child = json!({"agent":"pi","kind":"path","value":child_path});
         assert_eq!(
-            rows(&root.path(), before),
+            rows(&mut app, &root.path(), before),
             vec![
                 json!({"type":"session_reported","pane":pane,"terminal":terminal,"key":parent,"cwd":"project"}),
                 json!({"type":"label_worn","key":parent,"pane":pane,"label":"original","source":"person"}),
@@ -440,6 +493,7 @@ mod tests {
         assert_eq!(crate::persist::logbook::read(&root.path()).unwrap(), typed);
         // Reopening also rebuilds deduplication from the complete prefix.
         app.initialize_logbook();
+        settle(&mut app);
         rename(
             &mut app,
             &pane,
@@ -450,6 +504,7 @@ mod tests {
             pane_id,
             exit_reason: crate::platform::ChildExitReason::Exited,
         });
+        settle(&mut app);
         let recovered = crate::persist::logbook::read(&root.path()).unwrap();
         assert_eq!(&recovered[..typed.len()], typed);
         assert_eq!(recovered.len(), typed.len() + 2);
@@ -509,7 +564,7 @@ mod tests {
         let first = json!({"agent":"claude","kind":"id","value":"first-session"});
         let next = json!({"agent":"claude","kind":"id","value":"next-session"});
         assert_eq!(
-            rows(&root.path(), before),
+            rows(&mut app, &root.path(), before),
             vec![
                 json!({"type":"session_reported","pane":pane,"terminal":terminal,"key":first,"cwd":"project"}),
                 json!({"type":"label_worn","key":first,"pane":pane,"label":"first label","source":"editor"}),
@@ -561,7 +616,7 @@ mod tests {
             .into_iter()
             .map(|pane| json!({"type":"pane_closed","pane":pane}))
             .collect();
-        assert_eq!(rows(&root.path(), before), expected);
+        assert_eq!(rows(&mut app, &root.path(), before), expected);
         let response = app.handle_api_request(Request {
             id: "close-workspace".into(),
             method: Method::WorkspaceClose(crate::api::schema::WorkspaceCloseParams {
@@ -581,7 +636,7 @@ mod tests {
             pane_id: first,
             exit_reason: crate::platform::ChildExitReason::Exited,
         });
-        assert_eq!(rows(&root.path(), before), expected);
+        assert_eq!(rows(&mut app, &root.path(), before), expected);
         assert!(app.state.workspaces.is_empty());
     }
 
@@ -672,12 +727,14 @@ mod tests {
             std::ffi::OsString::from_vec(vec![0xff]).into();
         app.policy.persist_session = true;
         app.initialize_logbook();
+        settle(&mut app);
         assert!(
             !root.path().exists(),
             "a failed seed must not mark initialization complete"
         );
         app.state.terminals.get_mut(&terminal).unwrap().cwd = "project".into();
         app.initialize_logbook();
+        settle(&mut app);
         let events = crate::persist::logbook::read(&root.path()).unwrap();
         assert_eq!(events.len(), 4);
         assert_eq!(
@@ -689,6 +746,7 @@ mod tests {
             "second"
         );
         app.initialize_logbook();
+        settle(&mut app);
         assert_eq!(crate::persist::logbook::read(&root.path()).unwrap(), events);
     }
 
@@ -714,5 +772,219 @@ mod tests {
         );
         report(&mut app, pane_id, "session", 3, "resume");
         assert_eq!(crate::persist::logbook::read(&root.path()).unwrap(), events);
+    }
+
+    #[test]
+    fn logbook_keeps_labels_and_parent_after_hook_authority_accepts_session() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let root = ConfigRoot::new();
+        let before = crate::pane::unix_now_secs() * 1000;
+        let mut app = app();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane = app.public_pane_id(0, pane_id).unwrap();
+        let terminal = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        app.state.terminals.get_mut(&terminal).unwrap().cwd = "project".into();
+        let parent_path = root.root.join("parent.jsonl").display().to_string();
+        let child_path = root.root.join("child.jsonl").display().to_string();
+        app.handle_internal_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: crate::detect::Agent::Pi,
+            observed_at: std::time::Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
+        });
+        app.handle_internal_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            seq: Some(1),
+            session_ref: crate::agent_resume::AgentSessionRef::path(&parent_path),
+            session_start_source: Some("startup".into()),
+        });
+        app.handle_internal_event(AppEvent::HookStateReported {
+            pane_id,
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            seq: Some(2),
+            state: crate::detect::AgentState::Idle,
+            message: None,
+            cancelled: false,
+            session_ref: crate::agent_resume::AgentSessionRef::path(&parent_path),
+        });
+        rename(&mut app, &pane, Some("personal label"), None);
+        rename(
+            &mut app,
+            &pane,
+            Some("automatic label"),
+            Some(LabelSource::Editor),
+        );
+        app.handle_internal_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            seq: Some(3),
+            session_ref: crate::agent_resume::AgentSessionRef::path(&child_path),
+            session_start_source: Some("fork".into()),
+        });
+        let parent = json!({"agent":"pi","kind":"path","value":parent_path});
+        let child = json!({"agent":"pi","kind":"path","value":child_path});
+        assert_eq!(
+            rows(&mut app, &root.path(), before),
+            vec![
+                json!({"type":"session_reported","pane":pane,"terminal":terminal,"key":parent,"cwd":"project"}),
+                json!({"type":"label_worn","key":parent,"pane":pane,"label":"personal label","source":"person"}),
+                json!({"type":"label_worn","key":parent,"pane":pane,"label":"automatic label","source":"editor"}),
+                json!({"type":"session_reported","pane":pane,"terminal":terminal,"key":child,"cwd":"project"}),
+                json!({"type":"label_worn","key":child,"pane":pane,"label":"automatic label","source":"editor"}),
+                json!({"type":"parent","child":child,"parent":parent}),
+            ]
+        );
+    }
+
+    fn assert_logbook_pane_reuse(reopen: bool) {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let root = ConfigRoot::new();
+        let before = crate::pane::unix_now_secs() * 1000;
+        let mut app = app();
+        app.state.workspaces[0].id = "wreuse".into();
+        let first_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane = app.public_pane_id(0, first_id).unwrap();
+        let first_terminal = app.state.terminal_id_for_pane(0, first_id).unwrap();
+        app.state.terminals.get_mut(&first_terminal).unwrap().cwd = "project".into();
+        rename(&mut app, &pane, Some("same label"), None);
+        report(&mut app, first_id, "same-session", 1, "startup");
+        let response = app.handle_api_request(Request {
+            id: "close".into(),
+            method: Method::PaneClose(PaneTarget {
+                pane_id: pane.clone(),
+            }),
+        });
+        assert!(
+            serde_json::from_str::<Value>(&response)
+                .unwrap()
+                .get("error")
+                .is_none(),
+            "{response}"
+        );
+        settle(&mut app);
+        let closed = std::fs::read(root.path()).unwrap();
+        if reopen {
+            drop(app);
+            app = app_with_policy(AppPolicy::TEST);
+            app.policy.persist_session = true;
+            app.initialize_logbook();
+            settle(&mut app);
+        }
+        app.state.workspaces = vec![Workspace::test_new("recreated")];
+        app.state.workspaces[0].id = "wreuse".into();
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let next_id = app.state.workspaces[0].tabs[0].root_pane;
+        let next_terminal = app.state.terminal_id_for_pane(0, next_id).unwrap();
+        assert_eq!(
+            app.public_pane_id(0, next_id).as_deref(),
+            Some(pane.as_str())
+        );
+        assert_ne!(first_terminal, next_terminal);
+        app.state.terminals.get_mut(&next_terminal).unwrap().cwd = "project".into();
+        rename(&mut app, &pane, Some("same label"), None);
+        report(&mut app, next_id, "same-session", 1, "resume");
+        report(&mut app, next_id, "same-session", 2, "resume");
+        let key = json!({"agent":"claude","kind":"id","value":"same-session"});
+        assert_eq!(
+            rows(&mut app, &root.path(), before),
+            vec![
+                json!({"type":"session_reported","pane":pane,"terminal":first_terminal,"key":key,"cwd":"project"}),
+                json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
+                json!({"type":"pane_closed","pane":pane}),
+                json!({"type":"session_reported","pane":pane,"terminal":next_terminal,"key":key,"cwd":"project"}),
+                json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
+            ]
+        );
+        assert!(std::fs::read(root.path()).unwrap().starts_with(&closed));
+    }
+
+    #[test]
+    fn logbook_pane_reuse_records_session_and_label_after_close() {
+        assert_logbook_pane_reuse(false);
+    }
+
+    #[test]
+    fn logbook_pane_reuse_records_session_and_label_after_replay() {
+        assert_logbook_pane_reuse(true);
+    }
+
+    #[test]
+    fn logbook_paused_writer_does_not_block_app_actions_and_shutdown_drains_in_order() {
+        use std::time::Duration;
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let root = ConfigRoot::new();
+        let before = crate::pane::unix_now_secs() * 1000;
+        let mut app = app();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let pane = app.public_pane_id(0, pane_id).unwrap();
+        let terminal = app.state.terminal_id_for_pane(0, pane_id).unwrap();
+        app.state.terminals.get_mut(&terminal).unwrap().cwd = "project".into();
+        let paused = app.logbook_writer.as_ref().unwrap().pause_for_test();
+        assert!(!app
+            .logbook_writer
+            .as_ref()
+            .unwrap()
+            .drain_timeout(Duration::from_millis(10)));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let action_pane = pane.clone();
+        let actions = std::thread::spawn(move || {
+            app.handle_internal_event(AppEvent::AgentSessionReported {
+                pane_id,
+                source: "herdr:claude".into(),
+                agent_label: "claude".into(),
+                seq: Some(1),
+                session_ref: crate::agent_resume::AgentSessionRef::id("session"),
+                session_start_source: Some("startup".into()),
+            });
+            let renamed = app.handle_api_request(Request {
+                id: "rename".into(),
+                method: Method::PaneRename(PaneRenameParams {
+                    pane_id: action_pane.clone(),
+                    label: Some("queued label".into()),
+                    source: None,
+                }),
+            });
+            let closed = app.handle_api_request(Request {
+                id: "close".into(),
+                method: Method::PaneClose(PaneTarget {
+                    pane_id: action_pane,
+                }),
+            });
+            done_tx.send((app, renamed, closed)).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(5));
+        let while_paused = std::fs::read(root.path()).unwrap();
+        drop(paused);
+        actions.join().unwrap();
+        let (mut app, renamed, closed) =
+            result.expect("app actions must finish while the writer is paused");
+        assert!(
+            while_paused.is_empty(),
+            "the worker must remain paused throughout the actions"
+        );
+        for response in [renamed, closed] {
+            assert!(
+                serde_json::from_str::<Value>(&response)
+                    .unwrap()
+                    .get("error")
+                    .is_none(),
+                "{response}"
+            );
+        }
+        app.save_session_on_shutdown();
+        let key = json!({"agent":"claude","kind":"id","value":"session"});
+        assert_eq!(
+            rows(&mut app, &root.path(), before),
+            vec![
+                json!({"type":"session_reported","pane":pane,"terminal":terminal,"key":key,"cwd":"project"}),
+                json!({"type":"label_worn","pane":pane,"key":key,"label":"queued label","source":"person"}),
+                json!({"type":"pane_closed","pane":pane}),
+            ]
+        );
     }
 }

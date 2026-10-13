@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+mod background;
+pub(crate) use background::BackgroundWriter;
+#[cfg(unix)]
+pub(crate) use background::DRAIN_TIMEOUT;
+
 /// Resume identity without the reporting hook's source or record-file hint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionKey {
@@ -72,26 +77,33 @@ pub fn path() -> PathBuf {
 /// Read complete events in file order. Missing files are empty histories.
 /// Invalid lines are skipped, including a torn tail and tails subsequently
 /// delimited by an append. Filesystem errors are returned to the caller.
+// Kept as the typed consumer interface; the writer streams replay without collecting.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn read(path: &Path) -> io::Result<Vec<Event>> {
+    let mut events = Vec::new();
+    for_each_event(path, |event| events.push(event))?;
+    Ok(events)
+}
+
+fn for_each_event(path: &Path, mut visit: impl FnMut(Event)) -> io::Result<()> {
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
-    let mut events = Vec::new();
     for (index, line) in BufReader::new(file).split(b'\n').enumerate() {
         let line = line?;
         if line.is_empty() {
             continue;
         }
         match serde_json::from_slice(&line) {
-            Ok(event) => events.push(event),
+            Ok(event) => visit(event),
             Err(err) => {
                 tracing::warn!(line = index + 1, %err, "skipping incomplete or invalid logbook event")
             }
         }
     }
-    Ok(events)
+    Ok(())
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -125,9 +137,7 @@ impl Writer {
             labels: HashMap::new(),
             parents: HashSet::new(),
         };
-        for event in read(path)? {
-            writer.remember(&event);
-        }
+        for_each_event(path, |event| writer.remember(&event))?;
         Ok(writer)
     }
 
@@ -190,7 +200,12 @@ impl Writer {
                 self.labels
                     .insert((pane.clone(), key.clone()), (label.clone(), *source));
             }
-            Event::PaneClosed { .. } => {}
+            Event::PaneClosed { pane, .. } => {
+                self.sessions
+                    .retain(|(recorded_pane, _)| recorded_pane != pane);
+                self.labels
+                    .retain(|(recorded_pane, _), _| recorded_pane != pane);
+            }
             Event::Parent { child, parent } => {
                 self.parents.insert((child.clone(), parent.clone()));
             }

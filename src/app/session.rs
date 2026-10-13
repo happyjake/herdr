@@ -123,6 +123,7 @@ impl App {
     }
 
     pub(crate) fn save_session_on_shutdown(&mut self) {
+        self.shutdown_logbook();
         if self.pane_exit_checkpoint_pending && !self.state.session_dirty {
             self.session_save_deadline = None;
             return;
