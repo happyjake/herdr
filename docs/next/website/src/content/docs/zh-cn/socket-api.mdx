@@ -92,7 +92,7 @@ herdr pane read w1:p2 --source recent --lines 50
 
 | 领域 | 方法 |
 | --- | --- |
-| 服务器 | `ping`、`server.stop`、`server.reload_config`、`server.agent_manifests`、`server.reload_agent_manifests`、`server.lookup_place` |
+| 服务器 | `ping`、`server.stop`、`server.reload_config`、`server.agent_manifests`、`server.reload_agent_manifests`、`server.lookup_place`、`server.search_sessions` |
 | 通知 | `notification.show` |
 | 客户端 | `client.window_title.set`、`client.window_title.clear` |
 | 会话 | `session.snapshot` |
@@ -108,6 +108,22 @@ herdr pane read w1:p2 --source recent --lines 50
 | 插件 | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
 
 `agent.wait` 由服务器拥有并由事件驱动。它会固定到已解析的窗格占用者,因此替换后的智能体不能满足该等待。`agent.prompt` 接受可选的 `wait` 对象,其中包含 `until` 和 `timeout_ms`;这样可在一个请求中提交提示并开始等待,避免两个独立调用之间的竞态。如果解析出的智能体已经是 `blocked`,`agent.prompt` 不会发送输入或开始等待,而是返回 `agent_blocked`。
+
+`server.search_sessions` 搜索此服务器保存的 Claude、Codex 和 pi 会话，以及 Claude/Codex 的提示历史。所有参数均可省略：
+
+```json
+{"id":"req_search","method":"server.search_sessions","params":{"terms":["keyboard","layout"],"agent":"claude","limit":50}}
+```
+
+`terms` 对标题、提示、cwd 和分支做不区分大小写的字面子串匹配。每个不同的匹配词为 `score` 加 1，因此全部词命中的会话排在部分命中之前；同分时按最近活动排序。没有搜索词时按最近活动浏览。`since_ms` 和 `until_ms` 是包含边界的硬筛选条件，检查是否与 `[started_at_ms, last_active_at_ms]` 重叠。`place` 是不区分大小写的 cwd 子串；`agent` 必须与名称完全一致。`limit` 默认 50，上限 200。`embedding` 预留但忽略；接受 `include_headless`，目前不影响结果。
+
+`server_search_sessions` 结果包含 `sessions`、筛选前检查的会话行数 `scanned` 和 `partial`。每行带有 `key`（`agent`、`kind`、`value`）、`cwd`（未知时为 null）、可选的 `branch` 和经过有效性判断的 `title`、约 400 字符的 `first_prompt`、最多三条各约 240 字符的 `recent_prompts`（最新的在最后），以及毫秒活动时间。Claude/Codex 按 id 标识，pi 按 path 标识。没有会话 id 的旧 Claude 历史按项目和 UTC 日期分组，kind 为 `day`，value 为 `<cwd>|<YYYY-MM-DD>`。Claude 记录移到其他项目目录后仍使用同一个键。
+
+`state` 为 `live`、`ended` 或 `record_gone`。live 行包含此服务器的 `live_pane_id`。`place_state` 为 `present` 或 `gone`；目录消失且存在祖先目录时，返回 `nearest_existing`。`resume` 包含恢复规划器生成的 `command` 和 `cwd`，或为 null 并带有 `resume_blocked`（`live`、`record_gone` 或 `folder_gone`）。Claude/Codex 的 id 和 pi 的路径可以从最近的现存祖先目录恢复。未知目录和项目日期分组行不能恢复。`labels` 为空，`headless` 为 false，`subagent_count` 为 0，省略 `parent`。跳过 Claude 子智能体文件和 source 为对象的 Codex 记录。
+
+命中行的 `why` 包含 `field`、匹配的 `line` 和 `terms`；浏览时为 `why: null`。提示中超出预览截断长度的内容仍可搜索。提示提取和标题判断复用 `pane.prompt_trail` 的规则，排除助手输出、工具通信和注入文本。Codex 名称取自会话索引，最后一条优先，并支持 `.jsonl.zst` 归档记录。只读取智能体文件，不写入。
+
+后台目录按路径、修改时间和大小复用记录，每 30 秒刷新。查询使用缓存快照，约 2 秒的预算包含等待两个并发名额之一和请求应用窗格列表。目录尚未完成或扫描超时，会返回已找到的行及 `partial: true`。超时工作在真正结束前仍占用名额。应用不能提供窗格身份时返回 `server_unavailable`。旧服务器按未知方法返回 `invalid_request`，无需能力标志或协议版本升级。
 
 `workspace.move_block` 会将有序的 `workspace_ids` 原子地移动到 `before_workspace_id` 之前;省略锚点则将该块移动到末尾。id 必须唯一,且锚点不能属于被移动的块。响应包含服务器确认的有序工作区列表。
 

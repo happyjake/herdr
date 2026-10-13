@@ -793,6 +793,9 @@ fn handle_request(
         Method::ServerLookupPlace(params) => {
             crate::api::place_lookup::handle_lookup(request.id, &params, api_tx)
         }
+        Method::ServerSearchSessions(params) => {
+            crate::api::search_sessions::handle_search(request.id, &params, api_tx)
+        }
         // A trail opens a session record, walks it and parses it. Served
         // here for the same reason, with the app asked only for the pane's
         // own identity and the session it reports.
@@ -850,6 +853,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
         Method::ServerLookupPlace(_) => "server.lookup_place",
+        Method::ServerSearchSessions(_) => "server.search_sessions",
         Method::AttachmentCreate(_) => "attachment.create",
         Method::AttachmentBegin(_) => "attachment.begin",
         Method::AttachmentAppend(_) => "attachment.append",

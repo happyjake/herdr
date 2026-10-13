@@ -9,6 +9,7 @@ pub mod integrations;
 pub mod panes;
 pub mod plugins;
 pub mod response;
+pub mod search_sessions;
 pub mod server;
 pub mod session;
 pub mod tabs;
@@ -24,6 +25,7 @@ pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
 pub use response::*;
+pub use search_sessions::*;
 pub use server::*;
 pub use session::*;
 pub use tabs::*;
@@ -66,6 +68,8 @@ pub enum Method {
     // method, and a client reads that refusal as the lookup's absence.
     #[serde(rename = "server.lookup_place")]
     ServerLookupPlace(ServerLookupPlaceParams),
+    #[serde(rename = "server.search_sessions")]
+    ServerSearchSessions(ServerSearchSessionsParams),
     #[serde(rename = "attachment.create")]
     AttachmentCreate(AttachmentCreateParams),
     // A file beyond one message's carry. Additive verbs, with the

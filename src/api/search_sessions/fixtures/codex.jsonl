@@ -1,0 +1,3 @@
+{"type":"session_meta","timestamp":"2025-01-01T00:00:00Z","payload":{"id":"compressed-a","cwd":"/home/user/project","source":"cli","git":{"branch":"archive"}}}
+{"type":"response_item","timestamp":"2025-01-01T00:01:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Find the archived keyboard work"}]}}
+{"type":"response_item","timestamp":"2025-01-01T00:02:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Read the second frame too"}]}}

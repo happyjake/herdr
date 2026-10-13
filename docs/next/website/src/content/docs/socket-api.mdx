@@ -96,7 +96,7 @@ Raw socket method names use dot notation:
 
 | Area | Methods |
 | --- | --- |
-| Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests`, `server.lookup_place` |
+| Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests`, `server.lookup_place`, `server.search_sessions` |
 | Notification | `notification.show` |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
@@ -222,6 +222,55 @@ abandoned upload is swept like any other scratch file. Refusals carry
 one `attachment.create` or `attachment.append` may carry; size chunks from it
 rather than from a hard-coded number. A server without the capability takes
 photos through `attachment.create` only.
+
+`server.search_sessions` searches saved Claude, Codex, and pi sessions on this
+server, including Claude and Codex prompt histories. All parameters are optional:
+
+```json
+{"id":"req_search","method":"server.search_sessions","params":{"terms":["keyboard","layout"],"agent":"claude","limit":50}}
+```
+
+`terms` uses case-insensitive literal substrings across the title, prompts, cwd,
+and branch. Each distinct matching term adds one to `score`, so all-term matches
+rank above partial matches; ties use newest activity first. No terms means browse,
+newest first. `since_ms` and `until_ms` are inclusive hard filters on overlap with
+`[started_at_ms, last_active_at_ms]`. `place` is a case-insensitive cwd substring;
+`agent` is an exact name. `limit` defaults to 50 and is capped at 200. `embedding`
+is reserved and ignored. `include_headless` is accepted and currently inert.
+
+The `server_search_sessions` result carries `sessions`, `scanned` (session rows
+considered before filtering), and `partial`. Each row includes its `key`
+(`agent`, `kind`, `value`), `cwd` (null when unknown), optional `branch` and judged
+`title`, `first_prompt` (about 400 characters), up to three `recent_prompts`
+(about 240 characters each, newest last), and activity times in milliseconds.
+Claude and Codex use id keys; pi uses a path key. Claude history without a session
+id groups by project and UTC day with kind `day` and value `<cwd>|<YYYY-MM-DD>`.
+Claude ids remain the same when records move between project directories.
+
+`state` is `live`, `ended`, or `record_gone`. A live row carries `live_pane_id` for
+this server. `place_state` is `present` or `gone`; a gone place includes
+`nearest_existing` when an ancestor exists. `resume` contains the planner's
+`command` and `cwd`, or is null with `resume_blocked` (`live`, `record_gone`, or
+`folder_gone`). Claude/Codex ids and pi paths can resume from the nearest existing
+ancestor. Unknown places and project-day rows cannot resume. `labels` is empty,
+`headless` is false, `subagent_count` is zero, and `parent` is omitted. Claude
+subagent files and Codex rollouts with an object-valued source are skipped.
+
+A matching row's `why` gives the `field`, matching `line`, and matching `terms`;
+browse rows have `why: null`. Full prompts remain searchable beyond their clipped
+previews. Prompt extraction and title judgement follow `pane.prompt_trail`,
+including the exclusions for assistant output, tool traffic, and injected text.
+Codex names come from its session index, latest entry first in precedence; archived
+`.jsonl.zst` rollouts are supported. Harness files are only read.
+
+A background catalog reuses records by path, modification time, and size and
+refreshes every 30 seconds. Queries use cached snapshots, with a two-second budget
+including the wait for one of two permits and the app's pane list. An unfinished
+catalog or an expired scan returns rows found so far with `partial: true`.
+Timed-out work retains its permit until it finishes. If the app cannot supply
+pane identity, the method returns `server_unavailable`. Older servers refuse the
+unknown method with `invalid_request`; no capability flag or protocol bump is
+required.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 

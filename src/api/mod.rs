@@ -6,6 +6,7 @@ mod event_hub;
 mod place_lookup;
 mod prompt_trail;
 pub mod schema;
+mod search_sessions;
 mod server;
 mod server_executable;
 mod server_name;

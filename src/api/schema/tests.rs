@@ -553,6 +553,85 @@ fn a_lookup_without_a_limit_carries_no_limit_field() {
 }
 
 #[test]
+fn search_sessions_request_round_trips_optional_filters_and_reserved_embedding() {
+    for params in [
+        serde_json::json!({}),
+        serde_json::json!({
+            "terms": ["keyboard", "sim"],
+            "since_ms": 1791000000000_u64,
+            "until_ms": 1791600000000_u64,
+            "place": "project",
+            "agent": "claude",
+            "include_headless": false,
+            "limit": 50,
+            "embedding": [0.1, 0.2]
+        }),
+    ] {
+        let wire = serde_json::json!({
+            "id": "req_search", "method": "server.search_sessions", "params": params
+        });
+        let request: Request = serde_json::from_value(wire.clone()).expect("search request");
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert_eq!(
+            crate::api::server::api_method_name_for_test(&request.method),
+            "server.search_sessions"
+        );
+    }
+}
+
+#[test]
+fn search_sessions_response_round_trips_nulls_and_optional_fields() {
+    let wire = serde_json::json!({
+        "id": "req_search",
+        "result": {
+            "type": "server_search_sessions", "scanned": 3, "partial": false,
+            "sessions": [{
+                "key": {"agent": "claude", "kind": "id", "value": "session-a"},
+                "agent": "claude", "cwd": "/home/user/project", "place_state": "present",
+                "branch": "feature/search", "title": "Keyboard focus",
+                "first_prompt": "Fix the keyboard", "recent_prompts": ["Check focus"],
+                "started_at_ms": 1791000000000_u64, "last_active_at_ms": 1791003600000_u64,
+                "labels": [], "state": "ended",
+                "resume": {"command": "claude --resume session-a", "cwd": "/home/user/project"},
+                "headless": false, "subagent_count": 0,
+                "why": {"field": "title", "line": "Keyboard focus", "terms": ["keyboard"]},
+                "score": 1.0
+            }, {
+                "key": {"agent": "claude", "kind": "day", "value": "/home/user/project|2026-10-03"},
+                "agent": "claude", "cwd": null, "place_state": "gone",
+                "first_prompt": "Older prompt", "recent_prompts": ["Older prompt"],
+                "started_at_ms": 1791000000000_u64, "last_active_at_ms": 1791000000000_u64,
+                "labels": [], "state": "record_gone", "resume": null,
+                "resume_blocked": "record_gone", "headless": false,
+                "subagent_count": 0, "why": null, "score": 0.0
+            }]
+        }
+    });
+    let response: SuccessResponse = serde_json::from_value(wire.clone()).expect("search result");
+    assert_eq!(serde_json::to_value(response).unwrap(), wire);
+}
+
+#[test]
+fn search_sessions_optional_metadata_keeps_its_wire_shape() {
+    let row = serde_json::json!({
+        "key": {"agent": "pi", "kind": "path", "value": "/home/user/session.jsonl"},
+        "agent": "pi", "cwd": "/home/user/removed", "place_state": "gone",
+        "nearest_existing": "/home/user", "first_prompt": "Check layout", "recent_prompts": [],
+        "started_at_ms": 1791000000000_u64, "last_active_at_ms": 1791003600000_u64,
+        "labels": [
+            {"label": "Layout", "source": "editor", "pane_id": "w1:p1", "from_ms": 1791000000000_u64, "to_ms": 1791003600000_u64},
+            {"label": "Layout check", "source": "person", "pane_id": "w1:p1", "from_ms": 1791003600000_u64}
+        ],
+        "state": "outside", "outside": {"pid": 20914, "detail": "pi pid 20914"},
+        "resume": null, "resume_blocked": "outside", "headless": true,
+        "parent": {"agent": "claude", "kind": "id", "value": "parent-session"},
+        "subagent_count": 2, "why": null, "score": 0.0
+    });
+    let decoded: SessionHit = serde_json::from_value(row.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), row);
+}
+
+#[test]
 fn the_lookup_result_names_every_place_and_the_memory_it_came_from() {
     let response = SuccessResponse {
         id: "req_place".into(),
