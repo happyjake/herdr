@@ -2,6 +2,7 @@ use super::*;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+mod folding;
 mod outside;
 
 struct FixtureHome {
@@ -26,6 +27,7 @@ impl FixtureHome {
             home: Some(root.clone()),
             processes: Box::new(move || Ok(view.lock().unwrap().clone())),
             registry_retry_sleep: Box::new(|_| {}),
+            logbook: root.join("logbook.jsonl"),
         }));
         Self {
             root,
@@ -46,6 +48,12 @@ impl FixtureHome {
         let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    // Core search tests opt in to records with no pane history.
+    fn search_all(&self, mut params: Value, panes: Vec<Value>) -> Value {
+        params["include_headless"] = json!(true);
+        self.search(params, panes)
     }
 
     fn search(&self, params: Value, panes: Vec<Value>) -> Value {
@@ -124,7 +132,7 @@ fn browse_reads_a_claude_session_and_offers_resume() {
     );
     home.catalog.refresh();
 
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     assert_eq!(
         response["result"],
         json!({
@@ -136,7 +144,7 @@ fn browse_reads_a_claude_session_and_offers_resume() {
                 "first_prompt": "Fix the keyboard", "recent_prompts": ["Fix the keyboard", "Check focus"],
                 "started_at_ms": 1790985600123_u64, "last_active_at_ms": 1790989200456_u64,
                 "labels": [], "state": "ended", "resume": {"command": "claude --resume session-a", "cwd": cwd},
-                "headless": false, "subagent_count": 0, "why": null, "score": 0.0
+                "headless": true, "subagent_count": 0, "why": null, "score": 0.0
             }]
         })
     );
@@ -192,7 +200,7 @@ fn browse_covers_codex_pi_and_both_prompt_histories() {
     );
     home.catalog.refresh();
 
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     assert_eq!(response["result"]["scanned"], 5);
     assert_eq!(response["result"]["partial"], false);
     let codex = by_key(&response, "codex-a");
@@ -254,7 +262,7 @@ fn moved_claude_session_keeps_its_key_and_live_state_blocks_resume() {
         json!({"display": "Original prompt", "project": cwd, "sessionId": "session-a", "timestamp": 1790985600000_u64}),
     ]);
     home.catalog.refresh();
-    let before = home.search(json!({}), vec![]);
+    let before = home.search_all(json!({}), vec![]);
     assert_eq!(by_key(&before, "session-a")["state"], "ended");
 
     let ancestor = home.dir("projects/destination");
@@ -276,7 +284,7 @@ fn moved_claude_session_keeps_its_key_and_live_state_blocks_resume() {
     .unwrap();
     home.catalog.refresh();
 
-    let after = home.search(json!({}), vec![live_pane("codex", "id", "session-a")]);
+    let after = home.search_all(json!({}), vec![live_pane("codex", "id", "session-a")]);
     assert_eq!(after["result"]["sessions"].as_array().unwrap().len(), 1);
     let row = by_key(&after, "session-a");
     assert_eq!(row["state"], "ended");
@@ -289,7 +297,7 @@ fn moved_claude_session_keeps_its_key_and_live_state_blocks_resume() {
     );
     assert!(row.get("resume_blocked").is_none());
 
-    let live = home.search(json!({}), vec![live_pane("claude", "id", "session-a")]);
+    let live = home.search_all(json!({}), vec![live_pane("claude", "id", "session-a")]);
     let row = by_key(&live, "session-a");
     assert_eq!(row["state"], "live");
     assert_eq!(row["live_pane_id"], "w1:p1");
@@ -343,7 +351,7 @@ fn literal_or_scoring_explains_hits_and_hard_filters_use_session_windows() {
     );
     home.catalog.refresh();
 
-    let response = home.search(json!({"terms": ["keyboard", "sim"]}), vec![]);
+    let response = home.search_all(json!({"terms": ["keyboard", "sim"]}), vec![]);
     let rows = response["result"]["sessions"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["key"]["value"], "all-terms");
@@ -365,10 +373,10 @@ fn literal_or_scoring_explains_hits_and_hard_filters_use_session_windows() {
         (json!(["feature/search"]), "branch"),
         (json!(["PROJECT"]), "cwd"),
     ] {
-        let response = home.search(json!({"terms": terms}), vec![]);
+        let response = home.search_all(json!({"terms": terms}), vec![]);
         assert_eq!(by_key(&response, "all-terms")["why"]["field"], field);
     }
-    let filtered = home.search(
+    let filtered = home.search_all(
         json!({"terms": ["keyboard", "sim"], "agent": "claude",
         "place": "pRoJeCt", "since_ms": 1790991000000_u64, "until_ms": 1790992800000_u64}),
         vec![],
@@ -384,25 +392,28 @@ fn literal_or_scoring_explains_hits_and_hard_filters_use_session_windows() {
         json!({"since_ms": 1791200000000_u64}),
         json!({"until_ms": 1790900000000_u64}),
     ] {
-        assert_eq!(home.search(params, vec![])["result"]["sessions"], json!([]));
+        assert_eq!(
+            home.search_all(params, vec![])["result"]["sessions"],
+            json!([])
+        );
     }
-    let limited = home.search(json!({"terms": ["keyboard", "sim"], "limit": 1}), vec![]);
+    let limited = home.search_all(json!({"terms": ["keyboard", "sim"], "limit": 1}), vec![]);
     assert_eq!(limited["result"]["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(
         limited["result"]["sessions"][0]["key"]["value"],
         "all-terms"
     );
-    let browse = home.search(
+    let browse = home.search_all(
         json!({"terms": [], "include_headless": true, "embedding": [0.1]}),
         vec![],
     );
     assert_eq!(browse["result"]["sessions"][0]["key"]["value"], "unrelated");
     assert_eq!(browse["result"]["sessions"][0]["why"], Value::Null);
-    assert_eq!(browse, home.search(json!({}), vec![]));
+    assert_eq!(browse, home.search_all(json!({}), vec![]));
 }
 
 #[test]
-fn search_skips_subagents_and_injected_material_and_judges_both_harness_titles() {
+fn search_excludes_injected_material_and_judges_both_harness_titles() {
     let home = FixtureHome::new();
     let cwd = home.dir("project");
     let mut meta = claude_prompt("claude-a", &cwd, "excluded-meta", "2026-10-03T00:01:00Z");
@@ -461,20 +472,26 @@ fn search_skips_subagents_and_injected_material_and_judges_both_harness_titles()
     home.write(".claude/history.jsonl", &[
         json!({"sessionId": "claude-a", "project": cwd, "timestamp": 1790985600000_u64, "display": "<system-reminder>excluded-history</system-reminder>"}),
     ]);
+    home.write(
+        "logbook.jsonl",
+        &[
+            folding::reported("claude", "claude-a", "w1:p1", &cwd, 1790985600000),
+            folding::reported("codex", "codex-a", "w1:p2", &cwd, 1790985600000),
+        ],
+    );
     home.catalog.refresh();
 
-    let browse = home.search(json!({"include_headless": true}), vec![]);
+    let browse = home.search(json!({}), vec![]);
     assert_eq!(browse["result"]["sessions"].as_array().unwrap().len(), 2);
     for id in ["claude-a", "codex-a"] {
         let row = by_key(&browse, id);
         assert!(row.get("title").is_none());
         assert_eq!(row["headless"], false);
-        assert_eq!(row["subagent_count"], 0);
         assert!(row.get("parent").is_none());
         assert!(row.get("outside").is_none());
     }
     assert_eq!(
-        home.search(json!({"terms": ["genuine"]}), vec![])["result"]["sessions"]
+        home.search_all(json!({"terms": ["genuine"]}), vec![])["result"]["sessions"]
             .as_array()
             .unwrap()
             .len(),
@@ -490,7 +507,7 @@ fn search_skips_subagents_and_injected_material_and_judges_both_harness_titles()
         &[json!({"id": "codex-a", "thread_name": "Project synthesis"})],
     );
     home.catalog.refresh();
-    let renamed = home.search(json!({"terms": ["synthesis"]}), vec![]);
+    let renamed = home.search_all(json!({"terms": ["synthesis"]}), vec![]);
     assert_eq!(
         by_key(&renamed, "codex-a")["why"],
         json!({"field": "title", "line": "Project synthesis", "terms": ["synthesis"]})
@@ -507,7 +524,7 @@ fn older_zstd_rollouts_are_searchable_and_resumable_by_id() {
     // Two concatenated frames; codex.jsonl holds the uncompressed source.
     std::fs::write(path, include_bytes!("fixtures/codex.jsonl.zst")).unwrap();
     home.catalog.refresh();
-    let response = home.search(json!({"terms": ["archived"]}), vec![]);
+    let response = home.search_all(json!({"terms": ["archived"]}), vec![]);
     let row = by_key(&response, "compressed-a");
     assert_eq!(response["result"]["partial"], false);
     assert_eq!(row["first_prompt"], "Find the archived keyboard work");
@@ -568,7 +585,7 @@ fn a_scan_deadline_preserves_the_rows_already_found() {
     }
     home.catalog.refresh();
     assert_eq!(
-        home.search(json!({}), vec![])["result"]["sessions"]
+        home.search_all(json!({}), vec![])["result"]["sessions"]
             .as_array()
             .unwrap()
             .len(),
@@ -579,14 +596,17 @@ fn a_scan_deadline_preserves_the_rows_already_found() {
     let start = Instant::now();
     let response = respond_with_budget(
         "search".into(),
-        &ServerSearchSessionsParams::default(),
+        &ServerSearchSessionsParams {
+            include_headless: Some(true),
+            ..Default::default()
+        },
         Sources {
             live: Box::new(|| json!([]).to_string()),
             catalog: Arc::clone(&home.catalog),
             now: Arc::new(move || {
-                // The first call starts the budget, the next admits one row,
-                // and the following row encounters an expired scan deadline.
-                if ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                // Allow the ownership fold and one row; the following row
+                // encounters an expired scan deadline.
+                if ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 6 {
                     start
                 } else {
                     start + Duration::from_secs(10)
@@ -673,7 +693,10 @@ fn timed_out_searches_keep_their_permits_until_the_work_finishes() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(home.search(json!({}), vec![])["result"]["partial"], false);
+    assert_eq!(
+        home.search_all(json!({}), vec![])["result"]["partial"],
+        false
+    );
     assert_eq!(
         started.load(Ordering::SeqCst),
         2,
@@ -699,7 +722,10 @@ fn cached_records_refresh_by_mtime_and_size_and_deleted_records_use_history() {
     ]);
     home.catalog.refresh();
     assert_eq!(
-        by_key(&home.search(json!({"terms": ["alpha"]}), vec![]), "cache-a")["state"],
+        by_key(
+            &home.search_all(json!({"terms": ["alpha"]}), vec![]),
+            "cache-a"
+        )["state"],
         "ended"
     );
     let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -711,17 +737,20 @@ fn cached_records_refresh_by_mtime_and_size_and_deleted_records_use_history() {
     // With the same path, mtime and size, maintenance and queries reuse the
     // parsed record. A reader that opens every file again would return bravo.
     assert_eq!(
-        home.search(json!({"terms": ["bravo"]}), vec![])["result"]["sessions"],
+        home.search_all(json!({"terms": ["bravo"]}), vec![])["result"]["sessions"],
         json!([])
     );
     file.set_modified(stamp + Duration::from_secs(1)).unwrap();
     home.catalog.refresh();
     assert_eq!(
-        by_key(&home.search(json!({"terms": ["bravo"]}), vec![]), "cache-a")["state"],
+        by_key(
+            &home.search_all(json!({"terms": ["bravo"]}), vec![]),
+            "cache-a"
+        )["state"],
         "ended"
     );
     assert_eq!(
-        home.search(json!({"terms": ["alpha"]}), vec![])["result"]["sessions"],
+        home.search_all(json!({"terms": ["alpha"]}), vec![])["result"]["sessions"],
         json!([])
     );
     use std::io::Write;
@@ -736,24 +765,27 @@ fn cached_records_refresh_by_mtime_and_size_and_deleted_records_use_history() {
     .unwrap();
     file.set_modified(stamp + Duration::from_secs(1)).unwrap();
     assert_eq!(
-        home.search(json!({"terms": ["grown"]}), vec![])["result"]["sessions"],
+        home.search_all(json!({"terms": ["grown"]}), vec![])["result"]["sessions"],
         json!([])
     );
     home.catalog.refresh();
     assert_eq!(
-        by_key(&home.search(json!({"terms": ["grown"]}), vec![]), "cache-a")["last_active_at_ms"],
+        by_key(
+            &home.search_all(json!({"terms": ["grown"]}), vec![]),
+            "cache-a"
+        )["last_active_at_ms"],
         1791072000000_u64
     );
     drop(file);
     std::fs::remove_file(&path).unwrap();
     home.catalog.refresh();
-    let gone = home.search(json!({}), vec![]);
+    let gone = home.search_all(json!({}), vec![]);
     let row = by_key(&gone, "cache-a");
     assert_eq!(row["state"], "record_gone");
     assert_eq!(row["resume_blocked"], "record_gone");
     assert_eq!(row["first_prompt"], "history survives");
     assert_eq!(row["recent_prompts"], json!(["history survives"]));
-    let live = home.search(json!({}), vec![live_pane("claude", "id", "cache-a")]);
+    let live = home.search_all(json!({}), vec![live_pane("claude", "id", "cache-a")]);
     assert_eq!(by_key(&live, "cache-a")["state"], "live");
 }
 
@@ -773,7 +805,7 @@ fn resume_uses_existing_ancestors_for_codex_and_pi_and_blocks_unknown_places() {
         json!({"type": "session", "id": "pi-a", "cwd": gone, "timestamp": "2026-10-03T00:00:00Z"})
     ]);
     home.catalog.refresh();
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     for key in ["codex-a", pi.to_str().unwrap()] {
         let row = by_key(&response, key);
         assert_eq!(row["state"], "ended");
@@ -786,7 +818,7 @@ fn resume_uses_existing_ancestors_for_codex_and_pi_and_blocks_unknown_places() {
     assert_eq!(unknown["cwd"], Value::Null);
     assert_eq!(unknown["resume"], Value::Null);
     assert_eq!(unknown["resume_blocked"], "folder_gone");
-    let live = home.search(
+    let live = home.search_all(
         json!({}),
         vec![live_pane("pi", "path", pi.to_str().unwrap())],
     );
@@ -812,7 +844,7 @@ fn browse_defaults_to_fifty_and_caps_the_requested_limit_at_two_hundred() {
         (json!({"limit": 999}), 200),
         (json!({"limit": 0}), 0),
     ] {
-        let response = home.search(params, vec![]);
+        let response = home.search_all(params, vec![]);
         assert_eq!(response["result"]["scanned"], 201);
         assert_eq!(
             response["result"]["sessions"].as_array().unwrap().len(),
@@ -845,7 +877,10 @@ fn a_cold_catalog_is_partial_and_an_indexed_empty_catalog_is_complete() {
         true
     );
     home.catalog.refresh();
-    assert_eq!(home.search(json!({}), vec![])["result"]["partial"], false);
+    assert_eq!(
+        home.search_all(json!({}), vec![])["result"]["partial"],
+        false
+    );
 }
 
 #[test]
@@ -893,7 +928,7 @@ fn long_prompts_are_searchable_beyond_previews_and_why_keeps_the_matching_text()
         )],
     );
     home.catalog.refresh();
-    let response = home.search(json!({"terms": ["終点"]}), vec![]);
+    let response = home.search_all(json!({"terms": ["終点"]}), vec![]);
     let row = by_key(&response, "session-a");
     assert!(row["first_prompt"].as_str().unwrap().chars().count() <= 401);
     assert!(row["recent_prompts"][0].as_str().unwrap().chars().count() <= 241);
@@ -902,7 +937,7 @@ fn long_prompts_are_searchable_beyond_previews_and_why_keeps_the_matching_text()
     assert_eq!(row["why"]["field"], "prompt");
     assert_eq!(row["why"]["terms"], json!(["終点"]));
     assert_eq!(
-        home.search(
+        home.search_all(
             json!({"terms": ["pane label"]}),
             vec![live_pane("claude", "id", "session-a")]
         )["result"]["sessions"],
@@ -923,7 +958,7 @@ fn appended_codex_metadata_keeps_the_original_prompt_and_session_window() {
         ],
     );
     home.catalog.refresh();
-    let before = home.search(json!({}), vec![]);
+    let before = home.search_all(json!({}), vec![]);
     assert_eq!(
         by_key(&before, "codex-a")["first_prompt"],
         "Original question"
@@ -945,7 +980,7 @@ fn appended_codex_metadata_keeps_the_original_prompt_and_session_window() {
     .unwrap();
     drop(file);
     home.catalog.refresh();
-    let after = home.search(json!({}), vec![]);
+    let after = home.search_all(json!({}), vec![]);
     let row = by_key(&after, "codex-a");
     assert_eq!(row["first_prompt"], "Original question");
     assert_eq!(
@@ -993,7 +1028,7 @@ fn search_sessions_excludes_injected_turns_and_normalizes_claude_commands() {
         claude_prompt("claude-a", &cwd, "<command-message>inspect</command-message><command-name>/inspect</command-name><command-args>the cache</command-args>", "2026-10-03T00:02:00Z"),
     ]);
     home.catalog.refresh();
-    let browse = home.search(json!({}), vec![]);
+    let browse = home.search_all(json!({}), vec![]);
     assert_eq!(
         by_key(&browse, "codex-a")["first_prompt"],
         "Actual keyboard request"
@@ -1011,13 +1046,13 @@ fn search_sessions_excludes_injected_turns_and_normalizes_claude_commands() {
         json!(["/inspect the parser", "/inspect the cache"])
     );
     assert_eq!(
-        home.search(
+        home.search_all(
             json!({"terms": ["injected", "command-name", "subagent_notification"]}),
             vec![]
         )["result"]["sessions"],
         json!([])
     );
-    let found = home.search(json!({"terms": ["parser"]}), vec![]);
+    let found = home.search_all(json!({"terms": ["parser"]}), vec![]);
     assert_eq!(
         by_key(&found, "claude-a")["why"]["line"],
         "/inspect the parser"
@@ -1040,7 +1075,7 @@ fn search_sessions_retained_reference_is_not_an_active_occupant() {
     home.catalog.refresh();
     let mut retained = live_pane("claude", "id", "claude-a");
     retained["agent"] = json!("codex");
-    let response = home.search(json!({}), vec![retained]);
+    let response = home.search_all(json!({}), vec![retained]);
     let row = by_key(&response, "claude-a");
     assert_eq!(row["state"], "ended");
     assert!(row["resume"].is_object());
@@ -1176,7 +1211,7 @@ fn search_sessions_bad_records_do_not_hide_history_or_wait_for_impossible_comple
     std::fs::write(&archive, include_bytes!("fixtures/codex.jsonl.zst")).unwrap();
     home.catalog.refresh();
     assert_eq!(
-        home.search(json!({}), vec![])["result"]["sessions"]
+        home.search_all(json!({}), vec![])["result"]["sessions"]
             .as_array()
             .unwrap()
             .len(),
@@ -1191,7 +1226,7 @@ fn search_sessions_bad_records_do_not_hide_history_or_wait_for_impossible_comple
     for _ in 0..2 {
         home.catalog.refresh();
         let began = Instant::now();
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         let elapsed = began.elapsed();
         assert_eq!(response["result"]["sessions"].as_array().unwrap().len(), 4);
         for key in ["claude-gone", "codex-gone", &format!("{cwd}|2026-10-03")] {
@@ -1207,7 +1242,7 @@ fn search_sessions_bad_records_do_not_hide_history_or_wait_for_impossible_comple
     std::fs::remove_file(oversized).unwrap();
     std::fs::write(archive, include_bytes!("fixtures/codex.jsonl.zst")).unwrap();
     home.catalog.refresh();
-    let repaired = home.search(json!({}), vec![]);
+    let repaired = home.search_all(json!({}), vec![]);
     assert_eq!(repaired["result"]["partial"], false);
     assert_eq!(by_key(&repaired, "compressed-a")["state"], "ended");
 }
@@ -1222,7 +1257,7 @@ fn skippable_frames_preserve_session(leading: bool) {
         let archive = include_bytes!("fixtures/codex.jsonl.zst");
         std::fs::write(&path, archive).unwrap();
         home.catalog.refresh();
-        let expected = home.search(json!({}), vec![]);
+        let expected = home.search_all(json!({}), vec![]);
         assert_eq!(expected["result"]["sessions"].as_array().unwrap().len(), 1);
         let payload: &[u8] = if magic == 0x184d2a50 {
             b""
@@ -1240,7 +1275,7 @@ fn skippable_frames_preserve_session(leading: bool) {
         std::fs::write(path, bytes).unwrap();
         home.catalog.refresh();
         assert_eq!(
-            home.search(json!({}), vec![]),
+            home.search_all(json!({}), vec![]),
             expected,
             "magic {magic:x}, leading={leading}"
         );

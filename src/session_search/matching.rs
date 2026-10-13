@@ -93,6 +93,16 @@ impl<'a> Query<'a> {
                 best = Some((field, text, matching));
             }
         };
+        for label in &session.labels {
+            if !has_time() {
+                return None;
+            }
+            consider(
+                SessionWhyField::Label,
+                &label.label,
+                &label.label.to_lowercase(),
+            );
+        }
         if let Some(title) = &session.title {
             consider(SessionWhyField::Title, title, &title.to_lowercase());
         }

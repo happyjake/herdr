@@ -46,7 +46,7 @@ pub struct ServerSearchSessionsParams {
     pub place: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    /// Accepted but currently inert. All returned sessions have headless=false.
+    /// Include folded children and records never hosted by this server. Defaults to false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_headless: Option<bool>,
     /// Defaults to 50 and is capped at 200.

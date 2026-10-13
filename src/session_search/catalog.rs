@@ -12,11 +12,13 @@ pub(crate) struct Desk {
     pub processes:
         Box<dyn Fn() -> std::io::Result<Vec<crate::platform::SessionProcess>> + Send + Sync>,
     pub registry_retry_sleep: Box<dyn Fn(Duration) + Send + Sync>,
+    pub logbook: PathBuf,
 }
 
 pub(crate) struct Catalog {
     desk: Desk,
     files: Mutex<HashMap<PathBuf, CachedFile>>,
+    logbook: Mutex<CachedLogbook>,
     snapshot: Mutex<Arc<Snapshot>>,
     ready: Condvar,
 }
@@ -40,11 +42,18 @@ struct CachedFile {
     data: FileData,
 }
 
+#[derive(Default)]
+struct CachedLogbook {
+    stamp: Option<Stamp>,
+    sessions: BTreeMap<crate::api::schema::SearchSessionKey, Session>,
+}
+
 impl Catalog {
     pub(crate) fn new(desk: Desk) -> Self {
         Self {
             desk,
             files: Mutex::new(HashMap::new()),
+            logbook: Mutex::new(CachedLogbook::default()),
             snapshot: Mutex::new(Arc::new(Snapshot::default())),
             ready: Condvar::new(),
         }
@@ -66,6 +75,33 @@ impl Catalog {
         };
         let mut files = Vec::new();
         let mut complete = true;
+        let mut logbook_complete = true;
+        let Ok(mut logbook) = self.logbook.lock() else {
+            return;
+        };
+        let history = std::fs::metadata(&self.desk.logbook)
+            .map(|metadata| Some(stamp(&metadata)))
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            });
+        match history {
+            Ok(stamp) if stamp != logbook.stamp => match super::logbook::read(&self.desk.logbook) {
+                Ok(sessions) => *logbook = CachedLogbook { stamp, sessions },
+                Err(error) => {
+                    tracing::warn!(%error, "could not refresh session logbook");
+                    logbook_complete = false;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "could not stat session logbook");
+                logbook_complete = false;
+            }
+            _ => {}
+        }
         if let Some(home) = &self.desk.home {
             for (root, depth, kind) in [
                 (".claude/projects", 1, FileKind::Claude),
@@ -112,10 +148,16 @@ impl Catalog {
                 }
             }
             if index % 32 == 0 {
-                self.publish(&cache, false, false, false);
+                self.publish(&cache, &logbook.sessions, false, false, false);
             }
         }
-        self.publish(&cache, discovery_complete, complete, true);
+        self.publish(
+            &cache,
+            &logbook.sessions,
+            discovery_complete,
+            complete && logbook_complete,
+            true,
+        );
     }
 
     pub(super) fn snapshot_until(&self, deadline: Instant) -> Arc<Snapshot> {
@@ -135,11 +177,12 @@ impl Catalog {
     fn publish(
         &self,
         cache: &HashMap<PathBuf, CachedFile>,
+        logbook: &BTreeMap<crate::api::schema::SearchSessionKey, Session>,
         discovery_complete: bool,
         complete: bool,
         refreshed: bool,
     ) {
-        let mut sessions = merge(cache, discovery_complete);
+        let mut sessions = merge(cache, logbook, discovery_complete);
         sessions.sort_by(|a, b| {
             b.last_active_at_ms
                 .cmp(&a.last_active_at_ms)
@@ -157,7 +200,7 @@ impl Catalog {
 }
 
 /// Fixed harness layout, newest buckets first. No symlink traversal or unrelated
-/// directory search; a Claude session's nested subagents are below this depth.
+/// directory search. Claude subagents have one explicitly recognized nested layout.
 fn walk(
     dir: &Path,
     depth: usize,
@@ -202,8 +245,18 @@ fn walk(
     for (path, metadata) in children {
         if depth > 0 && metadata.is_dir() {
             walk(&path, depth - 1, kind, found, complete);
+        } else if depth == 0 && metadata.is_dir() && matches!(kind, FileKind::Claude) {
+            let subagents = path.join("subagents");
+            if std::fs::symlink_metadata(&subagents).is_ok_and(|metadata| metadata.is_dir()) {
+                walk(&subagents, 0, FileKind::ClaudeSubagent, found, complete);
+            }
         } else if depth == 0
             && metadata.is_file()
+            && (!matches!(kind, FileKind::ClaudeSubagent)
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("agent-")))
             && (path.extension().is_some_and(|ext| ext == "jsonl")
                 || (matches!(kind, FileKind::Codex)
                     && path
@@ -225,11 +278,11 @@ fn stamp(metadata: &std::fs::Metadata) -> Stamp {
 
 /// History contributes prompts, while a record supplies the current place and
 /// resume identity. Claude's id deliberately survives moves between projects.
-fn merge(cache: &HashMap<PathBuf, CachedFile>, complete: bool) -> Vec<Arc<Session>> {
-    let excluded: HashSet<_> = cache
-        .values()
-        .flat_map(|entry| entry.data.excluded.iter())
-        .collect();
+fn merge(
+    cache: &HashMap<PathBuf, CachedFile>,
+    logbook: &BTreeMap<crate::api::schema::SearchSessionKey, Session>,
+    complete: bool,
+) -> Vec<Arc<Session>> {
     let mut sources: Vec<_> = cache
         .values()
         .flat_map(|entry| {
@@ -247,13 +300,15 @@ fn merge(cache: &HashMap<PathBuf, CachedFile>, complete: bool) -> Vec<Arc<Sessio
             .then_with(|| a.0.cmp(&b.0))
             .then_with(|| a.1.record_path.cmp(&b.1.record_path))
     });
-    let mut sessions: BTreeMap<_, Session> = BTreeMap::new();
+    let mut sessions = logbook.clone();
     for (_, source) in sources {
         if let Some(session) = sessions.get_mut(&source.key) {
+            session.record_id = source.record_id.clone().or(session.record_id.take());
             session.cwd = source.cwd.clone().or(session.cwd.take());
             session.branch = source.branch.clone().or(session.branch.take());
             session.title = source.title.clone().or(session.title.take());
             session.record_path = source.record_path.clone().or(session.record_path.take());
+            session.parent = source.parent.clone().or(session.parent.take());
             session.started_at_ms = session.started_at_ms.min(source.started_at_ms);
             session.last_active_at_ms = session.last_active_at_ms.max(source.last_active_at_ms);
             session.prompts.extend(source.prompts.iter().cloned());
@@ -276,7 +331,7 @@ fn merge(cache: &HashMap<PathBuf, CachedFile>, complete: bool) -> Vec<Arc<Sessio
     sessions
         .into_values()
         .filter(|session| {
-            !excluded.contains(&session.key) && (complete || session.record_path.is_some())
+            session.started_at_ms != u64::MAX && (complete || session.record_path.is_some())
         })
         .map(|mut session| {
             session.prompts.sort_by_key(|prompt| prompt.at);

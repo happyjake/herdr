@@ -85,7 +85,7 @@ pub fn read(path: &Path) -> io::Result<Vec<Event>> {
     Ok(events)
 }
 
-fn for_each_event(path: &Path, mut visit: impl FnMut(Event)) -> io::Result<()> {
+pub(crate) fn for_each_event(path: &Path, mut visit: impl FnMut(Event)) -> io::Result<()> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),

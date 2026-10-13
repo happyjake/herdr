@@ -2,6 +2,50 @@ use super::*;
 use crate::platform::SessionProcess;
 
 #[test]
+fn logbook_merge_retains_pi_id_for_outside_detection() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    let path = home.write(
+        ".pi/agent/sessions/project/session-a.jsonl",
+        &[json!({"type": "session", "id": "pi-a", "cwd": cwd,
+            "timestamp": "2026-10-12T11:39:11Z"})],
+    );
+    home.processes.lock().unwrap().push(SessionProcess {
+        pid: 243,
+        started_at: "Mon Oct 12 11:39:11 2026".into(),
+        argv: vec!["pi".into(), "--session-id".into(), "pi-a".into()],
+        cwd: None,
+    });
+    home.catalog.refresh();
+    let key = path.to_str().unwrap();
+    assert_eq!(
+        by_key(&home.search_all(json!({}), vec![]), key)["state"],
+        "outside"
+    );
+
+    let session_key = json!({"agent": "pi", "kind": "path", "value": key});
+    home.write(
+        "logbook.jsonl",
+        &[
+            json!({"type": "session_reported", "key": session_key, "pane": "w1:p1",
+            "terminal": "terminal-a", "cwd": cwd, "at": 1791805151000_u64}),
+            json!({"type": "label_worn", "key": session_key, "pane": "w1:p1",
+            "label": "Saved task", "source": "person", "at": 1791805151000_u64}),
+            json!({"type": "pane_closed", "pane": "w1:p1", "at": 1791805152000_u64}),
+        ],
+    );
+    home.catalog.refresh();
+    let response = home.search(json!({}), vec![]);
+    let row = by_key(&response, key);
+    assert_eq!(row["state"], "outside");
+    assert_eq!(row["outside"], json!({"pid": 243, "detail": "pi pid 243"}));
+    assert_eq!(row["resume"], Value::Null);
+    assert_eq!(row["resume_blocked"], "outside");
+    assert_eq!(row["headless"], false);
+    assert_eq!(row["labels"][0]["label"], "Saved task");
+}
+
+#[test]
 fn a_torn_live_registry_entry_is_retried_before_returning_a_resume() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,6 +58,7 @@ fn a_torn_live_registry_entry_is_retried_before_returning_a_resume() {
     let processes = Arc::clone(&home.processes);
     home.catalog = Arc::new(Catalog::new(Desk {
         home: Some(home.root.clone()),
+        logbook: home.root.join("logbook.jsonl"),
         processes: Box::new(move || Ok(processes.lock().unwrap().clone())),
         registry_retry_sleep: Box::new(move |delay| {
             assert_eq!(delay, Duration::from_millis(20));
@@ -25,7 +70,7 @@ fn a_torn_live_registry_entry_is_retried_before_returning_a_resume() {
     }));
     home.catalog.refresh();
 
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     let row = by_key(&response, "session-a");
     assert_eq!(row["state"], "outside");
     assert_eq!(row["resume"], Value::Null);
@@ -40,7 +85,7 @@ fn a_persistently_torn_registry_entry_uses_the_live_claude_resume_operand() {
     for flag in ["--resume", "-r", "--session-id"] {
         home.processes.lock().unwrap()[0].argv =
             vec!["claude".into(), flag.into(), "session-a".into()];
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         let row = by_key(&response, "session-a");
         assert_eq!(row["state"], "outside", "{flag}");
         assert_eq!(
@@ -63,13 +108,14 @@ fn a_persistently_torn_registry_without_an_argv_identity_leaves_resume_available
     let processes = Arc::clone(&home.processes);
     home.catalog = Arc::new(Catalog::new(Desk {
         home: Some(home.root.clone()),
+        logbook: home.root.join("logbook.jsonl"),
         processes: Box::new(move || Ok(processes.lock().unwrap().clone())),
         registry_retry_sleep: Box::new(move |_| {
             observed_sleeps.fetch_add(1, Ordering::SeqCst);
         }),
     }));
     home.catalog.refresh();
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     let row = by_key(&response, "session-a");
     assert_eq!(row["state"], "ended");
     assert_eq!(row["resume"]["command"], "claude --resume session-a");
@@ -108,7 +154,7 @@ fn running_claude() -> FixtureHome {
 #[test]
 fn a_running_claude_registry_entry_blocks_resume_outside_the_server() {
     let home = running_claude();
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     let row = by_key(&response, "session-a");
     assert_eq!(row["state"], "outside");
     assert_eq!(
@@ -124,12 +170,12 @@ fn a_running_claude_registry_entry_blocks_resume_outside_the_server() {
 fn a_dead_claude_pid_leaves_a_resumable_ended_session() {
     let home = running_claude();
     assert_eq!(
-        by_key(&home.search(json!({}), vec![]), "session-a")["state"],
+        by_key(&home.search_all(json!({}), vec![]), "session-a")["state"],
         "outside"
     );
     home.processes.lock().unwrap().clear();
 
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     let row = by_key(&response, "session-a");
     assert_eq!(row["state"], "ended");
     assert_eq!(row["resume"]["command"], "claude --resume session-a");
@@ -141,12 +187,12 @@ fn a_dead_claude_pid_leaves_a_resumable_ended_session() {
 fn a_reused_claude_pid_does_not_claim_the_old_session() {
     let home = running_claude();
     assert_eq!(
-        by_key(&home.search(json!({}), vec![]), "session-a")["state"],
+        by_key(&home.search_all(json!({}), vec![]), "session-a")["state"],
         "outside"
     );
     for started_at in ["Mon Oct 12 11:39:12 2026", ""] {
         home.processes.lock().unwrap()[0].started_at = started_at.into();
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         let row = by_key(&response, "session-a");
         assert_eq!(row["state"], "ended", "{started_at:?}");
         assert_eq!(row["resume"]["command"], "claude --resume session-a");
@@ -157,10 +203,10 @@ fn a_reused_claude_pid_does_not_claim_the_old_session() {
 #[test]
 fn this_servers_live_pane_wins_over_a_running_registry_entry() {
     let home = running_claude();
-    let unrelated = home.search(json!({}), vec![live_pane("codex", "id", "session-a")]);
+    let unrelated = home.search_all(json!({}), vec![live_pane("codex", "id", "session-a")]);
     assert_eq!(by_key(&unrelated, "session-a")["state"], "outside");
 
-    let response = home.search(json!({}), vec![live_pane("claude", "id", "session-a")]);
+    let response = home.search_all(json!({}), vec![live_pane("claude", "id", "session-a")]);
     let row = by_key(&response, "session-a");
     assert_eq!(row["state"], "live");
     assert_eq!(row["live_pane_id"], "w1:p1");
@@ -185,7 +231,7 @@ fn a_codex_resume_process_marks_its_saved_session_outside() {
         argv: vec!["/usr/bin/codex".into(), "resume".into(), "session-a".into()],
     });
 
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     let row = by_key(&response, "session-a");
     assert_eq!(row["state"], "outside");
     assert_eq!(
@@ -223,7 +269,7 @@ fn pi_process_arguments_match_session_paths_and_record_ids() {
             started_at: "Mon Oct 12 11:39:11 2026".into(),
             argv: argv.iter().map(|arg| (*arg).into()).collect(),
         }];
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         let row = by_key(&response, key);
         assert_eq!(row["state"], "outside", "{argv:?}");
         assert_eq!(row["outside"], json!({"pid": 243, "detail": "pi pid 243"}));
@@ -270,7 +316,7 @@ fn pi_session_paths_resolve_dot_components_and_relative_paths_from_process_cwd()
             argv: vec!["pi".into(), "--session".into(), operand.into()],
             cwd: process_cwd,
         }];
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         let row = by_key(&response, key);
         assert_eq!(
             row["state"],
@@ -287,7 +333,7 @@ fn pi_session_paths_resolve_dot_components_and_relative_paths_from_process_cwd()
             argv: vec!["pi".into(), "--session-id".into(), identity.into()],
             cwd: Some(parent.to_path_buf()),
         }];
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         assert_eq!(
             by_key(&response, key)["state"],
             if identity == "pi-a" {
@@ -332,7 +378,7 @@ fn pi_fork_sources_and_other_operands_do_not_own_the_saved_session() {
                 .map(str::to_string)
                 .collect(),
         }];
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         let row = by_key(&response, key);
         assert_eq!(
             row["state"],
@@ -370,7 +416,7 @@ fn codex_only_the_resume_operand_owns_the_saved_session() {
                 .map(str::to_string)
                 .collect(),
         }];
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         let row = by_key(&response, "session-a");
         assert_eq!(
             row["state"],
@@ -406,7 +452,7 @@ fn codex_process_matches_use_complete_arguments_and_the_correct_agent() {
             started_at: "Mon Oct 12 11:39:11 2026".into(),
             argv: argv.iter().map(|arg| (*arg).into()).collect(),
         }];
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         let row = by_key(&response, "session-a");
         assert_eq!(
             row["state"],
@@ -447,11 +493,11 @@ fn this_servers_live_panes_win_over_codex_and_pi_process_matches() {
             argv: vec!["pi".into(), "--session".into(), path.into()],
         },
     ];
-    let outside = home.search(json!({}), vec![]);
+    let outside = home.search_all(json!({}), vec![]);
     for key in ["session-a", path] {
         assert_eq!(by_key(&outside, key)["state"], "outside");
     }
-    let response = home.search(
+    let response = home.search_all(
         json!({}),
         vec![
             live_pane("codex", "id", "session-a"),
@@ -472,7 +518,7 @@ fn this_servers_live_panes_win_over_codex_and_pi_process_matches() {
 fn claude_requires_a_valid_registry_entry_and_ignores_key_files() {
     let home = running_claude();
     assert_eq!(
-        by_key(&home.search(json!({}), vec![]), "session-a")["state"],
+        by_key(&home.search_all(json!({}), vec![]), "session-a")["state"],
         "outside"
     );
     home.processes.lock().unwrap()[0].argv =
@@ -483,7 +529,7 @@ fn claude_requires_a_valid_registry_entry_and_ignores_key_files() {
     )
     .unwrap();
     assert_eq!(
-        by_key(&home.search(json!({}), vec![]), "session-a")["state"],
+        by_key(&home.search_all(json!({}), vec![]), "session-a")["state"],
         "ended"
     );
 
@@ -495,7 +541,7 @@ fn claude_requires_a_valid_registry_entry_and_ignores_key_files() {
         json!({"pid": 241, "sessionId": "another-session", "procStart": "Mon Oct 12 11:39:11 2026"}),
     ] {
         home.write(".claude/sessions/241.json", std::slice::from_ref(&entry));
-        let response = home.search(json!({}), vec![]);
+        let response = home.search_all(json!({}), vec![]);
         let row = by_key(&response, "session-a");
         assert_eq!(row["state"], "ended", "{entry}");
         assert!(row.get("outside").is_none());
@@ -511,7 +557,7 @@ fn registry_start_times_allow_space_padded_days() {
         &[json!({"pid": 241, "sessionId": "session-a", "procStart": "Fri Oct  9 07:46:31 2026"})],
     );
     home.processes.lock().unwrap()[0].started_at = "Fri Oct 9 07:46:31 2026".into();
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     assert_eq!(by_key(&response, "session-a")["state"], "outside");
 }
 
@@ -519,7 +565,7 @@ fn registry_start_times_allow_space_padded_days() {
 fn a_running_session_blocks_resume_even_when_its_folder_or_record_disappears() {
     let home = running_claude();
     std::fs::remove_dir(home.root.join("project")).unwrap();
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     let row = by_key(&response, "session-a");
     assert_eq!(row["state"], "outside");
     assert_eq!(row["place_state"], "gone");
@@ -536,11 +582,11 @@ fn a_running_session_blocks_resume_even_when_its_folder_or_record_disappears() {
     std::fs::remove_file(home.root.join(".claude/projects/project/session-a.jsonl")).unwrap();
     home.catalog.refresh();
     assert_eq!(
-        by_key(&home.search(json!({}), vec![]), "session-a")["state"],
+        by_key(&home.search_all(json!({}), vec![]), "session-a")["state"],
         "outside"
     );
     home.processes.lock().unwrap().clear();
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     let row = by_key(&response, "session-a");
     assert_eq!(row["state"], "record_gone");
     assert_eq!(row["resume_blocked"], "record_gone");
@@ -551,16 +597,17 @@ fn a_running_session_blocks_resume_even_when_its_folder_or_record_disappears() {
 fn an_unavailable_process_view_does_not_offer_an_optimistic_resume() {
     let mut home = running_claude();
     assert_eq!(
-        by_key(&home.search(json!({}), vec![]), "session-a")["state"],
+        by_key(&home.search_all(json!({}), vec![]), "session-a")["state"],
         "outside"
     );
     home.catalog = Arc::new(Catalog::new(Desk {
         home: Some(home.root.clone()),
+        logbook: home.root.join("logbook.jsonl"),
         processes: Box::new(|| Err(std::io::Error::other("process view unavailable"))),
         registry_retry_sleep: Box::new(|_| {}),
     }));
     home.catalog.refresh();
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     assert_eq!(response["error"]["code"], "server_unavailable");
     assert!(response.get("result").is_none());
 }
@@ -569,12 +616,12 @@ fn an_unavailable_process_view_does_not_offer_an_optimistic_resume() {
 fn an_unreadable_running_registry_does_not_offer_an_optimistic_resume() {
     let home = running_claude();
     assert_eq!(
-        by_key(&home.search(json!({}), vec![]), "session-a")["state"],
+        by_key(&home.search_all(json!({}), vec![]), "session-a")["state"],
         "outside"
     );
     std::fs::remove_dir_all(home.root.join(".claude/sessions")).unwrap();
     home.write(".claude/sessions", &[]);
-    let response = home.search(json!({}), vec![]);
+    let response = home.search_all(json!({}), vec![]);
     assert_eq!(response["error"]["code"], "server_unavailable");
     assert!(response.get("result").is_none());
 }
@@ -586,6 +633,7 @@ fn a_stalled_process_view_obeys_the_request_deadline() {
     let held = Mutex::new(held);
     home.catalog = Arc::new(Catalog::new(Desk {
         home: Some(home.root.clone()),
+        logbook: home.root.join("logbook.jsonl"),
         processes: Box::new(move || {
             let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(2));
             Ok(Vec::new())

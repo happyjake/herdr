@@ -1,7 +1,9 @@
 //! Read-only session catalog, independent of panes and presentation.
 
 mod catalog;
+mod folding;
 mod live;
+mod logbook;
 mod matching;
 mod outside;
 mod records;
@@ -52,12 +54,22 @@ impl Catalog {
         let outside = self.outside_sessions()?;
         let query = matching::Query::new(params);
         let limit = params.limit.unwrap_or(50).min(200) as usize;
+        let Some(folding) = folding::Folding::new(&snapshot.sessions, &live, &|| now() < deadline)
+        else {
+            return Ok(());
+        };
         for session in &snapshot.sessions {
             if now() >= deadline {
                 break;
             }
             if let Ok(mut result) = progress.lock() {
                 result.scanned += 1;
+            }
+            if !params.include_headless.unwrap_or(false)
+                && (folding.headless.contains(&session.key)
+                    || folding.parents.contains_key(&session.key))
+            {
+                continue;
             }
             let Some((score, why)) = query.matches(session, &|| now() < deadline) else {
                 continue;
@@ -82,6 +94,12 @@ impl Catalog {
             // Existence checks and command rendering happen only for candidates
             // that can enter the bounded result set, outside the progress lock.
             let mut row = hit(session, live.get(&session.key), outside.get(session));
+            row.headless = folding.headless.contains(&session.key);
+            row.parent = folding
+                .parents
+                .get(&session.key)
+                .map(|parent| (*parent).clone());
+            row.subagent_count = folding.children.get(&session.key).copied().unwrap_or(0);
             row.score = score;
             row.why = why;
             if let Ok(mut result) = progress.lock() {
@@ -200,7 +218,7 @@ fn hit(
             .collect(),
         started_at_ms: session.started_at_ms,
         last_active_at_ms: session.last_active_at_ms,
-        labels: Vec::new(),
+        labels: session.labels.clone(),
         state,
         live_pane_id: live_pane_id.cloned(),
         outside: outside.filter(|_| state == SessionState::Outside),

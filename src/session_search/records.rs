@@ -8,12 +8,13 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::agent_resume::AgentSessionRef;
-use crate::api::schema::{PromptTrailAgent, SearchSessionKey, SearchSessionKeyKind};
+use crate::api::schema::{PromptTrailAgent, SearchSessionKey, SearchSessionKeyKind, SessionLabel};
 use crate::prompt_trail::{self, LineRead};
 
 #[derive(Clone, Copy)]
 pub(super) enum FileKind {
     Claude,
+    ClaudeSubagent,
     Codex,
     Pi,
     ClaudeHistory,
@@ -24,7 +25,7 @@ pub(super) enum FileKind {
 impl FileKind {
     fn agent(self) -> PromptTrailAgent {
         match self {
-            Self::Claude | Self::ClaudeHistory => PromptTrailAgent::Claude,
+            Self::Claude | Self::ClaudeSubagent | Self::ClaudeHistory => PromptTrailAgent::Claude,
             Self::Codex | Self::CodexHistory | Self::CodexIndex => PromptTrailAgent::Codex,
             Self::Pi => PromptTrailAgent::Pi,
         }
@@ -58,10 +59,13 @@ pub(super) struct Session {
     pub started_at_ms: u64,
     pub last_active_at_ms: u64,
     pub record_path: Option<PathBuf>,
+    pub labels: Vec<SessionLabel>,
+    pub parent: Option<SearchSessionKey>,
+    pub reported: bool,
 }
 
 impl Session {
-    fn new(key: SearchSessionKey, record_path: Option<PathBuf>) -> Self {
+    pub(super) fn new(key: SearchSessionKey, record_path: Option<PathBuf>) -> Self {
         Self {
             key,
             record_id: None,
@@ -72,10 +76,13 @@ impl Session {
             started_at_ms: u64::MAX,
             last_active_at_ms: 0,
             record_path,
+            labels: Vec::new(),
+            parent: None,
+            reported: false,
         }
     }
 
-    fn at(&mut self, at: u64) {
+    pub(super) fn at(&mut self, at: u64) {
         self.started_at_ms = self.started_at_ms.min(at);
         self.last_active_at_ms = self.last_active_at_ms.max(at);
     }
@@ -85,7 +92,6 @@ impl Session {
 pub(super) struct FileData {
     pub sessions: Vec<Session>,
     pub names: BTreeMap<String, String>,
-    pub excluded: Vec<SearchSessionKey>,
 }
 
 pub(super) fn read(
@@ -104,15 +110,25 @@ pub(super) fn read(
     let mut data = FileData::default();
     let mut history = BTreeMap::new();
     let mut session = match kind {
-        FileKind::Claude => path
+        FileKind::Claude | FileKind::ClaudeSubagent => path
             .file_stem()
             .and_then(|id| id.to_str())
             .and_then(AgentSessionRef::id)
             .map(|id| {
-                Session::new(
+                let mut session = Session::new(
                     key(kind, SearchSessionKeyKind::Id, id.value),
                     Some(path.into()),
-                )
+                );
+                if matches!(kind, FileKind::ClaudeSubagent) {
+                    session.parent = path
+                        .parent()
+                        .and_then(Path::parent)
+                        .and_then(Path::file_name)
+                        .and_then(|name| name.to_str())
+                        .and_then(AgentSessionRef::id)
+                        .map(|id| key(kind, SearchSessionKeyKind::Id, id.value));
+                }
+                session
             }),
         FileKind::Pi => path
             .to_str()
@@ -161,17 +177,19 @@ pub(super) fn read(
         }
         if matches!(kind, FileKind::Codex) && line["type"] == "session_meta" {
             if let Some(id) = line["payload"]["id"].as_str().and_then(AgentSessionRef::id) {
-                if line["payload"]["source"].is_object() {
-                    data.excluded
-                        .push(key(kind, SearchSessionKeyKind::Id, id.value));
-                    return Ok(data);
-                }
-                session.get_or_insert_with(|| {
+                let session = session.get_or_insert_with(|| {
                     Session::new(
                         key(kind, SearchSessionKeyKind::Id, id.value),
                         Some(path.into()),
                     )
                 });
+                if let Some(parent) = line["payload"]["source"]["subagent"]["thread_spawn"]
+                    ["parent_thread_id"]
+                    .as_str()
+                    .and_then(AgentSessionRef::id)
+                {
+                    session.parent = Some(key(kind, SearchSessionKeyKind::Id, parent.value));
+                }
             }
         }
         let Some(session) = session.as_mut() else {
@@ -220,6 +238,7 @@ fn read_metadata(session: &mut Session, kind: FileKind, line: &Value) {
         FileKind::Codex => &line["payload"],
         _ => line,
     };
+    // Nested Claude records can repeat the parent's sessionId; keep their file identity.
     if matches!(kind, FileKind::Claude) {
         if let Some(id) = line
             .get("sessionId")

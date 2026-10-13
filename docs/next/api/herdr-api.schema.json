@@ -4287,7 +4287,7 @@
               ]
             },
             "include_headless": {
-              "description": "Accepted but currently inert. All returned sessions have headless=false.",
+              "description": "Include folded children and records never hosted by this server. Defaults to false.",
               "type": [
                 "boolean",
                 "null"
