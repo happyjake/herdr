@@ -1,21 +1,23 @@
 //! Read-only session catalog, independent of panes and presentation.
 
 mod catalog;
+mod live;
 mod matching;
 mod records;
 mod zstd;
 
 pub(crate) use catalog::{Catalog, Desk};
+pub(crate) use live::{active_sessions, ActiveSession};
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::agent_resume::{self, AgentSessionRef, AgentSessionRefKind};
+use crate::agent_resume::{self, AgentSessionRef};
 use crate::api::schema::{
-    PaneInfo, SearchSessionKey, SearchSessionKeyKind, ServerSearchSessionsParams, SessionHit,
-    SessionPlaceState, SessionResume, SessionResumeBlocked, SessionState,
+    SearchSessionKeyKind, ServerSearchSessionsParams, SessionHit, SessionPlaceState, SessionResume,
+    SessionResumeBlocked, SessionState,
 };
 use crate::prompt_trail;
 
@@ -30,27 +32,14 @@ impl Catalog {
     pub(crate) fn search(
         &self,
         params: &ServerSearchSessionsParams,
-        panes: &[PaneInfo],
+        panes: &[ActiveSession],
         deadline: Instant,
         now: &dyn Fn() -> Instant,
         progress: &Mutex<SearchResult>,
     ) {
         let live: HashMap<_, _> = panes
             .iter()
-            .filter_map(|pane| {
-                let session = pane.agent_session.as_ref()?;
-                Some((
-                    SearchSessionKey {
-                        agent: session.agent.clone(),
-                        kind: match session.kind {
-                            AgentSessionRefKind::Id => SearchSessionKeyKind::Id,
-                            AgentSessionRefKind::Path => SearchSessionKeyKind::Path,
-                        },
-                        value: session.value.clone(),
-                    },
-                    pane.pane_id.clone(),
-                ))
-            })
+            .map(|pane| (pane.key.clone(), pane.pane_id.clone()))
             .collect();
         // Leave time to search the published rows even while a cold index is
         // still filling. No record I/O is performed by the query itself.

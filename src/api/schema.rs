@@ -294,6 +294,10 @@ pub enum Method {
     PluginPaneFocus(PluginPaneFocusParams),
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
+    /// In-process data request only; never a JSON or endpoint method.
+    #[serde(skip)]
+    #[schemars(skip)]
+    InternalActiveSessions { deadline: std::time::Instant },
 }
 
 #[cfg(test)]

@@ -261,12 +261,15 @@ browse rows have `why: null`. Full prompts remain searchable beyond their clippe
 previews. Prompt extraction and title judgement follow `pane.prompt_trail`,
 including the exclusions for assistant output, tool traffic, and injected text.
 Codex names come from its session index, latest entry first in precedence; archived
-`.jsonl.zst` rollouts are supported. Harness files are only read.
+`.jsonl.zst` rollouts support skippable metadata frames; decoder windows over
+16 MiB are rejected. Harness files are only read.
 
 A background catalog reuses records by path, modification time, and size and
 refreshes every 30 seconds. Queries use cached snapshots, with a two-second budget
-including the wait for one of two permits and the app's pane list. An unfinished
+including the wait for one of two permits and the app's active-session snapshot. An unfinished
 catalog or an expired scan returns rows found so far with `partial: true`.
+Unreadable records are skipped individually and mark the result partial;
+unrelated history rows remain available without waiting for another refresh.
 Timed-out work retains its permit until it finishes. If the app cannot supply
 pane identity, the method returns `server_unavailable`. Older servers refuse the
 unknown method with `invalid_request`; no capability flag or protocol bump is

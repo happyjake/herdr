@@ -22,6 +22,8 @@ pub(crate) struct Catalog {
 pub(super) struct Snapshot {
     pub sessions: Vec<Arc<Session>>,
     pub complete: bool,
+    /// A refresh attempt ended, even if individual sources could not be read.
+    refreshed: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -79,6 +81,7 @@ impl Catalog {
         if complete {
             cache.retain(|path, _| present.contains(path));
         }
+        let discovery_complete = complete;
         for (index, (path, stamp, kind)) in files.into_iter().enumerate() {
             if cache.get(&path).is_some_and(|cached| cached.stamp == stamp) {
                 continue;
@@ -93,14 +96,15 @@ impl Catalog {
                     cache.insert(path, CachedFile { stamp, data });
                 }
                 Err(_) => {
+                    cache.remove(&path);
                     complete = false;
                 }
             }
             if index % 32 == 0 {
-                self.publish(&cache, false);
+                self.publish(&cache, false, false, false);
             }
         }
-        self.publish(&cache, complete);
+        self.publish(&cache, discovery_complete, complete, true);
     }
 
     pub(super) fn snapshot_until(&self, deadline: Instant) -> Arc<Snapshot> {
@@ -111,21 +115,31 @@ impl Catalog {
             .wait_timeout_while(
                 snapshot,
                 deadline.saturating_duration_since(Instant::now()),
-                |snapshot| !snapshot.complete,
+                |snapshot| !snapshot.refreshed,
             )
             .map(|(snapshot, _)| Arc::clone(&snapshot))
             .unwrap_or_default()
     }
 
-    fn publish(&self, cache: &HashMap<PathBuf, CachedFile>, complete: bool) {
-        let mut sessions = merge(cache, complete);
+    fn publish(
+        &self,
+        cache: &HashMap<PathBuf, CachedFile>,
+        discovery_complete: bool,
+        complete: bool,
+        refreshed: bool,
+    ) {
+        let mut sessions = merge(cache, discovery_complete);
         sessions.sort_by(|a, b| {
             b.last_active_at_ms
                 .cmp(&a.last_active_at_ms)
                 .then_with(|| a.key.cmp(&b.key))
         });
         if let Ok(mut snapshot) = self.snapshot.lock() {
-            *snapshot = Arc::new(Snapshot { sessions, complete });
+            *snapshot = Arc::new(Snapshot {
+                sessions,
+                complete,
+                refreshed,
+            });
             self.ready.notify_all();
         }
     }

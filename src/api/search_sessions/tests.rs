@@ -38,8 +38,38 @@ impl FixtureHome {
     }
 
     fn search(&self, params: Value, panes: Vec<Value>) -> Value {
-        let live =
-            json!({"id": "panes", "result": {"type": "pane_list", "panes": panes}}).to_string();
+        let mut state = crate::app::AppState::test_new();
+        for pane in panes {
+            let pane: crate::api::schema::PaneInfo = serde_json::from_value(pane).unwrap();
+            let mut workspace = crate::workspace::Workspace::test_new("project");
+            workspace.id = pane.workspace_id;
+            let terminal_id = workspace.tabs[0]
+                .terminal_id(workspace.tabs[0].root_pane)
+                .unwrap()
+                .clone();
+            let mut terminal =
+                crate::terminal::TerminalState::new(terminal_id.clone(), self.root.clone());
+            terminal.set_detected_state(
+                pane.agent
+                    .as_deref()
+                    .and_then(crate::detect::parse_agent_label),
+                crate::detect::AgentState::Idle,
+            );
+            if let Some(session) = pane.agent_session {
+                terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                    source: session.source,
+                    agent: session.agent,
+                    session_ref: crate::agent_resume::AgentSessionRef {
+                        kind: session.kind,
+                        value: session.value,
+                        record_path: session.record_path,
+                    },
+                });
+            }
+            state.terminals.insert(terminal_id, terminal);
+            state.workspaces.push(workspace);
+        }
+        let live = serde_json::to_string(&crate::session_search::active_sessions(&state)).unwrap();
         serde_json::from_str::<Value>(&respond(
             "search".into(),
             &serde_json::from_value(params).unwrap(),
@@ -190,7 +220,7 @@ fn browse_covers_codex_pi_and_both_prompt_histories() {
 fn live_pane(agent: &str, kind: &str, value: &str) -> Value {
     json!({
         "pane_id": "w1:p1", "terminal_id": "terminal-a", "workspace_id": "w1", "tab_id": "w1:t1",
-        "focused": false, "agent_status": "idle", "revision": 0,
+        "focused": false, "agent": agent, "agent_status": "idle", "revision": 0,
         "label": "A pane label is not folded into search",
         "agent_session": {"agent": agent, "source": format!("herdr:{agent}"), "kind": kind, "value": value}
     })
@@ -495,7 +525,7 @@ fn the_request_deadline_includes_a_stalled_app() {
         Sources {
             live: Box::new(move || {
                 let _ = held.recv_timeout(Duration::from_secs(2));
-                json!({"id": "panes", "result": {"type": "pane_list", "panes": []}}).to_string()
+                json!([]).to_string()
             }),
             catalog: Arc::clone(&home.catalog),
             now: Arc::new(Instant::now),
@@ -540,9 +570,7 @@ fn a_scan_deadline_preserves_the_rows_already_found() {
         "search".into(),
         &ServerSearchSessionsParams::default(),
         Sources {
-            live: Box::new(|| {
-                json!({"id": "panes", "result": {"type": "pane_list", "panes": []}}).to_string()
-            }),
+            live: Box::new(|| json!([]).to_string()),
             catalog: Arc::clone(&home.catalog),
             now: Arc::new(move || {
                 // The first call starts the budget, the next admits one row,
@@ -587,8 +615,7 @@ fn timed_out_searches_keep_their_permits_until_the_work_finishes() {
                         started.fetch_add(1, Ordering::SeqCst);
                         entered.send(()).unwrap();
                         let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(5));
-                        json!({"id": "panes", "result": {"type": "pane_list", "panes": []}})
-                            .to_string()
+                        json!([]).to_string()
                     }),
                     catalog,
                     now: Arc::new(Instant::now),
@@ -796,9 +823,7 @@ fn a_cold_catalog_is_partial_and_an_indexed_empty_catalog_is_complete() {
         "search".into(),
         &ServerSearchSessionsParams::default(),
         Sources {
-            live: Box::new(|| {
-                json!({"id": "panes", "result": {"type": "pane_list", "panes": []}}).to_string()
-            }),
+            live: Box::new(|| json!([]).to_string()),
             catalog: Arc::clone(&home.catalog),
             now: Arc::new(Instant::now),
         },
@@ -918,4 +943,305 @@ fn appended_codex_metadata_keeps_the_original_prompt_and_session_window() {
     );
     assert_eq!(row["started_at_ms"], 1790985600000_u64);
     assert_eq!(row["last_active_at_ms"], 1791072060000_u64);
+}
+
+#[test]
+fn search_sessions_excludes_injected_turns_and_normalizes_claude_commands() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    let injections = [
+        "<subagent_notification>{\"agent_id\":\"child\",\"status\":{\"completed\":\"injected-result\"}}</subagent_notification>",
+        "<recommended_plugins>injected-plugins</recommended_plugins>",
+        "<codex_internal_context source=\"goal\">injected-context</codex_internal_context>",
+        "<skill><name>example</name><path>/home/user/skill.md</path>injected-skill</skill>",
+        "<user_action><context>Review requested</context><action>review</action><results>injected-review</results></user_action>",
+    ];
+    let mut codex = vec![
+        json!({"type": "session_meta", "payload": {"id": "codex-a", "cwd": cwd, "source": "cli"}}),
+    ];
+    codex.extend(
+        injections
+            .iter()
+            .map(|text| codex_prompt(text, "2026-10-03T00:00:00Z")),
+    );
+    codex.push(codex_prompt(
+        "Actual keyboard request",
+        "2026-10-03T00:01:00Z",
+    ));
+    home.write(".codex/sessions/2026/10/03/rollout-codex-a.jsonl", &codex);
+    home.write(
+        ".codex/history.jsonl",
+        &injections
+            .iter()
+            .map(|text| json!({"session_id": "codex-a", "ts": 1790985600, "text": text}))
+            .collect::<Vec<_>>(),
+    );
+    home.write(".claude/projects/project/claude-a.jsonl", &[
+        claude_prompt("claude-a", &cwd, "<local-command-caveat>injected-caveat</local-command-caveat>", "2026-10-03T00:00:00Z"),
+        claude_prompt("claude-a", &cwd, "<command-name>/inspect</command-name><command-message>inspect</command-message><command-args>the parser</command-args>", "2026-10-03T00:01:00Z"),
+        claude_prompt("claude-a", &cwd, "<command-message>inspect</command-message><command-name>/inspect</command-name><command-args>the cache</command-args>", "2026-10-03T00:02:00Z"),
+    ]);
+    home.catalog.refresh();
+    let browse = home.search(json!({}), vec![]);
+    assert_eq!(
+        by_key(&browse, "codex-a")["first_prompt"],
+        "Actual keyboard request"
+    );
+    assert_eq!(
+        by_key(&browse, "codex-a")["recent_prompts"],
+        json!(["Actual keyboard request"])
+    );
+    assert_eq!(
+        by_key(&browse, "claude-a")["first_prompt"],
+        "/inspect the parser"
+    );
+    assert_eq!(
+        by_key(&browse, "claude-a")["recent_prompts"],
+        json!(["/inspect the parser", "/inspect the cache"])
+    );
+    assert_eq!(
+        home.search(
+            json!({"terms": ["injected", "command-name", "subagent_notification"]}),
+            vec![]
+        )["result"]["sessions"],
+        json!([])
+    );
+    let found = home.search(json!({"terms": ["parser"]}), vec![]);
+    assert_eq!(
+        by_key(&found, "claude-a")["why"]["line"],
+        "/inspect the parser"
+    );
+}
+
+#[test]
+fn search_sessions_retained_reference_is_not_an_active_occupant() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".claude/projects/project/claude-a.jsonl",
+        &[claude_prompt(
+            "claude-a",
+            &cwd,
+            "Actual request",
+            "2026-10-03T00:00:00Z",
+        )],
+    );
+    home.catalog.refresh();
+    let mut retained = live_pane("claude", "id", "claude-a");
+    retained["agent"] = json!("codex");
+    let response = home.search(json!({}), vec![retained]);
+    let row = by_key(&response, "claude-a");
+    assert_eq!(row["state"], "ended");
+    assert!(row["resume"].is_object());
+    assert!(row.get("live_pane_id").is_none());
+    assert!(row.get("resume_blocked").is_none());
+}
+
+#[test]
+fn search_sessions_reads_live_identity_while_a_terminal_core_is_locked() {
+    for count in [1, 80] {
+        let home = FixtureHome::new();
+        let cwd = home.dir("project");
+        home.write(
+            ".claude/projects/project/claude-a.jsonl",
+            &[claude_prompt(
+                "claude-a",
+                &cwd,
+                "Actual request",
+                "2026-10-03T00:00:00Z",
+            )],
+        );
+        home.catalog.refresh();
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let app_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let _entered = runtime.enter();
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = crate::app::App::new(
+                &crate::config::Config::default(),
+                crate::app::AppPolicy::TEST,
+                None,
+                rx,
+                crate::api::EventHub::default(),
+            );
+            let mut ws = crate::workspace::Workspace::test_new("project");
+            ws.id = "w1".into();
+            for _ in 1..count {
+                ws.test_split(ratatui::layout::Direction::Vertical);
+            }
+            let root = ws.tabs[0].root_pane;
+            let root_terminal = ws.tabs[0].terminal_id(root).unwrap().clone();
+            app.state.workspaces = vec![ws];
+            app.state.ensure_test_terminals();
+            for (id, terminal) in &mut app.state.terminals {
+                terminal.set_detected_state(
+                    Some(crate::detect::Agent::Claude),
+                    crate::detect::AgentState::Idle,
+                );
+                terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                    source: "herdr:claude".into(),
+                    agent: "claude".into(),
+                    session_ref: crate::agent_resume::AgentSessionRef::id(
+                        if *id == root_terminal {
+                            "claude-a".into()
+                        } else {
+                            format!("session-{id}")
+                        },
+                    )
+                    .unwrap(),
+                });
+                app.terminal_runtimes.insert(
+                    id.clone(),
+                    crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"populated"),
+                );
+            }
+            let (release, held) = app
+                .terminal_runtimes
+                .get(&root_terminal)
+                .unwrap()
+                .test_hold_core();
+            ready_tx.send(release).unwrap();
+            let request = api_rx.blocking_recv().unwrap();
+            let response = handle_active_session_snapshot(&request.request, &app.state)
+                .unwrap_or_else(|| {
+                    app.handle_api_request_after_internal_events_drained(request.request)
+                });
+            let _ = request.respond_to.send(response);
+            held.join().unwrap();
+        });
+        let release = ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let response = respond(
+            "search".into(),
+            &ServerSearchSessionsParams::default(),
+            Sources {
+                live: Box::new(move || live_sessions(&api_tx)),
+                catalog: Arc::clone(&home.catalog),
+                now: Arc::new(Instant::now),
+            },
+        );
+        release.send(()).unwrap();
+        app_thread.join().unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            by_key(&response, "claude-a")["state"],
+            "live",
+            "{count} panes"
+        );
+        assert_eq!(by_key(&response, "claude-a")["live_pane_id"], "w1:p1");
+    }
+}
+
+#[test]
+fn search_sessions_bad_records_do_not_hide_history_or_wait_for_impossible_completion() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".claude/projects/project/valid.jsonl",
+        &[claude_prompt(
+            "valid",
+            &cwd,
+            "Readable session",
+            "2026-10-03T00:00:00Z",
+        )],
+    );
+    home.write(".claude/history.jsonl", &[
+        json!({"sessionId": "claude-gone", "project": cwd, "display": "Claude history", "timestamp": 1790985600000_u64}),
+        json!({"project": cwd, "display": "Legacy history", "timestamp": 1790985600000_u64}),
+    ]);
+    home.write(
+        ".codex/history.jsonl",
+        &[json!({"session_id": "codex-gone", "ts": 1790985600, "text": "Codex history"})],
+    );
+    let archive = home.write(
+        ".codex/sessions/2025/01/01/rollout-compressed-a.jsonl.zst",
+        &[],
+    );
+    std::fs::write(&archive, include_bytes!("fixtures/codex.jsonl.zst")).unwrap();
+    home.catalog.refresh();
+    assert_eq!(
+        home.search(json!({}), vec![])["result"]["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    std::fs::write(&archive, b"invalid zstd").unwrap();
+    let oversized = home.write(".claude/projects/project/oversized.jsonl", &[]);
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(crate::prompt_trail::MAX_LINE_BYTES as u64 + 1)
+        .unwrap();
+    for _ in 0..2 {
+        home.catalog.refresh();
+        let began = Instant::now();
+        let response = home.search(json!({}), vec![]);
+        let elapsed = began.elapsed();
+        assert_eq!(response["result"]["sessions"].as_array().unwrap().len(), 4);
+        for key in ["claude-gone", "codex-gone", &format!("{cwd}|2026-10-03")] {
+            assert_eq!(by_key(&response, key)["state"], "record_gone");
+        }
+        assert_eq!(by_key(&response, "valid")["state"], "ended");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "finished refresh held query for {elapsed:?}"
+        );
+        assert_eq!(response["result"]["partial"], true);
+    }
+    std::fs::remove_file(oversized).unwrap();
+    std::fs::write(archive, include_bytes!("fixtures/codex.jsonl.zst")).unwrap();
+    home.catalog.refresh();
+    let repaired = home.search(json!({}), vec![]);
+    assert_eq!(repaired["result"]["partial"], false);
+    assert_eq!(by_key(&repaired, "compressed-a")["state"], "ended");
+}
+
+fn skippable_frames_preserve_session(leading: bool) {
+    for magic in 0x184d2a50_u32..=0x184d2a5f {
+        let home = FixtureHome::new();
+        let path = home.write(
+            ".codex/sessions/2025/01/01/rollout-compressed-a.jsonl.zst",
+            &[],
+        );
+        let archive = include_bytes!("fixtures/codex.jsonl.zst");
+        std::fs::write(&path, archive).unwrap();
+        home.catalog.refresh();
+        let expected = home.search(json!({}), vec![]);
+        assert_eq!(expected["result"]["sessions"].as_array().unwrap().len(), 1);
+        let payload: &[u8] = if magic == 0x184d2a50 {
+            b""
+        } else {
+            b"metadata\x00\xff"
+        };
+        let mut metadata = magic.to_le_bytes().to_vec();
+        metadata.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        metadata.extend_from_slice(payload);
+        let bytes = if leading {
+            [metadata.as_slice(), archive].concat()
+        } else {
+            [archive.as_slice(), metadata.as_slice()].concat()
+        };
+        std::fs::write(path, bytes).unwrap();
+        home.catalog.refresh();
+        assert_eq!(
+            home.search(json!({}), vec![]),
+            expected,
+            "magic {magic:x}, leading={leading}"
+        );
+    }
+}
+
+#[test]
+fn search_sessions_zstd_skippable_leading_frames_preserve_prompts() {
+    skippable_frames_preserve_session(true);
+}
+
+#[test]
+fn search_sessions_zstd_skippable_trailing_frames_preserve_prompts() {
+    skippable_frames_preserve_session(false);
 }

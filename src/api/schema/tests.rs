@@ -632,6 +632,61 @@ fn search_sessions_optional_metadata_keeps_its_wire_shape() {
 }
 
 #[test]
+fn search_sessions_nullable_keys_are_required_in_schema_and_round_trips() {
+    let row = serde_json::json!({
+        "key": {"agent": "codex", "kind": "id", "value": "history-a"},
+        "agent": "codex", "cwd": null, "place_state": "gone",
+        "first_prompt": "An old prompt", "recent_prompts": [],
+        "started_at_ms": 1791000000000_u64, "last_active_at_ms": 1791000000000_u64,
+        "labels": [], "state": "record_gone", "resume": null, "resume_blocked": "record_gone",
+        "headless": false, "subagent_count": 0, "why": null, "score": 0.0
+    });
+    let response: SessionHit = serde_json::from_value(row.clone()).unwrap();
+    assert_eq!(serde_json::to_value(response).unwrap(), row);
+    let schema = protocol_schema_document();
+    let hit = &schema["schemas"]["success_response"]["$defs"]["SessionHit"];
+    for key in ["cwd", "resume", "why"] {
+        assert!(
+            hit["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(key)),
+            "schema made {key} optional"
+        );
+        let property = &hit["properties"][key];
+        let nullable = property["type"]
+            .as_array()
+            .is_some_and(|types| types.contains(&serde_json::json!("null")))
+            || property["anyOf"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|entry| entry["type"] == "null"));
+        assert!(nullable, "schema forbids null for {key}");
+        let mut omitted = row.clone();
+        omitted.as_object_mut().unwrap().remove(key);
+        assert!(
+            serde_json::from_value::<SessionHit>(omitted).is_err(),
+            "round-trip accepted omitted {key}"
+        );
+    }
+}
+
+#[test]
+fn search_sessions_identity_request_is_not_a_wire_method() {
+    for method in ["internal.active_sessions", "InternalActiveSessions"] {
+        let request = serde_json::json!({"id": "request", "method": method, "params": {}});
+        assert!(serde_json::from_value::<Request>(request).is_err());
+        assert!(!protocol_schema_document().to_string().contains(method));
+    }
+    assert!(serde_json::to_value(Request {
+        id: "internal".into(),
+        method: Method::InternalActiveSessions {
+            deadline: std::time::Instant::now()
+        }
+    })
+    .is_err());
+}
+
+#[test]
 fn the_lookup_result_names_every_place_and_the_memory_it_came_from() {
     let response = SuccessResponse {
         id: "req_place".into(),

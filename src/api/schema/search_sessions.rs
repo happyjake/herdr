@@ -35,6 +35,8 @@ pub enum SearchSessionKeyKind {
 pub struct SessionHit {
     pub key: SearchSessionKey,
     pub agent: String,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(schema_with = "nullable_schema::<String>")]
     pub cwd: Option<String>,
     pub place_state: SessionPlaceState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +55,8 @@ pub struct SessionHit {
     pub live_pane_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside: Option<SessionOutside>,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(schema_with = "nullable_schema::<SessionResume>")]
     pub resume: Option<SessionResume>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_blocked: Option<SessionResumeBlocked>,
@@ -60,8 +64,24 @@ pub struct SessionHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<SearchSessionKey>,
     pub subagent_count: u32,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(schema_with = "nullable_schema::<SessionWhy>")]
     pub why: Option<SessionWhy>,
     pub score: f64,
+}
+
+// A custom field schema retains null without Option's implicit key optionality.
+fn nullable_schema<T: schemars::JsonSchema>(
+    generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    <Option<T> as schemars::JsonSchema>::json_schema(generator)
+}
+
+// No serde default: a missing key is an error, while an explicit null is valid.
+fn required_nullable<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

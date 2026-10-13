@@ -1,4 +1,4 @@
-//! Serve session search on the connection thread, asking the app only for panes.
+//! Serve session search using a data-only active-session snapshot from the app.
 
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -7,10 +7,10 @@ use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 
 use crate::api::schema::{
-    Method, PaneListParams, Request, ResponseResult, ServerSearchSessionsParams, SuccessResponse,
+    Method, Request, ResponseResult, ServerSearchSessionsParams, SuccessResponse,
 };
 use crate::api::ApiRequestSender;
-use crate::session_search::{Catalog, Desk, SearchResult};
+use crate::session_search::{ActiveSession, Catalog, Desk, SearchResult};
 
 const CONCURRENT_SEARCHES: usize = 2;
 
@@ -50,20 +50,39 @@ pub(super) fn handle_search(
         request_id,
         params,
         Sources {
-            live: Box::new(move || {
-                crate::api::server::dispatch_to_app_with_timeout(
-                    Request {
-                        id: "internal:search_sessions:panes".into(),
-                        method: Method::PaneList(PaneListParams { workspace_id: None }),
-                    },
-                    &api_tx,
-                    Some(Duration::from_millis(500)),
-                )
-            }),
+            live: Box::new(move || live_sessions(&api_tx)),
             catalog: catalog(),
             now: Arc::new(Instant::now),
         },
     )
+}
+
+fn live_sessions(api_tx: &ApiRequestSender) -> String {
+    let timeout = Duration::from_millis(500);
+    crate::api::server::dispatch_to_app_with_timeout(
+        Request {
+            id: "internal:search_sessions:panes".into(),
+            method: Method::InternalActiveSessions {
+                deadline: Instant::now() + timeout,
+            },
+        },
+        api_tx,
+        Some(timeout),
+    )
+}
+
+/// The queue consumer calls this before general API work. Expired requests do
+/// no snapshot work; a live request only clones active keys from pure state.
+pub(crate) fn handle_active_session_snapshot(
+    request: &Request,
+    state: &crate::app::AppState,
+) -> Option<String> {
+    let Method::InternalActiveSessions { deadline } = &request.method else {
+        return None;
+    };
+    let sessions =
+        (Instant::now() < *deadline).then(|| crate::session_search::active_sessions(state));
+    Some(serde_json::to_string(&sessions).unwrap_or_else(|_| "null".into()))
 }
 
 fn respond(request_id: String, params: &ServerSearchSessionsParams, sources: Sources) -> String {
@@ -144,11 +163,8 @@ fn blocking_search(
             tokio::task::spawn_blocking(move || {
                 // Blocking work keeps its permit after the caller times out.
                 let _permit = permit;
-                let panes = match serde_json::from_str::<SuccessResponse>(&(sources.live)()) {
-                    Ok(SuccessResponse {
-                        result: ResponseResult::PaneList { panes },
-                        ..
-                    }) => panes,
+                let panes = match serde_json::from_str::<Vec<ActiveSession>>(&(sources.live)()) {
+                    Ok(panes) => panes,
                     _ => return Err("could not read live sessions"),
                 };
                 sources.catalog.search(

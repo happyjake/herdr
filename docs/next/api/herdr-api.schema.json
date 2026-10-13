@@ -11972,6 +11972,7 @@
           "required": [
             "key",
             "agent",
+            "cwd",
             "place_state",
             "first_prompt",
             "recent_prompts",
@@ -11979,8 +11980,10 @@
             "last_active_at_ms",
             "labels",
             "state",
+            "resume",
             "headless",
             "subagent_count",
+            "why",
             "score"
           ],
           "type": "object"

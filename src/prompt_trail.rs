@@ -63,6 +63,7 @@ const CLAUDE_FALLBACK_TITLE: &str = "Claude Code";
 
 /// Texts a claude record carries as a user turn that no person typed.
 const CLAUDE_SKIPPED_PREFIXES: &[&str] = &[
+    "<local-command-caveat>",
     "<local-command-stdout>",
     "<system-reminder>",
     "<bash-input>",
@@ -82,6 +83,11 @@ const CODEX_SKIPPED_PREFIXES: &[&str] = &[
     "<permissions",
     "<turn_aborted",
     "<collaboration_mode",
+    "<subagent_notification",
+    "<recommended_plugins>",
+    "<codex_internal_context",
+    "<skill>",
+    "<user_action>",
 ];
 
 /// The harness a session belongs to, when its records are ones this reads.
@@ -317,7 +323,7 @@ fn claude_prompt(line: &Value) -> Option<String> {
     };
     let text = clean(&text);
 
-    if text.starts_with("<command-message>") {
+    if text.starts_with("<command-message>") || text.starts_with("<command-name>") {
         return claude_command_prompt(&text);
     }
     if CLAUDE_SKIPPED_PREFIXES
@@ -1039,6 +1045,45 @@ mod tests {
         // none of a trail's business.
         assert_eq!(trail.title, None);
         assert_eq!(trail.newest_at, Some(1772698320));
+    }
+
+    #[test]
+    fn prompt_trail_excludes_injected_codex_turns() {
+        let home = FixtureHome::new();
+        let mut turns: Vec<_> = [
+            "<subagent_notification>{\"agent_id\":\"child\",\"status\":{\"completed\":\"generated result\"}}</subagent_notification>",
+            "<recommended_plugins>Generated plugin suggestions</recommended_plugins>",
+            "<codex_internal_context source=\"goal\">Continue the task</codex_internal_context>",
+            "<skill><name>example</name><path>/home/user/skill.md</path>Injected instructions</skill>",
+            "<user_action><context>User initiated a review</context><action>review</action><results>Generated review</results></user_action>",
+        ].into_iter().map(|text| serde_json::json!({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]
+        }})).collect();
+        turns.push(serde_json::json!({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "The actual request"}]
+        }}));
+        let record = home.write("records/codex.jsonl", &lines(&turns));
+        let trail = read(&record, PromptTrailAgent::Codex).unwrap();
+        assert_eq!(trail.count, 1);
+        assert_eq!(trail.first.unwrap().text, "The actual request");
+        assert_eq!(texts(&trail.recent), vec!["The actual request"]);
+    }
+
+    #[test]
+    fn prompt_trail_normalizes_both_claude_command_orders() {
+        let home = FixtureHome::new();
+        let record = home.write("records/claude.jsonl", &lines(&[
+            claude_user("<local-command-caveat>Generated local-command warning</local-command-caveat>", "2026-03-04T09:00:00Z"),
+            claude_user("<command-name>/inspect</command-name><command-message>inspect</command-message><command-args>the parser</command-args>", "2026-03-04T09:01:00Z"),
+            claude_user("<command-message>inspect</command-message><command-name>/inspect</command-name><command-args>the cache</command-args>", "2026-03-04T09:02:00Z"),
+        ]));
+        let trail = read(&record, PromptTrailAgent::Claude).unwrap();
+        assert_eq!(trail.count, 2);
+        assert_eq!(trail.first.unwrap().text, "/inspect the parser");
+        assert_eq!(
+            texts(&trail.recent),
+            vec!["/inspect the parser", "/inspect the cache"]
+        );
     }
 
     #[test]

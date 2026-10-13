@@ -2840,6 +2840,11 @@ impl HeadlessServer {
             return false;
         }
 
+        if let Some(response) = api::handle_active_session_snapshot(&msg.request, &self.app.state) {
+            let _ = msg.respond_to.send(response);
+            return false;
+        }
+
         let frozen_alt_screen_read = match self.alt_screen_read_conflict(&msg.request) {
             AltScreenReadConflict::None => None,
             AltScreenReadConflict::Frozen(snapshot) => Some(snapshot),
