@@ -5,6 +5,7 @@
 //! Installed plugins are persisted separately at `plugins.json`.
 
 mod io;
+pub mod logbook;
 pub mod plugin_registry;
 mod restore;
 mod snapshot;

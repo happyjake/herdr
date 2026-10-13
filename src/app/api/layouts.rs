@@ -163,10 +163,14 @@ impl App {
                 .state
                 .terminal_ids_for_tab(target_ws_idx, target_tab_idx);
             let plugin_pane_ids = self.state.pane_ids_for_tab(target_ws_idx, target_tab_idx);
+            let logbook_events = self
+                .state
+                .logbook_tab_close_events(target_ws_idx, target_tab_idx);
             let Some(ws) = self.state.workspaces.get_mut(target_ws_idx) else {
                 return encode_error(id, "tab_not_found", "tab not found");
             };
             if ws.close_tab(target_tab_idx) {
+                self.state.enqueue_logbook_events(logbook_events);
                 self.state.remove_plugin_pane_records(plugin_pane_ids);
                 self.state.remove_unattached_terminal_ids(terminal_ids);
                 self.shutdown_detached_terminal_runtimes();
@@ -489,6 +493,8 @@ impl App {
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
             terminal.set_manual_label(label.to_string());
         }
+        self.state.record_logbook_label(ws_idx, pane_id);
+        self.flush_logbook();
     }
 
     fn rollback_layout_tab(&mut self, ws_idx: usize, root_pane: PaneId) {
@@ -502,12 +508,14 @@ impl App {
         };
         let terminal_ids = self.state.terminal_ids_for_tab(ws_idx, tab_idx);
         let plugin_pane_ids = self.state.pane_ids_for_tab(ws_idx, tab_idx);
+        let logbook_events = self.state.logbook_tab_close_events(ws_idx, tab_idx);
         if self
             .state
             .workspaces
             .get_mut(ws_idx)
             .is_some_and(|ws| ws.close_tab(tab_idx))
         {
+            self.state.enqueue_logbook_events(logbook_events);
             self.state.remove_plugin_pane_records(plugin_pane_ids);
             self.state.remove_unattached_terminal_ids(terminal_ids);
             self.shutdown_detached_terminal_runtimes();

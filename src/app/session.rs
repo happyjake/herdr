@@ -19,6 +19,7 @@ impl App {
     }
 
     pub(crate) fn sync_session_save_schedule(&mut self) {
+        self.flush_logbook();
         if self.state.session_dirty {
             self.state.session_dirty = false;
             self.schedule_session_save();
@@ -88,6 +89,7 @@ impl App {
     }
 
     pub(crate) fn save_session_now(&mut self) {
+        self.flush_logbook();
         if let Some(thread) = self.session_save_thread.take() {
             let _ = thread.join();
         }

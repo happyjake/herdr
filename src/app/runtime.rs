@@ -34,6 +34,9 @@ impl App {
     }
 
     pub(crate) fn shutdown_detached_terminal_runtimes(&mut self) {
+        // Internal events and explicit layout mutations converge here after
+        // applying state. Persist their queued history before detaching runtimes.
+        self.flush_logbook();
         let terminal_ids = std::mem::take(&mut self.state.terminal_runtime_shutdowns);
         for terminal_id in terminal_ids {
             self.shutdown_terminal_runtime(terminal_id);

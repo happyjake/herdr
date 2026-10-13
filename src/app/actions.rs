@@ -955,6 +955,9 @@ impl AppState {
         let mut terminal_ids = Vec::new();
         let mut pane_ids = Vec::new();
         for idx in &close_indices {
+            for pane_id in self.pane_ids_for_workspace(*idx) {
+                self.record_logbook_close(*idx, pane_id);
+            }
             terminal_ids.extend(self.terminal_ids_for_workspace(*idx));
             pane_ids.extend(self.pane_ids_for_workspace(*idx));
             if let Some(workspace_id) = self.workspaces.get(*idx).map(|ws| ws.id.clone()) {
@@ -1810,22 +1813,50 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
-            } => self
-                .update_terminal_state(
-                    pane_id,
-                    crate::events::StatusReading::DisplayOnly,
-                    |terminal| {
-                        terminal.set_agent_session_ref_for_session_start(
-                            source,
-                            agent_label,
-                            session_ref,
-                            seq,
-                            session_start_source,
-                        )
-                    },
-                )
-                .into_iter()
-                .collect(),
+            } => {
+                // Only an explicit fork/branch relates the new session to the
+                // current one. Resume, clear and selection imply no ancestry.
+                let parent = matches!(session_start_source.as_deref(), Some("fork" | "branch"))
+                    .then(|| self.logbook_key(pane_id))
+                    .flatten();
+                let mut unchanged_session_accepted = false;
+                let updates = self
+                    .update_terminal_state(
+                        pane_id,
+                        crate::events::StatusReading::DisplayOnly,
+                        |terminal| {
+                            let mutation = terminal.set_agent_session_ref_for_session_start(
+                                source,
+                                agent_label,
+                                session_ref,
+                                seq,
+                                session_start_source,
+                            );
+                            unchanged_session_accepted = mutation
+                                .as_ref()
+                                .is_some_and(|mutation| !mutation.session_ref_changed);
+                            mutation
+                        },
+                    )
+                    .into_iter()
+                    .collect();
+                // Changed identities are queued by update_terminal_state. An
+                // accepted repeat can recover a failed append; disk history
+                // determines whether it has already been recorded here.
+                if unchanged_session_accepted && self.logbook_events.is_some() {
+                    if let Some(ws_idx) = self
+                        .workspaces
+                        .iter()
+                        .position(|ws| ws.pane_state(pane_id).is_some())
+                    {
+                        self.record_logbook_session(ws_idx, pane_id);
+                    }
+                }
+                if let Some(parent) = parent {
+                    self.record_logbook_parent(pane_id, parent);
+                }
+                updates
+            }
             AppEvent::HookMetadataReported {
                 pane_id,
                 source,
@@ -2024,6 +2055,9 @@ impl AppState {
         }
         if mutation.session_ref_changed || managed_changed || agent_name_changed {
             self.mark_session_dirty();
+        }
+        if mutation.session_ref_changed {
+            self.record_logbook_session(ws_idx, pane_id);
         }
         let agent_released = mutation.agent_released;
         let Some(change) = mutation.effective_state_change.or(unchanged_change) else {
@@ -2372,6 +2406,7 @@ impl AppState {
             return;
         };
 
+        self.record_logbook_close(ws_idx, pane_id);
         let pane_terminal_id = self.terminal_id_for_pane(ws_idx, pane_id);
         let workspace_terminal_ids = self.terminal_ids_for_workspace(ws_idx);
         self.pane_id_aliases.retain(|_, alias| *alias != pane_id);
