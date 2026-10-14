@@ -209,6 +209,30 @@ pub(crate) fn read_source(include_detection: bool) -> Input<ReadSource> {
     })
 }
 
+pub(crate) fn flag_due() -> Input<Option<u64>> {
+    Input::value("due", "RFC3339|EPOCH-SECONDS", |slot, value| {
+        *slot = Some(
+            value
+                .parse::<u64>()
+                .or_else(|_| {
+                    time::OffsetDateTime::parse(
+                        value,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .map_err(|_| ())?
+                    .unix_timestamp()
+                    .try_into()
+                    .map_err(|_| ())
+                })
+                .map_err(|_| {
+                    ParseError::Usage("--due must be RFC3339 or nonnegative epoch seconds".into())
+                })?,
+        );
+        Ok(())
+    })
+    .once()
+}
+
 pub(crate) fn lines() -> Input<Option<u32>> {
     Input::value("lines", "N", |slot, value| {
         *slot = Some(crate::cli::parse_u32_flag("--lines", value)?);
@@ -451,6 +475,22 @@ macro_rules! leaf {
 }
 
 pub(super) const LEAVES: &[Leaf] = &[
+    leaf!(
+        "flag",
+        "Flag a pane with an optional deadline",
+        "cli:pane:flag",
+        Json,
+        PaneSetFlagProjection,
+        PaneSetFlag
+    ),
+    leaf!(
+        "unflag",
+        "Clear a pane flag",
+        "cli:pane:flag",
+        Json,
+        PaneTargetProjection,
+        PaneClearFlag
+    ),
     leaf!(
         "list",
         "List panes",

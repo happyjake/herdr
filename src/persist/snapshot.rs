@@ -159,6 +159,11 @@ pub struct PaneSnapshot {
     /// existed restores every pane unpinned instead of failing the session.
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub flag: Option<crate::api::schema::PaneFlag>,
+    /// Latest flag date, retained even when the flag has been cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag_set_through: Option<u64>,
     /// Who wrote the label, when it was not a person. Absent from a
     /// snapshot written before provenance was kept, which restores a label
     /// that is nobody's — the same thing it was.
@@ -506,6 +511,8 @@ fn capture_tab(
                 agent_status_reported_through,
                 agent_status_captured_pair_reported,
                 pinned,
+                flag: terminal.and_then(|terminal| terminal.flag.clone()),
+                flag_set_through: terminal.and_then(|terminal| terminal.flag_set_through),
                 label_source,
                 label_at,
             },
@@ -1040,6 +1047,38 @@ mod tests {
     }
 
     #[test]
+    fn flag_snapshot_captures_the_whole_flag_and_retains_its_date_after_clear() {
+        let mut state = state_with_workspaces(&["flag-capture"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_flag(Some("review".into()), Some(123))
+            .unwrap();
+        let expected = serde_json::to_value(&state.terminals[&terminal_id].flag).unwrap();
+        let capture_pane = |state: &AppState| {
+            let json = serde_json::to_value(capture_from_state(state)).unwrap();
+            json["workspaces"][0]["tabs"][0]["panes"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone()
+        };
+        let captured = capture_pane(&state);
+        assert_eq!(captured.get("flag"), Some(&expected));
+        state.terminals.get_mut(&terminal_id).unwrap().clear_flag();
+        let cleared = capture_pane(&state);
+        assert_eq!(cleared.get("flag"), Some(&serde_json::Value::Null));
+        assert_eq!(cleared["flag_set_through"], expected["set_at"]);
+    }
+
+    #[test]
     fn a_captured_pane_carries_the_pin_its_terminal_holds() {
         let mut state = state_with_workspaces(&["pinned-capture"]);
         let root = state.workspaces[0].tabs[0].root_pane;
@@ -1201,6 +1240,8 @@ mod tests {
                 agent_status_reported_through: None,
                 agent_status_captured_pair_reported: true,
                 pinned: false,
+                flag: None,
+                flag_set_through: None,
                 label_source: None,
                 label_at: None,
             },
@@ -1222,6 +1263,8 @@ mod tests {
                 agent_status_reported_through: None,
                 agent_status_captured_pair_reported: true,
                 pinned: false,
+                flag: None,
+                flag_set_through: None,
                 label_source: None,
                 label_at: None,
             },
@@ -1983,6 +2026,8 @@ mod tests {
                 agent_status_reported_through: None,
                 agent_status_captured_pair_reported: true,
                 pinned: false,
+                flag: None,
+                flag_set_through: None,
                 label_source: None,
                 label_at: None,
             },
@@ -2006,6 +2051,8 @@ mod tests {
                 agent_status_reported_through: None,
                 agent_status_captured_pair_reported: true,
                 pinned: false,
+                flag: None,
+                flag_set_through: None,
                 label_source: None,
                 label_at: None,
             },

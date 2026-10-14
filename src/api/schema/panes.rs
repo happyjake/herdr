@@ -396,6 +396,26 @@ crate::cli::projection::cli_params! {
     }
 }
 
+/// A user-kept to-do. Dates are whole unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneFlag {
+    pub note: Option<String>,
+    pub due_at: Option<u64>,
+    pub set_at: u64,
+    pub announced_at: Option<u64>,
+}
+
+crate::cli::projection::cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct PaneSetFlagParams => PaneSetFlagProjection {
+        pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
+        #[serde(default)]
+        pub note: Option<String> => Field::new(None).input(binding::optional_text("note", "TEXT").once()),
+        #[serde(default)]
+        pub due_at: Option<u64> => Field::new(None).input(binding::flag_due()),
+    }
+}
+
 crate::cli::projection::cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
     pub struct PaneSendTextParams => PaneSendTextProjection {
@@ -680,6 +700,9 @@ pub struct PaneInfo {
     /// and write it only when the user asks for it.
     #[serde(default)]
     pub pinned: bool,
+    /// Always serialized: null is unflagged; an absent key means no flag capability.
+    #[serde(default)]
+    pub flag: Option<PaneFlag>,
     /// Who wrote the standing `label`, when it was not a person.
     ///
     /// Always serialized, like `pinned` and for the same reason: a client

@@ -1597,6 +1597,7 @@ mod tests {
             alternate_screen: false,
             agent_status_changed_at: Some(1_700_000_000),
             pinned: false,
+            flag: None,
             label_source: None,
             label_at: None,
             revision: 0,

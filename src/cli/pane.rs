@@ -506,6 +506,76 @@ mod tests {
         }
     }
 
+    fn parse_pane_flag_args(args: &[String], clear: bool) -> Result<Method, ParseError> {
+        bindings::LEAVES.iter().find(|leaf| leaf.name == if clear { "unflag" } else { "flag" })
+            .expect("flag command")
+            .request(args)
+            .map(|request| request.method)
+    }
+
+    #[test]
+    fn pane_flag_arguments_accept_absolute_dates_and_optional_notes() {
+        for due in [
+            "2000-01-01T00:00:00Z",
+            "2000-01-01T08:00:00+08:00",
+            "946684800",
+        ] {
+            let method =
+                parse_pane_flag_args(&args(&["w1:p1", "--note", "review", "--due", due]), false)
+                    .unwrap();
+            let value = serde_json::to_value(method).unwrap();
+            assert_eq!(value["method"], "pane.set_flag");
+            assert_eq!(
+                value["params"],
+                serde_json::json!({"pane_id": "w1:p1", "note": "review", "due_at": 946684800})
+            );
+        }
+        let bare =
+            serde_json::to_value(parse_pane_flag_args(&args(&["w1:p1"]), false).unwrap()).unwrap();
+        assert_eq!(
+            bare["params"],
+            serde_json::json!({"pane_id": "w1:p1", "note": null, "due_at": null})
+        );
+        let clear =
+            serde_json::to_value(parse_pane_flag_args(&args(&["w1:p1"]), true).unwrap()).unwrap();
+        assert_eq!(
+            clear,
+            serde_json::json!({"method": "pane.clear_flag", "params": {"pane_id": "w1:p1"}})
+        );
+    }
+
+    #[test]
+    fn pane_flag_arguments_reject_relative_times_and_malformed_options() {
+        for due in [
+            "tomorrow",
+            "in 1 hour",
+            "1h",
+            "2000-01-01",
+            "garbage",
+            "-1",
+            "1.5",
+        ] {
+            assert!(
+                parse_pane_flag_args(&args(&["w1:p1", "--due", due]), false).is_err(),
+                "{due}"
+            );
+        }
+        for values in [
+            vec![],
+            vec!["w1:p1", "--note"],
+            vec!["w1:p1", "--due"],
+            vec!["w1:p1", "--unknown"],
+            vec!["w1:p1", "extra"],
+        ] {
+            assert!(
+                parse_pane_flag_args(&args(&values), false).is_err(),
+                "{values:?}"
+            );
+        }
+        assert!(parse_pane_flag_args(&args(&[]), true).is_err());
+        assert!(parse_pane_flag_args(&args(&["w1:p1", "--note", "review"]), true).is_err());
+    }
+
     #[test]
     fn pane_pin_and_unpin_require_exactly_one_pane_id() {
         assert_eq!(run_pane_command(&args(&["pin"])).unwrap(), 2);

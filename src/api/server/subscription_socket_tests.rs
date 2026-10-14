@@ -214,6 +214,13 @@ fn reply(request: ApiRequestMessage, result: ResponseResult) {
 }
 
 fn reply_to_probe(request: ApiRequestMessage) {
+    reply_to_probe_with_flag(request, None);
+}
+
+fn reply_to_probe_with_flag(
+    request: ApiRequestMessage,
+    flag: Option<crate::api::schema::PaneFlag>,
+) {
     let result = match request.request.method {
         Method::PaneGet(_) => ResponseResult::PaneInfo {
             pane: PaneInfo {
@@ -240,6 +247,7 @@ fn reply_to_probe(request: ApiRequestMessage) {
                 alternate_screen: false,
                 agent_status_changed_at: None,
                 pinned: false,
+                flag,
                 label_source: None,
                 label_at: None,
                 revision: 0,
@@ -361,4 +369,70 @@ fn lagging_subscription_closes_without_interrupting_other_clients() {
     let response = ordinary.response();
     assert_eq!(response["id"], "ordinary");
     assert_eq!(response["result"]["type"], "workspace_list");
+}
+
+#[test]
+fn flag_subscription_socket_carries_seed_and_concurrent_changes_and_null() {
+    let mut test = SocketTest::new();
+    let mut client = test.connect();
+    client.subscribe(
+        "flags",
+        json!([{
+            "type": "pane.agent_status_changed", "pane_id": "pane_1", "agent_status": "working"
+        }]),
+    );
+    let probe = test.app_request();
+    let flag = json!({"note": "review", "due_at": 123, "set_at": 120, "announced_at": 124});
+    let event = |flag: Value| {
+        serde_json::from_value(json!({
+            "event": "pane_agent_status_changed",
+            "data": {
+                "type": "pane_agent_status_changed", "pane_id": "pane_1",
+                "workspace_id": "workspace_1", "agent_status": "working", "flag": flag
+            }
+        }))
+        .unwrap()
+    };
+    // Changes published during the probe speak for themselves even if its
+    // answer still carries the older flag.
+    let edited = json!({"note": "recheck", "due_at": 123, "set_at": 125, "announced_at": 124});
+    test.hub.push(event(edited.clone()));
+    test.hub.push(event(Value::Null));
+    reply_to_probe_with_flag(probe, Some(serde_json::from_value(flag.clone()).unwrap()));
+    client.assert_started("flags");
+    let changed = client.response();
+    assert_eq!(changed["data"].get("flag"), Some(&edited), "{changed}");
+    let cleared = client.response();
+    assert_eq!(cleared["data"].get("flag"), Some(&Value::Null), "{cleared}");
+}
+
+#[test]
+fn flag_subscription_socket_detects_snapshot_only_changes() {
+    let flag = json!({"note": null, "due_at": null, "set_at": 120, "announced_at": null});
+    for seed in [Value::Null, flag.clone()] {
+        let mut test = SocketTest::new();
+        let mut client = test.connect();
+        client.subscribe(
+            "flag-snapshot",
+            json!([{
+                "type": "pane.agent_status_changed", "pane_id": "pane_1", "agent_status": "working"
+            }]),
+        );
+        reply_to_probe_with_flag(
+            test.app_request(),
+            serde_json::from_value(seed.clone()).unwrap(),
+        );
+        client.assert_started("flag-snapshot");
+        assert_eq!(client.response()["data"].get("flag"), Some(&seed));
+        let edited =
+            json!({"note": "recheck", "due_at": null, "set_at": 121, "announced_at": null});
+        reply_to_probe_with_flag(
+            test.app_request(),
+            Some(serde_json::from_value(edited.clone()).unwrap()),
+        );
+        let changed = client.response();
+        assert_eq!(changed["data"].get("flag"), Some(&edited), "{changed}");
+        reply_to_probe(test.app_request());
+        assert_eq!(client.response()["data"].get("flag"), Some(&Value::Null));
+    }
 }

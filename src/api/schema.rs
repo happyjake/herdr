@@ -162,6 +162,8 @@ operations::define_operations! {
     AttachmentCommit(AttachmentCommitParams) => "attachment.commit", false, false;
     PanePromptTrail(PaneTarget) => "pane.prompt_trail", false, false;
     ServerSearchSessions(ServerSearchSessionsParams) => "server.search_sessions", false, false;
+    PaneSetFlag(PaneSetFlagParams) => "pane.set_flag", false, false;
+    PaneClearFlag(PaneTarget) => "pane.clear_flag", false, false;
     @internal {
         // In-process only; absent from wire schemas and advertised operations.
         InternalActiveSessions { deadline: std::time::Instant } => "internal.active_sessions";

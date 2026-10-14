@@ -176,12 +176,8 @@ mod tests {
             .iter()
             .any(|candidate| candidate.name == operation.name));
         assert!(!super::client_shell_method_names().contains(&operation.name));
-        assert!(!crate::server::client_commands::supports_client_shell_method(
-            &method
-        ));
-        assert!(!crate::server::client_commands::supports_client_shell_method_name(
-            operation.name
-        ));
+        assert!(!crate::server::client_commands::supports_client_shell_method(&method));
+        assert!(!crate::server::client_commands::supports_client_shell_method_name(operation.name));
         assert!(!crate::api::request_changes_ui(&Request {
             id: "internal".into(),
             method,

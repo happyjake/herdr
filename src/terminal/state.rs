@@ -153,6 +153,9 @@ pub struct TerminalState {
     /// set only by an explicit request, persists with the session, and says
     /// nothing about the label, the agent, or anything the terminal does.
     pub pinned: bool,
+    pub flag: Option<crate::api::schema::PaneFlag>,
+    /// Retained after clearing so a later flag never reuses an earlier date.
+    pub flag_set_through: Option<u64>,
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
     managed_agent: Option<ManagedAgent>,
@@ -196,6 +199,8 @@ impl TerminalState {
             label_source: None,
             label_at: None,
             pinned: false,
+            flag: None,
+            flag_set_through: None,
             agent_name: None,
             agent_name_owner: None,
             managed_agent: None,
@@ -2173,6 +2178,82 @@ impl TerminalState {
         self.label_source = label.as_ref().and(source);
         self.label_at = label.as_ref().and(at);
         self.manual_label = label;
+    }
+
+    pub fn set_flag(
+        &mut self,
+        note: Option<String>,
+        due_at: Option<u64>,
+    ) -> Result<bool, &'static str> {
+        if note
+            .as_ref()
+            .is_some_and(|note| note.contains(['\n', '\r']))
+        {
+            return Err("flag note must be one line");
+        }
+        let note = note
+            .map(|note| note.trim().to_string())
+            .filter(|note| !note.is_empty());
+        if note.as_ref().is_some_and(|note| note.chars().count() > 200) {
+            return Err("flag note must be at most 200 characters");
+        }
+        if self
+            .flag
+            .as_ref()
+            .is_some_and(|flag| flag.note == note && flag.due_at == due_at)
+        {
+            return Ok(false);
+        }
+        let previous = self
+            .flag_set_through
+            .into_iter()
+            .chain(self.flag.as_ref().map(|flag| flag.set_at))
+            .max();
+        let floor = match previous {
+            Some(date) => date.checked_add(1).ok_or("flag date exhausted")?,
+            None => 0,
+        };
+        let set_at = crate::pane::unix_now_secs().max(floor);
+        let announced_at = self
+            .flag
+            .as_ref()
+            .filter(|flag| flag.due_at == due_at)
+            .and_then(|flag| flag.announced_at);
+        self.flag = Some(crate::api::schema::PaneFlag {
+            note,
+            due_at,
+            set_at,
+            announced_at,
+        });
+        self.flag_set_through = Some(set_at);
+        Ok(true)
+    }
+
+    pub fn announce_flag_at(&mut self, now_unix: u64) -> bool {
+        let Some(flag) = self.flag.as_mut().filter(|flag| {
+            flag.announced_at.is_none() && flag.due_at.is_some_and(|due| due <= now_unix)
+        }) else {
+            return false;
+        };
+        flag.announced_at = Some(now_unix);
+        true
+    }
+
+    /// Restore the flag without treating a restore as a new write.
+    pub fn restore_flag(
+        &mut self,
+        flag: Option<crate::api::schema::PaneFlag>,
+        set_through: Option<u64>,
+    ) {
+        self.flag_set_through = set_through
+            .into_iter()
+            .chain(flag.as_ref().map(|flag| flag.set_at))
+            .max();
+        self.flag = flag;
+    }
+
+    pub fn clear_flag(&mut self) -> bool {
+        self.flag.take().is_some()
     }
 
     pub fn set_pinned(&mut self, pinned: bool) {

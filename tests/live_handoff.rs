@@ -1057,6 +1057,171 @@ fn live_handoff_preserves_installed_plugins() {
 }
 
 #[test]
+fn live_handoff_preserves_the_flag_and_its_next_write_date() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "create", "method": "workspace.create", "params": {"cwd": base, "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let due_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let flagged = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "flag", "method": "pane.set_flag",
+            "params": {"pane_id": pane_id, "note": "review", "due_at": due_at}
+        }),
+    );
+    let before = flagged["result"]["pane"]["flag"].clone();
+    assert_eq!(before["note"], "review", "{flagged}");
+    assert_eq!(before["announced_at"], serde_json::Value::Null);
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "handoff", "method": "server.live_handoff", "params": {}
+        }),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let restored = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "get", "method": "pane.get", "params": {"pane_id": pane_id}
+        }),
+    );
+    assert_eq!(restored["result"]["pane"]["flag"], before, "{restored}");
+    let edited = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "edit", "method": "pane.set_flag",
+            "params": {"pane_id": pane_id, "note": "recheck", "due_at": due_at}
+        }),
+    );
+    assert!(
+        edited["result"]["pane"]["flag"]["set_at"].as_u64().unwrap()
+            > before["set_at"].as_u64().unwrap()
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "stop", "method": "server.stop", "params": {}
+        }),
+    ));
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn live_handoff_rearms_a_pending_flag_and_preserves_its_announcement() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "create", "method": "workspace.create", "params": {"cwd": base, "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let due_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 10;
+    let flagged = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "flag", "method": "pane.set_flag",
+            "params": {"pane_id": pane_id, "note": "review", "due_at": due_at}
+        }),
+    );
+    assert_eq!(flagged["result"]["pane"]["flag"]["due_at"], due_at);
+    let get_flag = || {
+        request(
+            &api_socket,
+            serde_json::json!({
+                "id": "get", "method": "pane.get", "params": {"pane_id": pane_id}
+            }),
+        )["result"]["pane"]["flag"]
+            .clone()
+    };
+    let handoff = || {
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": "handoff", "method": "server.live_handoff", "params": {}
+            }),
+        ));
+    };
+    handoff();
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let pending = get_flag();
+    // Require the handoff to finish while still pending, so this tests the replacement's timer.
+    assert_eq!(
+        pending["announced_at"],
+        serde_json::Value::Null,
+        "{pending}"
+    );
+    assert_eq!(pending, flagged["result"]["pane"]["flag"]);
+    let timeout = Instant::now() + Duration::from_secs(15);
+    let announced = loop {
+        let flag = get_flag();
+        if flag["announced_at"].as_u64().is_some() {
+            break flag;
+        }
+        assert!(
+            Instant::now() < timeout,
+            "replacement never announced the due flag: {flag}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(announced["announced_at"].as_u64().unwrap() >= due_at);
+    assert_eq!(announced["set_at"], pending["set_at"]);
+
+    handoff();
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    assert_eq!(get_flag(), announced);
+    let edited = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "edit", "method": "pane.set_flag",
+            "params": {"pane_id": pane_id, "note": "recheck", "due_at": due_at}
+        }),
+    );
+    assert_eq!(
+        edited["result"]["pane"]["flag"]["announced_at"],
+        announced["announced_at"]
+    );
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(get_flag()["announced_at"], announced["announced_at"]);
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "stop", "method": "server.stop", "params": {}
+        }),
+    ));
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_preserves_pane_process_io() {
     let _lock = test_lock();
     let base = unique_test_dir();
