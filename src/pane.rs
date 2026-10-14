@@ -39,7 +39,8 @@ use self::agent_detection::{
     detection_update_for_publish_with_osc, mark_detection_content_changed,
     observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
     DetectionScreenReadInput, DetectionTextCache, PendingIdleConfirmation,
-    ScreenDetectionPublishInput, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    ScreenDetectionPublishInput, ScreenTextChange, AGENT_PENDING_IDLE_RECHECK,
+    AGENT_STARTUP_GRACE_WINDOW,
 };
 use self::background_agent::{AgentJobStatus, AgentJobTracker};
 pub(crate) use self::state::AgentStatusProjection;
@@ -1182,9 +1183,12 @@ fn spawn_basic_detection_task(
                 DetectionScreenReadDecision::Skip => continue,
             }
 
-            let content_changed = last_detection_text
+            let ScreenTextChange {
+                content_changed,
+                screen_changed,
+            } = last_detection_text
                 .refresh(agent, &content_seq, || terminal.detection_text_for_cache());
-            let content = &last_detection_text.text;
+            let content = last_detection_text.text();
             last_screen_scan_detection_content_seq = current_detection_content_seq;
             let osc_title = terminal.agent_osc_title();
             let osc_progress = terminal.agent_osc_progress();
@@ -1221,6 +1225,7 @@ fn spawn_basic_detection_task(
             match decide_screen_detection_publish(
                 ScreenDetectionPublishInput {
                     screen_detection,
+                    screen_changed,
                     current_state: state,
                     last_visible_idle,
                     last_visible_blocker,
@@ -3196,11 +3201,13 @@ impl PaneRuntime {
                         DetectionScreenReadDecision::Skip => continue,
                     }
 
-                    let content_changed =
-                        last_detection_text.refresh(agent, &text_content_seq, || {
-                            terminal.detection_text_for_cache()
-                        });
-                    let content = &last_detection_text.text;
+                    let ScreenTextChange {
+                        content_changed,
+                        screen_changed,
+                    } = last_detection_text.refresh(agent, &text_content_seq, || {
+                        terminal.detection_text_for_cache()
+                    });
+                    let content = last_detection_text.text();
                     last_screen_scan_detection_content_seq = current_detection_content_seq;
                     let osc_title = terminal.agent_osc_title();
                     let osc_progress = terminal.agent_osc_progress();
@@ -3237,6 +3244,7 @@ impl PaneRuntime {
                     match decide_screen_detection_publish(
                         ScreenDetectionPublishInput {
                             screen_detection,
+                            screen_changed,
                             current_state: state,
                             last_visible_idle,
                             last_visible_blocker,
@@ -4186,10 +4194,12 @@ mod tests {
         let mut cache = DetectionTextCache::default();
         let reads = Cell::new(0);
         let refresh = |cache: &mut DetectionTextCache| {
-            cache.refresh(None, &runtime.content_seq, || {
-                reads.set(reads.get() + 1);
-                runtime.terminal.detection_text_for_cache()
-            })
+            cache
+                .refresh(None, &runtime.content_seq, || {
+                    reads.set(reads.get() + 1);
+                    runtime.terminal.detection_text_for_cache()
+                })
+                .content_changed
         };
         assert!(
             refresh(&mut cache),
@@ -4203,7 +4213,7 @@ mod tests {
             1,
             "viewport scrolling must not rebuild bottom text"
         );
-        assert_eq!(cache.text, runtime.detection_text());
+        assert_eq!(cache.text(), runtime.detection_text());
 
         // Control-only and fragmented output still invalidate the physical read,
         // but do not manufacture a text change for acquisition scheduling.
@@ -4213,27 +4223,27 @@ mod tests {
         runtime.test_process_pty_bytes(b"2J\x1b[Hupdated");
         assert!(refresh(&mut cache));
         assert_eq!(reads.get(), 3);
-        assert_eq!(cache.text, runtime.detection_text());
+        assert_eq!(cache.text(), runtime.detection_text());
 
         runtime.resize(4, 8, 0, 0);
         refresh(&mut cache);
         assert_eq!(reads.get(), 4);
-        assert_eq!(cache.text, runtime.detection_text());
+        assert_eq!(cache.text(), runtime.detection_text());
         runtime.clear_screen().unwrap();
         refresh(&mut cache);
         assert_eq!(reads.get(), 5);
-        assert_eq!(cache.text, runtime.detection_text());
+        assert_eq!(cache.text(), runtime.detection_text());
         runtime.test_process_pty_bytes(b"\x1b[?1049halt");
         assert!(refresh(&mut cache));
         assert_eq!(reads.get(), 6);
-        assert_eq!(cache.text, runtime.detection_text());
+        assert_eq!(cache.text(), runtime.detection_text());
         assert!(!refresh(&mut cache));
         assert_eq!(reads.get(), 6);
         runtime.test_process_pty_bytes(b"\x1b[?1049l");
         assert!(refresh(&mut cache));
         assert_eq!(reads.get(), 7);
-        assert_eq!(cache.text, runtime.detection_text());
-        assert!(!cache.text.contains("alt"));
+        assert_eq!(cache.text(), runtime.detection_text());
+        assert!(!cache.text().contains("alt"));
         assert!(!refresh(&mut cache));
         assert_eq!(reads.get(), 7);
     }
@@ -6867,6 +6877,7 @@ mod tests {
             visible_idle: false,
             visible_blocker: false,
             visible_working: false,
+            working_from_title_only: false,
         };
         let mut last_ready = false;
         let prompt = "› Ask Codex to do anything";

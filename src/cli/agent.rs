@@ -162,6 +162,12 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
     } else {
         println!("rule: none");
     }
+    if explain["working_from_title_only"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        println!("title only: over an unchanged screen, a pane starts a turn on this working only after it persists");
+    }
     if let Some(reason) = explain["fallback_reason"].as_str() {
         println!("fallback_reason: {reason}");
     }

@@ -36,6 +36,12 @@ pub struct AgentDetection {
     /// activity is the normal working authority; this remains diagnostic
     /// metadata and for non-PTY fallback paths.
     pub visible_working: bool,
+    /// True when a working verdict rests on the terminal title alone, with no
+    /// rule on another region agreeing. Agents also animate their title for
+    /// work that is not a turn, such as booting a tool server, so over a
+    /// screen that has not changed this evidence must persist before it
+    /// starts a turn.
+    pub working_from_title_only: bool,
 }
 
 /// Which agent we detected running in a pane.
@@ -321,6 +327,7 @@ pub fn detect_agent_with_osc(
             visible_idle: false,
             visible_blocker: false,
             visible_working: false,
+            working_from_title_only: false,
         };
     };
     manifest::detect_with_osc(

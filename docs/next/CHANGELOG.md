@@ -135,6 +135,9 @@ This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature r
 ### Changed
 - `PaneInfo.agent_status_changed_at` now dates every change of a pane's reported status later than anything that pane reported before, so two changes inside one second (an agent finishing a turn and starting the next) no longer share a date, and a client that names transitions by their date can tell them apart. A burst of changes can run the date a few seconds ahead of the wall clock until the clock passes it. A live handoff carries the latest reported date (`agent_status_reported_through` in the session snapshot), so the new process dates after it; older servers ignore the field.
 
+### Fixed
+- A working state that only an agent's terminal title shows, over a screen that has not changed, no longer starts a turn until it has lasted 15 seconds. Codex spins its title while it boots a tool server, for example after refreshing its sign-in, with the screen unchanged; reporting that as working made the idle that followed read as a newly finished turn, so panes nobody had touched were reported done again with a fresh `agent_status_changed_at`. A turn that draws its working status or its answer on screen still reports working at once, and so does any other change to the screen text during the spin. `herdr agent explain` shows `working_from_title_only` for such a reading.
+
 ## [0.9.1] - 2026-09-16
 
 ### Added
