@@ -544,6 +544,40 @@ mod tests {
     }
 
     #[test]
+    fn agent_prompt_spec_includes_conditional_expectation_flags() {
+        let cmd = super::command();
+        let prompt = command_path(&cmd, &["agent", "prompt"]);
+        for option in [
+            "expect-terminal",
+            "expect-agent",
+            "expect-session",
+            "if-status",
+        ] {
+            assert!(
+                has_option(prompt, option),
+                "herdr agent prompt is missing --{option}"
+            );
+        }
+        assert_eq!(
+            option_values(prompt, "if-status"),
+            ["idle", "done", "blocked", "working"]
+        );
+
+        let help = long_help(&["agent", "prompt"]);
+        for flag in [
+            "--expect-terminal",
+            "--expect-agent",
+            "--expect-session",
+            "--if-status",
+        ] {
+            assert!(
+                help.contains(flag),
+                "herdr agent prompt --help is missing {flag}: {help}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_rename_requires_exactly_one_name_or_clear() {
         for valid in [
             &["herdr", "agent", "rename", "reviewer", "worker"][..],

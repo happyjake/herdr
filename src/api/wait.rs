@@ -194,6 +194,9 @@ pub(super) fn prompt_agent<T: ApiTransport>(
     };
 
     let wait_started = std::time::Instant::now();
+    let has_identity_expectations = params.expect_terminal.is_some()
+        || params.expect_agent.is_some()
+        || params.expect_session.is_some();
     let before_prompt = match agent_get_for_prompt(
         &request_id,
         &params.target,
@@ -201,15 +204,19 @@ pub(super) fn prompt_agent<T: ApiTransport>(
         wait.timeout_ms,
         wait_started,
     ) {
-        Ok(agent) => agent,
+        Ok(agent) => Some(agent),
+        Err(response) if has_identity_expectations && response.error.code == "agent_not_found" => {
+            None
+        }
         Err(response) => {
             return serde_json::to_string(&response)
                 .map(Some)
                 .map_err(std::io::Error::other);
         }
     };
-    let prompt_started_working =
-        before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
+    let prompt_started_working = before_prompt
+        .as_ref()
+        .is_some_and(|agent| agent.agent_status == crate::api::schema::AgentStatus::Working);
     let target = params.target.clone();
     if let Some(prompt_wait) = params.wait.as_mut() {
         prompt_wait.submission_deadline = wait
@@ -232,13 +239,15 @@ pub(super) fn prompt_agent<T: ApiTransport>(
     let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
         return Ok(Some(prompt_response));
     };
-    if !agent_wait_identity_matches(
-        &prompted,
-        &before_prompt.terminal_id,
-        before_prompt.name.as_deref().filter(|name| *name == target),
-        before_prompt.agent.as_deref(),
-    ) {
-        return agent_wait_not_running(request_id).map(Some);
+    if let Some(before_prompt) = before_prompt.as_ref() {
+        if !agent_wait_identity_matches(
+            &prompted,
+            &before_prompt.terminal_id,
+            before_prompt.name.as_deref().filter(|name| *name == target),
+            before_prompt.agent.as_deref(),
+        ) {
+            return agent_wait_not_running(request_id).map(Some);
+        }
     }
 
     let prompt_activity_observed = prompt_started_working

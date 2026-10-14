@@ -1,13 +1,9 @@
 use super::bindings::{self, Operation};
 use crate::api::schema::{Method, Request};
-use crate::cli::projection::{self, ParseError};
+use crate::cli::projection::ParseError;
 
 fn parse(args: &[&str]) -> Result<Operation, ParseError> {
-    projection::parse(
-        super::command(),
-        &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
-        bindings::from_matches,
-    )
+    bindings::parse(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
 }
 
 fn params(args: &[&str]) -> serde_json::Value {

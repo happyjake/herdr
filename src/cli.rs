@@ -778,7 +778,7 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
 
 pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Value> {
     let client = target::api_client()?;
-    ensure_server_protocol_compatible(&client, &request.id)?;
+    ensure_server_protocol_compatible(&client, request)?;
     client
         .request_value(request)
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
@@ -791,14 +791,23 @@ pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde
         .map_err(|err| map_server_not_running_or_io(err, &request.id, &client))
 }
 
-fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> std::io::Result<()> {
+fn ensure_server_protocol_compatible(client: &ApiClient, request: &Request) -> std::io::Result<()> {
     let status = target::server_status(client)
-        .map_err(|err| map_server_not_running_or_io(err, request_id, client))?;
+        .map_err(|err| map_server_not_running_or_io(err, &request.id, client))?;
     let server_protocol = status
         .protocol
         .ok_or_else(|| std::io::Error::other("server ping did not include a protocol version"))?;
+    let restart_guidance = target::restart_guidance();
     let Some(response) =
-        protocol_guard::mismatch_response(request_id, server_protocol, &target::restart_guidance())
+        protocol_guard::mismatch_response(&request.id, server_protocol, &restart_guidance).or_else(
+            || {
+                protocol_guard::missing_capability_response(
+                    request,
+                    status.capabilities.as_ref(),
+                    &restart_guidance,
+                )
+            },
+        )
     else {
         return Ok(());
     };

@@ -73,9 +73,11 @@ pub(crate) struct PtyIoActorConfig {
 enum PtyIoDataCommand {
     WriteUserInput(Bytes),
     SubmitUserInput {
+        prefix: Bytes,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+        guard: Option<super::PtySubmissionGuard>,
         reply: std_mpsc::Sender<std::io::Result<()>>,
     },
 }
@@ -146,9 +148,11 @@ impl PtyIoActorHandle {
 
     pub(crate) fn queue_user_input_submission(
         &self,
+        prefix: Bytes,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+        guard: Option<super::PtySubmissionGuard>,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
@@ -163,9 +167,11 @@ impl PtyIoActorHandle {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.data_tx
             .try_send(PtyIoDataCommand::SubmitUserInput {
+                prefix,
                 text,
                 enter,
                 delay,
+                guard,
                 reply: reply_tx,
             })
             .map_err(|err| match err {
@@ -462,9 +468,23 @@ enum SubmissionBoundary {
 }
 
 enum SubmissionPhase {
-    WritingText,
+    PendingDelivery {
+        prefix: Bytes,
+        text: Bytes,
+        guard: Option<super::PtySubmissionGuard>,
+    },
+    WritingText {
+        uncommitted_guard: Option<super::PtySubmissionGuard>,
+    },
     WaitingUntil(Instant),
     WritingEnter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingSubmissionStart {
+    NoChange,
+    Started,
+    Rejected,
 }
 
 impl PtyIoActorRunner {
@@ -486,6 +506,57 @@ impl PtyIoActorRunner {
         }
     }
 
+    fn start_pending_submission_delivery(&mut self) -> PendingSubmissionStart {
+        if !self.pending_writes.is_empty() {
+            return PendingSubmissionStart::NoChange;
+        }
+        let Some(mut submission) = self.active_submission.take() else {
+            return PendingSubmissionStart::NoChange;
+        };
+        let SubmissionPhase::PendingDelivery {
+            prefix,
+            text,
+            mut guard,
+        } = submission.phase
+        else {
+            self.active_submission = Some(submission);
+            return PendingSubmissionStart::NoChange;
+        };
+        let phase = match (prefix.is_empty(), text.is_empty()) {
+            (true, true) => {
+                if let Some(guard) = guard.as_mut() {
+                    if let Err(err) = guard() {
+                        let _ = submission.reply.send(Err(err));
+                        return PendingSubmissionStart::Rejected;
+                    }
+                }
+                SubmissionPhase::WaitingUntil(Instant::now() + submission.delay)
+            }
+            (false, true) => {
+                self.enqueue_submission_write(prefix, SubmissionBoundary::Text);
+                SubmissionPhase::WritingText {
+                    uncommitted_guard: guard,
+                }
+            }
+            (true, false) => {
+                self.enqueue_submission_write(text, SubmissionBoundary::Text);
+                SubmissionPhase::WritingText {
+                    uncommitted_guard: guard,
+                }
+            }
+            (false, false) => {
+                self.enqueue_write(prefix);
+                self.enqueue_submission_write(text, SubmissionBoundary::Text);
+                SubmissionPhase::WritingText {
+                    uncommitted_guard: guard,
+                }
+            }
+        };
+        submission.phase = phase;
+        self.active_submission = Some(submission);
+        PendingSubmissionStart::Started
+    }
+
     fn run(&mut self) {
         let mut should_exit = false;
         while !should_exit {
@@ -493,8 +564,13 @@ impl PtyIoActorRunner {
             if should_exit || self.state == ActorState::Released {
                 break;
             }
+            let had_active_submission = self.active_submission.is_some();
 
             self.apply_pending_controls();
+
+            if self.start_pending_submission_delivery() == PendingSubmissionStart::Rejected {
+                continue;
+            }
 
             if !self.pending_writes.is_empty() {
                 match self.flush_pending_writes_once() {
@@ -506,8 +582,13 @@ impl PtyIoActorRunner {
                     }
                 }
             }
+            if self.start_pending_submission_delivery() != PendingSubmissionStart::NoChange {
+                continue;
+            }
             self.schedule_submission_enter();
-            if self.active_submission.is_none() && self.pending_handoff.is_some() {
+            if (had_active_submission && self.active_submission.is_none())
+                || (self.active_submission.is_none() && self.pending_handoff.is_some())
+            {
                 continue;
             }
 
@@ -626,22 +707,22 @@ impl PtyIoActorRunner {
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
+                prefix,
                 text,
                 enter,
                 delay,
+                guard,
                 reply,
             } => {
                 if self.state == ActorState::Running {
-                    let phase = if text.is_empty() {
-                        SubmissionPhase::WaitingUntil(Instant::now() + delay)
-                    } else {
-                        self.enqueue_submission_write(text, SubmissionBoundary::Text);
-                        SubmissionPhase::WritingText
-                    };
                     self.active_submission = Some(ActiveSubmission {
                         enter,
                         delay,
-                        phase,
+                        phase: SubmissionPhase::PendingDelivery {
+                            prefix,
+                            text,
+                            guard,
+                        },
                         reply,
                     });
                 } else {
@@ -843,7 +924,12 @@ impl PtyIoActorRunner {
                 let Some(submission) = self.active_submission.as_mut() else {
                     return;
                 };
-                debug_assert!(matches!(submission.phase, SubmissionPhase::WritingText));
+                debug_assert!(matches!(
+                    submission.phase,
+                    SubmissionPhase::WritingText {
+                        uncommitted_guard: None
+                    }
+                ));
                 submission.phase = SubmissionPhase::WaitingUntil(Instant::now() + submission.delay);
             }
             SubmissionBoundary::Enter => {
@@ -898,6 +984,43 @@ impl PtyIoActorRunner {
         }
     }
 
+    fn check_uncommitted_submission_guard(&mut self) -> bool {
+        let Some(ActiveSubmission {
+            phase:
+                SubmissionPhase::WritingText {
+                    uncommitted_guard: Some(guard),
+                },
+            ..
+        }) = self.active_submission.as_mut()
+        else {
+            return true;
+        };
+        debug_assert_eq!(self.current_write_offset, 0);
+        match guard() {
+            Ok(()) => true,
+            Err(err) => {
+                while let Some(write) = self.pending_writes.pop_front() {
+                    if write.boundary == Some(SubmissionBoundary::Text) {
+                        break;
+                    }
+                }
+                self.current_write_offset = 0;
+                self.fail_active_submission(err);
+                false
+            }
+        }
+    }
+
+    fn commit_active_submission_write(&mut self) {
+        if let Some(ActiveSubmission {
+            phase: SubmissionPhase::WritingText { uncommitted_guard },
+            ..
+        }) = self.active_submission.as_mut()
+        {
+            *uncommitted_guard = None;
+        }
+    }
+
     fn close_input_queue(&mut self) {
         self.data_rx.close();
         self.fail_active_submission(input_submission_closed_error());
@@ -909,9 +1032,16 @@ impl PtyIoActorRunner {
     }
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
-        while let Some(write) = self.pending_writes.front() {
-            let chunk = &write.bytes[self.current_write_offset..];
-            match self.file.as_ref().write(chunk) {
+        while !self.pending_writes.is_empty() {
+            if !self.check_uncommitted_submission_guard() {
+                continue;
+            }
+            let (write_len, write_result) = {
+                let write = self.pending_writes.front().unwrap();
+                let chunk = &write.bytes[self.current_write_offset..];
+                (write.bytes.len(), self.file.as_ref().write(chunk))
+            };
+            match write_result {
                 Ok(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -919,8 +1049,9 @@ impl PtyIoActorRunner {
                     ));
                 }
                 Ok(written) => {
+                    self.commit_active_submission_write();
                     self.current_write_offset += written;
-                    if self.current_write_offset >= write.bytes.len() {
+                    if self.current_write_offset >= write_len {
                         let completed = self.pending_writes.pop_front().unwrap();
                         self.current_write_offset = 0;
                         if let Some(boundary) = completed.boundary {
@@ -1111,7 +1242,7 @@ mod tests {
         });
 
         let completion = handle
-            .queue_user_input_submission(text, Bytes::from_static(b"\r"), delay)
+            .queue_user_input_submission(Bytes::new(), text, Bytes::from_static(b"\r"), delay, None)
             .expect("submission queues");
         handle
             .try_write_user_input(Bytes::from_static(b"user"))
@@ -1127,9 +1258,11 @@ mod tests {
         assert!(enter_received.duration_since(prompt_completed) >= delay / 2);
 
         let err = match handle.queue_user_input_submission(
+            Bytes::new(),
             Bytes::from_static(b"prompt"),
             Bytes::from_static(b"\r"),
             Duration::ZERO,
+            None,
         ) {
             Ok(completion) => completion
                 .recv()
@@ -1153,7 +1286,13 @@ mod tests {
             .expect("peer timeout");
 
         let completion = handle
-            .queue_user_input_submission(Bytes::new(), Bytes::from_static(b"\r"), Duration::ZERO)
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::new(),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
             .expect("empty prompt submission queues");
         let mut enter = [0; 1];
         peer.read_exact(&mut enter)
@@ -1166,9 +1305,11 @@ mod tests {
 
         let completion = handle
             .queue_user_input_submission(
+                Bytes::new(),
                 Bytes::from_static(b"prompt"),
                 Bytes::new(),
                 Duration::from_millis(40),
+                None,
             )
             .expect("empty enter submission queues");
         let handoff_handle = handle.clone();
@@ -1194,9 +1335,11 @@ mod tests {
         let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
         let completion = handle
             .queue_user_input_submission(
+                Bytes::new(),
                 Bytes::from_static(b"prompt"),
                 Bytes::from_static(b"\r"),
                 Duration::from_secs(1),
+                None,
             )
             .expect("submission queues");
         let mut prompt = [0; 6];
@@ -1215,18 +1358,22 @@ mod tests {
         let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
         let active = handle
             .queue_user_input_submission(
+                Bytes::new(),
                 Bytes::from_static(b"first"),
                 Bytes::from_static(b"\r"),
                 Duration::from_secs(1),
+                None,
             )
             .expect("first submission queues");
         let mut prompt = [0; 5];
         peer.read_exact(&mut prompt).expect("peer receives prompt");
         let buffered = handle
             .queue_user_input_submission(
+                Bytes::new(),
                 Bytes::from_static(b"second"),
                 Bytes::from_static(b"\r"),
                 Duration::ZERO,
+                None,
             )
             .expect("second submission queues");
 
@@ -1242,6 +1389,398 @@ mod tests {
 
         assert_eq!(active_err.kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(buffered_err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn actor_evaluates_submission_guard_at_deferred_delivery_boundary() {
+        let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+
+        let first = handle
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::from_static(b"first"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(80),
+                None,
+            )
+            .expect("first submission queues");
+
+        let allow_second = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let guard_flag = Arc::clone(&allow_second);
+        let second = handle
+            .queue_user_input_submission(
+                Bytes::from_static(b"\x1b[I"),
+                Bytes::from_static(b"second"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(80),
+                Some(Box::new(move || {
+                    if guard_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(super::super::submission_rejected_error(
+                            r#"{"id":"req","error":{"code":"agent_busy","message":"busy"}}"#.into(),
+                        ))
+                    }
+                })),
+            )
+            .expect("second submission queues while first is in flight");
+
+        // Flip the condition while the first submission is still holding the actor.
+        allow_second.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let third = handle
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::from_static(b"third"),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
+            .expect("third submission queues behind second");
+
+        first
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first submission reports")
+            .expect("first submission succeeds");
+        let second_err = second
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second submission reports")
+            .expect_err("second submission is rejected by guard");
+        assert!(super::super::submission_rejected_response(&second_err)
+            .unwrap()
+            .contains("agent_busy"));
+        third
+            .recv_timeout(Duration::from_secs(1))
+            .expect("third submission reports")
+            .expect("third submission succeeds");
+
+        let mut received = [0u8; 12];
+        peer.read_exact(&mut received)
+            .expect("peer receives only first and third submissions");
+        assert_eq!(&received, b"first\rthird\r");
+        handle.shutdown();
+    }
+
+    #[test]
+    fn actor_revalidates_submission_guard_after_initial_write_would_block() {
+        let (mut actor_socket, mut peer) = UnixStream::pair().expect("socket pair");
+        actor_socket
+            .set_nonblocking(true)
+            .expect("actor socket nonblocking");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+
+        let fill = [0xAA; 8192];
+        let mut prefilled = 0;
+        loop {
+            match actor_socket.write(&fill) {
+                Ok(written) => prefilled += written,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("failed to fill actor write buffer: {err}"),
+            }
+        }
+        assert!(prefilled > 0, "actor write buffer should accept some bytes");
+
+        let owned = unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) };
+        let (poll_tx, poll_rx) = std_mpsc::channel();
+        let handle = PtyIoActor::spawn_with_poll_observer(
+            PtyIoActorConfig {
+                pane_id: 1,
+                master_fd: owned,
+                initially_quiesced: false,
+                on_read: Box::new(|_| PtyReadResult::empty()),
+                on_reader_exit: None,
+            },
+            poll_tx,
+        )
+        .expect("actor spawn");
+
+        poll_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("actor entered initial poll");
+
+        let allow = Arc::new(AtomicBool::new(true));
+        let guard_allow = Arc::clone(&allow);
+        let guard_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard_calls_counter = Arc::clone(&guard_calls);
+        let (guard_entered_tx, guard_entered_rx) = std_mpsc::channel();
+        let guarded = handle
+            .queue_user_input_submission(
+                Bytes::from_static(b"\x1b[I"),
+                Bytes::from_static(b"guarded"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(20),
+                Some(Box::new(move || {
+                    guard_calls_counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = guard_entered_tx.send(());
+                    if guard_allow.load(Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(super::super::submission_rejected_error(
+                            r#"{"id":"req","error":{"code":"agent_busy","message":"busy"}}"#.into(),
+                        ))
+                    }
+                })),
+            )
+            .expect("guarded submission queues");
+
+        guard_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("guard runs on initial write attempt");
+        poll_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("actor returns to poll after initial WouldBlock");
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+
+        allow.store(false, Ordering::SeqCst);
+
+        let mut drained = vec![0u8; prefilled];
+        peer.read_exact(&mut drained)
+            .expect("peer drains prefill buffer");
+        assert!(drained.iter().all(|byte| *byte == 0xAA));
+
+        let err = guarded
+            .recv_timeout(Duration::from_secs(1))
+            .expect("guarded submission reports")
+            .expect_err("guarded submission is rejected after initial WouldBlock");
+        assert!(super::super::submission_rejected_response(&err)
+            .unwrap()
+            .contains("agent_busy"));
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 2);
+
+        let sentinel = handle
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::from_static(b"sentinel"),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
+            .expect("sentinel submission queues after guarded rejection");
+        sentinel
+            .recv_timeout(Duration::from_secs(1))
+            .expect("sentinel submission reports")
+            .expect("sentinel submission completes");
+
+        let mut after_drain = [0u8; 9];
+        peer.read_exact(&mut after_drain)
+            .expect("peer receives only sentinel submission");
+        assert_eq!(&after_drain, b"sentinel\r");
+        handle.shutdown();
+    }
+
+    #[test]
+    fn actor_delivers_guarded_submission_when_condition_still_holds_after_initial_would_block() {
+        let (mut actor_socket, mut peer) = UnixStream::pair().expect("socket pair");
+        actor_socket
+            .set_nonblocking(true)
+            .expect("actor socket nonblocking");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+
+        let fill = [0xAA; 8192];
+        let mut prefilled = 0;
+        loop {
+            match actor_socket.write(&fill) {
+                Ok(written) => prefilled += written,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("failed to fill actor write buffer: {err}"),
+            }
+        }
+        assert!(prefilled > 0, "actor write buffer should accept some bytes");
+
+        let owned = unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) };
+        let (poll_tx, poll_rx) = std_mpsc::channel();
+        let handle = PtyIoActor::spawn_with_poll_observer(
+            PtyIoActorConfig {
+                pane_id: 1,
+                master_fd: owned,
+                initially_quiesced: false,
+                on_read: Box::new(|_| PtyReadResult::empty()),
+                on_reader_exit: None,
+            },
+            poll_tx,
+        )
+        .expect("actor spawn");
+
+        poll_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("actor entered initial poll");
+
+        let allow = Arc::new(AtomicBool::new(true));
+        let guard_allow = Arc::clone(&allow);
+        let guard_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard_calls_counter = Arc::clone(&guard_calls);
+        let (guard_entered_tx, guard_entered_rx) = std_mpsc::channel();
+        let guarded = handle
+            .queue_user_input_submission(
+                Bytes::from_static(b"\x1b[I"),
+                Bytes::from_static(b"guarded"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(60),
+                Some(Box::new(move || {
+                    guard_calls_counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = guard_entered_tx.send(());
+                    if guard_allow.load(Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(super::super::submission_rejected_error(
+                            r#"{"id":"req","error":{"code":"agent_busy","message":"busy"}}"#.into(),
+                        ))
+                    }
+                })),
+            )
+            .expect("guarded submission queues");
+
+        guard_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("guard runs on initial write attempt");
+        poll_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("actor returns to poll after initial WouldBlock");
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 1);
+
+        let mut drained = vec![0u8; prefilled];
+        peer.read_exact(&mut drained)
+            .expect("peer drains prefill buffer");
+        assert!(drained.iter().all(|byte| *byte == 0xAA));
+
+        let mut prefix_and_text = [0u8; 10];
+        peer.read_exact(&mut prefix_and_text)
+            .expect("peer receives prefix and text once socket drains");
+        assert_eq!(&prefix_and_text, b"\x1b[Iguarded");
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 2);
+
+        // Once the first byte has been written, the submission is committed and
+        // flipping the guard condition must not abort the remaining bytes or Enter.
+        allow.store(false, Ordering::SeqCst);
+
+        let mut enter = [0u8; 1];
+        peer.read_exact(&mut enter)
+            .expect("peer receives delayed enter for committed submission");
+        assert_eq!(&enter, b"\r");
+
+        guarded
+            .recv_timeout(Duration::from_secs(1))
+            .expect("guarded submission reports")
+            .expect("guarded submission completes once committed");
+        assert_eq!(guard_calls.load(Ordering::SeqCst), 2);
+
+        let unguarded = handle
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::from_static(b"unguarded"),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
+            .expect("unguarded submission queues");
+        unguarded
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unguarded submission reports")
+            .expect("unguarded submission completes");
+
+        let mut unguarded_bytes = [0u8; 10];
+        peer.read_exact(&mut unguarded_bytes)
+            .expect("peer receives unguarded submission");
+        assert_eq!(&unguarded_bytes, b"unguarded\r");
+        handle.shutdown();
+    }
+
+    #[test]
+    fn actor_finishes_a_guarded_prompt_after_a_partial_write_commits() {
+        let (actor_socket, mut peer) = UnixStream::pair().expect("socket pair");
+        actor_socket
+            .set_nonblocking(true)
+            .expect("actor socket nonblocking");
+        let send_buffer: libc::c_int = 4096;
+        // SAFETY: the socket is owned here and the option points to a live integer.
+        let configured = unsafe {
+            libc::setsockopt(
+                actor_socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&send_buffer as *const libc::c_int).cast(),
+                std::mem::size_of_val(&send_buffer) as libc::socklen_t,
+            )
+        };
+        assert_eq!(configured, 0, "set bounded socket buffer");
+        let mut actual_buffer: libc::c_int = 0;
+        let mut option_len = std::mem::size_of_val(&actual_buffer) as libc::socklen_t;
+        // SAFETY: both output pointers are writable and have the declared sizes.
+        let queried = unsafe {
+            libc::getsockopt(
+                actor_socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&mut actual_buffer as *mut libc::c_int).cast(),
+                &mut option_len,
+            )
+        };
+        assert_eq!(queried, 0, "read bounded socket buffer");
+        assert!(actual_buffer > 0 && actual_buffer < 1024 * 1024);
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer timeout");
+        // SAFETY: into_raw_fd transfers the descriptor's sole ownership.
+        let owned = unsafe { OwnedFd::from_raw_fd(actor_socket.into_raw_fd()) };
+        let (poll_tx, _poll_rx) = std_mpsc::channel();
+        let handle = PtyIoActor::spawn_with_poll_observer(
+            PtyIoActorConfig {
+                pane_id: 1,
+                master_fd: owned,
+                initially_quiesced: false,
+                on_read: Box::new(|_| PtyReadResult::empty()),
+                on_reader_exit: None,
+            },
+            poll_tx,
+        )
+        .expect("actor spawn");
+        let allow = Arc::new(AtomicBool::new(true));
+        let guard_allow = Arc::clone(&allow);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard_calls = Arc::clone(&calls);
+        const TEXT_LEN: usize = 2 * 1024 * 1024;
+        let completion = handle
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::from(vec![b'x'; TEXT_LEN]),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                Some(Box::new(move || {
+                    guard_calls.fetch_add(1, Ordering::SeqCst);
+                    if guard_allow.load(Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(super::super::submission_rejected_error(
+                            r#"{"id":"partial","error":{"code":"agent_busy","message":"changed"}}"#
+                                .into(),
+                        ))
+                    }
+                })),
+            )
+            .expect("guarded prompt queues");
+
+        let mut first = [0];
+        peer.read_exact(&mut first)
+            .expect("first prompt byte commits");
+        assert_eq!(first, [b'x']);
+        let calls_at_commit = calls.load(Ordering::SeqCst);
+        assert!(calls_at_commit > 0, "the delivery guard must have run");
+        allow.store(false, Ordering::SeqCst);
+
+        let mut remainder = vec![0; TEXT_LEN];
+        peer.read_exact(&mut remainder)
+            .expect("a committed partial prompt must finish with Enter");
+        assert!(remainder[..TEXT_LEN - 1].iter().all(|byte| *byte == b'x'));
+        assert_eq!(remainder[TEXT_LEN - 1], b'\r');
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("submission reports")
+            .expect("committed submission completes");
+        assert_eq!(calls.load(Ordering::SeqCst), calls_at_commit);
+        handle.shutdown();
     }
 
     #[test]
@@ -1268,9 +1807,11 @@ mod tests {
                         .expect("actor handle installed")
                         .clone();
                     let attempt = handle.queue_user_input_submission(
+                        Bytes::new(),
                         Bytes::from_static(b"prompt"),
                         Bytes::from_static(b"\r"),
                         Duration::ZERO,
+                        None,
                     );
                     attempt_tx.send(attempt).expect("attempt receiver alive");
                 }
@@ -1361,7 +1902,13 @@ mod tests {
 
         let marker = Bytes::from_static(b"queued-input");
         let completion = handle
-            .queue_user_input_submission(marker.clone(), Bytes::from_static(b"\r"), Duration::ZERO)
+            .queue_user_input_submission(
+                Bytes::new(),
+                marker.clone(),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
             .expect("submission accepted");
 
         const OUTPUT_LEN: usize = 128 * 1024;

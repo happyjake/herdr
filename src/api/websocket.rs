@@ -390,54 +390,41 @@ pub fn start_websocket_server_with_capabilities(
     // rotation of that one credential without any further plumbing.
     credentials.attach_managing_token(token.clone());
 
-    let thread = std::thread::spawn(move || {
-        loop {
-            if !listener_running.load(Ordering::Relaxed) {
-                break;
-            }
-            match listener.accept() {
-                Ok((stream, peer)) => {
-                    let api_tx = api_tx.clone();
-                    let event_hub = event_hub.clone();
-                    let capabilities = capabilities.clone();
-                    let server_name = server_name.clone();
-                    let server_reach = server_reach.clone();
-                    let advertised_endpoint = advertised_endpoint.clone();
-                    let connection_running = Arc::clone(&listener_running);
-                    let credentials = credentials.clone();
-                    std::thread::spawn(move || {
-                        if let Err(err) = handle_ws_connection(
-                            stream,
-                            &credentials,
-                            &api_tx,
-                            &event_hub,
-                            &connection_running,
-                            capabilities,
-                            &server_name,
-                            &server_reach,
-                            &advertised_endpoint,
-                        ) {
-                            warn!(peer = %peer, err = %err, "websocket api connection failed");
-                        }
-                    });
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    wait_for_connection(&listener, CONNECTION_POLL_INTERVAL);
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(err) => {
-                    error!(err = %err, "websocket api listener accept failed");
-                    break;
-                }
-            }
-        }
+    let thread = crate::thread_spawn::spawn_named("herdr-ws-accept", move || {
+        run_accept_loop(
+            || listener.accept(),
+            &listener_running,
+            || wait_for_connection(&listener, CONNECTION_POLL_INTERVAL),
+            Duration::from_millis(50),
+            |(stream, peer)| {
+                let api_tx = api_tx.clone();
+                let event_hub = event_hub.clone();
+                let capabilities = capabilities.clone();
+                let server_name = server_name.clone();
+                let server_reach = server_reach.clone();
+                let advertised_endpoint = advertised_endpoint.clone();
+                let connection_running = Arc::clone(&listener_running);
+                let credentials = credentials.clone();
+                crate::thread_spawn::spawn_named("herdr-ws-conn", move || {
+                    if let Err(err) = handle_ws_connection(
+                        stream,
+                        &credentials,
+                        &api_tx,
+                        &event_hub,
+                        &connection_running,
+                        capabilities,
+                        &server_name,
+                        &server_reach,
+                        &advertised_endpoint,
+                    ) {
+                        warn!(peer = %peer, err = %err, "websocket api connection failed");
+                    }
+                })
+                .map(drop)
+            },
+        );
         debug!("websocket api server thread exiting");
-    });
+    })?;
 
     let handle = WebSocketServerHandle {
         thread: Some(thread),
@@ -447,6 +434,58 @@ pub fn start_websocket_server_with_capabilities(
     };
     info!(addr = %handle.local_addr(), "websocket api server listening");
     Ok(Some(handle))
+}
+
+/// Keeps ownership of the listener through transient accept and worker-spawn
+/// failures. Normal idle polling remains socket-driven; error retries are bounded
+/// to one short sleep so dropping the server handle can still join promptly.
+fn run_accept_loop<S>(
+    mut accept: impl FnMut() -> io::Result<S>,
+    running: &AtomicBool,
+    mut wait: impl FnMut(),
+    error_backoff: Duration,
+    mut handle: impl FnMut(S) -> io::Result<()>,
+) {
+    let mut consecutive_errors = 0_u64;
+    while running.load(Ordering::Relaxed) {
+        let result = match accept() {
+            Ok(stream) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                handle(stream)
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                wait();
+                continue;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(()) => {
+                if consecutive_errors > 0 {
+                    info!(consecutive_errors, "websocket api listener recovered");
+                    consecutive_errors = 0;
+                }
+            }
+            Err(err) => {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                if consecutive_errors == 0 {
+                    error!(err = %err, "websocket api accept or worker spawn failed; retrying");
+                }
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                std::thread::sleep(error_backoff);
+            }
+        }
+    }
 }
 
 /// Wait until the listener has a connection ready to accept, or until
@@ -1870,6 +1909,125 @@ mod tests {
     }
 
     #[test]
+    fn accept_loop_recovers_from_errors_and_keeps_idle_polling() {
+        let running = AtomicBool::new(true);
+        let mut outcomes = [
+            Err(io::Error::other("accept resource failure")),
+            Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted")),
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "idle")),
+            Err(io::Error::new(io::ErrorKind::ConnectionAborted, "aborted")),
+            Ok(7),
+        ]
+        .into_iter();
+        let mut handled = Vec::new();
+        let mut waits = 0;
+        run_accept_loop(
+            || outcomes.next().expect("loop must stop after recovery"),
+            &running,
+            || waits += 1,
+            Duration::ZERO,
+            |value| {
+                handled.push(value);
+                running.store(false, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        assert_eq!(handled, [7]);
+        assert_eq!(waits, 1);
+    }
+
+    #[test]
+    fn accept_loop_stops_during_repeated_errors() {
+        let running = AtomicBool::new(true);
+        let mut attempts = 0;
+        run_accept_loop::<()>(
+            || {
+                attempts += 1;
+                if attempts == 3 {
+                    running.store(false, Ordering::Relaxed);
+                }
+                Err(io::Error::other("accept failure"))
+            },
+            &running,
+            || panic!("not idle"),
+            Duration::ZERO,
+            |_| panic!("no connection"),
+        );
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn accept_loop_drops_failed_worker_socket_and_serves_the_next_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut first = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut second = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        for client in [&first, &second] {
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+        }
+        let running = AtomicBool::new(true);
+        let mut accepted = 0;
+        let mut polls = 0;
+        crate::thread_spawn::test_hook::fail_next_spawns(1);
+        run_accept_loop(
+            || listener.accept(),
+            &running,
+            || {
+                polls += 1;
+                assert!(polls < 200);
+                wait_for_connection(&listener, Duration::from_millis(1));
+            },
+            Duration::ZERO,
+            |(mut stream, _)| {
+                accepted += 1;
+                let spawned = crate::thread_spawn::spawn_named("test-ws-worker", move || {
+                    stream.write_all(b"ok").unwrap()
+                });
+                if accepted == 2 {
+                    running.store(false, Ordering::Relaxed);
+                }
+                spawned.map(drop)
+            },
+        );
+        let mut bytes = [0; 2];
+        assert_eq!(
+            first.read(&mut bytes).unwrap(),
+            0,
+            "failed spawn drops its socket"
+        );
+        second.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"ok");
+    }
+
+    #[test]
+    fn accept_thread_spawn_failure_releases_the_bound_port() {
+        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let config = spec_config(Some(&address.to_string()), Some(TEST_TOKEN));
+        let (api_tx, _api_rx) = mpsc::unbounded_channel();
+        crate::thread_spawn::test_hook::fail_next_spawns(1);
+        let result = start_websocket_server_with_capabilities(
+            &config,
+            api_tx,
+            EventHub::default(),
+            test_registry(),
+            None,
+            crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string()),
+            crate::api::SharedServerReach::from_config(&config),
+            crate::api::SharedAdvertisedEndpoint::from_config(&config),
+        );
+        let Err(error) = result else {
+            panic!("injected spawn failure must be returned")
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let rebound = TcpListener::bind(address).expect("failed startup releases listener");
+        assert_eq!(rebound.local_addr().unwrap(), address);
+    }
+
+    #[test]
     fn start_returns_none_when_not_configured() {
         let (api_tx, _api_rx) = mpsc::unbounded_channel();
         let handle = start_websocket_server_with_capabilities(
@@ -2092,6 +2250,7 @@ mod tests {
             credential_registry: true,
             file_attachments: Some(crate::api::attachment::file_attachments_capability()),
             agent_report_cancelled: false,
+            agent_prompt_expectations: false,
         }));
         let mut websocket = connect_authorized(&server);
 

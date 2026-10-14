@@ -459,6 +459,7 @@ impl Workspace {
             if let Some(tab) = self.tabs.get_mut(idx) {
                 for pane in tab.panes.values_mut() {
                     pane.seen = true;
+                    pane.sync_delivery_snapshot();
                 }
             }
         }

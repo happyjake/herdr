@@ -81,6 +81,35 @@ impl App {
         })
     }
 
+    pub(crate) fn resolve_agent_prompt_target(
+        &self,
+        target: &str,
+        expect_terminal: Option<&str>,
+    ) -> Result<TerminalTarget, TerminalTargetError> {
+        if let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(target) {
+            if let Some(resolved) = self.terminal_target_for_pane(ws_idx, pane_id) {
+                return Ok(resolved);
+            }
+        }
+        match self.resolve_agent_target(target) {
+            Ok(resolved) => Ok(resolved),
+            Err(TerminalTargetError::NotFound { target }) => {
+                if let Some(expected_terminal) = expect_terminal {
+                    let terminal_matches: Vec<_> = self
+                        .terminal_targets()
+                        .into_iter()
+                        .filter(|candidate| candidate.terminal_id == expected_terminal)
+                        .collect();
+                    if let Some(resolved) = self.single_terminal_match(&target, terminal_matches)? {
+                        return Ok(resolved);
+                    }
+                }
+                Err(TerminalTargetError::NotFound { target })
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub(crate) fn resolve_agent_target(
         &self,
         target: &str,

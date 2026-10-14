@@ -1,3 +1,28 @@
+use std::fmt;
+
+pub(crate) type PtySubmissionGuard = Box<dyn FnMut() -> std::io::Result<()> + Send + 'static>;
+
+#[derive(Debug)]
+struct SubmissionRejected(String);
+
+impl fmt::Display for SubmissionRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SubmissionRejected {}
+
+pub(crate) fn submission_rejected_error(response: String) -> std::io::Error {
+    std::io::Error::other(SubmissionRejected(response))
+}
+
+pub(crate) fn submission_rejected_response(err: &std::io::Error) -> Option<&str> {
+    err.get_ref()
+        .and_then(|source| source.downcast_ref::<SubmissionRejected>())
+        .map(|rejected| rejected.0.as_str())
+}
+
 #[cfg(unix)]
 mod unix;
 
@@ -14,6 +39,8 @@ mod windows {
     use portable_pty::{MasterPty, PtySize};
     use tokio::sync::{mpsc, oneshot};
     use tracing::{debug, warn};
+
+    use super::PtySubmissionGuard;
 
     pub(crate) struct PtyReadResult {
         pub terminal_responses: Vec<Bytes>,
@@ -46,10 +73,12 @@ mod windows {
     enum PtyIoDataCommand {
         WriteUserInput(Bytes),
         SubmitUserInput {
+            prefix: Bytes,
             text: Bytes,
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
+            guard: Option<PtySubmissionGuard>,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
     }
@@ -57,7 +86,9 @@ mod windows {
     enum PtyIoWriteCommand {
         Write(Bytes),
         SubmissionPart {
+            prefix: Bytes,
             bytes: Bytes,
+            guard: Option<PtySubmissionGuard>,
             deadline: Option<Instant>,
             reply: oneshot::Sender<std::io::Result<()>>,
             enter_completion: Option<std_mpsc::Sender<()>>,
@@ -116,10 +147,12 @@ mod windows {
 
         pub(crate) fn queue_user_input_submission(
             &self,
+            prefix: Bytes,
             text: Bytes,
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
+            guard: Option<PtySubmissionGuard>,
         ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
             let accepting = self
                 .accepting
@@ -134,10 +167,12 @@ mod windows {
             let (reply_tx, reply_rx) = std_mpsc::channel();
             self.data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    prefix,
                     text,
                     enter,
                     delay,
                     deadline,
+                    guard,
                     reply: reply_tx,
                 })
                 .map_err(|err| match err {
@@ -315,19 +350,34 @@ mod windows {
             let result = match command {
                 PtyIoWriteCommand::Write(bytes) => write_and_flush(writer, &bytes),
                 PtyIoWriteCommand::SubmissionPart {
+                    prefix,
                     bytes,
+                    guard,
                     deadline,
                     reply,
                     enter_completion,
                 } => {
                     let result = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         Err(input_submission_timed_out())
+                    } else if let Some(mut guard) = guard {
+                        guard().and_then(|()| {
+                            if !prefix.is_empty() {
+                                write_and_flush(writer, &prefix)?;
+                            }
+                            write_and_flush(writer, &bytes)
+                        })
                     } else {
-                        write_and_flush(writer, &bytes)
+                        let prefix_result = if prefix.is_empty() {
+                            Ok(())
+                        } else {
+                            write_and_flush(writer, &prefix)
+                        };
+                        prefix_result.and_then(|()| write_and_flush(writer, &bytes))
                     };
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                    let failed = result.as_ref().is_err_and(|err| {
+                        err.kind() != std::io::ErrorKind::TimedOut
+                            && super::submission_rejected_response(err).is_none()
+                    });
                     // Wake synchronous shutdown directly; it may be blocking the executor
                     // worker that would otherwise receive the async acknowledgement.
                     drop(enter_completion);
@@ -357,10 +407,12 @@ mod windows {
                     }
                 }
                 PtyIoDataCommand::SubmitUserInput {
+                    prefix,
                     text,
                     enter,
                     delay,
                     deadline,
+                    guard,
                     reply,
                 } => {
                     let result = if deadline.is_some_and(|deadline| {
@@ -371,19 +423,36 @@ mod windows {
                         let text_deadline =
                             deadline.and_then(|deadline| deadline.checked_sub(delay));
                         async {
-                            write_submission_part(&write_tx, text, text_deadline, None).await?;
+                            write_submission_part(
+                                &write_tx,
+                                prefix,
+                                text,
+                                guard,
+                                text_deadline,
+                                None,
+                            )
+                            .await?;
                             // A started text write is committed. Finish Enter even if the caller
                             // stops waiting so a timeout cannot leave a partial prompt.
                             if !delay.is_zero() {
                                 tokio::time::sleep(delay).await;
                             }
-                            write_submission_part(&write_tx, enter, None, Some(&accepting)).await
+                            write_submission_part(
+                                &write_tx,
+                                Bytes::new(),
+                                enter,
+                                None,
+                                None,
+                                Some(&accepting),
+                            )
+                            .await
                         }
                         .await
                     };
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                    let failed = result.as_ref().is_err_and(|err| {
+                        err.kind() != std::io::ErrorKind::TimedOut
+                            && super::submission_rejected_response(err).is_none()
+                    });
                     let _ = reply.send(result);
                     if failed {
                         break;
@@ -395,7 +464,9 @@ mod windows {
 
     async fn write_submission_part(
         write_tx: &std_mpsc::Sender<PtyIoWriteCommand>,
+        prefix: Bytes,
         bytes: Bytes,
+        guard: Option<PtySubmissionGuard>,
         deadline: Option<Instant>,
         accepting: Option<&Arc<Mutex<InputAcceptance>>>,
     ) -> std::io::Result<()> {
@@ -418,7 +489,9 @@ mod windows {
             };
             write_tx
                 .send(PtyIoWriteCommand::SubmissionPart {
+                    prefix,
                     bytes,
+                    guard,
                     deadline,
                     reply,
                     enter_completion,
@@ -528,10 +601,12 @@ mod windows {
             let accepting = input_acceptance(true);
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    prefix: Bytes::new(),
                     text: Bytes::from_static(b"prompt"),
                     enter: Bytes::from_static(b"\r"),
                     delay,
                     deadline,
+                    guard: None,
                     reply: reply_tx,
                 })
                 .unwrap();
@@ -619,19 +694,23 @@ mod windows {
             let accepting = input_acceptance(true);
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    prefix: Bytes::new(),
                     text: Bytes::from_static(b"first"),
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::from_millis(30),
                     deadline: None,
+                    guard: None,
                     reply: first_reply_tx,
                 })
                 .unwrap();
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    prefix: Bytes::new(),
                     text: Bytes::from_static(b"expired"),
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::ZERO,
                     deadline: Some(Instant::now() + Duration::from_millis(10)),
+                    guard: None,
                     reply: expired_reply_tx,
                 })
                 .unwrap();
@@ -701,7 +780,9 @@ mod windows {
             drop(reply_rx);
             reply.send(Ok(())).unwrap();
             let PtyIoWriteCommand::SubmissionPart {
+                prefix,
                 bytes,
+                guard,
                 deadline,
                 reply,
                 enter_completion,
@@ -710,6 +791,11 @@ mod windows {
                 panic!("queued user input cannot overtake Enter");
             };
             assert_eq!(bytes, b"\r".as_slice());
+            assert!(prefix.is_empty());
+            assert!(
+                guard.is_none(),
+                "committed Enter must not recheck the guard"
+            );
             assert!(deadline.is_none(), "committed Enter cannot expire");
             assert!(
                 write_rx.try_recv().is_err(),
@@ -743,7 +829,9 @@ mod windows {
                 let input_task = runtime.spawn(async move {
                     write_submission_part(
                         &write_tx,
+                        Bytes::new(),
                         Bytes::from_static(b"\r"),
+                        None,
                         None,
                         Some(&input_accepting),
                     )
@@ -816,18 +904,30 @@ mod windows {
         async fn enter_rejects_quiesced_actor_and_failed_enqueue_releases_shutdown_wait() {
             let (write_tx, write_rx) = std_mpsc::channel();
             let accepting = input_acceptance(false);
-            let error =
-                write_submission_part(&write_tx, Bytes::from_static(b"\r"), None, Some(&accepting))
-                    .await
-                    .unwrap_err();
+            let error = write_submission_part(
+                &write_tx,
+                Bytes::new(),
+                Bytes::from_static(b"\r"),
+                None,
+                None,
+                Some(&accepting),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
             assert!(write_rx.try_recv().is_err());
             accepting.lock().unwrap().accepting = true;
             drop(write_rx);
-            let error =
-                write_submission_part(&write_tx, Bytes::from_static(b"\r"), None, Some(&accepting))
-                    .await
-                    .unwrap_err();
+            let error = write_submission_part(
+                &write_tx,
+                Bytes::new(),
+                Bytes::from_static(b"\r"),
+                None,
+                None,
+                Some(&accepting),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
             let completion = accepting.lock().unwrap().enter_completion.take().unwrap();
             assert!(matches!(

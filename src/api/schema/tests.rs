@@ -163,11 +163,19 @@ fn agent_start_and_prompt_requests_round_trip() {
         method: Method::AgentPrompt(AgentPromptParams {
             target: "reviewer".into(),
             text: "review this".into(),
+            expect_terminal: None,
+            expect_agent: None,
+            expect_session: None,
+            if_status: Vec::new(),
             wait: None,
         }),
     };
     let prompt_json = serde_json::to_value(&prompt).unwrap();
     assert_eq!(prompt_json["method"], "agent.prompt");
+    assert!(prompt_json["params"].get("expect_terminal").is_none());
+    assert!(prompt_json["params"].get("expect_agent").is_none());
+    assert!(prompt_json["params"].get("expect_session").is_none());
+    assert!(prompt_json["params"].get("if_status").is_none());
     assert_eq!(
         serde_json::from_value::<Request>(prompt_json).unwrap(),
         prompt
@@ -178,6 +186,10 @@ fn agent_start_and_prompt_requests_round_trip() {
         method: Method::AgentPrompt(AgentPromptParams {
             target: "reviewer".into(),
             text: "review this".into(),
+            expect_terminal: Some("term_1".into()),
+            expect_agent: Some("claude".into()),
+            expect_session: Some("sess-1".into()),
+            if_status: vec![AgentStatus::Idle, AgentStatus::Done],
             wait: Some(AgentPromptWaitOptions {
                 until: vec![AgentStatus::Idle, AgentStatus::Done],
                 timeout_ms: Some(120_000),
@@ -186,6 +198,13 @@ fn agent_start_and_prompt_requests_round_trip() {
         }),
     };
     let prompt_and_wait_json = serde_json::to_value(&prompt_and_wait).unwrap();
+    assert_eq!(prompt_and_wait_json["params"]["expect_terminal"], "term_1");
+    assert_eq!(prompt_and_wait_json["params"]["expect_agent"], "claude");
+    assert_eq!(prompt_and_wait_json["params"]["expect_session"], "sess-1");
+    assert_eq!(
+        prompt_and_wait_json["params"]["if_status"],
+        serde_json::json!(["idle", "done"])
+    );
     assert_eq!(
         prompt_and_wait_json["params"]["wait"]["until"],
         serde_json::json!(["idle", "done"])
@@ -1468,6 +1487,28 @@ fn server_advertises_cancelled_agent_reports() {
 }
 
 #[test]
+fn server_advertises_agent_prompt_expectations() {
+    assert!(crate::api::server_capabilities().agent_prompt_expectations);
+    let predating: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+    assert!(!predating.agent_prompt_expectations);
+}
+
+#[test]
+fn agent_prompt_rejects_unknown_fields() {
+    let err = serde_json::from_value::<Request>(serde_json::json!({
+        "id": "req_1",
+        "method": "agent.prompt",
+        "params": {
+            "target": "w1:p1",
+            "text": "hello",
+            "expect_term": "term_1"
+        }
+    }))
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
 fn success_response_round_trips() {
     let response = SuccessResponse {
         id: "req_1".into(),
@@ -1489,6 +1530,7 @@ fn success_response_round_trips() {
                     chunk_bytes: 783_360,
                 }),
                 agent_report_cancelled: false,
+                agent_prompt_expectations: true,
             }),
             name: Some("home-box".into()),
             reach: Some("home-box".into()),

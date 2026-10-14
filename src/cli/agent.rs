@@ -36,11 +36,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         }
         _ => args,
     };
-    let operation = match super::projection::parse(
-        command().bin_name("herdr agent"),
-        args,
-        bindings::from_matches,
-    ) {
+    let operation = match bindings::parse(args) {
         Ok(operation) => operation,
         Err(ParseError::Clap(error)) => return super::print_clap_error(&error),
         Err(ParseError::Usage(message)) => {
@@ -619,4 +615,128 @@ fn agent_read(params: AgentReadParams) -> std::io::Result<i32> {
         method: Method::AgentRead(params),
     })?;
     super::print_read_response(&response)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::schema::AgentStatus;
+
+    fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, i32> {
+        let mut argv = vec!["prompt".to_owned()];
+        argv.extend_from_slice(args);
+        match bindings::parse(&argv) {
+            Ok(bindings::Operation::Prompt(params)) => Ok(params),
+            _ => Err(2),
+        }
+    }
+
+    fn vec_str(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_agent_prompt_args_accepts_conditional_flags_before_and_after_text() {
+        let after = parse_agent_prompt_args(&vec_str(&[
+            "w1:p1",
+            "review this",
+            "--expect-terminal",
+            "term_1",
+            "--expect-agent",
+            "claude",
+            "--expect-session",
+            "sess-abc",
+            "--if-status",
+            "idle,done",
+        ]))
+        .unwrap();
+        assert_eq!(after.target, "w1:p1");
+        assert_eq!(after.text, "review this");
+        assert_eq!(after.expect_terminal.as_deref(), Some("term_1"));
+        assert_eq!(after.expect_agent.as_deref(), Some("claude"));
+        assert_eq!(after.expect_session.as_deref(), Some("sess-abc"));
+        assert_eq!(after.if_status, vec![AgentStatus::Idle, AgentStatus::Done]);
+        assert_eq!(after.wait, None);
+
+        let before = parse_agent_prompt_args(&vec_str(&[
+            "w1:p1",
+            "--expect-terminal=term_1",
+            "--expect-agent=pi",
+            "--expect-session=sess-xyz",
+            "--if-status=idle,blocked,working",
+            "follow up",
+        ]))
+        .unwrap();
+        assert_eq!(before.target, "w1:p1");
+        assert_eq!(before.text, "follow up");
+        assert_eq!(before.expect_terminal.as_deref(), Some("term_1"));
+        assert_eq!(before.expect_agent.as_deref(), Some("pi"));
+        assert_eq!(before.expect_session.as_deref(), Some("sess-xyz"));
+        assert_eq!(
+            before.if_status,
+            vec![
+                AgentStatus::Idle,
+                AgentStatus::Blocked,
+                AgentStatus::Working
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_agent_prompt_args_preserves_legacy_positional_literal_text_and_validates_if_status() {
+        let literal = parse_agent_prompt_args(&vec_str(&["main", "--wait"])).unwrap();
+        assert_eq!(literal.target, "main");
+        assert_eq!(literal.text, "--wait");
+        assert_eq!(literal.wait, None);
+
+        let literal_wait_and_wait =
+            parse_agent_prompt_args(&vec_str(&["reviewer", "--wait", "--wait"])).unwrap();
+        assert_eq!(literal_wait_and_wait.target, "reviewer");
+        assert_eq!(literal_wait_and_wait.text, "--wait");
+        assert!(literal_wait_and_wait.wait.is_some());
+
+        let literal_double_dash_and_wait =
+            parse_agent_prompt_args(&vec_str(&["reviewer", "--", "--wait"])).unwrap();
+        assert_eq!(literal_double_dash_and_wait.target, "reviewer");
+        assert_eq!(literal_double_dash_and_wait.text, "--");
+        assert!(literal_double_dash_and_wait.wait.is_some());
+
+        let literal_double_dash_only =
+            parse_agent_prompt_args(&vec_str(&["reviewer", "--"])).unwrap();
+        assert_eq!(literal_double_dash_only.target, "reviewer");
+        assert_eq!(literal_double_dash_only.text, "--");
+        assert_eq!(literal_double_dash_only.wait, None);
+
+        let leading_flag_then_double_dash_text = parse_agent_prompt_args(&vec_str(&[
+            "reviewer",
+            "--expect-terminal",
+            "term_1",
+            "--",
+            "--wait",
+        ]))
+        .unwrap();
+        assert_eq!(leading_flag_then_double_dash_text.target, "reviewer");
+        assert_eq!(leading_flag_then_double_dash_text.text, "--wait");
+        assert_eq!(
+            leading_flag_then_double_dash_text
+                .expect_terminal
+                .as_deref(),
+            Some("term_1")
+        );
+        assert_eq!(leading_flag_then_double_dash_text.wait, None);
+
+        for invalid in [
+            &["w1:p1", "hi", "--if-status", "unknown"][..],
+            &["w1:p1", "hi", "--if-status", "bogus"][..],
+            &["w1:p1", "hi", "--if-status", ""][..],
+            &["w1:p1", "hi", "--if-status", "idle,"][..],
+            &["w1:p1", "--expect-terminal", "term_1"][..],
+            &["w1:p1", "hi", "--"][..],
+        ] {
+            assert_eq!(
+                parse_agent_prompt_args(&vec_str(invalid)),
+                Err(2),
+                "expected Err(2) for {invalid:?}"
+            );
+        }
+    }
 }

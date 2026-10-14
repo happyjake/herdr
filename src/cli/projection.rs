@@ -39,7 +39,18 @@ pub(crate) fn parse<T>(
     args: &[String],
     from_matches: impl FnOnce(&ArgMatches) -> Result<T, ParseError>,
 ) -> Result<T, ParseError> {
-    let args = protect_verbatim_slots(&command, args);
+    parse_with_leading_options(command, args, &[], from_matches)
+}
+
+/// Lets selected declared options precede a verbatim operand without changing
+/// the literal treatment of other flag-shaped words at that operand's slot.
+pub(crate) fn parse_with_leading_options<T>(
+    command: Command,
+    args: &[String],
+    leading_options: &[&str],
+    from_matches: impl FnOnce(&ArgMatches) -> Result<T, ParseError>,
+) -> Result<T, ParseError> {
+    let args = protect_verbatim_slots(&command, args, leading_options)?;
     let matches = command.no_binary_name(true).try_get_matches_from(args)?;
     from_matches(&matches)
 }
@@ -241,10 +252,15 @@ pub(crate) fn operands<'a>(command: &Command, args: &'a [String]) -> Vec<&'a str
 /// Text operands are read by argv position, so words such as `--wait` or `-h`
 /// in those positions stay text instead of becoming flags. The escape keeps
 /// Clap from treating them as options and is removed by `Input::verbatim`.
-fn protect_verbatim_slots(command: &Command, args: &[String]) -> Vec<String> {
+fn protect_verbatim_slots(
+    command: &Command,
+    args: &[String],
+    leading_options: &[&str],
+) -> Result<Vec<String>, ParseError> {
     let (leaf, start) = select_leaf(command, args);
     let operands = &args[start..];
     let mut protected = args.to_vec();
+    let mut fixed_verbatim = false;
     for argument in leaf
         .get_positionals()
         .filter(|argument| is_verbatim(argument))
@@ -260,6 +276,12 @@ fn protect_verbatim_slots(command: &Command, args: &[String]) -> Vec<String> {
         {
             continue;
         }
+        if declared_option(leaf, &operands[slot])
+            .is_some_and(|option| leading_options.contains(&option.get_id().as_str()))
+        {
+            continue;
+        }
+        fixed_verbatim = true;
         let end = if argument
             .get_num_args()
             .is_some_and(|range| range.max_values() > 1)
@@ -284,7 +306,15 @@ fn protect_verbatim_slots(command: &Command, args: &[String]) -> Vec<String> {
             }
         }
     }
-    protected
+    // In fixed-slot mode a separator following the text was never an option.
+    // Reuse the declared-option walker so a value equal to "--" stays a value.
+    if !leading_options.is_empty()
+        && fixed_verbatim
+        && self::operands(command, &protected).contains(&"--")
+    {
+        return Err(ParseError::Usage("unexpected separator after text".into()));
+    }
+    Ok(protected)
 }
 
 fn string_values(matches: &ArgMatches, argument: &Arg) -> Vec<String> {

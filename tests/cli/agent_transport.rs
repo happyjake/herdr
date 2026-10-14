@@ -281,3 +281,278 @@ fn prompt_wait_is_sent_as_one_agent_request() {
     server.join().unwrap();
     cleanup_test_base(&base);
 }
+
+fn accept_fake_cli_operation_with_prompt_expectations(
+    listener: &UnixListener,
+) -> (UnixStream, String) {
+    loop {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        reader.read_line(&mut line).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if request["method"] != "ping" {
+            return (stream, line);
+        }
+
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({
+                "id": request["id"],
+                "result": {
+                    "type": "pong",
+                    "version": "different-build-same-protocol",
+                    "protocol": CURRENT_PROTOCOL,
+                    "capabilities": {
+                        "live_handoff": true,
+                        "detached_server_daemon": true,
+                        "agent_prompt_expectations": true
+                    }
+                }
+            })
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+}
+
+#[test]
+fn prompt_refuses_expectations_when_server_lacks_capability() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    let server = thread::spawn(move || {
+        // First command: conditional prompt against a server whose pong omits
+        // `agent_prompt_expectations`. The CLI must fail closed after the ping
+        // without sending `agent.prompt`.
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        reader.read_line(&mut line).unwrap();
+        let ping: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ping["method"], "ping");
+        write_fake_pong(
+            &mut stream,
+            &ping,
+            "base-branch-same-protocol",
+            CURRENT_PROTOCOL,
+        );
+
+        // Second command: legacy `--wait` literal text + `--wait` option
+        // without expectations still succeeds against the same older server.
+        let (mut wait_stream, wait_line) = accept_fake_cli_operation(&listener);
+        let wait_req: serde_json::Value = serde_json::from_str(&wait_line).unwrap();
+        assert_eq!(wait_req["method"], "agent.prompt");
+        assert_eq!(wait_req["params"]["target"], "reviewer");
+        assert_eq!(wait_req["params"]["text"], "--wait");
+        assert_eq!(wait_req["params"]["wait"], serde_json::json!({}));
+        writeln!(
+            wait_stream,
+            "{}",
+            serde_json::json!({
+                "id": wait_req["id"],
+                "result": {
+                    "type": "agent",
+                    "agent": sample_agent_json("idle")
+                }
+            })
+        )
+        .unwrap();
+        wait_stream.flush().unwrap();
+
+        // Third command: legacy `--` literal text + `--wait` option submits
+        // literal `--` and waits.
+        let (mut dash_stream, dash_line) = accept_fake_cli_operation(&listener);
+        let dash_req: serde_json::Value = serde_json::from_str(&dash_line).unwrap();
+        assert_eq!(dash_req["method"], "agent.prompt");
+        assert_eq!(dash_req["params"]["target"], "reviewer");
+        assert_eq!(dash_req["params"]["text"], "--");
+        assert_eq!(dash_req["params"]["wait"], serde_json::json!({}));
+        writeln!(
+            dash_stream,
+            "{}",
+            serde_json::json!({
+                "id": dash_req["id"],
+                "result": {
+                    "type": "agent",
+                    "agent": sample_agent_json("idle")
+                }
+            })
+        )
+        .unwrap();
+        dash_stream.flush().unwrap();
+    });
+
+    let refused = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "prompt",
+            "reviewer",
+            "hello",
+            "--expect-terminal",
+            "term_wrong",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(refused.stdout.is_empty());
+    let refused_err: serde_json::Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(refused_err["id"], "cli:agent:prompt");
+    assert_eq!(refused_err["error"]["code"], "protocol_mismatch");
+    assert!(refused_err["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("agent_prompt_expectations"));
+
+    let literal_wait = run_cli(
+        &socket_path,
+        &["agent", "prompt", "reviewer", "--wait", "--wait"],
+    );
+    assert!(
+        literal_wait.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&literal_wait.stderr)
+    );
+
+    let literal_dash = run_cli(
+        &socket_path,
+        &["agent", "prompt", "reviewer", "--", "--wait"],
+    );
+    assert!(
+        literal_dash.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&literal_dash.stderr)
+    );
+
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn prompt_sends_conditional_expectations_and_reports_refusal() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+
+    for invalid_status in ["unknown", "bogus", "", "idle,"] {
+        let rejected = run_cli(
+            &socket_path,
+            &[
+                "agent",
+                "prompt",
+                "w1:p1",
+                "review this",
+                "--if-status",
+                invalid_status,
+            ],
+        );
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "expected exit 2 for --if-status {invalid_status:?}"
+        );
+    }
+
+    let server = thread::spawn(move || {
+        // First call: flags after <text>, server returns agent_mismatch.
+        let (mut mismatch_stream, mismatch_line) =
+            accept_fake_cli_operation_with_prompt_expectations(&listener);
+        let mismatch: serde_json::Value = serde_json::from_str(&mismatch_line).unwrap();
+        assert_eq!(mismatch["method"], "agent.prompt");
+        assert_eq!(mismatch["params"]["target"], "w1:p1");
+        assert_eq!(mismatch["params"]["text"], "review this");
+        assert_eq!(mismatch["params"]["expect_terminal"], "term_1");
+        assert_eq!(mismatch["params"]["expect_agent"], "claude");
+        assert_eq!(mismatch["params"]["expect_session"], "sess-abc");
+        assert_eq!(
+            mismatch["params"]["if_status"],
+            serde_json::json!(["idle", "done"])
+        );
+        writeln!(
+            mismatch_stream,
+            "{}",
+            serde_json::json!({
+                "id": mismatch["id"],
+                "error": {
+                    "code": "agent_mismatch",
+                    "message": "agent target w1:p1 has terminal term_2, expected term_1"
+                }
+            })
+        )
+        .unwrap();
+        mismatch_stream.flush().unwrap();
+
+        // Second call: flags before <text>, server returns agent_busy.
+        let (mut busy_stream, busy_line) =
+            accept_fake_cli_operation_with_prompt_expectations(&listener);
+        let busy: serde_json::Value = serde_json::from_str(&busy_line).unwrap();
+        assert_eq!(busy["method"], "agent.prompt");
+        assert_eq!(busy["params"]["target"], "w1:p1");
+        assert_eq!(busy["params"]["text"], "follow up");
+        assert_eq!(busy["params"]["expect_terminal"], "term_1");
+        assert_eq!(
+            busy["params"]["if_status"],
+            serde_json::json!(["idle", "blocked"])
+        );
+        writeln!(
+            busy_stream,
+            "{}",
+            serde_json::json!({
+                "id": busy["id"],
+                "error": {
+                    "code": "agent_busy",
+                    "message": "agent w1:p1 has status Working, which is not in expected if_status"
+                }
+            })
+        )
+        .unwrap();
+        busy_stream.flush().unwrap();
+    });
+
+    let mismatch = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "prompt",
+            "w1:p1",
+            "review this",
+            "--expect-terminal",
+            "term_1",
+            "--expect-agent",
+            "claude",
+            "--expect-session",
+            "sess-abc",
+            "--if-status",
+            "idle,done",
+        ],
+    );
+    assert_eq!(mismatch.status.code(), Some(1));
+    assert!(mismatch.stdout.is_empty());
+    let mismatch_err: serde_json::Value = serde_json::from_slice(&mismatch.stderr).unwrap();
+    assert_eq!(mismatch_err["error"]["code"], "agent_mismatch");
+
+    let busy = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "prompt",
+            "w1:p1",
+            "--expect-terminal",
+            "term_1",
+            "--if-status",
+            "idle,blocked",
+            "follow up",
+        ],
+    );
+    assert_eq!(busy.status.code(), Some(1));
+    assert!(busy.stdout.is_empty());
+    let busy_err: serde_json::Value = serde_json::from_slice(&busy.stderr).unwrap();
+    assert_eq!(busy_err["error"]["code"], "agent_busy");
+
+    server.join().unwrap();
+    cleanup_test_base(&base);
+}

@@ -629,6 +629,24 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
             finish_wait_response(transport, response, &request_id, method, changes_ui)
         }
         Method::AgentPrompt(params) => {
+            if params.has_expectations()
+                && capabilities
+                    .as_ref()
+                    .is_some_and(|caps| !caps.agent_prompt_expectations)
+            {
+                let response = error_response_json(
+                    request_id.clone(),
+                    "protocol_mismatch",
+                    "server does not support conditional agent prompt expectations (missing capability agent_prompt_expectations)".into(),
+                );
+                return write_and_log_response(
+                    transport,
+                    &response,
+                    &request_id,
+                    method,
+                    changes_ui,
+                );
+            }
             let response = prompt_agent(
                 request_id.clone(),
                 params,
@@ -881,6 +899,18 @@ fn handle_request(
             request.id,
             "connection_local_only",
             "client_shell.surface.set is only available through a client shell endpoint".into(),
+        );
+    }
+
+    if matches!(&request.method, Method::AgentPrompt(params) if params.has_expectations())
+        && capabilities
+            .as_ref()
+            .is_some_and(|caps| !caps.agent_prompt_expectations)
+    {
+        return error_response_json(
+            request.id,
+            "protocol_mismatch",
+            "server does not support conditional agent prompt expectations (missing capability agent_prompt_expectations)".into(),
         );
     }
 
@@ -1401,6 +1431,10 @@ fn caller_timeout_dispatch_uses_timeout_error() {
             method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
                 target: "reviewer".into(),
                 text: "review this".into(),
+                expect_terminal: None,
+                expect_agent: None,
+                expect_session: None,
+                if_status: Vec::new(),
                 wait: None,
             }),
         },
@@ -1898,6 +1932,7 @@ mod tests {
                 credential_registry: true,
                 file_attachments: Some(crate::api::attachment::file_attachments_capability()),
                 agent_report_cancelled: false,
+                agent_prompt_expectations: false,
             }),
             None,
             None,

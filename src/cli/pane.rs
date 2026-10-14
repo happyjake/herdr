@@ -258,6 +258,34 @@ mod tests {
     fn pane_projection_all_leaf_request_values() {
         use serde_json::json;
         let cases = [
+            (
+                "pin",
+                vec!["pane"],
+                "cli:pane:set_pinned",
+                "pane.set_pinned",
+                json!({"pane_id": "pane", "pinned": true}),
+            ),
+            (
+                "unpin",
+                vec!["pane"],
+                "cli:pane:set_pinned",
+                "pane.set_pinned",
+                json!({"pane_id": "pane", "pinned": false}),
+            ),
+            (
+                "flag",
+                vec!["pane", "--note", "review", "--due", "946684800"],
+                "cli:pane:flag",
+                "pane.set_flag",
+                json!({"pane_id": "pane", "note": "review", "due_at": 946684800}),
+            ),
+            (
+                "unflag",
+                vec!["pane"],
+                "cli:pane:flag",
+                "pane.clear_flag",
+                json!({"pane_id": "pane"}),
+            ),
             ("list", vec![], "cli:pane:list", "pane.list", json!({})),
             (
                 "current",
@@ -430,7 +458,15 @@ mod tests {
                 json!({"pane_id": "pane", "source": "hook", "clear_title": true, "clear_display_agent": false, "clear_state_labels": false}),
             ),
         ];
-        assert_eq!(cases.len(), bindings::LEAVES.len());
+        let cases_by_name: std::collections::BTreeSet<_> =
+            cases.iter().map(|case| case.0).collect();
+        let declarations: std::collections::BTreeSet<_> =
+            bindings::LEAVES.iter().map(|leaf| leaf.name).collect();
+        assert_eq!(cases.len(), cases_by_name.len(), "duplicate command case");
+        assert_eq!(
+            cases_by_name, declarations,
+            "every declared leaf needs a wire-value case"
+        );
         for (name, values, id, method, params) in cases {
             assert_eq!(
                 serde_json::to_value(request(name, &values).unwrap()).unwrap(),
@@ -507,7 +543,9 @@ mod tests {
     }
 
     fn parse_pane_flag_args(args: &[String], clear: bool) -> Result<Method, ParseError> {
-        bindings::LEAVES.iter().find(|leaf| leaf.name == if clear { "unflag" } else { "flag" })
+        bindings::LEAVES
+            .iter()
+            .find(|leaf| leaf.name == if clear { "unflag" } else { "flag" })
             .expect("flag command")
             .request(args)
             .map(|request| request.method)

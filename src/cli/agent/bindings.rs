@@ -22,6 +22,88 @@ const STATUSES: &[Choice<AgentStatus>] = &[
 ];
 const EXPLAIN_FORMATS: &[Choice<bool>] = &[Choice::new("text", false), Choice::new("json", true)];
 
+const PROMPT_STATUSES: &[Choice<AgentStatus>] = &[
+    Choice::new("idle", AgentStatus::Idle),
+    Choice::new("done", AgentStatus::Done),
+    Choice::new("blocked", AgentStatus::Blocked),
+    Choice::new("working", AgentStatus::Working),
+];
+
+const PROMPT_LEADING_OPTIONS: &[&str] = &[
+    "expect-terminal",
+    "expect-agent",
+    "expect-session",
+    "if-status",
+];
+
+pub(crate) fn parse(args: &[String]) -> Result<Operation, ParseError> {
+    crate::cli::projection::parse_with_leading_options(
+        command().bin_name("herdr agent"),
+        args,
+        if args.first().is_some_and(|arg| arg == "prompt") {
+            PROMPT_LEADING_OPTIONS
+        } else {
+            &[]
+        },
+        from_matches,
+    )
+}
+
+pub(crate) fn expectation(name: &'static str) -> Input<Option<String>> {
+    Input::value(name, "ID", |slot, value| {
+        if value.is_empty() {
+            return Err(ParseError::Usage(
+                "identity expectation must not be empty".into(),
+            ));
+        }
+        *slot = Some(value.to_owned());
+        Ok(())
+    })
+}
+
+pub(crate) fn if_status() -> Input<Vec<AgentStatus>> {
+    Input::value(
+        "if-status",
+        "STATUS[,STATUS...]",
+        |slot: &mut Vec<AgentStatus>, value| {
+            for status in value.split(',') {
+                let status = parse_choice(PROMPT_STATUSES, "conditional status", status)?;
+                if !slot.contains(&status) {
+                    slot.push(status);
+                }
+            }
+            Ok(())
+        },
+    )
+    .configure(|argument| argument.value_parser(ConditionalStatusCodec))
+}
+
+/// Advertises unit values for help/completion; the field reducer validates
+/// complete comma lists and every repeated occurrence without discarding empties.
+#[derive(Clone)]
+struct ConditionalStatusCodec;
+
+impl clap::builder::TypedValueParser for ConditionalStatusCodec {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        command: &Command,
+        argument: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        clap::builder::StringValueParser::new().parse_ref(command, argument, value)
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(PROMPT_STATUSES.iter().map(|status| {
+            clap::builder::PossibleValue::new(status.name)
+        })))
+    }
+}
+
 pub(crate) fn target() -> Input<String> {
     text_position("target", "TARGET", 0)
 }
@@ -269,7 +351,7 @@ pub(crate) fn command() -> Command {
         .subcommand(leaf("prompt", AgentPromptProjection::arguments(), "Submit a prompt to an agent")
             .args(AgentPromptWaitProjection::arguments().into_iter().map(|arg| arg.requires("wait")))
             .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
-            .after_help("If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match."))
+            .after_help("Conditional expectations (--expect-terminal, --expect-agent, --expect-session, --if-status) are checked atomically on the server at delivery time; mismatches fail with agent_mismatch (identity) or agent_busy (status) without sending input. If the agent is already blocked and --if-status does not include blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match."))
         .subcommand(leaf("start", AgentStartProjection::arguments(), "Start a supported interactive agent in an existing pane")
             .override_usage("herdr agent start <NAME> --kind <KIND> --pane <ID> [OPTIONS] [-- [AGENT_ARG]...]")
             .after_help("The pane must be at its interactive shell prompt. Success means the expected agent was detected in the same terminal and is ready for input.\n\nnext: herdr agent prompt <TARGET> <TEXT> --wait"))

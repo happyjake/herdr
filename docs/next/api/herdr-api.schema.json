@@ -1410,7 +1410,32 @@
     "request": {
       "$defs": {
         "AgentPromptParams": {
+          "additionalProperties": false,
           "properties": {
+            "expect_agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expect_session": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expect_terminal": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "if_status": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/AgentStatus"
+              },
+              "type": "array"
+            },
             "target": {
               "type": "string"
             },
@@ -12018,6 +12043,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_prompt_expectations": {
+              "default": false,
+              "description": "Whether `agent.prompt` honors delivery-time identity and status\nexpectations (`expect_terminal`, `expect_agent`, `expect_session`,\n`if_status`) instead of ignoring unknown fields. Additive: absent\n(false) in pongs of servers that predate it.",
+              "type": "boolean"
+            },
             "agent_report_cancelled": {
               "default": false,
               "description": "Whether `pane.report_agent` honors `cancelled`: an idle report for a\nrun the user cancelled, which settles without a completion. Additive:\nabsent (false) in pongs of servers that predate it, which ignore the\nfield and read the report as a finished run, so an integration sends\n`cancelled` only to a server that declares this.",

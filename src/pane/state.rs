@@ -126,6 +126,23 @@ impl AgentStatusProjection {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PaneDeliverySnapshot {
+    pub(crate) attached_terminal_id: TerminalId,
+    pub(crate) seen: bool,
+    pub(crate) restore_window: Option<RestoreWindow>,
+}
+
+impl PaneDeliverySnapshot {
+    pub(crate) fn reported_agent_status(&self, live: AgentStatus) -> AgentStatus {
+        let now_unix = unix_now_secs();
+        match self.restore_window {
+            Some(window) if window.live_at(now_unix) => window.captured.0,
+            _ => live,
+        }
+    }
+}
+
 /// Viewport state for a pane.
 ///
 /// Terminal identity, cwd, labels, and agent metadata live in TerminalState.
@@ -161,6 +178,7 @@ pub struct PaneState {
     reported_through: u64,
     /// Present only between a restore and the one resolution that ends it.
     restore_window: Option<RestoreWindow>,
+    delivery_snapshot: std::sync::Arc<std::sync::Mutex<PaneDeliverySnapshot>>,
 }
 
 impl PaneState {
@@ -170,6 +188,11 @@ impl PaneState {
 
     /// Same as [`PaneState::new`] with an explicit clock, for tests.
     pub fn new_at(attached_terminal_id: TerminalId, now_unix: u64) -> Self {
+        let delivery_snapshot = std::sync::Arc::new(std::sync::Mutex::new(PaneDeliverySnapshot {
+            attached_terminal_id: attached_terminal_id.clone(),
+            seen: true,
+            restore_window: None,
+        }));
         Self {
             attached_terminal_id,
             seen: true,
@@ -181,6 +204,7 @@ impl PaneState {
             agent_status_changed_at: now_unix,
             reported_through: now_unix,
             restore_window: None,
+            delivery_snapshot,
         }
     }
 
@@ -248,6 +272,17 @@ impl PaneState {
         } else {
             claim.changed_at
         };
+        let restore_window = Some(RestoreWindow {
+            captured: (claim.status, changed_at),
+            restored_at: now_unix,
+            resolve_by,
+            saw_other_status: claim.saw_other_status,
+        });
+        let delivery_snapshot = std::sync::Arc::new(std::sync::Mutex::new(PaneDeliverySnapshot {
+            attached_terminal_id: attached_terminal_id.clone(),
+            seen: true,
+            restore_window,
+        }));
         Self {
             attached_terminal_id,
             seen: true,
@@ -256,12 +291,23 @@ impl PaneState {
             observed_agent_status: AgentStatus::Unknown,
             agent_status_changed_at: changed_at,
             reported_through: published.max(now_unix).max(changed_at),
-            restore_window: Some(RestoreWindow {
-                captured: (claim.status, changed_at),
-                restored_at: now_unix,
-                resolve_by,
-                saw_other_status: claim.saw_other_status,
-            }),
+            restore_window,
+            delivery_snapshot,
+        }
+    }
+
+    pub(crate) fn delivery_snapshot_handle(
+        &self,
+    ) -> std::sync::Weak<std::sync::Mutex<PaneDeliverySnapshot>> {
+        self.sync_delivery_snapshot();
+        std::sync::Arc::downgrade(&self.delivery_snapshot)
+    }
+
+    pub(crate) fn sync_delivery_snapshot(&self) {
+        if let Ok(mut snapshot) = self.delivery_snapshot.lock() {
+            snapshot.attached_terminal_id = self.attached_terminal_id.clone();
+            snapshot.seen = self.seen;
+            snapshot.restore_window = self.restore_window;
         }
     }
 
@@ -377,6 +423,7 @@ impl PaneState {
         self.agent_status = status;
         self.agent_status_changed_at = changed_at;
         self.reported_through = self.reported_through.max(changed_at);
+        self.sync_delivery_snapshot();
     }
 
     /// The status and date to write to a snapshot, and the deadline that
@@ -438,6 +485,7 @@ impl PaneState {
                 window.saw_other_status = true;
             }
         }
+        self.sync_delivery_snapshot();
 
         let settles = match reading {
             // A statement about status settles what a session claimed,

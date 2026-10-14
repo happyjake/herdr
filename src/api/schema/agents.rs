@@ -202,11 +202,29 @@ cli_params! {
 
 cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    #[serde(deny_unknown_fields)]
     pub struct AgentPromptParams => AgentPromptProjection {
         pub target: String => Field::new(String::new()).input(bindings::target()),
         pub text: String => Field::new(String::new()).input(bindings::text_position("text", "TEXT", 1).verbatim()),
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expect_terminal: Option<String> => Field::new(None).input(bindings::expectation("expect-terminal")),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expect_agent: Option<String> => Field::new(None).input(bindings::expectation("expect-agent")),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expect_session: Option<String> => Field::new(None).input(bindings::expectation("expect-session")),
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub if_status: Vec<AgentStatus> => Field::new(Vec::new()).input(bindings::if_status()),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wait: Option<AgentPromptWaitOptions> => Field::new(None).input(bindings::wait_presence()),
+    }
+}
+
+impl AgentPromptParams {
+    pub fn has_expectations(&self) -> bool {
+        self.expect_terminal.is_some()
+            || self.expect_agent.is_some()
+            || self.expect_session.is_some()
+            || !self.if_status.is_empty()
     }
 }
 

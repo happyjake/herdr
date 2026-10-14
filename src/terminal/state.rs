@@ -121,6 +121,18 @@ struct RecentAgentProcessExit {
     observed_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TerminalDeliverySnapshot {
+    pub(crate) id: TerminalId,
+    pub(crate) agent_name: Option<String>,
+    pub(crate) is_agent_terminal: bool,
+    pub(crate) effective_agent_label: Option<String>,
+    pub(crate) effective_known_agent: Option<Agent>,
+    pub(crate) managed_agent_launch_pending: bool,
+    pub(crate) session_value: Option<String>,
+    pub(crate) state: AgentState,
+}
+
 /// Pure state for a server-owned terminal.
 ///
 /// During the migration this is still one-to-one with a pane-backed PTY, but
@@ -177,10 +189,22 @@ pub struct TerminalState {
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
+    delivery_snapshot: std::sync::Arc<std::sync::Mutex<TerminalDeliverySnapshot>>,
 }
 
 impl TerminalState {
     pub fn new(id: TerminalId, cwd: PathBuf) -> Self {
+        let delivery_snapshot =
+            std::sync::Arc::new(std::sync::Mutex::new(TerminalDeliverySnapshot {
+                id: id.clone(),
+                agent_name: None,
+                is_agent_terminal: false,
+                effective_agent_label: None,
+                effective_known_agent: None,
+                managed_agent_launch_pending: false,
+                session_value: None,
+                state: AgentState::Unknown,
+            }));
         Self {
             id,
             cwd,
@@ -222,6 +246,36 @@ impl TerminalState {
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
             restore_error: None,
+            delivery_snapshot,
+        }
+    }
+
+    pub(crate) fn delivery_snapshot_handle(
+        &self,
+    ) -> std::sync::Weak<std::sync::Mutex<TerminalDeliverySnapshot>> {
+        self.sync_delivery_snapshot();
+        std::sync::Arc::downgrade(&self.delivery_snapshot)
+    }
+
+    pub(crate) fn sync_delivery_snapshot(&self) {
+        if let Ok(mut snapshot) = self.delivery_snapshot.lock() {
+            snapshot.id = self.id.clone();
+            snapshot.agent_name = self.agent_name.clone();
+            snapshot.is_agent_terminal = self.is_agent_terminal();
+            snapshot.effective_agent_label = self.effective_agent_label().map(str::to_string);
+            snapshot.effective_known_agent = self.effective_known_agent();
+            snapshot.managed_agent_launch_pending = self.managed_agent_launch_pending();
+            snapshot.session_value = self
+                .hook_authority
+                .as_ref()
+                .and_then(|authority| authority.session_ref.as_ref())
+                .map(|session_ref| session_ref.value.clone())
+                .or_else(|| {
+                    self.persisted_agent_session
+                        .as_ref()
+                        .map(|session| session.session_ref.value.clone())
+                });
+            snapshot.state = self.state;
         }
     }
 
@@ -246,6 +300,7 @@ impl TerminalState {
             self.codex_prompt_ready = false;
             self.agent_process_acquisition_pending = true;
         }
+        self.sync_delivery_snapshot();
         mutation
     }
 
@@ -272,6 +327,7 @@ impl TerminalState {
         self.state = snapshot.authority.state;
         self.hook_authority = Some(snapshot.authority);
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
+        self.sync_delivery_snapshot();
     }
 
     pub(crate) fn finish_agent_process_acquisition(&mut self) -> bool {
@@ -280,6 +336,7 @@ impl TerminalState {
         if reached_idle {
             self.agent_process_acquisition_pending = false;
         }
+        self.sync_delivery_snapshot();
         suppress_completion
     }
 
@@ -1459,6 +1516,7 @@ impl TerminalState {
         session: crate::agent_resume::PersistedAgentSession,
     ) {
         self.persisted_agent_session = Some(session);
+        self.sync_delivery_snapshot();
     }
 
     pub fn set_managed_agent_launch_session(
@@ -1467,6 +1525,7 @@ impl TerminalState {
     ) {
         self.persisted_agent_session = Some(session.clone());
         self.managed_agent_launch_session = Some(session);
+        self.sync_delivery_snapshot();
     }
 
     pub fn set_agent_session_ref(
@@ -2285,6 +2344,7 @@ impl TerminalState {
                         })
                 })
         });
+        self.sync_delivery_snapshot();
     }
 
     pub fn begin_managed_agent(
@@ -2310,6 +2370,7 @@ impl TerminalState {
                 observed_expected: false,
             },
         });
+        self.sync_delivery_snapshot();
     }
 
     pub fn managed_agent_launch_pending(&self) -> bool {
@@ -2337,6 +2398,7 @@ impl TerminalState {
             return None;
         }
         self.codex_prompt_ready = ready;
+        self.sync_delivery_snapshot();
         Some(TerminalStateMutation::default())
     }
 
@@ -2388,6 +2450,7 @@ impl TerminalState {
                     phase: ManagedAgentPhase::Active,
                 });
                 self.managed_agent_launch_session = None;
+                self.sync_delivery_snapshot();
                 return true;
             }
             return false;
@@ -2403,6 +2466,7 @@ impl TerminalState {
                     kind: managed.kind,
                     phase: ManagedAgentPhase::Blocked,
                 });
+                self.sync_delivery_snapshot();
                 return true;
             }
             if now >= deadline {
@@ -2421,6 +2485,7 @@ impl TerminalState {
                         phase: ManagedAgentPhase::Active,
                     });
                     self.managed_agent_launch_session = None;
+                    self.sync_delivery_snapshot();
                     return true;
                 }
                 if ready_after.is_some() {
@@ -2432,6 +2497,7 @@ impl TerminalState {
                             observed_expected,
                         },
                     });
+                    self.sync_delivery_snapshot();
                     return true;
                 }
             }
@@ -2444,6 +2510,7 @@ impl TerminalState {
                         observed_expected,
                     },
                 });
+                self.sync_delivery_snapshot();
                 return true;
             }
         }
@@ -2460,6 +2527,7 @@ impl TerminalState {
             kind,
             phase: ManagedAgentPhase::Active,
         });
+        self.sync_delivery_snapshot();
     }
 
     pub fn clear_agent_name(&mut self) {
@@ -2475,6 +2543,7 @@ impl TerminalState {
         self.agent_name = None;
         self.agent_name_owner = None;
         self.managed_agent = None;
+        self.sync_delivery_snapshot();
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
@@ -2497,6 +2566,7 @@ impl TerminalState {
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
         self.clear_agent_name();
+        self.sync_delivery_snapshot();
     }
 
     pub fn is_agent_terminal(&self) -> bool {
@@ -2539,6 +2609,7 @@ impl TerminalState {
             }
             _ => {}
         }
+        self.sync_delivery_snapshot();
     }
 
     pub fn border_label(&self, show_agent_labels: bool) -> Option<String> {
@@ -2581,10 +2652,12 @@ impl TerminalState {
             && previous_state == state
             && previous_presentation == presentation
         {
+            self.sync_delivery_snapshot();
             return None;
         }
 
         self.state = state;
+        self.sync_delivery_snapshot();
         Some(EffectiveStateChange {
             previous_agent_label,
             previous_known_agent,
