@@ -14,6 +14,7 @@
 
 ### Fixed
 - A working state that only an agent's terminal title shows, over a screen that has not changed, no longer starts a turn until it has lasted 15 seconds. Codex spins its title while it boots a tool server, for example after refreshing its sign-in, with the screen unchanged; reporting that as working made the idle that followed read as a newly finished turn, so panes nobody had touched were reported done again with a fresh `agent_status_changed_at`. A turn that draws its working status or its answer on screen still reports working at once, and so does any other change to the screen text during the spin. `herdr agent explain` shows `working_from_title_only` for such a reading.
+- Codex's finished-turn separator is recognized whether it separates the turn duration from the time with a middle dot or, as later releases do, with a bullet, so a finished codex turn reads idle again where no other rule decides it.
 
 ## [0.9.1] - 2026-09-16
 

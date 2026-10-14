@@ -392,7 +392,8 @@ fn an_answer_streaming_with_its_status_row_hidden_publishes_working_and_its_fini
                     (finished.clone(), TITLE.to_string())
                 }
             },
-            stream_ends * 3,
+            // A finish that reads idle only under the supplement settles first.
+            stream_ends + SETTLED_IDLE_WINDOW * 2,
         );
         let working_at = first(&published, AgentState::Working)
             .unwrap_or_else(|| panic!("{rules:?}: working never published: {published:?}"));

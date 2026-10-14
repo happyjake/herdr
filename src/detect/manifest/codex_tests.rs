@@ -64,6 +64,13 @@ fn codex_finished_turn_separator_reads_idle() {
     assert_turn_complete(fixture!("idle-ultra-effort.txt"));
     // An empty focused composer can draw a braille starfield after its glyph.
     assert_turn_complete(fixture!("idle-starfield-composer.txt"));
+    // Later codex releases separate the duration and the time with a bullet.
+    assert_turn_complete(fixture!("idle-turn-complete-bullet.txt"));
+    let same_day = fixture!("idle-turn-complete-bullet.txt").replace(
+        "Worked for 16s • Sep 30 at 3:32 PM",
+        "Worked for 2m 3s • 9:41 AM",
+    );
+    assert_turn_complete(&same_day);
 }
 
 #[test]
@@ -134,6 +141,8 @@ fn codex_screens_without_turn_end_evidence_stay_unknown() {
     assert_not_turn_complete(fixture!("startup-banners.txt"), AgentState::Unknown);
     assert_not_turn_complete(fixture!("auth-expired.txt"), AgentState::Unknown);
     assert_not_turn_complete(fixture!("refusal-notice.txt"), AgentState::Unknown);
+    // A notice below the separator is later output, as the supplement says.
+    assert_not_turn_complete(fixture!("idle-turn-complete-0162.txt"), AgentState::Unknown);
 }
 
 const SEPARATOR_SCREEN: &str = "• Done.\n\n  Worked for 1m 2s · 9:41 AM\n\n›\n";
