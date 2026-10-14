@@ -3221,6 +3221,8 @@ impl HeadlessServer {
             changed = true;
         }
 
+        // Flags publish runtime metadata only; they do not request a TUI render.
+        self.app.announce_due_flags(now);
         changed |= self.app.resolve_due_agent_status_windows(now);
 
         if self

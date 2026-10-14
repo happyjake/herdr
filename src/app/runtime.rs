@@ -38,8 +38,12 @@ impl App {
         // applying state. Persist their queued history before detaching runtimes.
         self.flush_logbook();
         let terminal_ids = std::mem::take(&mut self.state.terminal_runtime_shutdowns);
+        let removed_terminals = !terminal_ids.is_empty();
         for terminal_id in terminal_ids {
             self.shutdown_terminal_runtime(terminal_id);
+        }
+        if removed_terminals {
+            self.sync_flag_deadline();
         }
     }
 
@@ -171,6 +175,7 @@ impl App {
         [
             self.config_diagnostic_deadline,
             self.toast_deadline,
+            self.flag_deadline,
             self.state.next_pending_agent_notification_deadline(),
             self.state.next_managed_agent_deadline(),
             self.state.next_agent_status_resolution_deadline(now),

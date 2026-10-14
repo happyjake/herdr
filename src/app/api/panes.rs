@@ -1690,6 +1690,7 @@ impl App {
             None => terminal.clear_flag(),
         };
         if changed {
+            self.sync_flag_deadline();
             self.state.mark_session_dirty();
             self.emit_pane_kept_presentation_changed(ws_idx, pane_id);
         }

@@ -5760,6 +5760,54 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
 }
 
 #[test]
+fn flag_deadline_tick_announces_once_and_schedules_save_without_rendering() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("due-flag");
+    let pane = workspace.tabs[0].root_pane;
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    let pane_id = server.app.public_pane_id(0, pane).unwrap();
+    let response = server.app.handle_api_request(crate::api::schema::Request {
+        id: "flag".into(),
+        method: crate::api::schema::Method::PaneSetFlag(crate::api::schema::PaneSetFlagParams {
+            pane_id,
+            note: Some("review".into()),
+            due_at: Some(0),
+        }),
+    });
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        response["result"]["pane"]["flag"]["announced_at"],
+        serde_json::Value::Null
+    );
+    let set_at = response["result"]["pane"]["flag"]["set_at"].clone();
+    let sequence = server.app.event_hub.current_sequence();
+    server.app.state.session_dirty = false;
+    server.app.policy.persist_session = true;
+
+    assert!(!server.handle_scheduled_tasks_headless(Instant::now(), false));
+    let events = server.app.event_hub.events_after(sequence);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        events[0].1.event,
+        crate::api::schema::EventKind::PaneAgentStatusChanged
+    );
+    let payload = serde_json::to_value(&events[0].1.data).unwrap();
+    assert_eq!(payload["flag"]["set_at"], set_at);
+    assert!(payload["flag"]["announced_at"].as_u64().is_some());
+    assert_eq!(
+        payload["agent_status"],
+        response["result"]["pane"]["agent_status"]
+    );
+    assert!(server.app.session_save_deadline.is_some());
+
+    let sequence = server.app.event_hub.current_sequence();
+    assert!(!server.handle_scheduled_tasks_headless(Instant::now(), false));
+    assert!(server.app.event_hub.events_after(sequence).is_empty());
+}
+
+#[test]
 fn headless_scheduled_tasks_clears_disabled_agent_manifest_update_deadline() {
     let mut server = test_headless_server();
     let now = Instant::now();

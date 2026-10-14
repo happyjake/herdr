@@ -2065,6 +2065,16 @@ impl TerminalState {
         Ok(true)
     }
 
+    pub fn announce_flag_at(&mut self, now_unix: u64) -> bool {
+        let Some(flag) = self.flag.as_mut().filter(|flag| {
+            flag.announced_at.is_none() && flag.due_at.is_some_and(|due| due <= now_unix)
+        }) else {
+            return false;
+        };
+        flag.announced_at = Some(now_unix);
+        true
+    }
+
     /// Restore the flag without treating a restore as a new write.
     pub fn restore_flag(
         &mut self,
