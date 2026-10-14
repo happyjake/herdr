@@ -184,6 +184,14 @@ pub struct AgentPromptParams {
     pub target: String,
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_terminal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub if_status: Vec<AgentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentPromptWaitOptions>,
 }
 

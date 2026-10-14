@@ -349,6 +349,24 @@ fn agent_command() -> Command {
                 .arg(required("target", "TARGET"))
                 .arg(required("text", "TEXT"))
                 .arg(
+                    option("expect-terminal", "TERMINAL_ID")
+                        .help("Refuse with agent_mismatch unless the target terminal ID matches"),
+                )
+                .arg(
+                    option("expect-agent", "KIND")
+                        .help("Refuse with agent_mismatch unless the target agent kind matches"),
+                )
+                .arg(
+                    option("expect-session", "SESSION_ID")
+                        .help("Refuse with agent_mismatch unless the target agent session ID matches"),
+                )
+                .arg(
+                    option("if-status", "STATUS")
+                        .value_delimiter(',')
+                        .value_parser(["idle", "done", "blocked", "working"])
+                        .help("Refuse with agent_busy unless the target status is in this comma-separated list"),
+                )
+                .arg(
                     flag("wait")
                         .help("Wait for the first matching state observed after submission"),
                 )
@@ -365,7 +383,7 @@ fn agent_command() -> Command {
                         .help("Fail after this many milliseconds"),
                 )
                 .after_help(
-                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
+                    "Conditional expectations (--expect-terminal, --expect-agent, --expect-session, --if-status) are checked atomically on the server at delivery time; mismatches fail with agent_mismatch (identity) or agent_busy (status) without sending input. If the agent is already blocked and --if-status does not include blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
                 ),
         )
         .subcommand(
@@ -1186,6 +1204,40 @@ mod tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    #[test]
+    fn agent_prompt_spec_includes_conditional_expectation_flags() {
+        let cmd = super::command();
+        let prompt = command_path(&cmd, &["agent", "prompt"]);
+        for option in [
+            "expect-terminal",
+            "expect-agent",
+            "expect-session",
+            "if-status",
+        ] {
+            assert!(
+                has_option(prompt, option),
+                "herdr agent prompt is missing --{option}"
+            );
+        }
+        assert_eq!(
+            option_values(prompt, "if-status"),
+            ["idle", "done", "blocked", "working"]
+        );
+
+        let help = long_help(&["agent", "prompt"]);
+        for flag in [
+            "--expect-terminal",
+            "--expect-agent",
+            "--expect-session",
+            "--if-status",
+        ] {
+            assert!(
+                help.contains(flag),
+                "herdr agent prompt --help is missing {flag}: {help}"
+            );
+        }
     }
 
     #[test]

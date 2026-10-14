@@ -127,33 +127,119 @@ impl App {
                 "agent prompt must not be empty",
             ));
         }
-        let resolved = match self.resolve_agent_target(&params.target) {
+        if params
+            .if_status
+            .contains(&crate::api::schema::AgentStatus::Unknown)
+        {
+            return Err(encode_error(
+                id,
+                "invalid_request",
+                "if_status only accepts idle, done, blocked, or working",
+            ));
+        }
+        let has_identity_expectations = params.expect_terminal.is_some()
+            || params.expect_agent.is_some()
+            || params.expect_session.is_some();
+        let resolved = match self
+            .resolve_agent_prompt_target(&params.target, params.expect_terminal.as_deref())
+        {
             Ok(resolved) => resolved,
             Err(err) => return Err(encode_error_body(id, self.agent_target_error_body(err))),
         };
-        let Some(terminal_id) = self
-            .state
-            .workspaces
-            .get(resolved.ws_idx)
-            .and_then(|workspace| workspace.terminal_id(resolved.pane_id))
-            .cloned()
-        else {
+        let Some(workspace) = self.state.workspaces.get(resolved.ws_idx) else {
             return Err(agent_not_found(id, &params.target));
         };
+        let Some(pane_state) = workspace.pane_state(resolved.pane_id) else {
+            return Err(agent_not_found(id, &params.target));
+        };
+        let terminal_id = pane_state.attached_terminal_id.clone();
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        if terminal.state == crate::detect::AgentState::Blocked {
+        if let Some(expected_terminal) = params.expect_terminal.as_deref() {
+            let actual_terminal = terminal.id.to_string();
+            if actual_terminal != expected_terminal {
+                return Err(encode_error(
+                    id,
+                    "agent_mismatch",
+                    format!(
+                        "agent target {} has terminal {actual_terminal}, expected {expected_terminal}",
+                        params.target
+                    ),
+                ));
+            }
+        }
+        if self.parse_current_public_pane_id(&params.target).is_none()
+            && terminal.agent_name.as_deref() != Some(params.target.as_str())
+        {
             return Err(encode_error(
                 id,
-                "agent_blocked",
+                "agent_mismatch",
                 format!(
-                    "agent {} is blocked and requires interactive input",
-                    params.target
+                    "agent target {} is no longer hosted by terminal {}",
+                    params.target, terminal.id
                 ),
             ));
         }
+        if let Some(expected_agent) = params.expect_agent.as_deref() {
+            let actual_agent = terminal
+                .is_agent_terminal()
+                .then(|| terminal.effective_agent_label())
+                .flatten();
+            if actual_agent != Some(expected_agent) {
+                return Err(encode_error(
+                    id,
+                    "agent_mismatch",
+                    format!(
+                        "agent target {} has agent {}, expected {expected_agent}",
+                        params.target,
+                        actual_agent.unwrap_or("none")
+                    ),
+                ));
+            }
+        }
+        if let Some(expected_session) = params.expect_session.as_deref() {
+            let actual_session = terminal
+                .is_agent_terminal()
+                .then(|| crate::app::creation::terminal_agent_session_info(terminal))
+                .flatten()
+                .map(|session| session.value);
+            if actual_session.as_deref() != Some(expected_session) {
+                return Err(encode_error(
+                    id,
+                    "agent_mismatch",
+                    format!(
+                        "agent target {} has session {}, expected {expected_session}",
+                        params.target,
+                        actual_session.as_deref().unwrap_or("none")
+                    ),
+                ));
+            }
+        }
+        if !terminal.is_agent_terminal() {
+            if has_identity_expectations {
+                return Err(encode_error(
+                    id,
+                    "agent_mismatch",
+                    format!(
+                        "agent target {} does not currently host an agent",
+                        params.target
+                    ),
+                ));
+            }
+            return Err(agent_not_found(id, &params.target));
+        }
         let Some(expected_agent) = terminal.effective_known_agent() else {
+            if has_identity_expectations {
+                return Err(encode_error(
+                    id,
+                    "agent_mismatch",
+                    format!(
+                        "agent target {} does not currently host an interactive agent",
+                        params.target
+                    ),
+                ));
+            }
             return Err(agent_not_ready(id, &params.target));
         };
         if terminal.managed_agent_launch_pending() {
@@ -163,11 +249,40 @@ impl App {
             return Err(agent_not_found(id, &params.target));
         };
         if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+            let code = if has_identity_expectations {
+                "agent_mismatch"
+            } else {
+                "agent_not_ready"
+            };
             return Err(encode_error(
                 id,
-                "agent_not_ready",
+                code,
                 format!(
                     "agent {} is no longer the pane foreground process",
+                    params.target
+                ),
+            ));
+        }
+        if !params.if_status.is_empty() {
+            let current_status = pane_state.reported_agent_status(
+                crate::app::api_helpers::pane_agent_status(terminal.state, pane_state.seen),
+            );
+            if !params.if_status.contains(&current_status) {
+                return Err(encode_error(
+                    id,
+                    "agent_busy",
+                    format!(
+                        "agent {} has status {:?}, which is not in expected if_status",
+                        params.target, current_status
+                    ),
+                ));
+            }
+        } else if terminal.state == crate::detect::AgentState::Blocked {
+            return Err(encode_error(
+                id,
+                "agent_blocked",
+                format!(
+                    "agent {} is blocked and requires interactive input",
                     params.target
                 ),
             ));
@@ -445,6 +560,18 @@ mod tests {
             .expect("agent prompt responds after submission")
     }
 
+    fn prompt_params(target: impl Into<String>, text: impl Into<String>) -> AgentPromptParams {
+        AgentPromptParams {
+            target: target.into(),
+            text: text.into(),
+            expect_terminal: None,
+            expect_agent: None,
+            expect_session: None,
+            if_status: Vec::new(),
+            wait: None,
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_codex_prompt_flushes_paste_burst_before_enter() {
@@ -459,15 +586,8 @@ mod tests {
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         app.state.insert_test_runtime(pane_id, runtime);
 
-        let response = run_deferred_agent_prompt(
-            &mut app,
-            "req",
-            AgentPromptParams {
-                target: "reviewer".into(),
-                text: "A != B".into(),
-                wait: None,
-            },
-        );
+        let response =
+            run_deferred_agent_prompt(&mut app, "req", prompt_params("reviewer", "A != B"));
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert!(matches!(
             success.result,
@@ -561,15 +681,8 @@ mod tests {
 
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         let bracketed_started = std::time::Instant::now();
-        let response_rx = start_deferred_agent_prompt(
-            &mut app,
-            "req",
-            AgentPromptParams {
-                target: public_pane_id,
-                text: "A != B".into(),
-                wait: None,
-            },
-        );
+        let response_rx =
+            start_deferred_agent_prompt(&mut app, "req", prompt_params(public_pane_id, "A != B"));
         assert!(response_rx.try_recv().is_err());
         let response = response_rx
             .recv_timeout(Duration::from_secs(1))
@@ -590,15 +703,8 @@ mod tests {
             .unwrap()
             .test_process_pty_bytes(b"\x1b[?2004l");
         let raw_started = std::time::Instant::now();
-        let raw = run_deferred_agent_prompt(
-            &mut app,
-            "req-raw",
-            AgentPromptParams {
-                target: "reviewer".into(),
-                text: "A != B".into(),
-                wait: None,
-            },
-        );
+        let raw =
+            run_deferred_agent_prompt(&mut app, "req-raw", prompt_params("reviewer", "A != B"));
         let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
         assert!(matches!(raw.result, ResponseResult::AgentPrompted { .. }));
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B"));
@@ -608,11 +714,7 @@ mod tests {
         let rejected = run_deferred_agent_prompt(
             &mut app,
             "req-label",
-            AgentPromptParams {
-                target: "opencode".into(),
-                text: "wrong target".into(),
-                wait: None,
-            },
+            prompt_params("opencode", "wrong target"),
         );
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
         assert_eq!(error.error.code, "agent_not_found");
@@ -635,11 +737,7 @@ mod tests {
         let response = run_deferred_agent_prompt(
             &mut app,
             "req",
-            AgentPromptParams {
-                target: "reviewer".into(),
-                text: "unrelated prompt".into(),
-                wait: None,
-            },
+            prompt_params("reviewer", "unrelated prompt"),
         );
 
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -672,15 +770,8 @@ mod tests {
         runtime.test_process_pty_bytes(b"\x1b[?2004h");
         app.state.insert_test_runtime(pane_id, runtime);
 
-        let response = run_deferred_agent_prompt(
-            &mut app,
-            "req",
-            AgentPromptParams {
-                target: "reviewer".into(),
-                text: "A != B".into(),
-                wait: None,
-            },
-        );
+        let response =
+            run_deferred_agent_prompt(&mut app, "req", prompt_params("reviewer", "A != B"));
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert!(matches!(
             success.result,
@@ -751,15 +842,8 @@ mod tests {
         let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         app.state.insert_test_runtime(pane_id, runtime);
 
-        let response = run_deferred_agent_prompt(
-            &mut app,
-            "req-pending",
-            AgentPromptParams {
-                target: "reviewer".into(),
-                text: "A != B".into(),
-                wait: None,
-            },
-        );
+        let response =
+            run_deferred_agent_prompt(&mut app, "req-pending", prompt_params("reviewer", "A != B"));
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "agent_not_ready");
         assert!(rx.try_recv().is_err());
@@ -878,5 +962,244 @@ mod tests {
                 Some("shell-pane")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_checks_expected_terminal_atomically() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        // Even when the pane currently hosts only a shell, both mismatched and matching
+        // terminal expectations report agent_mismatch without writing because no agent is live.
+        let mut mismatched_shell = prompt_params(&public_pane_id, "do not send");
+        mismatched_shell.expect_terminal = Some("term_other".into());
+        let rejected = run_deferred_agent_prompt(&mut app, "req-shell-mismatch", mismatched_shell);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(rx.try_recv().is_err());
+
+        let mut same_term_shell = prompt_params(&public_pane_id, "do not send");
+        same_term_shell.expect_terminal = Some(terminal_id.to_string());
+        let rejected = run_deferred_agent_prompt(&mut app, "req-same-term-shell", same_term_shell);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(rx.try_recv().is_err());
+
+        let mut cleared_name = prompt_params("reviewer", "do not send");
+        cleared_name.expect_terminal = Some(terminal_id.to_string());
+        let rejected = run_deferred_agent_prompt(&mut app, "req-cleared-name", cleared_name);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(rx.try_recv().is_err());
+
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+
+        let mut mismatched = prompt_params("reviewer", "do not send");
+        mismatched.expect_terminal = Some("term_other".into());
+        let rejected = run_deferred_agent_prompt(&mut app, "req-mismatch", mismatched);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(rx.try_recv().is_err());
+
+        let mut matched = prompt_params("reviewer", "deliver this");
+        matched.expect_terminal = Some(terminal_id.to_string());
+        let accepted = run_deferred_agent_prompt(&mut app, "req-match", matched);
+        let success: SuccessResponse = serde_json::from_str(&accepted).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"deliver this"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_checks_expected_agent_and_session_atomically() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let mut shell_agent_mismatch = prompt_params(&public_pane_id, "do not send");
+        shell_agent_mismatch.expect_agent = Some("claude".into());
+        let rejected = run_deferred_agent_prompt(&mut app, "req-shell-agent", shell_agent_mismatch);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(rx.try_recv().is_err());
+
+        // A persisted session left on a non-agent shell terminal does not satisfy expect_session.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "test".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef {
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: "sess-123".into(),
+                record_path: None,
+            },
+        });
+        let mut shell_stale_session = prompt_params(&public_pane_id, "do not send");
+        shell_stale_session.expect_session = Some("sess-123".into());
+        let rejected =
+            run_deferred_agent_prompt(&mut app, "req-shell-stale-session", shell_stale_session);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(rx.try_recv().is_err());
+
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.persisted_agent_session = None;
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+
+        let mut missing_session = prompt_params("reviewer", "do not send");
+        missing_session.expect_session = Some("sess-123".into());
+        let rejected = run_deferred_agent_prompt(&mut app, "req-no-session", missing_session);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(rx.try_recv().is_err());
+
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "test".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef {
+                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                value: "sess-123".into(),
+                record_path: None,
+            },
+        });
+
+        let mut wrong_agent = prompt_params("reviewer", "do not send");
+        wrong_agent.expect_agent = Some("claude".into());
+        let rejected = run_deferred_agent_prompt(&mut app, "req-wrong-agent", wrong_agent);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(rx.try_recv().is_err());
+
+        let mut wrong_session = prompt_params("reviewer", "do not send");
+        wrong_session.expect_session = Some("sess-other".into());
+        let rejected = run_deferred_agent_prompt(&mut app, "req-wrong-session", wrong_session);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(rx.try_recv().is_err());
+
+        let mut matched = prompt_params("reviewer", "deliver this");
+        matched.expect_agent = Some("pi".into());
+        matched.expect_session = Some("sess-123".into());
+        let accepted = run_deferred_agent_prompt(&mut app, "req-matched", matched);
+        let success: SuccessResponse = serde_json::from_str(&accepted).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"deliver this"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_checks_if_status_atomically() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let mut invalid_status = prompt_params("reviewer", "do not send");
+        invalid_status.if_status = vec![AgentStatus::Unknown];
+        let rejected = run_deferred_agent_prompt(&mut app, "req-invalid-status", invalid_status);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "invalid_request");
+        assert!(rx.try_recv().is_err());
+
+        let mut busy_working = prompt_params("reviewer", "do not send");
+        busy_working.if_status = vec![AgentStatus::Idle, AgentStatus::Done];
+        let rejected = run_deferred_agent_prompt(&mut app, "req-busy-working", busy_working);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_busy");
+        assert!(rx.try_recv().is_err());
+
+        // Transition to Done (Idle + seen=false).
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane_id)
+            .unwrap()
+            .seen = false;
+
+        let mut only_idle = prompt_params("reviewer", "do not send");
+        only_idle.if_status = vec![AgentStatus::Idle];
+        let rejected = run_deferred_agent_prompt(&mut app, "req-only-idle", only_idle);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_busy");
+        assert!(rx.try_recv().is_err());
+
+        let mut idle_or_done = prompt_params("reviewer", "deliver on done");
+        idle_or_done.if_status = vec![AgentStatus::Idle, AgentStatus::Done];
+        let accepted = run_deferred_agent_prompt(&mut app, "req-done-match", idle_or_done);
+        let success: SuccessResponse = serde_json::from_str(&accepted).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"deliver on done")
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+
+        // Transition to Blocked: rejected with agent_busy when if_status excludes blocked,
+        // and delivered when if_status explicitly includes blocked.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Blocked);
+
+        let mut blocked_excluded = prompt_params("reviewer", "do not send");
+        blocked_excluded.if_status = vec![AgentStatus::Idle, AgentStatus::Done];
+        let rejected =
+            run_deferred_agent_prompt(&mut app, "req-blocked-excluded", blocked_excluded);
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
+        assert_eq!(error.error.code, "agent_busy");
+        assert!(rx.try_recv().is_err());
+
+        let mut blocked_included = prompt_params("reviewer", "answer blocker");
+        blocked_included.if_status = vec![AgentStatus::Idle, AgentStatus::Blocked];
+        let accepted =
+            run_deferred_agent_prompt(&mut app, "req-blocked-included", blocked_included);
+        let success: SuccessResponse = serde_json::from_str(&accepted).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"answer blocker")
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
     }
 }

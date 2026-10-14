@@ -1411,6 +1411,30 @@
       "$defs": {
         "AgentPromptParams": {
           "properties": {
+            "expect_agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expect_session": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expect_terminal": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "if_status": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/AgentStatus"
+              },
+              "type": "array"
+            },
             "target": {
               "type": "string"
             },
