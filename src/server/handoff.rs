@@ -684,6 +684,8 @@ mod tests {
                         agent_status_reported_through: None,
                         agent_status_captured_pair_reported: true,
                         pinned: false,
+                        flag: None,
+                        flag_set_through: None,
                         label_source: None,
                         label_at: None,
                     },

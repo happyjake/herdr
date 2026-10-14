@@ -451,6 +451,7 @@ fn unavailable_restored_terminal(
     terminal.restore_error = Some(reason);
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
+        terminal.restore_flag(pane.flag.clone(), pane.flag_set_through);
         terminal.launch_argv = pane.launch_argv.clone();
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
@@ -531,6 +532,8 @@ fn restore_tab(
         // A snapshot written before the pin existed leaves this absent, and the
         // pane restores unpinned.
         let saved_pinned = saved_pane.is_some_and(|p| p.pinned);
+        let saved_flag = saved_pane.and_then(|p| p.flag.clone());
+        let saved_flag_set_through = saved_pane.and_then(|p| p.flag_set_through);
         let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
         let saved_managed_agent = saved_pane
             .and_then(|pane| pane.managed_agent_kind.as_deref())
@@ -646,6 +649,7 @@ fn restore_tab(
                 .with_pending_agent_resume_plan(plan);
             terminal.restore_manual_label(saved_label, saved_label_source, saved_label_at);
             terminal.set_pinned(saved_pinned);
+            terminal.restore_flag(saved_flag, saved_flag_set_through);
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
             }
@@ -742,6 +746,7 @@ fn restore_tab(
                 }
                 terminal.restore_manual_label(saved_label, saved_label_source, saved_label_at);
                 terminal.set_pinned(saved_pinned);
+                terminal.restore_flag(saved_flag, saved_flag_set_through);
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
@@ -1477,6 +1482,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -1528,6 +1535,75 @@ mod tests {
         assert_eq!(session.session_ref.value, "opencode-session");
     }
 
+    #[tokio::test]
+    async fn flag_restore_keeps_announced_state_and_defaults_a_missing_key() {
+        let cwd = std::env::current_dir().unwrap();
+        let flag = serde_json::json!({
+            "note": "review", "due_at": 123, "set_at": 4000000000_u64, "announced_at": 124,
+        });
+        let mut stored = serde_json::json!({
+            "version": super::super::snapshot::SNAPSHOT_VERSION,
+            "workspaces": [{
+                "identity_cwd": cwd,
+                "tabs": [{
+                    "layout": LayoutSnapshot::Pane(0),
+                    "panes": {"0": {"cwd": cwd, "flag": flag}},
+                    "zoomed": false,
+                }]
+            }],
+            "active": 0, "selected": 0,
+        });
+        let restore_once = |stored: serde_json::Value| {
+            let snapshot: SessionSnapshot = serde_json::from_value(stored).unwrap();
+            let (events, _event_rx) = mpsc::channel(4);
+            let (_, terminals, _runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            terminals.into_values().next().expect("restored terminal")
+        };
+        let mut terminal = restore_once(stored.clone());
+        assert_eq!(serde_json::to_value(&terminal.flag).unwrap(), flag);
+        terminal
+            .set_flag(Some("recheck".into()), Some(123))
+            .unwrap();
+        assert_eq!(terminal.flag.as_ref().unwrap().set_at, 4000000001);
+        assert_eq!(terminal.flag.as_ref().unwrap().announced_at, Some(124));
+        terminal
+            .set_flag(Some("recheck".into()), Some(456))
+            .unwrap();
+        assert_eq!(terminal.flag.as_ref().unwrap().set_at, 4000000002);
+        assert_eq!(terminal.flag.as_ref().unwrap().announced_at, None);
+        terminal.clear_flag();
+        terminal.set_flag(None, None).unwrap();
+        assert_eq!(terminal.flag.as_ref().unwrap().set_at, 4000000003);
+
+        strip_key(&mut stored, "flag");
+        assert!(restore_once(stored.clone()).flag.is_none());
+        stored["workspaces"][0]["tabs"][0]["panes"]["0"]["flag_set_through"] =
+            serde_json::json!(4000000010_u64);
+        let mut cleared = restore_once(stored.clone());
+        cleared.set_flag(None, None).unwrap();
+        assert_eq!(cleared.flag.as_ref().unwrap().set_at, 4000000011);
+
+        // An unavailable directory still restores the pane's kept state.
+        stored["workspaces"][0]["tabs"][0]["panes"]["0"]["flag"] = flag.clone();
+        stored["workspaces"][0]["tabs"][0]["panes"]["0"]["cwd"] =
+            serde_json::json!(cwd.join("missing-flag-directory"));
+        let unavailable = restore_once(stored);
+        assert!(unavailable.restore_error.is_some());
+        assert_eq!(serde_json::to_value(&unavailable.flag).unwrap(), flag);
+    }
+
     /// The pin survives a restart, and a session written before the pin
     /// existed restores every pane unpinned rather than failing to load.
     #[tokio::test]
@@ -1563,6 +1639,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: true,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -1667,6 +1745,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: Some(crate::api::schema::LabelSource::Editor),
                             label_at: Some(1_700_000_000),
                         },
@@ -1787,6 +1867,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -1883,6 +1965,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -2004,6 +2088,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -2132,6 +2218,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -2225,6 +2313,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -2314,6 +2404,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -2396,6 +2488,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -2478,6 +2572,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -2562,6 +2658,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -2649,6 +2747,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -2736,6 +2836,8 @@ mod tests {
                                 agent_status_reported_through: None,
                                 agent_status_captured_pair_reported: true,
                                 pinned: false,
+                                flag: None,
+                                flag_set_through: None,
                                 label_source: None,
                                 label_at: None,
                             },
@@ -2756,6 +2858,8 @@ mod tests {
                                 agent_status_reported_through: None,
                                 agent_status_captured_pair_reported: true,
                                 pinned: false,
+                                flag: None,
+                                flag_set_through: None,
                                 label_source: None,
                                 label_at: None,
                             },
@@ -2818,6 +2922,8 @@ mod tests {
                     agent_status_reported_through: None,
                     agent_status_captured_pair_reported: true,
                     pinned: false,
+                    flag: None,
+                    flag_set_through: None,
                     label_source: None,
                     label_at: None,
                 },
@@ -2843,6 +2949,8 @@ mod tests {
             agent_status_reported_through: None,
             agent_status_captured_pair_reported: true,
             pinned: false,
+            flag: None,
+            flag_set_through: None,
             label_source: None,
             label_at: None,
         };
@@ -3004,6 +3112,8 @@ mod tests {
                             agent_status_reported_through: None,
                             agent_status_captured_pair_reported: true,
                             pinned: false,
+                            flag: None,
+                            flag_set_through: None,
                             label_source: None,
                             label_at: None,
                         },
@@ -3557,6 +3667,8 @@ mod tests {
                 agent_status_reported_through: None,
                 agent_status_captured_pair_reported: true,
                 pinned: false,
+                flag: None,
+                flag_set_through: None,
                 label_source: None,
                 label_at: None,
             },

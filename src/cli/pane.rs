@@ -4,9 +4,9 @@ use crate::api::schema::{
     PaneMoveDestination, PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
     PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneRightClickTarget, PaneSendInputParams,
-    PaneSendKeysParams, PaneSendTextParams, PaneSetPinnedParams, PaneSplitParams, PaneSwapParams,
-    PaneTarget, PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource,
-    Request, SplitDirection,
+    PaneSendKeysParams, PaneSendTextParams, PaneSetFlagParams, PaneSetPinnedParams,
+    PaneSplitParams, PaneSwapParams, PaneTarget, PaneWaitForOutputParams, PaneZoomMode,
+    PaneZoomParams, ReadFormat, ReadSource, Request, SplitDirection,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -30,6 +30,8 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "rename" => pane_rename(&args[1..]),
         "pin" => pane_set_pinned(&args[1..], true),
         "unpin" => pane_set_pinned(&args[1..], false),
+        "flag" => pane_flag(&args[1..], false),
+        "unflag" => pane_flag(&args[1..], true),
         "input" => pane_input(&args[1..]),
         "split" => pane_split(&args[1..]),
         "swap" => pane_swap(&args[1..]),
@@ -470,6 +472,75 @@ fn pane_set_pinned(args: &[String], pinned: bool) -> std::io::Result<i32> {
         pane_id: super::normalize_pane_id(raw_pane_id),
         pinned,
     })
+}
+
+fn pane_flag(args: &[String], clear: bool) -> std::io::Result<i32> {
+    let method = match parse_pane_flag_args(args, clear) {
+        Ok(method) => method,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:pane:flag".into(),
+        method,
+    })?)
+}
+
+fn parse_pane_flag_args(args: &[String], clear: bool) -> Result<Method, String> {
+    let usage = if clear {
+        "usage: herdr pane unflag <pane_id>"
+    } else {
+        "usage: herdr pane flag <pane_id> [--note <text>] [--due <rfc3339|epoch-seconds>]"
+    };
+    let raw_pane_id = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or_else(|| usage.to_string())?;
+    let pane_id = super::normalize_pane_id(raw_pane_id);
+    if clear {
+        if args.len() != 1 {
+            return Err(usage.into());
+        }
+        return Ok(Method::PaneClearFlag(PaneTarget { pane_id }));
+    }
+    let mut note = None;
+    let mut due_at = None;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let value = args.get(index + 1).ok_or_else(|| usage.to_string())?;
+        match option {
+            "--note" if note.is_none() => note = Some(value.clone()),
+            "--due" if due_at.is_none() => {
+                due_at = Some(
+                    value
+                        .parse::<u64>()
+                        .or_else(|_| {
+                            time::OffsetDateTime::parse(
+                                value,
+                                &time::format_description::well_known::Rfc3339,
+                            )
+                            .map_err(|_| ())?
+                            .unix_timestamp()
+                            .try_into()
+                            .map_err(|_| ())
+                        })
+                        .map_err(|_| {
+                            "--due must be RFC3339 or nonnegative epoch seconds".to_string()
+                        })?,
+                );
+            }
+            _ => return Err(usage.into()),
+        }
+        index += 2;
+    }
+    Ok(Method::PaneSetFlag(PaneSetFlagParams {
+        pane_id,
+        note,
+        due_at,
+    }))
 }
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
@@ -1702,6 +1773,8 @@ fn print_pane_help() {
     eprintln!("  herdr pane rename <pane_id> <label>|--clear");
     eprintln!("  herdr pane pin <pane_id>");
     eprintln!("  herdr pane unpin <pane_id>");
+    eprintln!("  herdr pane flag <pane_id> [--note <text>] [--due <rfc3339|epoch-seconds>]");
+    eprintln!("  herdr pane unflag <pane_id>");
     eprintln!("  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr pane input [<pane_id>|--pane ID|--current] --right-click herdr|pane");
     eprintln!(
@@ -1729,6 +1802,69 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn pane_flag_arguments_accept_absolute_dates_and_optional_notes() {
+        for due in [
+            "2000-01-01T00:00:00Z",
+            "2000-01-01T08:00:00+08:00",
+            "946684800",
+        ] {
+            let method =
+                parse_pane_flag_args(&args(&["w1:p1", "--note", "review", "--due", due]), false)
+                    .unwrap();
+            let value = serde_json::to_value(method).unwrap();
+            assert_eq!(value["method"], "pane.set_flag");
+            assert_eq!(
+                value["params"],
+                serde_json::json!({"pane_id": "w1:p1", "note": "review", "due_at": 946684800})
+            );
+        }
+        let bare =
+            serde_json::to_value(parse_pane_flag_args(&args(&["w1:p1"]), false).unwrap()).unwrap();
+        assert_eq!(
+            bare["params"],
+            serde_json::json!({"pane_id": "w1:p1", "note": null, "due_at": null})
+        );
+        let clear =
+            serde_json::to_value(parse_pane_flag_args(&args(&["w1:p1"]), true).unwrap()).unwrap();
+        assert_eq!(
+            clear,
+            serde_json::json!({"method": "pane.clear_flag", "params": {"pane_id": "w1:p1"}})
+        );
+    }
+
+    #[test]
+    fn pane_flag_arguments_reject_relative_times_and_malformed_options() {
+        for due in [
+            "tomorrow",
+            "in 1 hour",
+            "1h",
+            "2000-01-01",
+            "garbage",
+            "-1",
+            "1.5",
+        ] {
+            assert!(
+                parse_pane_flag_args(&args(&["w1:p1", "--due", due]), false).is_err(),
+                "{due}"
+            );
+        }
+        for values in [
+            vec![],
+            vec!["w1:p1", "--note"],
+            vec!["w1:p1", "--due"],
+            vec!["w1:p1", "--unknown"],
+            vec!["w1:p1", "extra"],
+        ] {
+            assert!(
+                parse_pane_flag_args(&args(&values), false).is_err(),
+                "{values:?}"
+            );
+        }
+        assert!(parse_pane_flag_args(&args(&[]), true).is_err());
+        assert!(parse_pane_flag_args(&args(&["w1:p1", "--note", "review"]), true).is_err());
     }
 
     #[test]

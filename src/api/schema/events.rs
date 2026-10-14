@@ -432,6 +432,8 @@ pub struct PaneAgentStatusChangedEvent {
     /// predates the pin, not as an unpinned pane.
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub flag: Option<super::panes::PaneFlag>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -590,6 +592,8 @@ pub enum EventData {
         /// reason the label is.
         #[serde(default)]
         pinned: bool,
+        #[serde(default)]
+        flag: Option<super::panes::PaneFlag>,
     },
     LayoutUpdated {
         layout: super::panes::PaneLayoutSnapshot,

@@ -360,6 +360,24 @@ pub struct PaneSetPinnedParams {
     pub pinned: bool,
 }
 
+/// A user-kept to-do. Dates are whole unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneFlag {
+    pub note: Option<String>,
+    pub due_at: Option<u64>,
+    pub set_at: u64,
+    pub announced_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSetFlagParams {
+    pub pane_id: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub due_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSendTextParams {
     pub pane_id: String,
@@ -620,6 +638,9 @@ pub struct PaneInfo {
     /// and write it only when the user asks for it.
     #[serde(default)]
     pub pinned: bool,
+    /// Always serialized: null is unflagged; an absent key means no flag capability.
+    #[serde(default)]
+    pub flag: Option<PaneFlag>,
     /// Who wrote the standing `label`, when it was not a person.
     ///
     /// Always serialized, like `pinned` and for the same reason: a client

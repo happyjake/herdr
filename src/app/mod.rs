@@ -2680,6 +2680,262 @@ mod tests {
             .is_none());
     }
 
+    fn flag_request(app: &mut App, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "flag-test", "method": method, "params": params,
+        }))
+        .expect("flag request decodes");
+        serde_json::from_str(&app.handle_api_request(request)).unwrap()
+    }
+
+    #[test]
+    fn pane_flag_set_replace_clear_publish_one_status_event_per_change() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("flags");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let status = app.pane_info(0, pane).unwrap().agent_status;
+        let mut previous_date = 0;
+        for (method, fields, expected_note, expected_due) in [
+            (
+                "pane.set_flag",
+                serde_json::json!({"note": "  review  ", "due_at": 123}),
+                Some("review"),
+                Some(123),
+            ),
+            (
+                "pane.set_flag",
+                serde_json::json!({"note": "recheck"}),
+                Some("recheck"),
+                None,
+            ),
+            ("pane.clear_flag", serde_json::json!({}), None, None),
+        ] {
+            let mut params = fields;
+            params["pane_id"] = serde_json::json!(pane_id);
+            let sequence = app.event_hub.current_sequence();
+            let response = flag_request(&mut app, method, params.clone());
+            assert_eq!(response["result"]["type"], "pane_info", "{response}");
+            let flag = response["result"]["pane"]
+                .get("flag")
+                .expect("capability key");
+            if method == "pane.clear_flag" {
+                assert!(flag.is_null());
+            } else {
+                assert_eq!(flag["note"], serde_json::json!(expected_note));
+                assert_eq!(flag["due_at"], serde_json::json!(expected_due));
+                assert_eq!(flag.get("announced_at"), Some(&serde_json::Value::Null));
+                let date = flag["set_at"].as_u64().unwrap();
+                assert!(date > previous_date);
+                previous_date = date;
+            }
+            let events = app.event_hub.events_after(sequence);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(
+                events[0].1.event,
+                crate::api::schema::EventKind::PaneAgentStatusChanged
+            );
+            let payload = serde_json::to_value(&events[0].1.data).unwrap();
+            assert_eq!(payload.get("flag"), Some(flag));
+            assert_eq!(payload["agent_status"], serde_json::json!(status));
+
+            let sequence = app.event_hub.current_sequence();
+            let same = flag_request(&mut app, method, params);
+            assert_eq!(same["result"]["pane"]["flag"], *flag);
+            assert!(app.event_hub.events_after(sequence).is_empty());
+        }
+    }
+
+    #[test]
+    fn pane_flag_note_validation_is_atomic_and_counts_characters() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("flag-notes");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let original = flag_request(
+            &mut app,
+            "pane.set_flag",
+            serde_json::json!({"pane_id": pane_id, "note": "界".repeat(200), "due_at": 0}),
+        );
+        assert_eq!(original["result"]["pane"]["flag"]["note"], "界".repeat(200));
+        for note in [
+            "a\nb".to_string(),
+            "a\rb".into(),
+            "\n".into(),
+            "界".repeat(201),
+        ] {
+            let sequence = app.event_hub.current_sequence();
+            let response = flag_request(
+                &mut app,
+                "pane.set_flag",
+                serde_json::json!({"pane_id": pane_id, "note": note}),
+            );
+            assert_eq!(response["error"]["code"], "invalid_params", "{response}");
+            let current = flag_request(
+                &mut app,
+                "pane.get",
+                serde_json::json!({"pane_id": pane_id}),
+            );
+            assert_eq!(
+                current["result"]["pane"]["flag"],
+                original["result"]["pane"]["flag"]
+            );
+            assert!(app.event_hub.events_after(sequence).is_empty());
+        }
+        let blank = flag_request(
+            &mut app,
+            "pane.set_flag",
+            serde_json::json!({"pane_id": pane_id, "note": " \t "}),
+        );
+        assert_eq!(
+            blank["result"]["pane"]["flag"].get("note"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            blank["result"]["pane"]["flag"].get("due_at"),
+            Some(&serde_json::Value::Null)
+        );
+        let missing = flag_request(
+            &mut app,
+            "pane.set_flag",
+            serde_json::json!({"pane_id": "missing", "note": "review"}),
+        );
+        assert_eq!(missing["error"]["code"], "pane_not_found");
+    }
+
+    #[test]
+    fn pane_flag_dates_advance_and_only_retiming_clears_the_announcement() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("flag-dates");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let info = app.pane_info(0, pane).unwrap();
+        assert_eq!(
+            serde_json::to_value(&info).unwrap().get("flag"),
+            Some(&serde_json::Value::Null)
+        );
+        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        // A restored mint ahead of the wall clock makes the per-write rule deterministic.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .restore_flag(
+                Some(crate::api::schema::PaneFlag {
+                    note: Some("review".into()),
+                    due_at: Some(123),
+                    set_at: 4000000000,
+                    announced_at: Some(124),
+                }),
+                None,
+            );
+        for (note, due_at, set_at, announced_at) in [
+            ("recheck", 123, 4000000001_u64, Some(124)),
+            ("recheck again", 123, 4000000002, Some(124)),
+            ("recheck again", 456, 4000000003, None),
+        ] {
+            let params =
+                serde_json::json!({"pane_id": info.pane_id, "note": note, "due_at": due_at});
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": "flag", "method": "pane.set_flag", "params": params
+            }))
+            .unwrap();
+            assert!(!crate::api::request_changes_ui(&request));
+            let response = flag_request(&mut app, "pane.set_flag", params.clone());
+            assert_eq!(
+                response["result"]["pane"]["flag"],
+                serde_json::json!({
+                    "note": note, "due_at": due_at, "set_at": set_at, "announced_at": announced_at
+                })
+            );
+            let sequence = app.event_hub.current_sequence();
+            app.state.session_dirty = false;
+            let same = flag_request(&mut app, "pane.set_flag", params);
+            assert_eq!(same, response);
+            assert!(!app.state.session_dirty);
+            assert!(app.event_hub.events_after(sequence).is_empty());
+        }
+        flag_request(
+            &mut app,
+            "pane.clear_flag",
+            serde_json::json!({"pane_id": info.pane_id}),
+        );
+        let fresh = flag_request(
+            &mut app,
+            "pane.set_flag",
+            serde_json::json!({"pane_id": info.pane_id}),
+        );
+        assert_eq!(
+            fresh["result"]["pane"]["flag"],
+            serde_json::json!({
+                "note": null, "due_at": null, "set_at": 4000000004_u64, "announced_at": null
+            })
+        );
+        let sequence = app.event_hub.current_sequence();
+        flag_request(
+            &mut app,
+            "pane.rename",
+            serde_json::json!({"pane_id": info.pane_id, "label": "reviewer"}),
+        );
+        let events = app.event_hub.events_after(sequence);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&events[0].1.data).unwrap()["flag"],
+            fresh["result"]["pane"]["flag"]
+        );
+    }
+
+    #[test]
+    fn pane_flag_moves_with_the_terminal_and_is_removed_when_it_closes() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("flag-move");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let flagged = flag_request(
+            &mut app,
+            "pane.set_flag",
+            serde_json::json!({"pane_id": pane_id, "note": "review", "due_at": 123}),
+        );
+        let flag = flagged["result"]["pane"]["flag"].clone();
+        let moved = flag_request(
+            &mut app,
+            "pane.move",
+            serde_json::json!({
+                "pane_id": pane_id, "destination": {"type": "new_workspace"}
+            }),
+        );
+        let moved_pane = &moved["result"]["move_result"]["pane"];
+        assert_eq!(moved_pane.get("flag"), Some(&flag), "{moved}");
+        assert_eq!(
+            moved_pane["terminal_id"],
+            flagged["result"]["pane"]["terminal_id"]
+        );
+        let after_move = flag_request(
+            &mut app,
+            "pane.get",
+            serde_json::json!({"pane_id": moved_pane["pane_id"]}),
+        );
+        assert_eq!(after_move["result"]["pane"]["flag"], flag);
+        let closed = flag_request(
+            &mut app,
+            "pane.close",
+            serde_json::json!({"pane_id": moved_pane["pane_id"]}),
+        );
+        assert!(closed.get("error").is_none(), "{closed}");
+        assert!(app.state.terminals.is_empty());
+    }
+
     #[test]
     fn pane_set_pinned_request_sets_and_clears_the_pin() {
         let mut app = test_app();

@@ -979,6 +979,7 @@ fn the_status_event_carries_the_labels_provenance_beside_the_label() {
         label_source: Some(LabelSource::Editor),
         label_at: Some(1_700_000_000),
         pinned: false,
+        flag: None,
     };
 
     let json = serde_json::to_value(&event).unwrap();
@@ -1633,6 +1634,7 @@ fn worktree_request_and_response_round_trip() {
                 alternate_screen: false,
                 agent_status_changed_at: Some(1_700_000_000),
                 pinned: false,
+                flag: None,
                 label_source: None,
                 label_at: None,
                 revision: 0,
@@ -2070,6 +2072,7 @@ fn create_response_round_trips_with_root_pane() {
                 alternate_screen: false,
                 agent_status_changed_at: None,
                 pinned: false,
+                flag: None,
                 label_source: None,
                 label_at: None,
                 revision: 0,

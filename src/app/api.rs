@@ -24,6 +24,7 @@ pub(crate) struct KeptPanePresentation {
     label_source: Option<crate::api::schema::LabelSource>,
     label_at: Option<u64>,
     pinned: bool,
+    flag: Option<crate::api::schema::PaneFlag>,
 }
 
 impl KeptPanePresentation {
@@ -33,6 +34,7 @@ impl KeptPanePresentation {
             label_source: terminal.label_source,
             label_at: terminal.label_at,
             pinned: terminal.pinned,
+            flag: terminal.flag.clone(),
         }
     }
 }
@@ -61,6 +63,7 @@ fn pane_agent_status_changed_event(
             label_source: kept.label_source,
             label_at: kept.label_at,
             pinned: kept.pinned,
+            flag: kept.flag,
         },
     }
 }
@@ -791,11 +794,11 @@ impl App {
 
     /// Publish the pane's presentation because a field the pane keeps rather
     /// than derives changed: its manual label, whose that label is, when it
-    /// was written, or its pin. The agent status is reported exactly as the
+    /// was written, its pin, or its flag. The agent status is reported exactly as the
     /// pane holds it; only the kept field moved.
     ///
-    /// Every writer of either field publishes through here, so a subscriber
-    /// hears them the same way and neither can go out on its own path.
+    /// Every writer of kept presentation publishes through here, so a
+    /// subscriber hears the complete state through the same path.
     pub(crate) fn emit_pane_kept_presentation_changed(
         &mut self,
         ws_idx: usize,
@@ -1317,6 +1320,16 @@ impl App {
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneSetPinned(params) => {
                 return self.handle_pane_set_pinned(request.id, params)
+            }
+            Method::PaneSetFlag(params) => {
+                return self.handle_pane_flag(
+                    request.id,
+                    params.pane_id,
+                    Some((params.note, params.due_at)),
+                )
+            }
+            Method::PaneClearFlag(params) => {
+                return self.handle_pane_flag(request.id, params.pane_id, None)
             }
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneReportAgent(params) => {

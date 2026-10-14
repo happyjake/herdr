@@ -1661,6 +1661,44 @@ impl App {
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
+    pub(super) fn handle_pane_flag(
+        &mut self,
+        id: String,
+        target: String,
+        flag: Option<(Option<String>, Option<u64>)>,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target) else {
+            return pane_not_found(id, &target);
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id))
+            .cloned()
+        else {
+            return pane_not_found(id, &target);
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return pane_not_found(id, &target);
+        };
+        let changed = match flag {
+            Some((note, due_at)) => match terminal.set_flag(note, due_at) {
+                Ok(changed) => changed,
+                Err(message) => return encode_error(id, "invalid_params", message),
+            },
+            None => terminal.clear_flag(),
+        };
+        if changed {
+            self.state.mark_session_dirty();
+            self.emit_pane_kept_presentation_changed(ws_idx, pane_id);
+        }
+        let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            return pane_not_found(id, &target);
+        };
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
     pub(super) fn handle_pane_read(&mut self, id: String, params: PaneReadParams) -> String {
         let resolved = match self.resolve_pane_command_target(&id, &params.pane_id) {
             Ok(resolved) => resolved,

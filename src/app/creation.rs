@@ -382,6 +382,7 @@ impl App {
             alternate_screen,
             agent_status_changed_at,
             pinned: terminal.pinned,
+            flag: terminal.flag.clone(),
             label_source: terminal.label_source,
             label_at: terminal.label_at,
             revision: terminal.revision,

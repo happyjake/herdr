@@ -79,6 +79,7 @@ struct PanePresentationSnapshot {
     label_source: Option<crate::api::schema::LabelSource>,
     label_at: Option<u64>,
     pinned: bool,
+    flag: Option<crate::api::schema::PaneFlag>,
 }
 
 impl PanePresentationSnapshot {
@@ -91,6 +92,7 @@ impl PanePresentationSnapshot {
             label_source: pane.label_source,
             label_at: pane.label_at,
             pinned: pane.pinned,
+            flag: pane.flag.clone(),
         }
     }
 
@@ -108,6 +110,7 @@ impl PanePresentationSnapshot {
             label_source: kept.label_source,
             label_at: kept.label_at,
             pinned: kept.pinned,
+            flag: kept.flag.clone(),
         }
     }
 }
@@ -120,6 +123,7 @@ struct KeptPresentation {
     label_source: Option<crate::api::schema::LabelSource>,
     label_at: Option<u64>,
     pinned: bool,
+    flag: Option<crate::api::schema::PaneFlag>,
 }
 
 pub(super) struct ActiveEventSubscription {
@@ -264,6 +268,7 @@ impl ActiveSubscription {
                         label_source: probe.label_source,
                         label_at: probe.label_at,
                         pinned: probe.pinned,
+                        flag: probe.flag.clone(),
                     });
 
                 Ok(Self::AgentStatusChanged(Box::new(
@@ -482,6 +487,7 @@ impl ActiveAgentStatusChangedSubscription {
             label_source,
             label_at,
             pinned,
+            flag,
         } = event.data
         else {
             return None;
@@ -504,12 +510,14 @@ impl ActiveAgentStatusChangedSubscription {
                 label_source: known.label_source,
                 label_at: known.label_at,
                 pinned: known.pinned,
+                flag: known.flag.clone(),
             },
             None => KeptPresentation {
                 label,
                 label_source,
                 label_at,
                 pinned,
+                flag,
             },
         };
         self.last_status = Some(agent_status);
@@ -541,6 +549,7 @@ impl ActiveAgentStatusChangedSubscription {
                 label_source: kept.label_source,
                 label_at: kept.label_at,
                 pinned: kept.pinned,
+                flag: kept.flag.clone(),
             }),
         })
     }
@@ -614,6 +623,7 @@ impl ActiveAgentStatusChangedSubscription {
                 label_source: pane.label_source,
                 label_at: pane.label_at,
                 pinned: pane.pinned,
+                flag: pane.flag.clone(),
             }),
         })
     }
@@ -783,6 +793,7 @@ mod tests {
                 label_source,
                 label_at,
                 pinned,
+                flag: None,
             },
         }
     }
@@ -835,6 +846,7 @@ mod tests {
             alternate_screen: false,
             agent_status_changed_at: Some(1_700_000_000),
             pinned: false,
+            flag: None,
             label_source: None,
             label_at: None,
             revision: 0,
@@ -949,6 +961,7 @@ mod tests {
                         label_source: None,
                         label_at: None,
                         pinned: false,
+                        flag: None,
                     }),
                     request_prefix: "batch".into(),
                 },
@@ -1038,6 +1051,7 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                flag: None,
                 label_source: None,
                 label_at: None,
             }),
@@ -1080,6 +1094,7 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                flag: None,
                 label_source: None,
                 label_at: None,
             }),
@@ -1095,6 +1110,7 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                flag: None,
                 label_source: None,
                 label_at: None,
             }),
@@ -1130,6 +1146,7 @@ mod tests {
             state_labels: HashMap::new(),
             label: None,
             pinned: false,
+            flag: None,
             label_source: None,
             label_at: None,
         };
@@ -1318,6 +1335,7 @@ mod tests {
             state_labels: HashMap::new(),
             label: None,
             pinned: false,
+            flag: None,
             label_source: None,
             label_at: None,
         };
@@ -1747,6 +1765,7 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                flag: None,
                 label_source: None,
                 label_at: None,
             }),
@@ -1762,6 +1781,7 @@ mod tests {
                 state_labels: HashMap::new(),
                 label: None,
                 pinned: false,
+                flag: None,
                 label_source: None,
                 label_at: None,
             }),

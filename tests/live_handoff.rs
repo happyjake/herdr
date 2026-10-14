@@ -1053,6 +1053,68 @@ fn live_handoff_preserves_installed_plugins() {
 }
 
 #[test]
+fn live_handoff_preserves_the_flag_and_its_next_write_date() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "create", "method": "workspace.create", "params": {"cwd": base, "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let flagged = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "flag", "method": "pane.set_flag",
+            "params": {"pane_id": pane_id, "note": "review", "due_at": 123}
+        }),
+    );
+    let before = flagged["result"]["pane"]["flag"].clone();
+    assert_eq!(before["note"], "review", "{flagged}");
+    assert_eq!(before["announced_at"], serde_json::Value::Null);
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "handoff", "method": "server.live_handoff", "params": {}
+        }),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    let restored = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "get", "method": "pane.get", "params": {"pane_id": pane_id}
+        }),
+    );
+    assert_eq!(restored["result"]["pane"]["flag"], before, "{restored}");
+    let edited = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "edit", "method": "pane.set_flag",
+            "params": {"pane_id": pane_id, "note": "recheck", "due_at": 123}
+        }),
+    );
+    assert!(
+        edited["result"]["pane"]["flag"]["set_at"].as_u64().unwrap()
+            > before["set_at"].as_u64().unwrap()
+    );
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "stop", "method": "server.stop", "params": {}
+        }),
+    ));
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_preserves_pane_process_io() {
     let _lock = test_lock();
     let base = unique_test_dir();

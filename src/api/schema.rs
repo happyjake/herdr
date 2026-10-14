@@ -236,6 +236,10 @@ pub enum Method {
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.set_pinned")]
     PaneSetPinned(PaneSetPinnedParams),
+    #[serde(rename = "pane.set_flag")]
+    PaneSetFlag(PaneSetFlagParams),
+    #[serde(rename = "pane.clear_flag")]
+    PaneClearFlag(PaneTarget),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]

@@ -708,6 +708,17 @@
                     "null"
                   ]
                 },
+                "flag": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/event/$defs/PaneFlag"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
                 "label": {
                   "default": null,
                   "description": "The pane's manual label, always serialized and `null` when unset, so\na subscriber can tell a cleared label from a server that predates\nthe field.",
@@ -833,6 +844,42 @@
             }
           ]
         },
+        "PaneFlag": {
+          "description": "A user-kept to-do. Dates are whole unix seconds.",
+          "properties": {
+            "announced_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "due_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "set_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "set_at"
+          ],
+          "type": "object"
+        },
         "PaneInfo": {
           "properties": {
             "agent": {
@@ -879,6 +926,18 @@
                 "string",
                 "null"
               ]
+            },
+            "flag": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/PaneFlag"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Always serialized: null is unflagged; an absent key means no flag capability."
             },
             "focused": {
               "type": "boolean"
@@ -3558,6 +3617,33 @@
           "required": [
             "pane_id",
             "text"
+          ],
+          "type": "object"
+        },
+        "PaneSetFlagParams": {
+          "properties": {
+            "due_at": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "note": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
           ],
           "type": "object"
         },
@@ -6515,6 +6601,38 @@
         {
           "properties": {
             "method": {
+              "const": "pane.set_flag",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSetFlagParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.clear_flag",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.send_text",
               "type": "string"
             },
@@ -7027,6 +7145,17 @@
                 "null"
               ]
             },
+            "flag": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneFlag"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "label": {
               "default": null,
               "description": "The pane's manual label, always serialized and `null` when unset, so a\nsubscriber can tell a cleared label from a server that predates the\nfield. The other optional presentation fields stay omitted when unset.",
@@ -7085,6 +7214,42 @@
             "pane_id",
             "workspace_id",
             "agent_status"
+          ],
+          "type": "object"
+        },
+        "PaneFlag": {
+          "description": "A user-kept to-do. Dates are whole unix seconds.",
+          "properties": {
+            "announced_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "due_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "set_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "set_at"
           ],
           "type": "object"
         },
@@ -8173,6 +8338,17 @@
                     "null"
                   ]
                 },
+                "flag": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/PaneFlag"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
                 "label": {
                   "default": null,
                   "description": "The pane's manual label, always serialized and `null` when unset, so\na subscriber can tell a cleared label from a server that predates\nthe field.",
@@ -8674,6 +8850,42 @@
           ],
           "type": "object"
         },
+        "PaneFlag": {
+          "description": "A user-kept to-do. Dates are whole unix seconds.",
+          "properties": {
+            "announced_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "due_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "note": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "set_at": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "set_at"
+          ],
+          "type": "object"
+        },
         "PaneFocusDirectionReason": {
           "enum": [
             "no_neighbor"
@@ -8761,6 +8973,18 @@
                 "string",
                 "null"
               ]
+            },
+            "flag": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneFlag"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Always serialized: null is unflagged; an absent key means no flag capability."
             },
             "focused": {
               "type": "boolean"
