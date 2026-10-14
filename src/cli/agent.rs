@@ -202,6 +202,12 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
     if explain["idle_needs_settling"].as_bool().unwrap_or(false) {
         println!("settle: a pane publishes this idle only after it holds across consecutive reads");
     }
+    if explain["working_from_title_only"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        println!("title only: over an unchanged screen, a pane starts a turn on this working only after it persists");
+    }
     if let Some(reason) = explain["fallback_reason"].as_str() {
         println!("fallback_reason: {reason}");
     }

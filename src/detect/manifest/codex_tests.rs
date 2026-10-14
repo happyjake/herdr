@@ -196,6 +196,36 @@ fn codex_supplement_defers_to_a_local_override() {
     });
 }
 
+/// Runs `f` with `manifest` installed as the cached remote codex manifest.
+pub(crate) fn with_codex_remote_manifest<T>(
+    name: &str,
+    manifest: &str,
+    f: impl FnOnce() -> T,
+) -> T {
+    with_codex_manifest_dirs(name, || {
+        let path = crate::detect::manifest_update::remote_manifest_path(Agent::Codex);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, manifest).unwrap();
+        reload_manifests();
+        f()
+    })
+}
+
+/// Runs `f` with `manifest` installed as the local codex override.
+pub(crate) fn with_codex_override_manifest<T>(
+    name: &str,
+    manifest: &str,
+    f: impl FnOnce() -> T,
+) -> T {
+    with_codex_manifest_dirs(name, || {
+        let path = override_path(Agent::Codex).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, manifest).unwrap();
+        reload_manifests();
+        f()
+    })
+}
+
 pub(crate) fn with_codex_manifest_dirs<T>(name: &str, f: impl FnOnce() -> T) -> T {
     let _guard = crate::config::test_config_env_lock().lock().unwrap();
     let old_config = std::env::var_os("XDG_CONFIG_HOME");

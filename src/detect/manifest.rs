@@ -37,6 +37,9 @@ pub struct DetectionExplain {
     /// The idle verdict came from a supplement rule and must hold across
     /// consecutive reads before a pane publishes it.
     pub idle_needs_settling: bool,
+    /// The working verdict came from a terminal title rule and no working rule
+    /// on another region matched the same read.
+    pub working_from_title_only: bool,
     pub skip_state_update: bool,
     pub skipped_update_reason: Option<String>,
     pub fallback_reason: Option<String>,
@@ -449,6 +452,7 @@ pub fn explain_for_label(agent_label: &str, screen_content: &str) -> DetectionEx
             visible_blocker: false,
             visible_working: false,
             idle_needs_settling: false,
+            working_from_title_only: false,
             skip_state_update: false,
             skipped_update_reason: None,
             fallback_reason: Some("unknown_agent".to_string()),
@@ -473,6 +477,7 @@ impl DetectionExplain {
             visible_blocker: self.visible_blocker,
             visible_working: self.visible_working,
             idle_needs_settling: self.idle_needs_settling,
+            working_from_title_only: self.working_from_title_only,
         }
     }
 }
@@ -521,6 +526,15 @@ fn evaluate_loaded_manifest(
     let skipped_update_reason = rule
         .skip_state_update
         .then(|| format!("matched_rule:{}", rule.id));
+    // Every rule was evaluated above, so agreement from another region costs
+    // no extra matching.
+    let working_from_title_only = state == AgentState::Working
+        && rule.region == "osc_title"
+        && !evaluated_rules.iter().any(|evaluated| {
+            evaluated.matched
+                && evaluated.state == AgentState::Working
+                && evaluated.region != "osc_title"
+        });
 
     let remote_update_status = include_update_status
         .then(|| remote_update_status(agent))
@@ -542,6 +556,7 @@ fn evaluate_loaded_manifest(
         visible_blocker: rule.visible_blocker && state == AgentState::Blocked,
         visible_working: rule.visible_working && state == AgentState::Working,
         idle_needs_settling: from_supplement && state == AgentState::Idle,
+        working_from_title_only,
         skip_state_update: rule.skip_state_update,
         skipped_update_reason,
         fallback_reason: None,
@@ -636,6 +651,7 @@ fn fallback_explain(
         visible_blocker: false,
         visible_working: false,
         idle_needs_settling: false,
+        working_from_title_only: false,
         skip_state_update: false,
         skipped_update_reason: None,
         fallback_reason: match agent {
@@ -949,6 +965,7 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
         "visible_blocker": explain.visible_blocker,
         "visible_working": explain.visible_working,
         "idle_needs_settling": explain.idle_needs_settling,
+        "working_from_title_only": explain.working_from_title_only,
         "screen_detection_skipped": explain.screen_detection_skipped,
         "skip_state_update": explain.skip_state_update,
         "skipped_update_reason": explain.skipped_update_reason,

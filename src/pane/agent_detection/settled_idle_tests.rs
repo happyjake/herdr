@@ -51,6 +51,7 @@ fn run(
                 last_visible_working: false,
                 last_visible_signal_refresh: None,
                 screen_detection: detection,
+                screen_changed: false,
                 process_exited: false,
                 agent_changed: false,
                 now: t0 + at,

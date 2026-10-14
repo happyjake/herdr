@@ -18,6 +18,13 @@ pub(super) const AGENT_STARTUP_GRACE_WINDOW: std::time::Duration =
 /// between streamed chunks, so this matches the startup grace window instead:
 /// long enough to outlast a pause in a stream, short enough for idle waits.
 pub(super) const SETTLED_IDLE_WINDOW: std::time::Duration = AGENT_STARTUP_GRACE_WINDOW;
+/// How long a working verdict that only the terminal title supports must
+/// persist over an unchanged screen before it starts a turn. Agents animate
+/// their title for work that is not a turn: booting a tool server spins it
+/// for a second or two with the screen untouched, and a server that fails to
+/// boot spins it until the agent's startup timeout. A turn draws on the
+/// screen, and a changed screen does not wait here.
+pub(super) const TITLE_ONLY_WORKING_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DetectionPublishState {
@@ -26,6 +33,7 @@ pub(super) struct DetectionPublishState {
     pub(super) visible_blocker: bool,
     pub(super) visible_working: bool,
     pub(super) idle_needs_settling: bool,
+    pub(super) working_from_title_only: bool,
 }
 
 #[derive(Debug, Default)]
@@ -33,17 +41,76 @@ pub(super) struct PendingIdleConfirmation {
     started_at: Option<std::time::Instant>,
     confirmations: u8,
     settling: bool,
+    /// When a title-only working verdict began to be held back.
+    title_only_working_since: Option<std::time::Instant>,
 }
 
 impl PendingIdleConfirmation {
+    /// Whether a held verdict waits on the next read. A held title-only
+    /// working verdict counts, so its screen keeps being read until the
+    /// title settles or the hold matures.
     pub(super) fn active(&self) -> bool {
-        self.started_at.is_some()
+        self.started_at.is_some() || self.title_only_working_since.is_some()
     }
 
     pub(super) fn clear(&mut self) {
         self.started_at = None;
         self.confirmations = 0;
         self.settling = false;
+        self.title_only_working_since = None;
+    }
+
+    /// Hold back a working verdict that only the terminal title supports
+    /// while the screen stays unchanged, until it has persisted for
+    /// [`TITLE_ONLY_WORKING_GRACE`].
+    ///
+    /// Publishing working and then idle again would read as a finished turn,
+    /// so a title that spins for a moment over a screen that never changed
+    /// would otherwise mint a completion nobody caused. A screen that changes
+    /// on the read, such as an answer streaming in with its status row
+    /// hidden, is treated as evidence of a turn and publishes at once; so is
+    /// an unrelated redraw, which is why the hold only narrows the case of a
+    /// title spinning over a still screen. Any other verdict ends the
+    /// hold without publishing. A pane already working keeps working on the
+    /// title alone; only the start of a turn is held.
+    pub(super) fn should_hold_title_only_working(
+        &mut self,
+        previous: DetectionPublishState,
+        next: DetectionPublishState,
+        screen_changed: bool,
+        agent_changed: bool,
+        process_exited: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        let starts_on_title_only = previous.state != AgentState::Working
+            && next.state == AgentState::Working
+            && next.working_from_title_only
+            && !screen_changed
+            && !agent_changed
+            && !process_exited;
+
+        if !starts_on_title_only {
+            self.title_only_working_since = None;
+            return false;
+        }
+        let hold = match self.title_only_working_since {
+            Some(since) if now.duration_since(since) >= TITLE_ONLY_WORKING_GRACE => false,
+            Some(_) => true,
+            None => {
+                self.title_only_working_since = Some(now);
+                true
+            }
+        };
+        if hold {
+            // A held reading is not idle, so an idle confirmation in progress
+            // starts over rather than counting these reads toward it.
+            self.started_at = None;
+            self.confirmations = 0;
+            self.settling = false;
+        } else {
+            self.title_only_working_since = None;
+        }
+        hold
     }
 
     pub(super) fn should_hold_idle(
@@ -111,6 +178,44 @@ impl PendingIdleConfirmation {
         }
 
         true
+    }
+}
+
+/// The screen text a pane task last read.
+#[derive(Debug, Default)]
+pub(super) struct ScreenTextBaseline {
+    text: String,
+    observed: bool,
+}
+
+/// What one read says about the screen text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ScreenTextChange {
+    /// The text differs from what the baseline holds, empty before any read.
+    pub(super) content_changed: bool,
+    /// The text differs from an earlier read's. A first read has nothing to
+    /// differ from, so it is never a change.
+    pub(super) screen_changed: bool,
+}
+
+impl ScreenTextBaseline {
+    pub(super) fn observe(&mut self, content: &str) -> ScreenTextChange {
+        let content_changed = content != self.text;
+        let change = ScreenTextChange {
+            content_changed,
+            screen_changed: self.observed && content_changed,
+        };
+        if content_changed {
+            self.text.clear();
+            self.text.push_str(content);
+        }
+        self.observed = true;
+        change
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.text.clear();
+        self.observed = false;
     }
 }
 
@@ -216,6 +321,9 @@ pub(super) enum DetectionTransitionDecision {
 pub(super) struct DetectionTransitionInput {
     pub(super) previous_publish: DetectionPublishState,
     pub(super) next_publish: DetectionPublishState,
+    /// The screen text differs from an earlier read's. A first read has
+    /// nothing to differ from, so it is not a change.
+    pub(super) screen_changed: bool,
     pub(super) agent_changed: bool,
     pub(super) process_exited: bool,
     pub(super) stable_refresh_due: bool,
@@ -226,6 +334,19 @@ pub(super) fn decide_detection_transition(
     input: DetectionTransitionInput,
     pending_idle: &mut PendingIdleConfirmation,
 ) -> DetectionTransitionDecision {
+    // Ahead of the idle hold: a held title restarts any idle confirmation
+    // itself, and its reads must not count toward one.
+    if pending_idle.should_hold_title_only_working(
+        input.previous_publish,
+        input.next_publish,
+        input.screen_changed,
+        input.agent_changed,
+        input.process_exited,
+        input.now,
+    ) {
+        return DetectionTransitionDecision::NoPublish;
+    }
+
     if pending_idle.should_hold_idle(
         input.previous_publish,
         input.next_publish,
@@ -269,6 +390,9 @@ pub(super) struct ScreenDetectionPublishInput {
     pub(super) last_visible_working: bool,
     pub(super) last_visible_signal_refresh: Option<std::time::Instant>,
     pub(super) screen_detection: AgentDetection,
+    /// The screen text differs from an earlier read's. A first read has
+    /// nothing to differ from, so it is not a change.
+    pub(super) screen_changed: bool,
     pub(super) process_exited: bool,
     pub(super) agent_changed: bool,
     pub(super) now: std::time::Instant,
@@ -284,6 +408,8 @@ pub(super) fn decide_screen_detection_publish(
     let visible_blocker = detection.visible_blocker && new_state == AgentState::Blocked;
     let visible_working = detection.visible_working && new_state == AgentState::Working;
     let idle_needs_settling = detection.idle_needs_settling && new_state == AgentState::Idle;
+    let working_from_title_only =
+        detection.working_from_title_only && new_state == AgentState::Working;
 
     let previous_publish = DetectionPublishState {
         state: input.current_state,
@@ -291,6 +417,7 @@ pub(super) fn decide_screen_detection_publish(
         visible_blocker: input.last_visible_blocker,
         visible_working: input.last_visible_working,
         idle_needs_settling: false,
+        working_from_title_only: false,
     };
     let next_publish = DetectionPublishState {
         state: new_state,
@@ -298,6 +425,7 @@ pub(super) fn decide_screen_detection_publish(
         visible_blocker,
         visible_working,
         idle_needs_settling,
+        working_from_title_only,
     };
     let stable_refresh_due = stable_visible_signal_refresh_due(
         previous_publish,
@@ -310,6 +438,7 @@ pub(super) fn decide_screen_detection_publish(
         DetectionTransitionInput {
             previous_publish,
             next_publish,
+            screen_changed: input.screen_changed,
             agent_changed: input.agent_changed,
             process_exited: input.process_exited,
             stable_refresh_due,
@@ -352,6 +481,7 @@ pub(super) fn detection_update_for_publish_with_osc(
             visible_blocker: false,
             visible_working: false,
             idle_needs_settling: false,
+            working_from_title_only: false,
         });
     }
 
@@ -390,6 +520,9 @@ pub(super) fn mark_detection_content_changed(detection_content_seq: &AtomicU64) 
 mod settled_idle_tests;
 
 #[cfg(test)]
+mod title_only_working_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -400,6 +533,7 @@ mod tests {
             visible_blocker: false,
             visible_working: false,
             idle_needs_settling: false,
+            working_from_title_only: false,
         }
     }
 
@@ -411,6 +545,7 @@ mod tests {
             visible_blocker: false,
             visible_working: state == AgentState::Working,
             idle_needs_settling: false,
+            working_from_title_only: false,
         }
     }
 
@@ -426,6 +561,7 @@ mod tests {
             last_visible_working: false,
             last_visible_signal_refresh: None,
             screen_detection,
+            screen_changed: false,
             process_exited: false,
             agent_changed: false,
             now,
@@ -578,6 +714,7 @@ mod tests {
                 DetectionTransitionInput {
                     previous_publish: publish_state(AgentState::Idle),
                     next_publish: blocked,
+                    screen_changed: false,
                     agent_changed: false,
                     process_exited: false,
                     stable_refresh_due: false,

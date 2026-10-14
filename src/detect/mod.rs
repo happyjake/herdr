@@ -40,6 +40,12 @@ pub struct AgentDetection {
     /// can also draw for a moment, so it must hold across consecutive reads
     /// before it is published.
     pub idle_needs_settling: bool,
+    /// True when a working verdict rests on the terminal title alone, with no
+    /// rule on another region agreeing. Agents also animate their title for
+    /// work that is not a turn, such as booting a tool server, so over a
+    /// screen that has not changed this evidence must persist before it
+    /// starts a turn.
+    pub working_from_title_only: bool,
 }
 
 /// Which agent we detected running in a pane.
@@ -319,6 +325,7 @@ pub fn detect_agent_with_osc(
             visible_blocker: false,
             visible_working: false,
             idle_needs_settling: false,
+            working_from_title_only: false,
         };
     };
     manifest::detect_with_osc(

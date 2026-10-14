@@ -2636,6 +2636,7 @@ mod tests {
             visible_blocker: false,
             visible_working: false,
             idle_needs_settling: false,
+            working_from_title_only: false,
         };
 
         assert_eq!(stabilize_agent_detection(detection), AgentState::Idle);
