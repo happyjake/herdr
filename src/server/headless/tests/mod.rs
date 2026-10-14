@@ -5759,6 +5759,108 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
         }));
 }
 
+#[tokio::test]
+async fn flag_deadline_after_handoff_announces_only_from_the_new_owner() {
+    let mut sender = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("handoff-flag");
+    let pane = workspace.tabs[0].root_pane;
+    sender.app.state.workspaces = vec![workspace];
+    sender.app.state.ensure_test_terminals();
+    sender.app.state.active = Some(0);
+    let pane_id = sender.app.public_pane_id(0, pane).unwrap();
+    let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+    sender.app.api_rx = api_rx;
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    api_tx
+        .send(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "due-during-drain".into(),
+                method: api::schema::Method::PaneSetFlag(api::schema::PaneSetFlagParams {
+                    pane_id,
+                    note: Some("review".into()),
+                    due_at: Some(0),
+                }),
+            },
+            respond_to,
+            response_write_complete: None,
+        })
+        .unwrap();
+    sender.drain_api_requests_with_shutdown_check();
+    let response: serde_json::Value = serde_json::from_str(&response_rx.recv().unwrap()).unwrap();
+    assert_eq!(
+        response["result"]["pane"]["flag"]["announced_at"],
+        serde_json::Value::Null
+    );
+
+    // Capture the unannounced flag before ownership transfers in the API phase.
+    let snapshot = crate::persist::capture(
+        &sender.app.state.workspaces,
+        &sender.app.state.terminals,
+        &sender.app.terminal_runtimes,
+        sender.app.state.active,
+        sender.app.state.selected,
+    );
+    let mut replacement = test_headless_server();
+    let (workspaces, terminals, runtimes) = crate::persist::restore(
+        &snapshot,
+        None,
+        24,
+        80,
+        0,
+        crate::app::exiting_test_command(),
+        crate::config::ShellModeConfig::NonLogin,
+        false,
+        replacement.app.event_tx.clone(),
+        replacement.app.render_notify.clone(),
+        replacement.app.render_dirty.clone(),
+    );
+    replacement.app.state.workspaces = workspaces;
+    replacement.app.state.terminals = terminals;
+    replacement.app.terminal_runtimes = runtimes.into();
+    replacement.app.state.active = snapshot.active;
+    replacement.app.sync_flag_deadline();
+    let sender_sequence = sender.app.event_hub.current_sequence();
+    let replacement_sequence = replacement.app.event_hub.current_sequence();
+
+    sender.finish_live_handoff_shutdown();
+    assert!(sender.shutting_down);
+    assert!(sender.app.state.should_quit);
+    assert!(!sender.should_quit.load(Ordering::Acquire));
+    // This is the remainder of the same iteration, before the next top-level shutdown check.
+    assert!(!sender.handle_scheduled_tasks_headless(Instant::now(), false));
+    assert!(!replacement.handle_scheduled_tasks_headless(Instant::now(), false));
+    assert!(sender
+        .app
+        .event_hub
+        .events_after(sender_sequence)
+        .is_empty());
+    let events = replacement.app.event_hub.events_after(replacement_sequence);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        events[0].1.event,
+        api::schema::EventKind::PaneAgentStatusChanged
+    );
+    let payload = serde_json::to_value(&events[0].1.data).unwrap();
+    assert!(payload["flag"]["announced_at"].as_u64().is_some());
+
+    assert!(!sender.handle_scheduled_tasks_headless(Instant::now(), false));
+    assert!(!replacement.handle_scheduled_tasks_headless(Instant::now(), false));
+    assert!(sender
+        .app
+        .event_hub
+        .events_after(sender_sequence)
+        .is_empty());
+    assert_eq!(
+        replacement
+            .app
+            .event_hub
+            .events_after(replacement_sequence)
+            .len(),
+        1
+    );
+    shutdown_test_runtimes(&mut replacement);
+}
+
 #[test]
 fn flag_deadline_tick_announces_once_and_schedules_save_without_rendering() {
     let mut server = test_headless_server();

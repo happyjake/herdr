@@ -444,7 +444,7 @@ impl HeadlessServer {
                 needs_graphics_render = false;
                 crate::render_prof::event("full_render_cause.internal_events");
             }
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.runtime_shutdown_pending() {
                 continue;
             }
             if self.app.expire_due_metadata(Instant::now()) {
@@ -459,7 +459,7 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.api_requests");
             }
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.runtime_shutdown_pending() {
                 continue;
             }
 
@@ -475,7 +475,7 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.server_events");
             }
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.runtime_shutdown_pending() {
                 continue;
             }
 
@@ -3192,10 +3192,18 @@ impl HeadlessServer {
         changed
     }
 
+    fn runtime_shutdown_pending(&self) -> bool {
+        self.shutting_down || self.app.state.should_quit || self.should_quit.load(Ordering::Acquire)
+    }
+
     /// Handle scheduled tasks for the headless server.
     ///
     /// Similar to the former App scheduler but without terminal resize polling.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
+        // Ownership can transfer while the current iteration drains API requests.
+        if self.runtime_shutdown_pending() {
+            return false;
+        }
         let mut changed = false;
 
         // No resize polling needed — server has no terminal.

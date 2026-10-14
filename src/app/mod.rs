@@ -116,6 +116,7 @@ pub struct App {
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) flag_deadline: Option<Instant>,
+    pub(crate) flag_due_at: Option<u64>,
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) last_git_repo_discovery_refresh: Instant,
@@ -594,6 +595,7 @@ impl App {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             flag_deadline: None,
+            flag_due_at: None,
             last_api_notification_at: None,
             state,
             pixel_mouse_available: false,
@@ -4129,6 +4131,46 @@ mod tests {
     }
 
     #[test]
+    fn flag_deadline_wall_jump_announces_before_monotonic_hint_and_backward_step_stays_silent() {
+        let (mut app, ids) = flag_deadline_app();
+        let wall_now = crate::pane::unix_now_secs();
+        let monotonic_now = Instant::now();
+        let due = wall_now + 3600;
+        flag_request(
+            &mut app,
+            "pane.set_flag",
+            serde_json::json!({
+                "pane_id": ids[0], "due_at": due
+            }),
+        );
+        let wake_hint = app.flag_deadline.expect("wake hint");
+        let after_wake = monotonic_now + Duration::from_secs(1);
+        assert!(after_wake < wake_hint);
+        let sequence = app.event_hub.current_sequence();
+
+        app.announce_due_flags_at(after_wake, Duration::from_secs(wall_now + 7200));
+        let announced = flag_announcements_after(&app, sequence);
+        assert_eq!(announced.len(), 1, "{announced:?}");
+        assert_eq!(announced[0]["flag"]["announced_at"], wall_now + 7200);
+        let held = flag_request(&mut app, "pane.get", serde_json::json!({"pane_id": ids[0]}));
+
+        app.announce_due_flags_at(
+            after_wake + Duration::from_secs(1),
+            Duration::from_secs(wall_now),
+        );
+        app.announce_due_flags_at(
+            wake_hint + Duration::from_secs(1),
+            Duration::from_secs(wall_now + 10800),
+        );
+        assert_eq!(flag_announcements_after(&app, sequence), announced);
+        let unchanged = flag_request(&mut app, "pane.get", serde_json::json!({"pane_id": ids[0]}));
+        assert_eq!(
+            unchanged["result"]["pane"]["flag"],
+            held["result"]["pane"]["flag"]
+        );
+    }
+
+    #[test]
     fn flag_deadline_announces_in_due_order_and_never_before_due() {
         let (mut app, ids) = flag_deadline_app();
         let earlier = crate::pane::unix_now_secs() + 60;
@@ -4150,7 +4192,7 @@ mod tests {
         let sequence = app.event_hub.current_sequence();
         app.announce_due_flags_at(
             deadline - Duration::from_millis(1),
-            Duration::from_secs(earlier),
+            Duration::from_secs(earlier - 1),
         );
         assert!(flag_announcements_after(&app, sequence).is_empty());
 
