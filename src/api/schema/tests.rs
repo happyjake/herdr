@@ -606,17 +606,17 @@ fn search_sessions_response_round_trips_nulls_and_optional_fields() {
             "type": "server_search_sessions", "scanned": 3, "partial": false,
             "sessions": [{
                 "key": {"agent": "claude", "kind": "id", "value": "session-a"},
-                "agent": "claude", "cwd": "/home/user/project", "place_state": "present",
+                "agent": "claude", "cwd": "/workspace/project", "place_state": "present",
                 "branch": "feature/search", "title": "Keyboard focus",
                 "first_prompt": "Fix the keyboard", "recent_prompts": ["Check focus"],
                 "started_at_ms": 1791000000000_u64, "last_active_at_ms": 1791003600000_u64,
                 "labels": [], "state": "ended",
-                "resume": {"command": "claude --resume session-a", "cwd": "/home/user/project"},
+                "resume": {"command": "claude --resume session-a", "cwd": "/workspace/project"},
                 "headless": false, "subagent_count": 0,
                 "why": {"field": "title", "line": "Keyboard focus", "terms": ["keyboard"]},
                 "score": 1.0
             }, {
-                "key": {"agent": "claude", "kind": "day", "value": "/home/user/project|2026-10-03"},
+                "key": {"agent": "claude", "kind": "day", "value": "/workspace/project|2026-10-03"},
                 "agent": "claude", "cwd": null, "place_state": "gone",
                 "first_prompt": "Older prompt", "recent_prompts": ["Older prompt"],
                 "started_at_ms": 1791000000000_u64, "last_active_at_ms": 1791000000000_u64,
@@ -633,9 +633,9 @@ fn search_sessions_response_round_trips_nulls_and_optional_fields() {
 #[test]
 fn search_sessions_optional_metadata_keeps_its_wire_shape() {
     let row = serde_json::json!({
-        "key": {"agent": "pi", "kind": "path", "value": "/home/user/session.jsonl"},
-        "agent": "pi", "cwd": "/home/user/removed", "place_state": "gone",
-        "nearest_existing": "/home/user", "first_prompt": "Check layout", "recent_prompts": [],
+        "key": {"agent": "pi", "kind": "path", "value": "/workspace/session.jsonl"},
+        "agent": "pi", "cwd": "/workspace/removed", "place_state": "gone",
+        "nearest_existing": "/workspace", "first_prompt": "Check layout", "recent_prompts": [],
         "started_at_ms": 1791000000000_u64, "last_active_at_ms": 1791003600000_u64,
         "labels": [
             {"label": "Layout", "source": "editor", "pane_id": "w1:p1", "from_ms": 1791000000000_u64, "to_ms": 1791003600000_u64},
@@ -712,11 +712,11 @@ fn the_lookup_result_names_every_place_and_the_memory_it_came_from() {
         result: ResponseResult::ServerLookupPlace {
             places: vec![
                 PlaceInfo {
-                    path: "/home/user/code/rocket".into(),
+                    path: "/workspace/example".into(),
                     source: PlaceSource::Workspace,
                 },
                 PlaceInfo {
-                    path: "/home/user/code/rocket-app".into(),
+                    path: "/workspace/example-app".into(),
                     source: PlaceSource::Z,
                 },
             ],
@@ -725,10 +725,7 @@ fn the_lookup_result_names_every_place_and_the_memory_it_came_from() {
 
     let json = serde_json::to_value(&response).unwrap();
     assert_eq!(json["result"]["type"], "server_lookup_place");
-    assert_eq!(
-        json["result"]["places"][0]["path"],
-        "/home/user/code/rocket"
-    );
+    assert_eq!(json["result"]["places"][0]["path"], "/workspace/example");
     assert_eq!(json["result"]["places"][0]["source"], "workspace");
     assert_eq!(json["result"]["places"][1]["source"], "z");
     let restored: SuccessResponse = serde_json::from_value(json).unwrap();
@@ -948,6 +945,43 @@ fn a_rename_says_nothing_about_a_source_unless_it_has_one() {
 }
 
 #[test]
+fn completion_seq_is_nullable_and_legacy_payloads_remain_readable() {
+    for completion_seq in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!(42)),
+    ] {
+        let mut json = serde_json::json!({
+            "pane_id": "pane_1",
+            "terminal_id": "terminal_1",
+            "workspace_id": "workspace_1",
+            "tab_id": "tab_1",
+            "focused": false,
+            "agent_status": "idle",
+            "revision": 0,
+        });
+        if let Some(value) = &completion_seq {
+            json["completion_seq"] = value.clone();
+        }
+        let expected = completion_seq.unwrap_or(serde_json::Value::Null);
+        let pane: PaneInfo = serde_json::from_value(json.clone()).unwrap();
+        let subscription: PaneAgentStatusChangedEvent =
+            serde_json::from_value(json.clone()).unwrap();
+        json["type"] = serde_json::json!("pane_agent_status_changed");
+        let event: EventEnvelope = serde_json::from_value(serde_json::json!({
+            "event": "pane_agent_status_changed", "data": json,
+        }))
+        .unwrap();
+        let pane = serde_json::to_value(pane).unwrap();
+        let subscription = serde_json::to_value(subscription).unwrap();
+        let event = serde_json::to_value(event).unwrap();
+        for payload in [&pane, &subscription, &event["data"]] {
+            assert_eq!(payload.get("completion_seq"), Some(&expected));
+        }
+    }
+}
+
+#[test]
 fn pane_info_always_states_whose_the_label_is_and_when_it_was_written() {
     let pane: PaneInfo = serde_json::from_value(serde_json::json!({
         "pane_id": "pane_1",
@@ -990,6 +1024,7 @@ fn the_status_event_carries_the_labels_provenance_beside_the_label() {
         pane_id: "pane_1".into(),
         workspace_id: "workspace_1".into(),
         agent_status: AgentStatus::Working,
+        completion_seq: None,
         agent: Some("pi".into()),
         title: None,
         display_agent: None,
@@ -1532,8 +1567,8 @@ fn success_response_round_trips() {
                 agent_report_cancelled: false,
                 agent_prompt_expectations: true,
             }),
-            name: Some("home-box".into()),
-            reach: Some("home-box".into()),
+            name: Some("test-server".into()),
+            reach: Some("test-server".into()),
             advertised_endpoint: Some("wss://a-host.example.net:8443".into()),
             session: Some("mobile".into()),
             exe: Some("/opt/herdr".into()),
@@ -1674,6 +1709,7 @@ fn worktree_request_and_response_round_trip() {
                 scroll: None,
                 mouse_tracking: false,
                 alternate_screen: false,
+                completion_seq: None,
                 agent_status_changed_at: Some(1_700_000_000),
                 pinned: false,
                 flag: None,
@@ -2112,6 +2148,7 @@ fn create_response_round_trips_with_root_pane() {
                 scroll: None,
                 mouse_tracking: false,
                 alternate_screen: false,
+                completion_seq: None,
                 agent_status_changed_at: None,
                 pinned: false,
                 flag: None,

@@ -3098,6 +3098,208 @@ mod tests {
         response["result"]["pane"].clone()
     }
 
+    #[tokio::test]
+    async fn api_pane_completion_seq_is_present_on_get_list_and_snapshot() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        for (state, completed) in [
+            (crate::detect::AgentState::Working, false),
+            (crate::detect::AgentState::Idle, true),
+            (crate::detect::AgentState::Working, false),
+        ] {
+            publish_agent_state(
+                &mut app,
+                pane_id,
+                state,
+                crate::events::StatusReading::Verdict,
+            );
+            let pane = requested_pane_info(&mut app, &public_pane_id);
+            let value = pane.get("completion_seq").expect("completion_seq key");
+            assert_eq!(value.is_u64(), completed);
+            if !completed {
+                assert!(value.is_null());
+            }
+            let list: serde_json::Value = serde_json::from_str(
+                &app.handle_pane_list("list".into(), PaneListParams::default()),
+            )
+            .unwrap();
+            assert_eq!(
+                list["result"]["panes"][0].get("completion_seq"),
+                Some(value)
+            );
+            let snapshot = serde_json::to_value(app.session_snapshot()).unwrap();
+            assert_eq!(snapshot["panes"][0].get("completion_seq"), Some(value));
+            let agent = serde_json::to_value(app.agent_info(0, pane_id).unwrap()).unwrap();
+            assert_eq!(value, &agent["completion_seq"]);
+            let event = app
+                .event_hub
+                .events_after(0)
+                .into_iter()
+                .rev()
+                .find(|(_, event)| event.event == EventKind::PaneAgentStatusChanged)
+                .expect("status event")
+                .1;
+            let event = serde_json::to_value(event).unwrap();
+            assert_eq!(event["data"].get("completion_seq"), Some(value));
+        }
+    }
+
+    fn assert_api_completion_seq(app: &mut App, public_pane_id: &str, after: u64, completed: bool) {
+        let pane = requested_pane_info(app, public_pane_id);
+        assert!(matches!(
+            pane["agent_status"].as_str(),
+            Some("idle" | "done")
+        ));
+        let value = pane.get("completion_seq").expect("completion_seq key");
+        assert_eq!(value.is_u64(), completed);
+        if !completed {
+            assert!(value.is_null());
+        }
+        let agent: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(crate::api::schema::Request {
+                id: "agent".into(),
+                method: crate::api::schema::Method::AgentGet(crate::api::schema::AgentTarget {
+                    target: public_pane_id.into(),
+                }),
+            }))
+            .unwrap();
+        assert!(agent.get("error").is_none(), "{agent}");
+        assert_eq!(value, &agent["result"]["agent"]["completion_seq"]);
+        let event = app
+            .event_hub
+            .events_after(after)
+            .into_iter()
+            .rev()
+            .find(|(_, event)| event.event == EventKind::PaneAgentStatusChanged)
+            .expect("new status event")
+            .1;
+        let event = serde_json::to_value(event).unwrap();
+        assert_eq!(event["data"].get("completion_seq"), Some(value));
+        assert_eq!(event["data"]["agent_status"], pane["agent_status"]);
+
+        let (_, pane_id) = app.parse_pane_id(public_pane_id).unwrap();
+        let after = app.event_hub.current_sequence();
+        app.emit_pane_kept_presentation_changed(0, pane_id);
+        let events = app.event_hub.events_after(after);
+        let event = serde_json::to_value(&events[0].1).unwrap();
+        assert_eq!(event["data"].get("completion_seq"), Some(value));
+    }
+
+    #[tokio::test]
+    async fn api_completion_seq_is_null_for_startup_and_unknown_to_idle() {
+        for acquired in [false, true] {
+            let (mut app, public_pane_id) = app_with_test_workspace();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            if acquired {
+                app.handle_internal_event(crate::events::AppEvent::AgentProcessDetected {
+                    pane_id,
+                    agent: Agent::Pi,
+                    observed_at: std::time::Instant::now(),
+                    reading: crate::events::StatusReading::Provisional,
+                });
+            }
+            for state in [
+                if acquired {
+                    AgentState::Blocked
+                } else {
+                    AgentState::Unknown
+                },
+                AgentState::Idle,
+            ] {
+                app.handle_internal_event(crate::events::AppEvent::StateChanged {
+                    pane_id,
+                    agent: Some(Agent::Pi),
+                    state,
+                    visible_blocker: state == AgentState::Blocked,
+                    visible_working: false,
+                    process_exited: false,
+                    observed_at: std::time::Instant::now(),
+                    reading: crate::events::StatusReading::Verdict,
+                });
+            }
+            assert_api_completion_seq(&mut app, &public_pane_id, 0, false);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_completion_seq_clears_on_agent_replacement() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        for (seq, label, state) in [
+            (1, "old", AgentState::Working),
+            (2, "old", AgentState::Idle),
+            (3, "new", AgentState::Idle),
+        ] {
+            let after = app.event_hub.current_sequence();
+            app.handle_internal_event(crate::events::AppEvent::HookStateReported {
+                pane_id,
+                source: "custom:worker".into(),
+                agent_label: label.into(),
+                state,
+                message: None,
+                seq: Some(seq),
+                session_ref: None,
+                cancelled: false,
+            });
+            if state == AgentState::Idle {
+                assert_api_completion_seq(&mut app, &public_pane_id, after, seq == 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_completion_seq_clears_on_session_replacement() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        for (seq, session, reason) in [(1, "first", "startup"), (2, "second", "clear")] {
+            let after = app.event_hub.current_sequence();
+            app.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
+                pane_id,
+                source: "herdr:claude".into(),
+                agent_label: "claude".into(),
+                seq: Some(seq),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session),
+                session_start_source: Some(reason.into()),
+            });
+            if seq == 1 {
+                for state in [AgentState::Working, AgentState::Idle] {
+                    app.handle_internal_event(crate::events::AppEvent::StateChanged {
+                        pane_id,
+                        agent: Some(Agent::Claude),
+                        state,
+                        visible_blocker: false,
+                        visible_working: state == AgentState::Working,
+                        process_exited: false,
+                        observed_at: std::time::Instant::now(),
+                        reading: crate::events::StatusReading::Verdict,
+                    });
+                }
+            }
+            assert_api_completion_seq(&mut app, &public_pane_id, after, seq == 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_completion_seq_distinguishes_finished_and_cancelled_runs() {
+        for cancelled in [false, true] {
+            let (mut app, public_pane_id) = app_with_test_workspace();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            for (seq, state) in [(1, AgentState::Working), (2, AgentState::Idle)] {
+                app.handle_internal_event(crate::events::AppEvent::HookStateReported {
+                    pane_id,
+                    source: "custom:worker".into(),
+                    agent_label: "pi".into(),
+                    state,
+                    message: None,
+                    seq: Some(seq),
+                    session_ref: None,
+                    cancelled: cancelled && state == AgentState::Idle,
+                });
+            }
+            assert_api_completion_seq(&mut app, &public_pane_id, 0, !cancelled);
+        }
+    }
+
     fn publish_agent_state(
         app: &mut App,
         pane_id: PaneId,

@@ -702,6 +702,16 @@
                 "agent_status": {
                   "$ref": "#/schemas/event/$defs/AgentStatus"
                 },
+                "completion_seq": {
+                  "default": null,
+                  "description": "The current idle completed work. Always serialized; null means no completion.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "display_agent": {
                   "type": [
                     "string",
@@ -914,6 +924,16 @@
               "default": false,
               "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
               "type": "boolean"
+            },
+            "completion_seq": {
+              "default": null,
+              "description": "The current idle completed work. Always serialized; null means no completion.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "cwd": {
               "type": [
@@ -5382,166 +5402,6 @@
         {
           "properties": {
             "method": {
-              "const": "server.lookup_place",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/ServerLookupPlaceParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "server.search_sessions",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/ServerSearchSessionsParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "attachment.create",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/AttachmentCreateParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "attachment.begin",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/AttachmentBeginParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "attachment.append",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/AttachmentAppendParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "attachment.commit",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/AttachmentCommitParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "credential.mint",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/CredentialMintParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "credential.list",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/CredentialActorParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "credential.revoke",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/CredentialRevokeParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "credential.revoke_all",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/CredentialActorParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
               "const": "notification.show",
               "type": "string"
             },
@@ -6534,22 +6394,6 @@
         {
           "properties": {
             "method": {
-              "const": "pane.prompt_trail",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
               "const": "pane.focus",
               "type": "string"
             },
@@ -6630,54 +6474,6 @@
         {
           "properties": {
             "method": {
-              "const": "pane.set_pinned",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/PaneSetPinnedParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "pane.set_flag",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/PaneSetFlagParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "pane.clear_flag",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
               "const": "pane.send_text",
               "type": "string"
             },
@@ -6715,22 +6511,6 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneSendInputParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "pane.send_mouse",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/PaneSendMouseParams"
             }
           },
           "required": [
@@ -7138,6 +6918,246 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "attachment.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttachmentCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.send_mouse",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSendMouseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.mint",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialMintParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialActorParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.revoke",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialRevokeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "credential.revoke_all",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/CredentialActorParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.set_pinned",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSetPinnedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.lookup_place",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerLookupPlaceParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "attachment.begin",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttachmentBeginParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "attachment.append",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttachmentAppendParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "attachment.commit",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttachmentCommitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.prompt_trail",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.search_sessions",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerSearchSessionsParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.set_flag",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSetFlagParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.clear_flag",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -7183,6 +7203,16 @@
             },
             "agent_status": {
               "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
+            },
+            "completion_seq": {
+              "default": null,
+              "description": "The current idle completed work. Always serialized; null means no completion.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "display_agent": {
               "type": [
@@ -8377,6 +8407,16 @@
                 "agent_status": {
                   "$ref": "#/schemas/success_response/$defs/AgentStatus"
                 },
+                "completion_seq": {
+                  "default": null,
+                  "description": "The current idle completed work. Always serialized; null means no completion.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "display_agent": {
                   "type": [
                     "string",
@@ -9006,6 +9046,16 @@
               "default": false,
               "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
               "type": "boolean"
+            },
+            "completion_seq": {
+              "default": null,
+              "description": "The current idle completed work. Always serialized; null means no completion.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "cwd": {
               "type": [
