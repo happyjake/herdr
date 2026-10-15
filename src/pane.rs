@@ -1517,7 +1517,7 @@ impl PaneRuntimeIo {
                         let state = Arc::clone(state);
                         std::thread::spawn(move || {
                             while let Ok(submission) = rx.recv() {
-                                if let Some(guard) = submission.guard {
+                                if let Some(mut guard) = submission.guard {
                                     if let Err(err) = guard() {
                                         let _ = submission.reply.send(Err(err));
                                         continue;

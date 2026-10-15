@@ -1,6 +1,6 @@
 use std::fmt;
 
-pub(crate) type PtySubmissionGuard = Box<dyn FnOnce() -> std::io::Result<()> + Send + 'static>;
+pub(crate) type PtySubmissionGuard = Box<dyn FnMut() -> std::io::Result<()> + Send + 'static>;
 
 #[derive(Debug)]
 struct SubmissionRejected(String);
@@ -340,7 +340,7 @@ mod windows {
                 } => {
                     let result = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         Err(input_submission_timed_out())
-                    } else if let Some(guard) = guard {
+                    } else if let Some(mut guard) = guard {
                         guard().and_then(|()| {
                             if !prefix.is_empty() {
                                 write_and_flush(writer, &prefix)?;
