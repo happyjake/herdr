@@ -819,6 +819,7 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
                     pane_id: data.pane_id,
                     workspace_id: data.workspace_id,
                     agent_status: data.agent_status,
+                    completion_seq: data.completion_seq,
                     agent: data.agent,
                     title: data.title,
                     display_agent: data.display_agent,
@@ -838,6 +839,27 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matched_wait_preserves_completion_seq() {
+        for completion_seq in [serde_json::Value::Null, serde_json::json!(42)] {
+            let event = serde_json::json!({
+                "event": "pane.agent_status_changed",
+                "data": {
+                    "pane_id": "pane_1",
+                    "workspace_id": "workspace_1",
+                    "agent_status": "idle",
+                    "completion_seq": completion_seq,
+                },
+            });
+            let response: serde_json::Value =
+                serde_json::from_str(&wait_matched_response("wait", event)).unwrap();
+            assert_eq!(
+                response["result"]["event"]["data"].get("completion_seq"),
+                Some(&completion_seq)
+            );
+        }
+    }
 
     /// A matched wait hands on every kept field the event carried, the
     /// label's provenance included: a client that waits instead of

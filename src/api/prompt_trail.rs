@@ -448,6 +448,7 @@ mod tests {
             scroll: None,
             mouse_tracking: false,
             alternate_screen: false,
+            completion_seq: None,
             agent_status_changed_at: None,
             pinned: false,
             flag: None,

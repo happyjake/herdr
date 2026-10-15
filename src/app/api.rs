@@ -45,6 +45,7 @@ fn pane_agent_status_changed_event(
     pane_id: String,
     workspace_id: String,
     agent_status: crate::api::schema::AgentStatus,
+    completion_seq: Option<u64>,
     agent: Option<String>,
     presentation: crate::terminal::EffectivePresentation,
     kept: KeptPanePresentation,
@@ -55,6 +56,7 @@ fn pane_agent_status_changed_event(
             pane_id,
             workspace_id,
             agent_status,
+            completion_seq,
             agent,
             title: presentation.title,
             display_agent: presentation.display_agent,
@@ -784,6 +786,10 @@ impl App {
                 pane_id,
                 workspace_id,
                 agent_status,
+                self.state
+                    .terminal_id_for_pane(update.ws_idx, update.pane_id)
+                    .and_then(|id| self.state.terminals.get(&id))
+                    .and_then(|terminal| terminal.last_agent_completion_seq),
                 update.agent_label.clone(),
                 update.presentation.clone(),
                 self.pane_kept_presentation(update.ws_idx, update.pane_id),
@@ -822,6 +828,7 @@ impl App {
             public_pane_id,
             self.public_workspace_id(ws_idx),
             pane.reported_agent_status(pane_agent_status(terminal.state, pane.seen)),
+            terminal.last_agent_completion_seq,
             terminal.effective_agent_label().map(str::to_string),
             terminal.effective_presentation(),
             KeptPanePresentation::of(terminal),

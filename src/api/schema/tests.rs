@@ -948,6 +948,43 @@ fn a_rename_says_nothing_about_a_source_unless_it_has_one() {
 }
 
 #[test]
+fn completion_seq_is_nullable_and_legacy_payloads_remain_readable() {
+    for completion_seq in [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!(42)),
+    ] {
+        let mut json = serde_json::json!({
+            "pane_id": "pane_1",
+            "terminal_id": "terminal_1",
+            "workspace_id": "workspace_1",
+            "tab_id": "tab_1",
+            "focused": false,
+            "agent_status": "idle",
+            "revision": 0,
+        });
+        if let Some(value) = &completion_seq {
+            json["completion_seq"] = value.clone();
+        }
+        let expected = completion_seq.unwrap_or(serde_json::Value::Null);
+        let pane: PaneInfo = serde_json::from_value(json.clone()).unwrap();
+        let subscription: PaneAgentStatusChangedEvent =
+            serde_json::from_value(json.clone()).unwrap();
+        json["type"] = serde_json::json!("pane_agent_status_changed");
+        let event: EventEnvelope = serde_json::from_value(serde_json::json!({
+            "event": "pane_agent_status_changed", "data": json,
+        }))
+        .unwrap();
+        let pane = serde_json::to_value(pane).unwrap();
+        let subscription = serde_json::to_value(subscription).unwrap();
+        let event = serde_json::to_value(event).unwrap();
+        for payload in [&pane, &subscription, &event["data"]] {
+            assert_eq!(payload.get("completion_seq"), Some(&expected));
+        }
+    }
+}
+
+#[test]
 fn pane_info_always_states_whose_the_label_is_and_when_it_was_written() {
     let pane: PaneInfo = serde_json::from_value(serde_json::json!({
         "pane_id": "pane_1",
@@ -990,6 +1027,7 @@ fn the_status_event_carries_the_labels_provenance_beside_the_label() {
         pane_id: "pane_1".into(),
         workspace_id: "workspace_1".into(),
         agent_status: AgentStatus::Working,
+        completion_seq: None,
         agent: Some("pi".into()),
         title: None,
         display_agent: None,
@@ -1674,6 +1712,7 @@ fn worktree_request_and_response_round_trip() {
                 scroll: None,
                 mouse_tracking: false,
                 alternate_screen: false,
+                completion_seq: None,
                 agent_status_changed_at: Some(1_700_000_000),
                 pinned: false,
                 flag: None,
@@ -2112,6 +2151,7 @@ fn create_response_round_trips_with_root_pane() {
                 scroll: None,
                 mouse_tracking: false,
                 alternate_screen: false,
+                completion_seq: None,
                 agent_status_changed_at: None,
                 pinned: false,
                 flag: None,

@@ -406,6 +406,9 @@ pub struct PaneAgentStatusChangedEvent {
     pub pane_id: String,
     pub workspace_id: String,
     pub agent_status: AgentStatus,
+    /// The current idle completed work. Always serialized; null means no completion.
+    #[serde(default)]
+    pub completion_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -567,6 +570,9 @@ pub enum EventData {
         pane_id: String,
         workspace_id: String,
         agent_status: AgentStatus,
+        /// The current idle completed work. Always serialized; null means no completion.
+        #[serde(default)]
+        completion_seq: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

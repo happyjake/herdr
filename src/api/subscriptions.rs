@@ -260,6 +260,7 @@ impl ActiveSubscription {
                         pane_id: probe.pane_id.clone(),
                         workspace_id: probe.workspace_id,
                         agent_status: probe.agent_status,
+                        completion_seq: probe.completion_seq,
                         agent: probe.agent,
                         title: probe.title,
                         display_agent: probe.display_agent,
@@ -479,6 +480,7 @@ impl ActiveAgentStatusChangedSubscription {
             pane_id,
             workspace_id,
             agent_status,
+            completion_seq,
             agent,
             title,
             display_agent,
@@ -541,6 +543,7 @@ impl ActiveAgentStatusChangedSubscription {
                 pane_id,
                 workspace_id,
                 agent_status,
+                completion_seq,
                 agent,
                 title,
                 display_agent,
@@ -615,6 +618,7 @@ impl ActiveAgentStatusChangedSubscription {
                 pane_id: pane.pane_id,
                 workspace_id: pane.workspace_id,
                 agent_status: current_status,
+                completion_seq: pane.completion_seq,
                 agent: pane.agent,
                 title: pane.title,
                 display_agent: pane.display_agent,
@@ -785,6 +789,7 @@ mod tests {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
+                completion_seq: None,
                 agent: Some("pi".into()),
                 title: title.map(str::to_string),
                 display_agent: None,
@@ -844,12 +849,79 @@ mod tests {
             scroll,
             mouse_tracking: false,
             alternate_screen: false,
+            completion_seq: None,
             agent_status_changed_at: Some(1_700_000_000),
             pinned: false,
             flag: None,
             label_source: None,
             label_at: None,
             revision: 0,
+        }
+    }
+
+    #[test]
+    fn status_subscription_completion_seq_survives_initial_history_and_snapshot() {
+        for completion_seq in [None, Some(42)] {
+            let expected = serde_json::json!(completion_seq);
+            let mut pane = pane_info_with_scroll(None);
+            pane.agent_status = AgentStatus::Idle;
+            pane.completion_seq = completion_seq;
+            let event_hub = EventHub::default();
+            let (api_tx, mut api_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+            let probe = pane.clone();
+            let responder = std::thread::spawn(move || {
+                while let Some(message) = api_rx.blocking_recv() {
+                    let response = serde_json::json!({
+                        "id": message.request.id,
+                        "result": { "type": "pane_info", "pane": probe },
+                    });
+                    message.respond_to.send(response.to_string()).unwrap();
+                }
+            });
+            let mut subscription = ActiveSubscription::new(
+                Subscription::PaneAgentStatusChanged {
+                    pane_id: pane.pane_id.clone(),
+                    agent_status: Some(AgentStatus::Idle),
+                },
+                "completion",
+                0,
+                &api_tx,
+                &event_hub,
+                0,
+            )
+            .unwrap();
+            let initial = subscription.poll_batch(&api_tx, &event_hub).unwrap();
+            drop(api_tx);
+            responder.join().unwrap();
+            assert_eq!(initial.len(), 1);
+            assert_eq!(initial[0]["data"].get("completion_seq"), Some(&expected));
+
+            let ActiveSubscription::AgentStatusChanged(mut subscription) = subscription else {
+                panic!("agent status subscription");
+            };
+            let mut event = presentation_event(None);
+            let EventData::PaneAgentStatusChanged {
+                agent_status,
+                completion_seq: value,
+                ..
+            } = &mut event.data
+            else {
+                panic!("status event");
+            };
+            *agent_status = AgentStatus::Idle;
+            *value = completion_seq;
+            for sequence in [0, 1] {
+                let replay = subscription
+                    .event_from_history(sequence, event.clone())
+                    .unwrap();
+                let json = serde_json::to_value(replay).unwrap();
+                assert_eq!(json["data"].get("completion_seq"), Some(&expected));
+            }
+            subscription.last_status = Some(AgentStatus::Working);
+            let snapshot = subscription.event_from_snapshot(pane).unwrap();
+            let json = serde_json::to_value(snapshot).unwrap();
+            assert_eq!(json["data"].get("completion_seq"), Some(&expected));
         }
     }
 
@@ -953,6 +1025,7 @@ mod tests {
                         pane_id: "pane_1".into(),
                         workspace_id: "workspace_1".into(),
                         agent_status: AgentStatus::Working,
+                        completion_seq: None,
                         agent: Some("pi".into()),
                         title: Some("stale initial snapshot".into()),
                         display_agent: None,
@@ -1104,6 +1177,7 @@ mod tests {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
+                completion_seq: None,
                 agent: Some("pi".into()),
                 title: None,
                 display_agent: None,
@@ -1140,6 +1214,7 @@ mod tests {
             pane_id: "pane_1".into(),
             workspace_id: "workspace_1".into(),
             agent_status: AgentStatus::Working,
+            completion_seq: None,
             agent: Some("pi".into()),
             title: None,
             display_agent: None,
@@ -1329,6 +1404,7 @@ mod tests {
             pane_id: "pane_1".into(),
             workspace_id: "workspace_1".into(),
             agent_status: AgentStatus::Working,
+            completion_seq: None,
             agent: Some("pi".into()),
             title: None,
             display_agent: None,
@@ -1775,6 +1851,7 @@ mod tests {
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
+                completion_seq: None,
                 agent: Some("pi".into()),
                 title: Some("short lived".into()),
                 display_agent: None,

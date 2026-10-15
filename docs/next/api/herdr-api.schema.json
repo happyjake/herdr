@@ -702,6 +702,16 @@
                 "agent_status": {
                   "$ref": "#/schemas/event/$defs/AgentStatus"
                 },
+                "completion_seq": {
+                  "default": null,
+                  "description": "The current idle completed work. Always serialized; null means no completion.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "display_agent": {
                   "type": [
                     "string",
@@ -914,6 +924,16 @@
               "default": false,
               "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
               "type": "boolean"
+            },
+            "completion_seq": {
+              "default": null,
+              "description": "The current idle completed work. Always serialized; null means no completion.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "cwd": {
               "type": [
@@ -7164,6 +7184,16 @@
             "agent_status": {
               "$ref": "#/schemas/subscription_event/$defs/AgentStatus"
             },
+            "completion_seq": {
+              "default": null,
+              "description": "The current idle completed work. Always serialized; null means no completion.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "display_agent": {
               "type": [
                 "string",
@@ -8357,6 +8387,16 @@
                 "agent_status": {
                   "$ref": "#/schemas/success_response/$defs/AgentStatus"
                 },
+                "completion_seq": {
+                  "default": null,
+                  "description": "The current idle completed work. Always serialized; null means no completion.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "display_agent": {
                   "type": [
                     "string",
@@ -8986,6 +9026,16 @@
               "default": false,
               "description": "Whether the pane's live terminal state currently uses the alternate screen.\nAdditive: payloads from older servers omit this and deserialize false.",
               "type": "boolean"
+            },
+            "completion_seq": {
+              "default": null,
+              "description": "The current idle completed work. Always serialized; null means no completion.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "cwd": {
               "type": [
