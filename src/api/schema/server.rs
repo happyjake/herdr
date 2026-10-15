@@ -199,4 +199,10 @@ pub struct ServerCapabilities {
     /// `cancelled` only to a server that declares this.
     #[serde(default)]
     pub agent_report_cancelled: bool,
+    /// Whether `agent.prompt` honors delivery-time identity and status
+    /// expectations (`expect_terminal`, `expect_agent`, `expect_session`,
+    /// `if_status`) instead of ignoring unknown fields. Additive: absent
+    /// (false) in pongs of servers that predate it.
+    #[serde(default)]
+    pub agent_prompt_expectations: bool,
 }

@@ -2051,6 +2051,7 @@ impl AppState {
                     .is_some_and(|change| change.previous_agent_label.is_none());
             if !(reacquired && pane.holds_unread_restored_completion()) {
                 pane.seen = true;
+                pane.sync_delivery_snapshot();
             }
         }
         if mutation.session_ref_changed || managed_changed || agent_name_changed {

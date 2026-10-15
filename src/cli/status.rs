@@ -430,6 +430,7 @@ mod tests {
                 credential_registry: false,
                 file_attachments: None,
                 agent_report_cancelled: false,
+                agent_prompt_expectations: false,
             }),
         }
     }

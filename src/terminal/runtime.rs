@@ -474,13 +474,15 @@ impl TerminalRuntime {
 
     pub fn queue_user_input_submission(
         &self,
+        prefix: Bytes,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::pty::actor::PtySubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.0
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission(prefix, text, enter, delay, deadline, guard)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -598,6 +600,10 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    pub(crate) fn child_pid_handle(&self) -> Arc<std::sync::atomic::AtomicU32> {
+        self.0.child_pid_handle()
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }
@@ -609,6 +615,22 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    pub(crate) fn test_foreground_agent_handle(
+        &self,
+    ) -> Option<Arc<std::sync::Mutex<Option<Option<crate::detect::Agent>>>>> {
+        self.0.test_foreground_agent_handle()
+    }
+
+    pub(crate) fn set_test_foreground_agent(&self, agent: Option<Option<crate::detect::Agent>>) {
+        self.0.set_test_foreground_agent(agent);
+    }
+
+    pub(crate) fn test_hold_next_submission(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.0.test_hold_next_submission()
+    }
+
     pub(crate) fn test_hold_core(
         &self,
     ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {

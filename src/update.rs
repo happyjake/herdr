@@ -2859,6 +2859,7 @@ mod tests {
                 credential_registry: false,
                 file_attachments: None,
                 agent_report_cancelled: false,
+                agent_prompt_expectations: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2939,6 +2940,7 @@ mod tests {
                     credential_registry: true,
                     file_attachments: None,
                     agent_report_cancelled: false,
+                    agent_prompt_expectations: false,
                 }),
             },
         };
@@ -3203,6 +3205,7 @@ mod tests {
                     credential_registry: false,
                     file_attachments: None,
                     agent_report_cancelled: false,
+                    agent_prompt_expectations: false,
                 }),
             },
         };

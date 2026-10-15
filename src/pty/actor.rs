@@ -1,3 +1,28 @@
+use std::fmt;
+
+pub(crate) type PtySubmissionGuard = Box<dyn FnOnce() -> std::io::Result<()> + Send + 'static>;
+
+#[derive(Debug)]
+struct SubmissionRejected(String);
+
+impl fmt::Display for SubmissionRejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SubmissionRejected {}
+
+pub(crate) fn submission_rejected_error(response: String) -> std::io::Error {
+    std::io::Error::other(SubmissionRejected(response))
+}
+
+pub(crate) fn submission_rejected_response(err: &std::io::Error) -> Option<&str> {
+    err.get_ref()
+        .and_then(|source| source.downcast_ref::<SubmissionRejected>())
+        .map(|rejected| rejected.0.as_str())
+}
+
 #[cfg(unix)]
 mod unix;
 
@@ -14,6 +39,8 @@ mod windows {
     use portable_pty::{MasterPty, PtySize};
     use tokio::sync::mpsc;
     use tracing::{debug, warn};
+
+    use super::PtySubmissionGuard;
 
     pub(crate) struct PtyReadResult {
         pub terminal_responses: Vec<Bytes>,
@@ -46,10 +73,12 @@ mod windows {
     enum PtyIoDataCommand {
         WriteUserInput(Bytes),
         SubmitUserInput {
+            prefix: Bytes,
             text: Bytes,
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
+            guard: Option<PtySubmissionGuard>,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
     }
@@ -57,7 +86,9 @@ mod windows {
     enum PtyIoWriteCommand {
         Write(Bytes),
         SubmissionPart {
+            prefix: Bytes,
             bytes: Bytes,
+            guard: Option<PtySubmissionGuard>,
             deadline: Option<Instant>,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
@@ -109,10 +140,12 @@ mod windows {
 
         pub(crate) fn queue_user_input_submission(
             &self,
+            prefix: Bytes,
             text: Bytes,
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
+            guard: Option<PtySubmissionGuard>,
         ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
             let accepting = self
                 .accepting
@@ -127,10 +160,12 @@ mod windows {
             let (reply_tx, reply_rx) = std_mpsc::channel();
             self.data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    prefix,
                     text,
                     enter,
                     delay,
                     deadline,
+                    guard,
                     reply: reply_tx,
                 })
                 .map_err(|err| match err {
@@ -297,18 +332,34 @@ mod windows {
             let result = match command {
                 PtyIoWriteCommand::Write(bytes) => write_and_flush(writer, &bytes),
                 PtyIoWriteCommand::SubmissionPart {
+                    prefix,
                     bytes,
+                    guard,
                     deadline,
                     reply,
                 } => {
                     let result = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         Err(input_submission_timed_out())
+                    } else if let Some(guard) = guard {
+                        guard().and_then(|()| {
+                            if !prefix.is_empty() {
+                                write_and_flush(writer, &prefix)?;
+                            }
+                            write_and_flush(writer, &bytes)
+                        })
                     } else {
+                        if !prefix.is_empty() {
+                            if let Err(err) = write_and_flush(writer, &prefix) {
+                                let _ = reply.send(Err(err));
+                                break;
+                            }
+                        }
                         write_and_flush(writer, &bytes)
                     };
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                    let failed = result.as_ref().is_err_and(|err| {
+                        err.kind() != std::io::ErrorKind::TimedOut
+                            && super::submission_rejected_response(err).is_none()
+                    });
                     let _ = reply.send(result);
                     if failed {
                         break;
@@ -335,10 +386,12 @@ mod windows {
                     }
                 }
                 PtyIoDataCommand::SubmitUserInput {
+                    prefix,
                     text,
                     enter,
                     delay,
                     deadline,
+                    guard,
                     reply,
                 } => {
                     let result = if deadline.is_some_and(|deadline| {
@@ -348,22 +401,24 @@ mod windows {
                     } else {
                         let text_deadline =
                             deadline.and_then(|deadline| deadline.checked_sub(delay));
-                        write_submission_part(&write_tx, text, text_deadline).and_then(|()| {
-                            // A started text write is committed. Finish Enter even if the caller
-                            // stops waiting so a timeout cannot leave a partial prompt.
-                            std::thread::sleep(delay);
-                            let accepting = accepting
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            if !*accepting {
-                                return Err(pty_actor_closed());
-                            }
-                            write_submission_part(&write_tx, enter, None)
-                        })
+                        write_submission_part(&write_tx, prefix, text, guard, text_deadline)
+                            .and_then(|()| {
+                                // A started text write is committed. Finish Enter even if the caller
+                                // stops waiting so a timeout cannot leave a partial prompt.
+                                std::thread::sleep(delay);
+                                let accepting = accepting
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if !*accepting {
+                                    return Err(pty_actor_closed());
+                                }
+                                write_submission_part(&write_tx, Bytes::new(), enter, None, None)
+                            })
                     };
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                    let failed = result.as_ref().is_err_and(|err| {
+                        err.kind() != std::io::ErrorKind::TimedOut
+                            && super::submission_rejected_response(err).is_none()
+                    });
                     let _ = reply.send(result);
                     if failed {
                         break;
@@ -375,13 +430,17 @@ mod windows {
 
     fn write_submission_part(
         write_tx: &std_mpsc::Sender<PtyIoWriteCommand>,
+        prefix: Bytes,
         bytes: Bytes,
+        guard: Option<PtySubmissionGuard>,
         deadline: Option<Instant>,
     ) -> std::io::Result<()> {
         let (reply, completion) = std_mpsc::channel();
         write_tx
             .send(PtyIoWriteCommand::SubmissionPart {
+                prefix,
                 bytes,
+                guard,
                 deadline,
                 reply,
             })
@@ -455,10 +514,12 @@ mod windows {
             let accepting = Arc::new(Mutex::new(true));
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    prefix: Bytes::new(),
                     text: Bytes::from_static(b"prompt"),
                     enter: Bytes::from_static(b"\r"),
                     delay,
                     deadline,
+                    guard: None,
                     reply: reply_tx,
                 })
                 .unwrap();
@@ -545,19 +606,23 @@ mod windows {
             let accepting = Arc::new(Mutex::new(true));
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    prefix: Bytes::new(),
                     text: Bytes::from_static(b"first"),
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::from_millis(30),
                     deadline: None,
+                    guard: None,
                     reply: first_reply_tx,
                 })
                 .unwrap();
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    prefix: Bytes::new(),
                     text: Bytes::from_static(b"expired"),
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::ZERO,
                     deadline: Some(Instant::now() + Duration::from_millis(10)),
+                    guard: None,
                     reply: expired_reply_tx,
                 })
                 .unwrap();

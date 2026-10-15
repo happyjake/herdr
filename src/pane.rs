@@ -40,9 +40,9 @@ use self::agent_detection::{
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
     ScreenTextBaseline, ScreenTextChange, AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
 };
-pub(crate) use self::state::AgentStatusProjection;
 #[cfg(test)]
 pub(crate) use self::state::RESTORE_DEADLINE_PROBE_SECS;
+pub(crate) use self::state::{AgentStatusProjection, PaneDeliverySnapshot};
 #[cfg(unix)]
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
@@ -1349,12 +1349,32 @@ pub struct PaneRuntime {
     detect_handle: Option<tokio::task::AbortHandle>,
 }
 
+#[cfg(test)]
+struct TestChannelSubmission {
+    prefix: Bytes,
+    text: Bytes,
+    enter: Bytes,
+    delay: std::time::Duration,
+    guard: Option<crate::pty::actor::PtySubmissionGuard>,
+    reply: std::sync::mpsc::Sender<std::io::Result<()>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestChannelState {
+    submission_worker: Mutex<Option<std::sync::mpsc::Sender<TestChannelSubmission>>>,
+    hold_next_submission:
+        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    foreground_agent: Arc<Mutex<Option<Option<Agent>>>>,
+}
+
 enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
     #[cfg(test)]
     TestChannel {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
+        state: Arc<TestChannelState>,
     },
 }
 
@@ -1467,36 +1487,81 @@ impl PaneRuntimeIo {
 
     fn queue_user_input_submission(
         &self,
+        prefix: Bytes,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::pty::actor::PtySubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 #[cfg(windows)]
-                return actor.queue_user_input_submission(text, enter, delay, deadline);
+                return actor
+                    .queue_user_input_submission(prefix, text, enter, delay, deadline, guard);
                 #[cfg(unix)]
                 {
                     let _ = deadline;
-                    actor.queue_user_input_submission(text, enter, delay)
+                    actor.queue_user_input_submission(prefix, text, enter, delay, guard)
                 }
             }
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => {
+            PaneRuntimeIo::TestChannel { sender, state, .. } => {
                 let _ = deadline;
-                let sender = sender.clone();
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let result = sender
-                        .try_send(text)
-                        .map_err(std::io::Error::other)
-                        .and_then(|()| {
-                            std::thread::sleep(delay);
-                            sender.try_send(enter).map_err(std::io::Error::other)
+                let mut worker_guard = state.submission_worker.lock().unwrap();
+                let submission_tx = worker_guard
+                    .get_or_insert_with(|| {
+                        let (tx, rx) = std::sync::mpsc::channel::<TestChannelSubmission>();
+                        let sender = sender.clone();
+                        let state = Arc::clone(state);
+                        std::thread::spawn(move || {
+                            while let Ok(submission) = rx.recv() {
+                                if let Some(guard) = submission.guard {
+                                    if let Err(err) = guard() {
+                                        let _ = submission.reply.send(Err(err));
+                                        continue;
+                                    }
+                                }
+                                if !submission.prefix.is_empty() {
+                                    if let Err(err) = sender.try_send(submission.prefix) {
+                                        let _ =
+                                            submission.reply.send(Err(std::io::Error::other(err)));
+                                        continue;
+                                    }
+                                }
+                                if let Err(err) = sender.try_send(submission.text) {
+                                    let _ = submission.reply.send(Err(std::io::Error::other(err)));
+                                    continue;
+                                }
+                                if let Some((held_tx, release_rx)) =
+                                    state.hold_next_submission.lock().unwrap().take()
+                                {
+                                    let _ = held_tx.send(());
+                                    let _ =
+                                        release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                                }
+                                std::thread::sleep(submission.delay);
+                                let result = sender
+                                    .try_send(submission.enter)
+                                    .map_err(std::io::Error::other);
+                                let _ = submission.reply.send(result);
+                            }
                         });
-                    let _ = reply_tx.send(result);
-                });
+                        tx
+                    })
+                    .clone();
+                drop(worker_guard);
+                submission_tx
+                    .send(TestChannelSubmission {
+                        prefix,
+                        text,
+                        enter,
+                        delay,
+                        guard,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))?;
                 Ok(reply_rx)
             }
         }
@@ -3477,13 +3542,15 @@ impl PaneRuntime {
 
     pub fn queue_user_input_submission(
         &self,
+        prefix: Bytes,
         text: Bytes,
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        guard: Option<crate::pty::actor::PtySubmissionGuard>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission(prefix, text, enter, delay, deadline, guard)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -3676,6 +3743,10 @@ impl PaneRuntime {
         (pid > 0).then_some(pid)
     }
 
+    pub(crate) fn child_pid_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.child_pid)
+    }
+
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
@@ -3721,6 +3792,30 @@ impl PaneRuntime {
 
 #[cfg(test)]
 impl PaneRuntime {
+    pub(crate) fn test_foreground_agent_handle(&self) -> Option<Arc<Mutex<Option<Option<Agent>>>>> {
+        match &self.io {
+            PaneRuntimeIo::TestChannel { state, .. } => Some(Arc::clone(&state.foreground_agent)),
+            PaneRuntimeIo::Actor(_) => None,
+        }
+    }
+
+    pub(crate) fn set_test_foreground_agent(&self, agent: Option<Option<Agent>>) {
+        if let PaneRuntimeIo::TestChannel { state, .. } = &self.io {
+            *state.foreground_agent.lock().unwrap() = agent;
+        }
+    }
+
+    pub(crate) fn test_hold_next_submission(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        if let PaneRuntimeIo::TestChannel { state, .. } = &self.io {
+            *state.hold_next_submission.lock().unwrap() = Some((held_tx, release_rx));
+        }
+        (held_rx, release_tx)
+    }
+
     /// Hold the real terminal core while a test exercises another reader.
     pub(crate) fn test_hold_core(
         &self,
@@ -3862,6 +3957,7 @@ impl PaneRuntime {
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
+                    state: Arc::new(TestChannelState::default()),
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
@@ -5067,6 +5163,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                state: Arc::new(TestChannelState::default()),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -5106,6 +5203,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                state: Arc::new(TestChannelState::default()),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),

@@ -92,10 +92,17 @@ impl App {
                 std::thread::spawn(move || {
                     let response = match completion.recv() {
                         Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
-                        Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
-                            encode_error(id, "timeout", err.to_string())
+                        Ok(Err(err)) => {
+                            if let Some(rejected) =
+                                crate::pty::actor::submission_rejected_response(&err)
+                            {
+                                rejected.to_owned()
+                            } else if err.kind() == std::io::ErrorKind::TimedOut {
+                                encode_error(id, "timeout", err.to_string())
+                            } else {
+                                encode_error(id, "agent_prompt_failed", err.to_string())
+                            }
                         }
-                        Ok(Err(err)) => encode_error(id, "agent_prompt_failed", err.to_string()),
                         Err(_) => encode_error(id, "agent_prompt_failed", "pty actor closed"),
                     };
                     let _ = respond_to.send(response);
@@ -137,9 +144,7 @@ impl App {
                 "if_status only accepts idle, done, blocked, or working",
             ));
         }
-        let has_identity_expectations = params.expect_terminal.is_some()
-            || params.expect_agent.is_some()
-            || params.expect_session.is_some();
+        let target_is_pane_id = self.parse_current_public_pane_id(&params.target).is_some();
         let resolved = match self
             .resolve_agent_prompt_target(&params.target, params.expect_terminal.as_deref())
         {
@@ -156,137 +161,56 @@ impl App {
         let Some(terminal) = self.state.terminals.get(&terminal_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        if let Some(expected_terminal) = params.expect_terminal.as_deref() {
-            let actual_terminal = terminal.id.to_string();
-            if actual_terminal != expected_terminal {
-                return Err(encode_error(
-                    id,
-                    "agent_mismatch",
-                    format!(
-                        "agent target {} has terminal {actual_terminal}, expected {expected_terminal}",
-                        params.target
-                    ),
-                ));
-            }
-        }
-        if self.parse_current_public_pane_id(&params.target).is_none()
-            && terminal.agent_name.as_deref() != Some(params.target.as_str())
-        {
-            return Err(encode_error(
-                id,
-                "agent_mismatch",
-                format!(
-                    "agent target {} is no longer hosted by terminal {}",
-                    params.target, terminal.id
-                ),
-            ));
-        }
-        if let Some(expected_agent) = params.expect_agent.as_deref() {
-            let actual_agent = terminal
-                .is_agent_terminal()
-                .then(|| terminal.effective_agent_label())
-                .flatten();
-            if actual_agent != Some(expected_agent) {
-                return Err(encode_error(
-                    id,
-                    "agent_mismatch",
-                    format!(
-                        "agent target {} has agent {}, expected {expected_agent}",
-                        params.target,
-                        actual_agent.unwrap_or("none")
-                    ),
-                ));
-            }
-        }
-        if let Some(expected_session) = params.expect_session.as_deref() {
-            let actual_session = terminal
-                .is_agent_terminal()
-                .then(|| crate::app::creation::terminal_agent_session_info(terminal))
-                .flatten()
-                .map(|session| session.value);
-            if actual_session.as_deref() != Some(expected_session) {
-                return Err(encode_error(
-                    id,
-                    "agent_mismatch",
-                    format!(
-                        "agent target {} has session {}, expected {expected_session}",
-                        params.target,
-                        actual_session.as_deref().unwrap_or("none")
-                    ),
-                ));
-            }
-        }
-        if !terminal.is_agent_terminal() {
-            if has_identity_expectations {
-                return Err(encode_error(
-                    id,
-                    "agent_mismatch",
-                    format!(
-                        "agent target {} does not currently host an agent",
-                        params.target
-                    ),
-                ));
-            }
-            return Err(agent_not_found(id, &params.target));
-        }
-        let Some(expected_agent) = terminal.effective_known_agent() else {
-            if has_identity_expectations {
-                return Err(encode_error(
-                    id,
-                    "agent_mismatch",
-                    format!(
-                        "agent target {} does not currently host an interactive agent",
-                        params.target
-                    ),
-                ));
-            }
-            return Err(agent_not_ready(id, &params.target));
-        };
-        if terminal.managed_agent_launch_pending() {
-            return Err(agent_not_ready(id, &params.target));
-        }
+        pane_state.sync_delivery_snapshot();
+        terminal.sync_delivery_snapshot();
+        let pane_snapshot_handle = pane_state.delivery_snapshot_handle();
+        let terminal_snapshot_handle = terminal.delivery_snapshot_handle();
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            if params.expect_terminal.is_some()
+                || params.expect_agent.is_some()
+                || params.expect_session.is_some()
+            {
+                let pane_snapshot = pane_snapshot_handle
+                    .upgrade()
+                    .and_then(|arc| arc.lock().ok().map(|guard| guard.clone()));
+                let terminal_snapshot = terminal_snapshot_handle
+                    .upgrade()
+                    .and_then(|arc| arc.lock().ok().map(|guard| guard.clone()));
+                let dummy_pid = std::sync::atomic::AtomicU32::new(0);
+                validate_agent_prompt_delivery(
+                    &id,
+                    &params,
+                    target_is_pane_id,
+                    pane_snapshot.as_ref(),
+                    terminal_snapshot.as_ref(),
+                    &dummy_pid,
+                    #[cfg(test)]
+                    None,
+                )?;
+            }
             return Err(agent_not_found(id, &params.target));
         };
-        if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
-            let code = if has_identity_expectations {
-                "agent_mismatch"
-            } else {
-                "agent_not_ready"
-            };
-            return Err(encode_error(
-                id,
-                code,
-                format!(
-                    "agent {} is no longer the pane foreground process",
-                    params.target
-                ),
-            ));
-        }
-        if !params.if_status.is_empty() {
-            let current_status = pane_state.reported_agent_status(
-                crate::app::api_helpers::pane_agent_status(terminal.state, pane_state.seen),
-            );
-            if !params.if_status.contains(&current_status) {
-                return Err(encode_error(
-                    id,
-                    "agent_busy",
-                    format!(
-                        "agent {} has status {:?}, which is not in expected if_status",
-                        params.target, current_status
-                    ),
-                ));
-            }
-        } else if terminal.state == crate::detect::AgentState::Blocked {
-            return Err(encode_error(
-                id,
-                "agent_blocked",
-                format!(
-                    "agent {} is blocked and requires interactive input",
-                    params.target
-                ),
-            ));
-        }
+        let child_pid_handle = runtime.child_pid_handle();
+        #[cfg(test)]
+        let test_foreground_agent = runtime.test_foreground_agent_handle();
+        let expected_agent = {
+            let pane_snapshot = pane_snapshot_handle
+                .upgrade()
+                .and_then(|arc| arc.lock().ok().map(|guard| guard.clone()));
+            let terminal_snapshot = terminal_snapshot_handle
+                .upgrade()
+                .and_then(|arc| arc.lock().ok().map(|guard| guard.clone()));
+            validate_agent_prompt_delivery(
+                &id,
+                &params,
+                target_is_pane_id,
+                pane_snapshot.as_ref(),
+                terminal_snapshot.as_ref(),
+                &child_pid_handle,
+                #[cfg(test)]
+                test_foreground_agent.as_ref(),
+            )?
+        };
         #[cfg(windows)]
         let submit_deadline = params
             .wait
@@ -294,7 +218,7 @@ impl App {
             .and_then(|wait| wait.submission_deadline);
         #[cfg(not(windows))]
         let submit_deadline = None;
-        if expected_agent == crate::detect::Agent::GithubCopilot {
+        let prefix = if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
                 Ok(focus) => focus,
@@ -302,10 +226,10 @@ impl App {
                     return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
                 }
             };
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(focus)) {
-                return Err(encode_error(id, "agent_prompt_failed", err.to_string()));
-            }
-        }
+            Bytes::from(focus)
+        } else {
+            Bytes::new()
+        };
         let (text, enter) =
             crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
         #[cfg(windows)]
@@ -319,12 +243,46 @@ impl App {
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
+        let guard_id = id.clone();
+        let guard_params = params;
+        let guard: crate::pty::actor::PtySubmissionGuard = Box::new(move || {
+            let pane_snapshot = match pane_snapshot_handle.upgrade() {
+                Some(arc) => Some(
+                    arc.lock()
+                        .map_err(|_| std::io::Error::other("pane delivery snapshot poisoned"))?
+                        .clone(),
+                ),
+                None => None,
+            };
+            let terminal_snapshot = match terminal_snapshot_handle.upgrade() {
+                Some(arc) => Some(
+                    arc.lock()
+                        .map_err(|_| std::io::Error::other("terminal delivery snapshot poisoned"))?
+                        .clone(),
+                ),
+                None => None,
+            };
+            validate_agent_prompt_delivery(
+                &guard_id,
+                &guard_params,
+                target_is_pane_id,
+                pane_snapshot.as_ref(),
+                terminal_snapshot.as_ref(),
+                &child_pid_handle,
+                #[cfg(test)]
+                test_foreground_agent.as_ref(),
+            )
+            .map(|_| ())
+            .map_err(crate::pty::actor::submission_rejected_error)
+        });
         let completion = runtime
             .queue_user_input_submission(
+                prefix,
                 Bytes::from(text),
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
+                Some(guard),
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
         Ok((id, agent, completion))
@@ -492,6 +450,181 @@ impl App {
 
         encode_success(id, ResponseResult::Ok {})
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_agent_prompt_delivery(
+    id: &str,
+    params: &AgentPromptParams,
+    target_is_pane_id: bool,
+    pane_snapshot: Option<&crate::pane::PaneDeliverySnapshot>,
+    terminal_snapshot: Option<&crate::terminal::state::TerminalDeliverySnapshot>,
+    child_pid_handle: &std::sync::atomic::AtomicU32,
+    #[cfg(test)] test_foreground_agent: Option<
+        &std::sync::Arc<std::sync::Mutex<Option<Option<crate::detect::Agent>>>>,
+    >,
+) -> Result<crate::detect::Agent, String> {
+    let has_identity_expectations = params.expect_terminal.is_some()
+        || params.expect_agent.is_some()
+        || params.expect_session.is_some();
+    let (Some(pane_snapshot), Some(terminal_snapshot)) = (pane_snapshot, terminal_snapshot) else {
+        if has_identity_expectations {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_mismatch",
+                format!(
+                    "agent target {} is no longer hosted by the expected terminal",
+                    params.target
+                ),
+            ));
+        }
+        return Err(agent_not_found(id.to_string(), &params.target));
+    };
+    if pane_snapshot.attached_terminal_id != terminal_snapshot.id {
+        if has_identity_expectations {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_mismatch",
+                format!(
+                    "agent target {} is no longer hosted by terminal {}",
+                    params.target, terminal_snapshot.id
+                ),
+            ));
+        }
+        return Err(agent_not_found(id.to_string(), &params.target));
+    }
+    if let Some(expected_terminal) = params.expect_terminal.as_deref() {
+        let actual_terminal = terminal_snapshot.id.to_string();
+        if actual_terminal != expected_terminal {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_mismatch",
+                format!(
+                    "agent target {} has terminal {actual_terminal}, expected {expected_terminal}",
+                    params.target
+                ),
+            ));
+        }
+    }
+    if !target_is_pane_id && terminal_snapshot.agent_name.as_deref() != Some(params.target.as_str())
+    {
+        return Err(encode_error(
+            id.to_string(),
+            "agent_mismatch",
+            format!(
+                "agent target {} is no longer hosted by terminal {}",
+                params.target, terminal_snapshot.id
+            ),
+        ));
+    }
+    if let Some(expected_agent) = params.expect_agent.as_deref() {
+        let actual_agent = terminal_snapshot
+            .is_agent_terminal
+            .then_some(terminal_snapshot.effective_agent_label.as_deref())
+            .flatten();
+        if actual_agent != Some(expected_agent) {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_mismatch",
+                format!(
+                    "agent target {} has agent {}, expected {expected_agent}",
+                    params.target,
+                    actual_agent.unwrap_or("none")
+                ),
+            ));
+        }
+    }
+    if let Some(expected_session) = params.expect_session.as_deref() {
+        let actual_session = terminal_snapshot
+            .is_agent_terminal
+            .then_some(terminal_snapshot.session_value.as_deref())
+            .flatten();
+        if actual_session != Some(expected_session) {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_mismatch",
+                format!(
+                    "agent target {} has session {}, expected {expected_session}",
+                    params.target,
+                    actual_session.unwrap_or("none")
+                ),
+            ));
+        }
+    }
+    if !terminal_snapshot.is_agent_terminal {
+        if has_identity_expectations {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_mismatch",
+                format!(
+                    "agent target {} does not currently host an agent",
+                    params.target
+                ),
+            ));
+        }
+        return Err(agent_not_found(id.to_string(), &params.target));
+    }
+    let Some(expected_agent) = terminal_snapshot.effective_known_agent else {
+        if has_identity_expectations {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_mismatch",
+                format!(
+                    "agent target {} does not currently host an interactive agent",
+                    params.target
+                ),
+            ));
+        }
+        return Err(agent_not_ready(id.to_string(), &params.target));
+    };
+    if terminal_snapshot.managed_agent_launch_pending {
+        return Err(agent_not_ready(id.to_string(), &params.target));
+    }
+    if !super::super::agents::runtime_handles_host_agent(
+        child_pid_handle,
+        #[cfg(test)]
+        test_foreground_agent,
+        expected_agent,
+    ) {
+        let code = if has_identity_expectations {
+            "agent_mismatch"
+        } else {
+            "agent_not_ready"
+        };
+        return Err(encode_error(
+            id.to_string(),
+            code,
+            format!(
+                "agent {} is no longer the pane foreground process",
+                params.target
+            ),
+        ));
+    }
+    if !params.if_status.is_empty() {
+        let current_status = pane_snapshot.reported_agent_status(
+            crate::app::api_helpers::pane_agent_status(terminal_snapshot.state, pane_snapshot.seen),
+        );
+        if !params.if_status.contains(&current_status) {
+            return Err(encode_error(
+                id.to_string(),
+                "agent_busy",
+                format!(
+                    "agent {} has status {:?}, which is not in expected if_status",
+                    params.target, current_status
+                ),
+            ));
+        }
+    } else if terminal_snapshot.state == crate::detect::AgentState::Blocked {
+        return Err(encode_error(
+            id.to_string(),
+            "agent_blocked",
+            format!(
+                "agent {} is blocked and requires interactive input",
+                params.target
+            ),
+        ));
+    }
+    Ok(expected_agent)
 }
 
 fn agent_not_ready(id: String, target: &str) -> String {
@@ -1201,5 +1334,114 @@ mod tests {
             Bytes::from_static(b"answer blocker")
         );
         assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_rechecks_if_status_at_deferred_delivery_boundary() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let (held_rx, release_tx) = runtime.test_hold_next_submission();
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let first_rx =
+            start_deferred_agent_prompt(&mut app, "req-first", prompt_params("reviewer", "first"));
+        held_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first submission held after writing text");
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"first"));
+
+        let mut second_params = prompt_params("reviewer", "second");
+        second_params.if_status = vec![AgentStatus::Idle, AgentStatus::Done];
+        let second_rx = start_deferred_agent_prompt(&mut app, "req-second", second_params);
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Working);
+
+        release_tx.send(()).unwrap();
+
+        let first_response = first_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first submission finishes");
+        let first_success: SuccessResponse = serde_json::from_str(&first_response).unwrap();
+        assert!(matches!(
+            first_success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+
+        let second_response = second_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second submission refused at delivery boundary");
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&second_response).unwrap();
+        assert_eq!(error.error.code, "agent_busy");
+        assert!(
+            rx.try_recv().is_err(),
+            "refused deferred prompt must not write text or Enter"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_rechecks_identity_at_deferred_delivery_boundary() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::GithubCopilot), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let (held_rx, release_tx) = runtime.test_hold_next_submission();
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let first_rx =
+            start_deferred_agent_prompt(&mut app, "req-first", prompt_params("reviewer", "first"));
+        held_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first submission held after writing text");
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\x1b[I"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"first"));
+
+        let mut second_params = prompt_params("reviewer", "second");
+        second_params.expect_agent = Some("copilot".into());
+        let second_rx = start_deferred_agent_prompt(&mut app, "req-second", second_params);
+
+        app.lookup_runtime_sender(0, pane_id)
+            .unwrap()
+            .set_test_foreground_agent(Some(Some(Agent::Codex)));
+
+        release_tx.send(()).unwrap();
+
+        let first_response = first_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first submission finishes");
+        let first_success: SuccessResponse = serde_json::from_str(&first_response).unwrap();
+        assert!(matches!(
+            first_success.result,
+            ResponseResult::AgentPrompted { .. }
+        ));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+
+        let second_response = second_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second submission refused at delivery boundary");
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&second_response).unwrap();
+        assert_eq!(error.error.code, "agent_mismatch");
+        assert!(
+            rx.try_recv().is_err(),
+            "refused deferred prompt must not write focus prefix, text, or Enter"
+        );
     }
 }

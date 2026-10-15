@@ -112,9 +112,11 @@ fn write_send_input_segments(
         } else {
             runtime
                 .queue_user_input_submission(
+                    Bytes::new(),
                     held.take().unwrap_or_default(),
                     segment.bytes,
                     segment.delay_before,
+                    None,
                     None,
                 )
                 .map_err(|err| err.to_string())?;

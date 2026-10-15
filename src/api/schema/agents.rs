@@ -180,6 +180,7 @@ pub struct AgentStartParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AgentPromptParams {
     pub target: String,
     pub text: String,
@@ -193,6 +194,15 @@ pub struct AgentPromptParams {
     pub if_status: Vec<AgentStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentPromptWaitOptions>,
+}
+
+impl AgentPromptParams {
+    pub fn has_expectations(&self) -> bool {
+        self.expect_terminal.is_some()
+            || self.expect_agent.is_some()
+            || self.expect_session.is_some()
+            || !self.if_status.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

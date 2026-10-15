@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::api::schema::{ErrorBody, ErrorResponse};
+use crate::api::schema::{ErrorBody, ErrorResponse, Method, Request, ServerCapabilities};
 
 #[derive(Debug)]
 pub(super) struct ProtocolMismatchReported;
@@ -40,6 +40,28 @@ pub(super) fn mismatch_response(
             message,
         },
     })
+}
+
+pub(super) fn missing_capability_response(
+    request: &Request,
+    capabilities: Option<&ServerCapabilities>,
+    restart_guidance: &str,
+) -> Option<ErrorResponse> {
+    if matches!(&request.method, Method::AgentPrompt(params) if params.has_expectations())
+        && !capabilities.is_some_and(|caps| caps.agent_prompt_expectations)
+    {
+        return Some(ErrorResponse {
+            id: request.id.clone(),
+            error: ErrorBody {
+                code: "protocol_mismatch".into(),
+                message: format!(
+                    "server does not support conditional agent prompt expectations (missing capability agent_prompt_expectations); restart the Herdr server before using this command. {restart_guidance}"
+                ),
+            },
+        });
+    }
+
+    None
 }
 
 pub(super) fn reported_error() -> std::io::Error {

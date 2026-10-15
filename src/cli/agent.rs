@@ -824,152 +824,154 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, i32> {
     let mut until = Vec::new();
     let mut timeout_ms = None;
 
-    if args.len() == 2 && args[1] != "--" {
-        text = Some(args[1].clone());
+    let leading_expectation_flags = is_expectation_flag(&args[1]);
+    let mut options_ended = false;
+    let mut index = if leading_expectation_flags {
+        1
     } else {
-        let mut options_ended = false;
-        let mut index = 1;
-        while index < args.len() {
-            let current = args[index].as_str();
-            if !options_ended && current == "--" {
-                options_ended = true;
+        text = Some(args[1].clone());
+        2
+    };
+    while index < args.len() {
+        let current = args[index].as_str();
+        if leading_expectation_flags && !options_ended && current == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if options_ended {
+            if text.is_none() {
+                text = Some(args[index].clone());
                 index += 1;
                 continue;
             }
-            if options_ended {
-                if text.is_none() {
-                    text = Some(args[index].clone());
-                    index += 1;
-                    continue;
-                }
-                eprintln!("unknown option: {current}");
-                return Err(2);
+            eprintln!("unknown option: {current}");
+            return Err(2);
+        }
+        let (flag, inline_value) = match current.split_once('=') {
+            Some((flag, value)) => (flag, Some(value)),
+            None => (current, None),
+        };
+        match flag {
+            "--wait" if inline_value.is_none() => {
+                wait = true;
+                index += 1;
             }
-            let (flag, inline_value) = match current.split_once('=') {
-                Some((flag, value)) => (flag, Some(value)),
-                None => (current, None),
-            };
-            match flag {
-                "--wait" if inline_value.is_none() => {
-                    wait = true;
-                    index += 1;
-                }
-                "--until" => {
-                    let (value, step) = match inline_value {
-                        Some(value) => (value, 1),
-                        None => {
-                            let Some(value) = args.get(index + 1) else {
-                                eprintln!("--until requires at least one status");
-                                return Err(2);
-                            };
-                            (value.as_str(), 2)
-                        }
-                    };
-                    let status = match super::parse_agent_status(value) {
-                        Ok(status) => status,
-                        Err(err) => {
-                            eprintln!("{err}");
+            "--until" => {
+                let (value, step) = match inline_value {
+                    Some(value) => (value, 1),
+                    None => {
+                        let Some(value) = args.get(index + 1) else {
+                            eprintln!("--until requires at least one status");
                             return Err(2);
-                        }
-                    };
-                    until.push(status);
-                    index += step;
-                }
-                "--timeout" => {
-                    let (value, step) = match inline_value {
-                        Some(value) => (value, 1),
-                        None => {
-                            let Some(value) = args.get(index + 1) else {
-                                eprintln!("missing value for --timeout");
-                                return Err(2);
-                            };
-                            (value.as_str(), 2)
-                        }
-                    };
-                    timeout_ms = Some(parse_timeout(value)?);
-                    index += step;
-                }
-                "--expect-terminal" => {
-                    let (value, step) = match inline_value {
-                        Some(value) => (value, 1),
-                        None => {
-                            let Some(value) = args.get(index + 1) else {
-                                eprintln!("missing value for --expect-terminal");
-                                return Err(2);
-                            };
-                            (value.as_str(), 2)
-                        }
-                    };
-                    if value.is_empty() {
-                        eprintln!("--expect-terminal must not be empty");
+                        };
+                        (value.as_str(), 2)
+                    }
+                };
+                let status = match super::parse_agent_status(value) {
+                    Ok(status) => status,
+                    Err(err) => {
+                        eprintln!("{err}");
                         return Err(2);
                     }
-                    expect_terminal = Some(value.to_string());
-                    index += step;
-                }
-                "--expect-agent" => {
-                    let (value, step) = match inline_value {
-                        Some(value) => (value, 1),
-                        None => {
-                            let Some(value) = args.get(index + 1) else {
-                                eprintln!("missing value for --expect-agent");
-                                return Err(2);
-                            };
-                            (value.as_str(), 2)
-                        }
-                    };
-                    if value.is_empty() {
-                        eprintln!("--expect-agent must not be empty");
-                        return Err(2);
+                };
+                until.push(status);
+                index += step;
+            }
+            "--timeout" => {
+                let (value, step) = match inline_value {
+                    Some(value) => (value, 1),
+                    None => {
+                        let Some(value) = args.get(index + 1) else {
+                            eprintln!("missing value for --timeout");
+                            return Err(2);
+                        };
+                        (value.as_str(), 2)
                     }
-                    expect_agent = Some(value.to_string());
-                    index += step;
-                }
-                "--expect-session" => {
-                    let (value, step) = match inline_value {
-                        Some(value) => (value, 1),
-                        None => {
-                            let Some(value) = args.get(index + 1) else {
-                                eprintln!("missing value for --expect-session");
-                                return Err(2);
-                            };
-                            (value.as_str(), 2)
-                        }
-                    };
-                    if value.is_empty() {
-                        eprintln!("--expect-session must not be empty");
-                        return Err(2);
+                };
+                timeout_ms = Some(parse_timeout(value)?);
+                index += step;
+            }
+            "--expect-terminal" => {
+                let (value, step) = match inline_value {
+                    Some(value) => (value, 1),
+                    None => {
+                        let Some(value) = args.get(index + 1) else {
+                            eprintln!("missing value for --expect-terminal");
+                            return Err(2);
+                        };
+                        (value.as_str(), 2)
                     }
-                    expect_session = Some(value.to_string());
-                    index += step;
-                }
-                "--if-status" => {
-                    let (value, step) = match inline_value {
-                        Some(value) => (value, 1),
-                        None => {
-                            let Some(value) = args.get(index + 1) else {
-                                eprintln!("missing value for --if-status");
-                                return Err(2);
-                            };
-                            (value.as_str(), 2)
-                        }
-                    };
-                    let parsed = parse_if_status_list(value)?;
-                    for status in parsed {
-                        if !if_status.contains(&status) {
-                            if_status.push(status);
-                        }
-                    }
-                    index += step;
-                }
-                _ if text.is_none() && (!current.starts_with('-') || index == 1) => {
-                    text = Some(args[index].clone());
-                    index += 1;
-                }
-                option => {
-                    eprintln!("unknown option: {option}");
+                };
+                if value.is_empty() {
+                    eprintln!("--expect-terminal must not be empty");
                     return Err(2);
                 }
+                expect_terminal = Some(value.to_string());
+                index += step;
+            }
+            "--expect-agent" => {
+                let (value, step) = match inline_value {
+                    Some(value) => (value, 1),
+                    None => {
+                        let Some(value) = args.get(index + 1) else {
+                            eprintln!("missing value for --expect-agent");
+                            return Err(2);
+                        };
+                        (value.as_str(), 2)
+                    }
+                };
+                if value.is_empty() {
+                    eprintln!("--expect-agent must not be empty");
+                    return Err(2);
+                }
+                expect_agent = Some(value.to_string());
+                index += step;
+            }
+            "--expect-session" => {
+                let (value, step) = match inline_value {
+                    Some(value) => (value, 1),
+                    None => {
+                        let Some(value) = args.get(index + 1) else {
+                            eprintln!("missing value for --expect-session");
+                            return Err(2);
+                        };
+                        (value.as_str(), 2)
+                    }
+                };
+                if value.is_empty() {
+                    eprintln!("--expect-session must not be empty");
+                    return Err(2);
+                }
+                expect_session = Some(value.to_string());
+                index += step;
+            }
+            "--if-status" => {
+                let (value, step) = match inline_value {
+                    Some(value) => (value, 1),
+                    None => {
+                        let Some(value) = args.get(index + 1) else {
+                            eprintln!("missing value for --if-status");
+                            return Err(2);
+                        };
+                        (value.as_str(), 2)
+                    }
+                };
+                let parsed = parse_if_status_list(value)?;
+                for status in parsed {
+                    if !if_status.contains(&status) {
+                        if_status.push(status);
+                    }
+                }
+                index += step;
+            }
+            _ if text.is_none() && !current.starts_with('-') => {
+                text = Some(args[index].clone());
+                index += 1;
+            }
+            option => {
+                eprintln!("unknown option: {option}");
+                return Err(2);
             }
         }
     }
@@ -998,6 +1000,17 @@ fn parse_agent_prompt_args(args: &[String]) -> Result<AgentPromptParams, i32> {
             submission_deadline: None,
         }),
     })
+}
+
+fn is_expectation_flag(arg: &str) -> bool {
+    let flag = match arg.split_once('=') {
+        Some((flag, _)) => flag,
+        None => arg,
+    };
+    matches!(
+        flag,
+        "--expect-terminal" | "--expect-agent" | "--expect-session" | "--if-status"
+    )
 }
 
 fn parse_if_status_list(value: &str) -> Result<Vec<crate::api::schema::AgentStatus>, i32> {
@@ -1201,11 +1214,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_prompt_args_preserves_two_arg_literal_text_and_validates_if_status() {
+    fn parse_agent_prompt_args_preserves_legacy_positional_literal_text_and_validates_if_status() {
         let literal = parse_agent_prompt_args(&vec_str(&["main", "--wait"])).unwrap();
         assert_eq!(literal.target, "main");
         assert_eq!(literal.text, "--wait");
         assert_eq!(literal.wait, None);
+
+        let literal_wait_and_wait =
+            parse_agent_prompt_args(&vec_str(&["reviewer", "--wait", "--wait"])).unwrap();
+        assert_eq!(literal_wait_and_wait.target, "reviewer");
+        assert_eq!(literal_wait_and_wait.text, "--wait");
+        assert!(literal_wait_and_wait.wait.is_some());
+
+        let literal_double_dash_and_wait =
+            parse_agent_prompt_args(&vec_str(&["reviewer", "--", "--wait"])).unwrap();
+        assert_eq!(literal_double_dash_and_wait.target, "reviewer");
+        assert_eq!(literal_double_dash_and_wait.text, "--");
+        assert!(literal_double_dash_and_wait.wait.is_some());
+
+        let literal_double_dash_only =
+            parse_agent_prompt_args(&vec_str(&["reviewer", "--"])).unwrap();
+        assert_eq!(literal_double_dash_only.target, "reviewer");
+        assert_eq!(literal_double_dash_only.text, "--");
+        assert_eq!(literal_double_dash_only.wait, None);
+
+        let leading_flag_then_double_dash_text = parse_agent_prompt_args(&vec_str(&[
+            "reviewer",
+            "--expect-terminal",
+            "term_1",
+            "--",
+            "--wait",
+        ]))
+        .unwrap();
+        assert_eq!(leading_flag_then_double_dash_text.target, "reviewer");
+        assert_eq!(leading_flag_then_double_dash_text.text, "--wait");
+        assert_eq!(
+            leading_flag_then_double_dash_text
+                .expect_terminal
+                .as_deref(),
+            Some("term_1")
+        );
+        assert_eq!(leading_flag_then_double_dash_text.wait, None);
 
         for invalid in [
             &["w1:p1", "hi", "--if-status", "unknown"][..],
@@ -1213,6 +1262,7 @@ mod tests {
             &["w1:p1", "hi", "--if-status", ""][..],
             &["w1:p1", "hi", "--if-status", "idle,"][..],
             &["w1:p1", "--expect-terminal", "term_1"][..],
+            &["w1:p1", "hi", "--"][..],
         ] {
             assert_eq!(
                 parse_agent_prompt_args(&vec_str(invalid)),

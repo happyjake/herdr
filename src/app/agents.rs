@@ -447,15 +447,40 @@ pub(super) fn runtime_hosts_agent(
     runtime: &crate::terminal::TerminalRuntime,
     expected: crate::detect::Agent,
 ) -> bool {
-    #[cfg(test)]
-    if runtime.child_pid().is_none() {
-        return true;
-    }
-    live_runtime_agent(runtime) == Some(expected)
+    runtime_handles_host_agent(
+        &runtime.child_pid_handle(),
+        #[cfg(test)]
+        runtime.test_foreground_agent_handle().as_ref(),
+        expected,
+    )
 }
 
-fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {
-    let job = crate::detect::foreground_job(runtime.child_pid()?)?;
+pub(super) fn runtime_handles_host_agent(
+    child_pid_handle: &std::sync::atomic::AtomicU32,
+    #[cfg(test)] test_foreground_agent: Option<
+        &std::sync::Arc<std::sync::Mutex<Option<Option<crate::detect::Agent>>>>,
+    >,
+    expected: crate::detect::Agent,
+) -> bool {
+    #[cfg(test)]
+    if let Some(override_agent) =
+        test_foreground_agent.and_then(|handle| handle.lock().ok().and_then(|guard| *guard))
+    {
+        return override_agent == Some(expected);
+    }
+    let pid = child_pid_handle.load(std::sync::atomic::Ordering::Acquire);
+    #[cfg(test)]
+    if pid == 0 {
+        return true;
+    }
+    if pid == 0 {
+        return false;
+    }
+    live_pid_agent(pid) == Some(expected)
+}
+
+fn live_pid_agent(child_pid: u32) -> Option<crate::detect::Agent> {
+    let job = crate::detect::foreground_job(child_pid)?;
     crate::detect::identify_agent_in_job(&job)
         .map(|(agent, _)| agent)
         .or_else(|| {

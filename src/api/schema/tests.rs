@@ -1487,6 +1487,28 @@ fn server_advertises_cancelled_agent_reports() {
 }
 
 #[test]
+fn server_advertises_agent_prompt_expectations() {
+    assert!(crate::api::server_capabilities().agent_prompt_expectations);
+    let predating: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+    assert!(!predating.agent_prompt_expectations);
+}
+
+#[test]
+fn agent_prompt_rejects_unknown_fields() {
+    let err = serde_json::from_value::<Request>(serde_json::json!({
+        "id": "req_1",
+        "method": "agent.prompt",
+        "params": {
+            "target": "w1:p1",
+            "text": "hello",
+            "expect_term": "term_1"
+        }
+    }))
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown field"));
+}
+
+#[test]
 fn success_response_round_trips() {
     let response = SuccessResponse {
         id: "req_1".into(),
@@ -1508,6 +1530,7 @@ fn success_response_round_trips() {
                     chunk_bytes: 783_360,
                 }),
                 agent_report_cancelled: false,
+                agent_prompt_expectations: true,
             }),
             name: Some("home-box".into()),
             reach: Some("home-box".into()),

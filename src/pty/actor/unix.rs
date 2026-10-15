@@ -73,9 +73,11 @@ pub(crate) struct PtyIoActorConfig {
 enum PtyIoDataCommand {
     WriteUserInput(Bytes),
     SubmitUserInput {
+        prefix: Bytes,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+        guard: Option<super::PtySubmissionGuard>,
         reply: std_mpsc::Sender<std::io::Result<()>>,
     },
 }
@@ -141,9 +143,11 @@ impl PtyIoActorHandle {
 
     pub(crate) fn queue_user_input_submission(
         &self,
+        prefix: Bytes,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+        guard: Option<super::PtySubmissionGuard>,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
@@ -158,9 +162,11 @@ impl PtyIoActorHandle {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.data_tx
             .try_send(PtyIoDataCommand::SubmitUserInput {
+                prefix,
                 text,
                 enter,
                 delay,
+                guard,
                 reply: reply_tx,
             })
             .map_err(|err| match err {
@@ -455,6 +461,11 @@ enum SubmissionBoundary {
 }
 
 enum SubmissionPhase {
+    PendingDelivery {
+        prefix: Bytes,
+        text: Bytes,
+        guard: Option<super::PtySubmissionGuard>,
+    },
     WritingText,
     WaitingUntil(Instant),
     WritingEnter,
@@ -479,6 +490,49 @@ impl PtyIoActorRunner {
         }
     }
 
+    fn start_pending_submission_delivery(&mut self) -> bool {
+        if !self.pending_writes.is_empty() {
+            return false;
+        }
+        let Some(mut submission) = self.active_submission.take() else {
+            return false;
+        };
+        let SubmissionPhase::PendingDelivery {
+            prefix,
+            text,
+            guard,
+        } = submission.phase
+        else {
+            self.active_submission = Some(submission);
+            return false;
+        };
+        if let Some(guard) = guard {
+            if let Err(err) = guard() {
+                let _ = submission.reply.send(Err(err));
+                return true;
+            }
+        }
+        let phase = match (prefix.is_empty(), text.is_empty()) {
+            (true, true) => SubmissionPhase::WaitingUntil(Instant::now() + submission.delay),
+            (false, true) => {
+                self.enqueue_submission_write(prefix, SubmissionBoundary::Text);
+                SubmissionPhase::WritingText
+            }
+            (true, false) => {
+                self.enqueue_submission_write(text, SubmissionBoundary::Text);
+                SubmissionPhase::WritingText
+            }
+            (false, false) => {
+                self.enqueue_write(prefix);
+                self.enqueue_submission_write(text, SubmissionBoundary::Text);
+                SubmissionPhase::WritingText
+            }
+        };
+        submission.phase = phase;
+        self.active_submission = Some(submission);
+        false
+    }
+
     fn run(&mut self) {
         let mut should_exit = false;
         while !should_exit {
@@ -489,6 +543,10 @@ impl PtyIoActorRunner {
 
             self.apply_pending_controls();
 
+            if self.start_pending_submission_delivery() {
+                continue;
+            }
+
             if !self.pending_writes.is_empty() {
                 match self.flush_pending_writes_once() {
                     Ok(Some(boundary)) => self.complete_submission_boundary(boundary),
@@ -498,6 +556,9 @@ impl PtyIoActorRunner {
                         break;
                     }
                 }
+            }
+            if self.start_pending_submission_delivery() {
+                continue;
             }
             self.schedule_submission_enter();
             if self.active_submission.is_none() && self.pending_handoff.is_some() {
@@ -619,24 +680,25 @@ impl PtyIoActorRunner {
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
+                prefix,
                 text,
                 enter,
                 delay,
+                guard,
                 reply,
             } => {
                 if self.state == ActorState::Running {
-                    let phase = if text.is_empty() {
-                        SubmissionPhase::WaitingUntil(Instant::now() + delay)
-                    } else {
-                        self.enqueue_submission_write(text, SubmissionBoundary::Text);
-                        SubmissionPhase::WritingText
-                    };
                     self.active_submission = Some(ActiveSubmission {
                         enter,
                         delay,
-                        phase,
+                        phase: SubmissionPhase::PendingDelivery {
+                            prefix,
+                            text,
+                            guard,
+                        },
                         reply,
                     });
+                    self.start_pending_submission_delivery();
                 } else {
                     let _ = reply.send(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -1104,7 +1166,7 @@ mod tests {
         });
 
         let completion = handle
-            .queue_user_input_submission(text, Bytes::from_static(b"\r"), delay)
+            .queue_user_input_submission(Bytes::new(), text, Bytes::from_static(b"\r"), delay, None)
             .expect("submission queues");
         handle
             .try_write_user_input(Bytes::from_static(b"user"))
@@ -1120,9 +1182,11 @@ mod tests {
         assert!(enter_received.duration_since(prompt_completed) >= delay / 2);
 
         let err = match handle.queue_user_input_submission(
+            Bytes::new(),
             Bytes::from_static(b"prompt"),
             Bytes::from_static(b"\r"),
             Duration::ZERO,
+            None,
         ) {
             Ok(completion) => completion
                 .recv()
@@ -1146,7 +1210,13 @@ mod tests {
             .expect("peer timeout");
 
         let completion = handle
-            .queue_user_input_submission(Bytes::new(), Bytes::from_static(b"\r"), Duration::ZERO)
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::new(),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
             .expect("empty prompt submission queues");
         let mut enter = [0; 1];
         peer.read_exact(&mut enter)
@@ -1159,9 +1229,11 @@ mod tests {
 
         let completion = handle
             .queue_user_input_submission(
+                Bytes::new(),
                 Bytes::from_static(b"prompt"),
                 Bytes::new(),
                 Duration::from_millis(40),
+                None,
             )
             .expect("empty enter submission queues");
         let handoff_handle = handle.clone();
@@ -1187,9 +1259,11 @@ mod tests {
         let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
         let completion = handle
             .queue_user_input_submission(
+                Bytes::new(),
                 Bytes::from_static(b"prompt"),
                 Bytes::from_static(b"\r"),
                 Duration::from_secs(1),
+                None,
             )
             .expect("submission queues");
         let mut prompt = [0; 6];
@@ -1208,18 +1282,22 @@ mod tests {
         let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
         let active = handle
             .queue_user_input_submission(
+                Bytes::new(),
                 Bytes::from_static(b"first"),
                 Bytes::from_static(b"\r"),
                 Duration::from_secs(1),
+                None,
             )
             .expect("first submission queues");
         let mut prompt = [0; 5];
         peer.read_exact(&mut prompt).expect("peer receives prompt");
         let buffered = handle
             .queue_user_input_submission(
+                Bytes::new(),
                 Bytes::from_static(b"second"),
                 Bytes::from_static(b"\r"),
                 Duration::ZERO,
+                None,
             )
             .expect("second submission queues");
 
@@ -1235,6 +1313,78 @@ mod tests {
 
         assert_eq!(active_err.kind(), std::io::ErrorKind::BrokenPipe);
         assert_eq!(buffered_err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn actor_evaluates_submission_guard_at_deferred_delivery_boundary() {
+        let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer timeout");
+
+        let first = handle
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::from_static(b"first"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(80),
+                None,
+            )
+            .expect("first submission queues");
+
+        let allow_second = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let guard_flag = Arc::clone(&allow_second);
+        let second = handle
+            .queue_user_input_submission(
+                Bytes::from_static(b"\x1b[I"),
+                Bytes::from_static(b"second"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(80),
+                Some(Box::new(move || {
+                    if guard_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(super::super::submission_rejected_error(
+                            r#"{"id":"req","error":{"code":"agent_busy","message":"busy"}}"#.into(),
+                        ))
+                    }
+                })),
+            )
+            .expect("second submission queues while first is in flight");
+
+        // Flip the condition while the first submission is still holding the actor.
+        allow_second.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let third = handle
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::from_static(b"third"),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
+            .expect("third submission queues behind second");
+
+        first
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first submission reports")
+            .expect("first submission succeeds");
+        let second_err = second
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second submission reports")
+            .expect_err("second submission is rejected by guard");
+        assert!(super::super::submission_rejected_response(&second_err)
+            .unwrap()
+            .contains("agent_busy"));
+        third
+            .recv_timeout(Duration::from_secs(1))
+            .expect("third submission reports")
+            .expect("third submission succeeds");
+
+        let mut received = [0u8; 12];
+        peer.read_exact(&mut received)
+            .expect("peer receives only first and third submissions");
+        assert_eq!(&received, b"first\rthird\r");
+        handle.shutdown();
     }
 
     #[test]
@@ -1261,9 +1411,11 @@ mod tests {
                         .expect("actor handle installed")
                         .clone();
                     let attempt = handle.queue_user_input_submission(
+                        Bytes::new(),
                         Bytes::from_static(b"prompt"),
                         Bytes::from_static(b"\r"),
                         Duration::ZERO,
+                        None,
                     );
                     attempt_tx.send(attempt).expect("attempt receiver alive");
                 }
@@ -1354,7 +1506,13 @@ mod tests {
 
         let marker = Bytes::from_static(b"queued-input");
         let completion = handle
-            .queue_user_input_submission(marker.clone(), Bytes::from_static(b"\r"), Duration::ZERO)
+            .queue_user_input_submission(
+                Bytes::new(),
+                marker.clone(),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
             .expect("submission accepted");
 
         const OUTPUT_LEN: usize = 128 * 1024;
