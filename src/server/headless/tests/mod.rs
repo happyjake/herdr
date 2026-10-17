@@ -7486,6 +7486,7 @@ fn completion_guard_api_startup_blocker_respects_suppression() {
                 agent_session_id: None,
                 agent_session_path: None,
                 cancelled: false,
+                peer: None,
             }),
         );
     }
@@ -7550,6 +7551,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                     agent_session_id: None,
                     agent_session_path: Some(new_session.clone()),
                     session_start_source: Some(reason.into()),
+                    peer: None,
                 }),
             );
             let mut report = PaneReportAgentParams {
@@ -7562,6 +7564,7 @@ fn completion_guard_api_session_replacement_does_not_notify_finished() {
                 agent_session_id: None,
                 agent_session_path: Some(new_session.clone()),
                 cancelled: false,
+                peer: None,
             };
             completion_guard_api_report(&mut server, Method::PaneReportAgent(report.clone()));
             let terminal = &server.app.state.terminals[&terminal_id];
@@ -7755,6 +7758,7 @@ fn stale_api_agent_report_does_not_forward_done_sound() {
                 agent_session_id: None,
                 agent_session_path: None,
                 cancelled: false,
+                peer: None,
             }),
         },
         respond_to,
@@ -7823,6 +7827,7 @@ fn background_pi_turn_settled(
             agent_session_id: None,
             agent_session_path: Some(session_path.clone()),
             session_start_source: Some("startup".into()),
+            peer: None,
         }),
     );
     for (seq, state, cancelled) in [
@@ -7842,6 +7847,7 @@ fn background_pi_turn_settled(
                 agent_session_id: None,
                 agent_session_path: Some(session_path.clone()),
                 cancelled,
+                peer: None,
             }),
         );
     }

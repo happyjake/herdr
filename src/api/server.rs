@@ -317,9 +317,10 @@ fn handle_connection_with_stop(
         return Ok(());
     };
 
-    let Some(request) = parse_api_request(&mut stream, &line)? else {
+    let Some(mut request) = parse_api_request(&mut stream, &line)? else {
         return Ok(());
     };
+    attach_request_peer(&mut request.method, &stream);
 
     // An SSH agent registration lives exactly as long as this local
     // connection, so it needs the owned local stream and stays outside the
@@ -346,6 +347,21 @@ fn handle_connection_with_stop(
             credentials,
         ),
     }
+}
+
+/// Agent lifecycle reports describe the agent running in a pane, so the app
+/// checks where their sender runs. Read the sender while it is connected:
+/// it may exit as soon as it has its answer.
+fn attach_request_peer(method: &mut Method, stream: &LocalStream) {
+    let peer = match method {
+        Method::PaneReportAgent(params) => &mut params.peer,
+        Method::PaneReportAgentSession(params) => &mut params.peer,
+        _ => return,
+    };
+    *peer = crate::ipc::local_stream_peer_pid(stream).and_then(|pid| {
+        crate::platform::process_placement(pid)
+            .map(|placement| crate::api::RequestPeer { pid, placement })
+    });
 }
 
 #[cfg(unix)]

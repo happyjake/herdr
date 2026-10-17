@@ -3329,6 +3329,7 @@ action = "missing"
                 agent_session_id: None,
                 agent_session_path: None,
                 cancelled: false,
+                peer: None,
             },
         );
 

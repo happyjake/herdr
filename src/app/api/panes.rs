@@ -1745,14 +1745,60 @@ impl App {
         )
     }
 
+    /// Herdr's own integrations report the agent running in the pane, and
+    /// every process that agent starts inherits the pane id. An agent started
+    /// from inside it in another terminal (a detached multiplexer session,
+    /// say) would report its own session into this pane and unseat the real
+    /// one, so a built-in report from a process outside the pane is refused.
+    /// A sender that cannot be placed is let through, as before.
+    fn refuse_integration_report_from_outside_pane(
+        &self,
+        id: &str,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        source: &str,
+        peer: Option<&crate::api::RequestPeer>,
+    ) -> Option<String> {
+        if !source.starts_with(BUILTIN_INTEGRATION_SOURCE_PREFIX) {
+            return None;
+        }
+        let peer = peer?;
+        let (runtime, _workspace_id) = self.lookup_runtime(ws_idx, pane_id)?;
+        let shell_pid = runtime.child_pid()?;
+        let pane_tty = crate::platform::process_tty(shell_pid).flatten();
+        if peer.in_pane(shell_pid, pane_tty) != crate::api::PeerInPane::Outside {
+            return None;
+        }
+        tracing::info!(
+            source,
+            peer_pid = peer.pid,
+            shell_pid,
+            "refused an agent report from a process outside its pane"
+        );
+        Some(encode_error(
+            id.to_string(),
+            "reporter_outside_pane",
+            format!("{source} reports must come from a process running in the pane"),
+        ))
+    }
+
     pub(super) fn handle_pane_report_agent(
         &mut self,
         id: String,
         params: PaneReportAgentParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Some(refusal) = self.refuse_integration_report_from_outside_pane(
+            &id,
+            ws_idx,
+            pane_id,
+            &params.source,
+            params.peer.as_ref(),
+        ) {
+            return refusal;
+        }
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
@@ -1780,9 +1826,18 @@ impl App {
         id: String,
         params: PaneReportAgentSessionParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Some(refusal) = self.refuse_integration_report_from_outside_pane(
+            &id,
+            ws_idx,
+            pane_id,
+            &params.source,
+            params.peer.as_ref(),
+        ) {
+            return refusal;
+        }
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
@@ -2268,6 +2323,9 @@ fn normalize_state_labels(
         .filter_map(Result::transpose)
         .collect()
 }
+
+/// Report sources in this namespace belong to herdr's built-in integrations.
+const BUILTIN_INTEGRATION_SOURCE_PREFIX: &str = "herdr:";
 
 fn pane_not_found(id: String, pane_id: &str) -> String {
     encode_error(id, "pane_not_found", format!("pane {pane_id} not found"))

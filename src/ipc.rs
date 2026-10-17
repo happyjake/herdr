@@ -22,6 +22,46 @@ pub(crate) enum LocalStreamReadCount {
     Closed,
 }
 
+/// Pid of the process on the other end of a local socket connection.
+#[cfg(target_os = "macos")]
+pub(crate) fn local_stream_peer_pid(stream: &LocalStream) -> Option<u32> {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let LocalStream::UdSocket(stream) = stream;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: `pid` and `len` describe a writable buffer of the size the
+    // option returns, and the fd stays open for the call.
+    let ret = unsafe {
+        libc::getsockopt(
+            stream.as_fd().as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        )
+    };
+    (ret == 0)
+        .then_some(pid)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+}
+
+/// Pid of the process on the other end of a local socket connection.
+#[cfg(target_os = "linux")]
+pub(crate) fn local_stream_peer_pid(stream: &LocalStream) -> Option<u32> {
+    use interprocess::local_socket::traits::StreamCommon as _;
+
+    let pid = stream.peer_creds().ok()?.pid()?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+/// Pid of the process on the other end of a local socket connection.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn local_stream_peer_pid(_stream: &LocalStream) -> Option<u32> {
+    None
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SocketFileIdentity {
     #[cfg(unix)]
@@ -344,6 +384,21 @@ mod tests {
     use interprocess::local_socket::traits::Listener as _;
     #[cfg(windows)]
     use std::path::PathBuf;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn local_stream_peer_pid_names_the_connected_process() {
+        use interprocess::local_socket::traits::Listener as _;
+
+        let path = std::env::temp_dir().join(format!("herdr-peer-pid-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let listener = bind_local_listener(&path).unwrap();
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let server = listener.accept().unwrap();
+
+        assert_eq!(local_stream_peer_pid(&server), Some(std::process::id()));
+        let _ = fs::remove_file(&path);
+    }
 
     #[test]
     fn stale_socket_connect_errors_keep_unix_would_block_strict() {

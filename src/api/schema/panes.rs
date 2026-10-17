@@ -476,6 +476,11 @@ pub struct PaneReportAgentParams {
     /// `agent_report_cancelled`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cancelled: bool,
+    /// The local-socket sender, filled in by the server; never read from
+    /// or written to the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub peer: Option<crate::api::RequestPeer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -491,6 +496,11 @@ pub struct PaneReportAgentSessionParams {
     pub agent_session_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_start_source: Option<String>,
+    /// The local-socket sender, filled in by the server; never read from
+    /// or written to the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub peer: Option<crate::api::RequestPeer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

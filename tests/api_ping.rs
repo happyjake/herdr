@@ -1700,6 +1700,166 @@ fn events_subscribe_streams_tab_and_workspace_close_events() {
     cleanup_spawned_herdr(child, base);
 }
 
+/// Every process an agent starts inherits its pane's id, including an agent
+/// it starts on another terminal (in a detached multiplexer session, say).
+/// That agent's integration reports its own session into the pane; it must
+/// not reach the pane, or the pane's own agent can no longer move it.
+#[test]
+fn builtin_agent_reports_from_outside_the_pane_are_refused() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    fs::create_dir_all(&base).unwrap();
+    let pi = support::InPaneReporter::write(&base, "pi", &socket_path);
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "outside_ws",
+            "method": "workspace.create",
+            "params": {"cwd": base.display().to_string(), "focus": true}
+        })
+        .to_string(),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let started = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "outside_start",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": pi.command(), "keys": ["Enter"]}
+        })
+        .to_string(),
+    );
+    assert_eq!(started["result"]["type"], "ok");
+    pi.wait_until_started(Duration::from_secs(5));
+    let pane = |id: &str| {
+        send_request(
+            &socket_path,
+            &serde_json::json!({"id": id, "method": "pane.get", "params": {"pane_id": pane_id}})
+                .to_string(),
+        )["result"]["pane"]
+            .clone()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pane("outside_detect")["agent"] != "pi" {
+        assert!(Instant::now() < deadline, "pi was never detected");
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let owner_session = base.join("owner.jsonl").display().to_string();
+    let nested_session = base.join("nested.jsonl").display().to_string();
+    let owner_report = |state: &str, seq: &str| {
+        pi.ok(&[
+            "pane",
+            "report-agent",
+            &pane_id,
+            "--source",
+            "herdr:pi",
+            "--agent",
+            "pi",
+            "--state",
+            state,
+            "--seq",
+            seq,
+            "--agent-session-path",
+            &owner_session,
+        ]);
+    };
+    pi.ok(&[
+        "pane",
+        "report-agent-session",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--seq",
+        "1",
+        "--agent-session-path",
+        &owner_session,
+        "--session-start-source",
+        "startup",
+    ]);
+    owner_report("working", "2");
+    assert_eq!(pane("outside_working")["agent_status"], "working");
+
+    // The nested agent runs outside the pane; its clock is ahead of the
+    // owner's, as a later start makes it.
+    let nested_start = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "outside_nested_session",
+            "method": "pane.report_agent_session",
+            "params": {
+                "pane_id": pane_id,
+                "source": "herdr:pi",
+                "agent": "pi",
+                "seq": 1000,
+                "agent_session_path": nested_session,
+                "session_start_source": "startup"
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(nested_start["error"]["code"], "reporter_outside_pane");
+    let nested_idle = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "outside_nested_idle",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": pane_id,
+                "source": "herdr:pi",
+                "agent": "pi",
+                "state": "idle",
+                "seq": 1001,
+                "agent_session_path": nested_session
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(nested_idle["error"]["code"], "reporter_outside_pane");
+    let during = pane("outside_during");
+    assert_eq!(during["agent_status"], "working");
+    assert_eq!(during["agent_session"]["value"], owner_session.as_str());
+
+    // The owner finishing its turn still settles the pane.
+    owner_report("idle", "3");
+    let settled = pane("outside_settled");
+    assert!(
+        settled["agent_status"] == "idle" || settled["agent_status"] == "done",
+        "the owner's idle did not land: {settled}"
+    );
+
+    // Reports under any other source still come from wherever they like.
+    let custom = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "outside_custom",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": pane_id,
+                "source": "custom:probe",
+                "agent": "probe",
+                "state": "working"
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(custom["result"]["type"], "ok", "{custom}");
+
+    pi.stop();
+    cleanup_spawned_herdr(child, base);
+}
+
 #[cfg(not(target_os = "macos"))]
 #[cfg(not(target_os = "macos"))]
 #[test]
@@ -1712,15 +1872,7 @@ fn pane_report_agent_updates_effective_state() {
     let bin_dir = base.join("bin");
 
     fs::create_dir_all(&bin_dir).unwrap();
-    let fake_pi = bin_dir.join("pi");
-    fs::write(&fake_pi, "#!/bin/sh\nprintf 'Working...\\n'\nsleep 3\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&fake_pi).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_pi, perms).unwrap();
-    }
+    let pi = support::InPaneReporter::write_showing(&bin_dir, "pi", &socket_path, "Working...");
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
@@ -1781,24 +1933,39 @@ fn pane_report_agent_updates_effective_state() {
     }
 
     let session_path = base.join("pi-session.jsonl");
-    let session = send_request(
-        &socket_path,
-        &format!(
-            r#"{{"id":"req_hook_session","method":"pane.report_agent_session","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","agent_session_path":"{}","session_start_source":"startup","seq":1}}}}"#,
-            pane_id,
-            session_path.display()
-        ),
-    );
-    assert_eq!(session["result"]["type"], "ok");
-    let hook = send_request(
-        &socket_path,
-        &format!(
-            r#"{{"id":"req_hook_5","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working","message":"thinking","agent_session_path":"{}","seq":2}}}}"#,
-            pane_id,
-            session_path.display()
-        ),
-    );
-    assert_eq!(hook["result"]["type"], "ok");
+    let session = session_path.display().to_string();
+    pi.ok(&[
+        "pane",
+        "report-agent-session",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--agent-session-path",
+        &session,
+        "--session-start-source",
+        "startup",
+        "--seq",
+        "1",
+    ]);
+    pi.ok(&[
+        "pane",
+        "report-agent",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--state",
+        "working",
+        "--message",
+        "thinking",
+        "--agent-session-path",
+        &session,
+        "--seq",
+        "2",
+    ]);
 
     let pane = send_request(
         &socket_path,
@@ -2141,23 +2308,7 @@ fn official_release_waits_for_confirmed_process_exit() {
     let bin_dir = base.join("bin");
 
     fs::create_dir_all(&bin_dir).unwrap();
-    let fake_pi = bin_dir.join("pi");
-    let stop_file = base.join("pi-stop");
-    fs::write(
-        &fake_pi,
-        format!(
-            "#!/bin/sh\nprintf 'Working...\\n'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\n",
-            stop_file.display()
-        ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&fake_pi).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_pi, perms).unwrap();
-    }
+    let pi = support::InPaneReporter::write_showing(&bin_dir, "pi", &socket_path, "Working...");
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
@@ -2218,24 +2369,37 @@ fn official_release_waits_for_confirmed_process_exit() {
     }
 
     let session_path = base.join("release-session.jsonl");
-    let session = send_request(
-        &socket_path,
-        &format!(
-            r#"{{"id":"req_release_session","method":"pane.report_agent_session","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","agent_session_path":"{}","session_start_source":"startup","seq":1}}}}"#,
-            pane_id,
-            session_path.display()
-        ),
-    );
-    assert_eq!(session["result"]["type"], "ok");
-    let hook = send_request(
-        &socket_path,
-        &format!(
-            r#"{{"id":"req_release_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"working","agent_session_path":"{}","seq":2}}}}"#,
-            pane_id,
-            session_path.display()
-        ),
-    );
-    assert_eq!(hook["result"]["type"], "ok");
+    let session = session_path.display().to_string();
+    pi.ok(&[
+        "pane",
+        "report-agent-session",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--agent-session-path",
+        &session,
+        "--session-start-source",
+        "startup",
+        "--seq",
+        "1",
+    ]);
+    pi.ok(&[
+        "pane",
+        "report-agent",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--state",
+        "working",
+        "--agent-session-path",
+        &session,
+        "--seq",
+        "2",
+    ]);
 
     let released = send_request(
         &socket_path,
@@ -2263,7 +2427,7 @@ fn official_release_waits_for_confirmed_process_exit() {
         thread::sleep(Duration::from_millis(50));
     }
 
-    fs::write(&stop_file, "stop").unwrap();
+    pi.stop();
 
     let cleared_deadline = Instant::now() + Duration::from_secs(1);
     loop {
@@ -2300,15 +2464,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
     let bin_dir = base.join("bin");
 
     fs::create_dir_all(&bin_dir).unwrap();
-    let fake_pi = bin_dir.join("pi");
-    fs::write(&fake_pi, "#!/bin/sh\nprintf 'Working...\\n'\nsleep 3\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&fake_pi).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_pi, perms).unwrap();
-    }
+    let pi = support::InPaneReporter::write_showing(&bin_dir, "pi", &socket_path, "Working...");
 
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path_override = format!("{}:{}", bin_dir.display(), inherited_path);
@@ -2380,14 +2536,17 @@ fn pane_clear_agent_authority_restores_fallback_state() {
         .unwrap()
         .to_string();
 
-    let hook = send_request(
-        &socket_path,
-        &format!(
-            r#"{{"id":"req_clear_4","method":"pane.report_agent","params":{{"pane_id":"{}","source":"herdr:pi","agent":"pi","state":"idle"}}}}"#,
-            pane_id
-        ),
-    );
-    assert_eq!(hook["result"]["type"], "ok");
+    pi.ok(&[
+        "pane",
+        "report-agent",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--state",
+        "idle",
+    ]);
 
     let cleared = send_request(
         &socket_path,
