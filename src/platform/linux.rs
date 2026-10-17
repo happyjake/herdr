@@ -785,6 +785,23 @@ pub(crate) fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
     process_ppid_and_comm_from_stat(&stat)
 }
 
+/// Parent pid and controlling terminal device of `pid`; the terminal is
+/// `None` for a process without one (`tty_nr` is 0).
+pub(crate) fn process_parent_and_tty(pid: u32) -> Option<(u32, Option<u64>)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_ppid_and_tty_from_stat(&stat)
+}
+
+fn process_ppid_and_tty_from_stat(stat: &str) -> Option<(u32, Option<u64>)> {
+    let close = stat.rfind(')')?;
+    let rest = stat.get(close + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let ppid: i32 = fields.get(1)?.parse().ok()?;
+    let tty_nr: i64 = fields.get(4)?.parse().ok()?;
+    let tty = u64::try_from(tty_nr).ok().filter(|tty| *tty != 0);
+    u32::try_from(ppid).ok().map(|ppid| (ppid, tty))
+}
+
 pub(crate) fn process_group_member_pids(process_group_id: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {

@@ -1030,6 +1030,14 @@ pub(crate) fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
     Some((info.pbi_ppid, name))
 }
 
+/// Parent pid and controlling terminal device of `pid`; the terminal is
+/// `None` for a process without one (the kernel reports `NODEV`).
+pub(crate) fn process_parent_and_tty(pid: u32) -> Option<(u32, Option<u64>)> {
+    let info = process_bsdinfo(pid)?;
+    let tty = (info.e_tdev != u32::MAX).then_some(u64::from(info.e_tdev));
+    Some((info.pbi_ppid, tty))
+}
+
 pub(crate) fn process_group_member_pids(process_group_id: u32) -> Vec<u32> {
     process_group_pids(process_group_id)
 }

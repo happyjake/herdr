@@ -77,6 +77,42 @@ pub struct ApiRequestMessage {
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 }
 
+/// The process that sent a request over the local socket, read by the
+/// server while the connection was open. Never taken from the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestPeer {
+    pub pid: u32,
+    pub placement: crate::platform::ProcessPlacement,
+}
+
+/// Whether a request's sender runs inside a given pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerInPane {
+    Inside,
+    Outside,
+    Unknown,
+}
+
+impl RequestPeer {
+    /// A sender with a controlling terminal is in the pane whose terminal
+    /// that is. A sender without one (a hook started detached) is in the
+    /// pane whose shell it descends from.
+    pub fn in_pane(&self, pane_shell_pid: u32, pane_tty: Option<u64>) -> PeerInPane {
+        if let (Some(peer_tty), Some(pane_tty)) = (self.placement.tty, pane_tty) {
+            return if peer_tty == pane_tty {
+                PeerInPane::Inside
+            } else {
+                PeerInPane::Outside
+            };
+        }
+        match &self.placement.ancestry {
+            Some(chain) if chain.contains(&pane_shell_pid) => PeerInPane::Inside,
+            Some(_) => PeerInPane::Outside,
+            None => PeerInPane::Unknown,
+        }
+    }
+}
+
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
 
 pub fn socket_path() -> PathBuf {
@@ -97,5 +133,79 @@ mod tests {
         assert!(capabilities.stream_multiplex);
         assert!(capabilities.agent_report_cancelled);
         assert!(capabilities.agent_prompt_expectations);
+    }
+
+    const PANE_SHELL: u32 = 500;
+    const PANE_TTY: u64 = 0x1000_0003;
+
+    fn peer(tty: Option<u64>, ancestry: Option<&[u32]>) -> super::RequestPeer {
+        super::RequestPeer {
+            pid: 900,
+            placement: crate::platform::ProcessPlacement {
+                tty,
+                ancestry: ancestry.map(<[u32]>::to_vec),
+            },
+        }
+    }
+
+    #[test]
+    fn a_sender_on_the_pane_terminal_is_inside_the_pane() {
+        let sender = peer(Some(PANE_TTY), Some(&[900, 1]));
+
+        assert_eq!(
+            sender.in_pane(PANE_SHELL, Some(PANE_TTY)),
+            super::PeerInPane::Inside
+        );
+    }
+
+    /// An agent started from the pane's agent in a detached multiplexer
+    /// session runs on that session's terminal and descends from its daemon.
+    #[test]
+    fn a_sender_on_another_terminal_is_outside_the_pane() {
+        let sender = peer(Some(0x1000_0007), Some(&[900, 800, 1]));
+
+        assert_eq!(
+            sender.in_pane(PANE_SHELL, Some(PANE_TTY)),
+            super::PeerInPane::Outside
+        );
+    }
+
+    /// A hook started detached has no terminal; its parents still lead back
+    /// to the pane's shell through the agent that ran it.
+    #[test]
+    fn a_sender_without_a_terminal_is_placed_by_its_parents() {
+        let hook = peer(None, Some(&[900, 700, 600, PANE_SHELL, 1]));
+        let daemon_child = peer(None, Some(&[900, 800, 1]));
+
+        assert_eq!(
+            hook.in_pane(PANE_SHELL, Some(PANE_TTY)),
+            super::PeerInPane::Inside
+        );
+        assert_eq!(
+            daemon_child.in_pane(PANE_SHELL, Some(PANE_TTY)),
+            super::PeerInPane::Outside
+        );
+    }
+
+    #[test]
+    fn a_pane_whose_terminal_is_unknown_places_the_sender_by_its_parents() {
+        let inside = peer(Some(PANE_TTY), Some(&[900, PANE_SHELL, 1]));
+        let outside = peer(Some(PANE_TTY), Some(&[900, 800, 1]));
+
+        assert_eq!(inside.in_pane(PANE_SHELL, None), super::PeerInPane::Inside);
+        assert_eq!(
+            outside.in_pane(PANE_SHELL, None),
+            super::PeerInPane::Outside
+        );
+    }
+
+    #[test]
+    fn a_sender_whose_parents_cannot_be_read_is_unknown() {
+        let sender = peer(None, None);
+
+        assert_eq!(
+            sender.in_pane(PANE_SHELL, Some(PANE_TTY)),
+            super::PeerInPane::Unknown
+        );
     }
 }

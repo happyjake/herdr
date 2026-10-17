@@ -1493,7 +1493,7 @@ while True:
     cleanup_test_base(&base);
 }
 
-/// Regression (phone report 2026-07-13): agent TUIs like claude live on the
+/// Regression: agent TUIs like claude live on the
 /// PRIMARY screen — their transcript is the pane's scrollback. A handoff
 /// must carry that scrollback and leave the pane accumulating more, not
 /// classify the pane "alternate screen" by agent identity, which destroyed
@@ -2193,8 +2193,6 @@ fn live_handoff_accepts_canonical_pane_id_from_child_env() {
 
 #[test]
 fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
-    use std::os::unix::fs::PermissionsExt;
-
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -2202,18 +2200,8 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     let api_socket = runtime_dir.join("herdr.sock");
     let old_session = base.join("old-session.jsonl");
     let new_session = base.join("new-session.jsonl");
-    let started_marker = base.join("agent-started");
-    let fake_pi = base.join("pi");
     fs::create_dir_all(&base).unwrap();
-    fs::write(
-        &fake_pi,
-        format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n:\n",
-            started_marker.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+    let pi = support::InPaneReporter::write(&base, "pi", &api_socket);
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -2235,40 +2223,40 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
         serde_json::json!({
             "id": "test:pane:start-agent",
             "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": fake_pi, "keys": ["Enter"]}
+            "params": {"pane_id": pane_id, "text": pi.command(), "keys": ["Enter"]}
         }),
     ));
-    support::wait_for_file(&started_marker, Duration::from_secs(5));
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent:session",
-            "method": "pane.report_agent_session",
-            "params": {
-                "pane_id": pane_id,
-                "source": "herdr:pi",
-                "agent": "pi",
-                "seq": 1,
-                "agent_session_path": old_session,
-                "session_start_source": "startup"
-            }
-        }),
-    ));
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent:report",
-            "method": "pane.report_agent",
-            "params": {
-                "pane_id": pane_id,
-                "source": "herdr:pi",
-                "agent": "pi",
-                "state": "idle",
-                "seq": 2,
-                "agent_session_path": old_session
-            }
-        }),
-    ));
+    pi.wait_until_started(Duration::from_secs(5));
+    pi.ok(&[
+        "pane",
+        "report-agent-session",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--seq",
+        "1",
+        "--agent-session-path",
+        &old_session.display().to_string(),
+        "--session-start-source",
+        "startup",
+    ]);
+    pi.ok(&[
+        "pane",
+        "report-agent",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--state",
+        "idle",
+        "--seq",
+        "2",
+        "--agent-session-path",
+        &old_session.display().to_string(),
+    ]);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let response = request(
@@ -2304,21 +2292,21 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(10));
 
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent:new-session",
-            "method": "pane.report_agent_session",
-            "params": {
-                "pane_id": pane_id,
-                "source": "herdr:pi",
-                "agent": "pi",
-                "seq": 3,
-                "agent_session_path": new_session,
-                "session_start_source": "new"
-            }
-        }),
-    ));
+    pi.ok(&[
+        "pane",
+        "report-agent-session",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--seq",
+        "3",
+        "--agent-session-path",
+        &new_session.display().to_string(),
+        "--session-start-source",
+        "new",
+    ]);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let old_name = request(
@@ -2390,20 +2378,34 @@ fn live_handoff_keeps_the_date_of_a_working_agent_with_a_resumable_session() {
     let api_socket = runtime_dir.join("herdr.sock");
     let fake_claude = base.join("claude");
     fs::create_dir_all(&base).unwrap();
-    // Named like the agent so process detection finds it, and drawing what
-    // the screen detector reads as a turn in progress.
+    let claude = support::PaneCommandInbox::new(&base.join("claude-inbox"), &api_socket);
+    // Named like the agent so process detection finds it, drawing what the
+    // screen detector reads as a turn in progress, and running the reports
+    // the test hands it from inside the pane.
     fs::write(
         &fake_claude,
         concat!(
             "#!/usr/bin/env python3\n",
-            "import sys, time\n",
+            "import os, subprocess, sys, time\n",
+            "inbox = sys.argv[1]\n",
             "n = 0\n",
+            "k = 0\n",
             "while True:\n",
             "    n += 1\n",
             "    sys.stdout.write('\\x1b]0;\\u280b Working\\x07')\n",
             "    sys.stdout.write('\\u273b Thinking\\u2026 (%ds \\u00b7 esc to interrupt)\\r\\n' % n)\n",
             "    sys.stdout.flush()\n",
-            "    time.sleep(1)\n",
+            "    for _ in range(20):\n",
+            "        cmd = os.path.join(inbox, '%d.cmd' % k)\n",
+            "        if os.path.exists(cmd):\n",
+            "            with open(os.path.join(inbox, '%d.out' % k), 'w') as out:\n",
+            "                code = subprocess.call(['/bin/sh', cmd], stdout=out, stderr=subprocess.STDOUT)\n",
+            "            tmp = os.path.join(inbox, '%d.tmp' % k)\n",
+            "            with open(tmp, 'w') as status:\n",
+            "                status.write('%d\\n' % code)\n",
+            "            os.rename(tmp, os.path.join(inbox, '%d.status' % k))\n",
+            "            k += 1\n",
+            "        time.sleep(0.05)\n",
         ),
     )
     .unwrap();
@@ -2432,27 +2434,31 @@ fn live_handoff_keeps_the_date_of_a_working_agent_with_a_resumable_session() {
         serde_json::json!({
             "id": "test:pane:start-agent",
             "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": fake_claude, "keys": ["Enter"]}
+            "params": {
+                "pane_id": pane_id,
+                "text": format!("{} {}", fake_claude.display(), claude.dir().display()),
+                "keys": ["Enter"]
+            }
         }),
     ));
     wait_for_pane_status(&api_socket, &pane_id, "working");
     // A session the new process could resume is what separates this pane
     // from one that carries nothing but its screen across the handoff.
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent:session",
-            "method": "pane.report_agent_session",
-            "params": {
-                "pane_id": pane_id,
-                "source": "herdr:claude",
-                "agent": "claude",
-                "seq": 1,
-                "agent_session_id": "claude-session",
-                "session_start_source": "startup"
-            }
-        }),
-    ));
+    claude.ok(&[
+        "pane",
+        "report-agent-session",
+        &pane_id,
+        "--source",
+        "herdr:claude",
+        "--agent",
+        "claude",
+        "--seq",
+        "1",
+        "--agent-session-id",
+        "claude-session",
+        "--session-start-source",
+        "startup",
+    ]);
     let working_since = wait_for_pane_status(&api_socket, &pane_id, "working");
     // Let the clock move past the date being carried, so a date minted by the
     // new process cannot coincide with it.
@@ -2494,25 +2500,13 @@ fn live_handoff_keeps_the_date_of_a_working_agent_with_a_resumable_session() {
 
 #[test]
 fn live_handoff_keeps_an_unseen_completion_done() {
-    use std::os::unix::fs::PermissionsExt;
-
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
-    let started_marker = base.join("agent-started");
-    let fake_pi = base.join("pi");
     fs::create_dir_all(&base).unwrap();
-    fs::write(
-        &fake_pi,
-        format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n:\n",
-            started_marker.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+    let pi = support::InPaneReporter::write(&base, "pi", &api_socket);
 
     let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -2548,10 +2542,10 @@ fn live_handoff_keeps_an_unseen_completion_done() {
         serde_json::json!({
             "id": "test:pane:start-agent",
             "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": fake_pi, "keys": ["Enter"]}
+            "params": {"pane_id": pane_id, "text": pi.command(), "keys": ["Enter"]}
         }),
     ));
-    support::wait_for_file(&started_marker, Duration::from_secs(5));
+    pi.wait_until_started(Duration::from_secs(5));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let response = request(
@@ -2571,38 +2565,38 @@ fn live_handoff_keeps_an_unseen_completion_done() {
         );
         thread::sleep(Duration::from_millis(25));
     }
-    let agent_session = base.join("session.jsonl");
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent:session",
-            "method": "pane.report_agent_session",
-            "params": {
-                "pane_id": pane_id,
-                "source": "herdr:pi",
-                "agent": "pi",
-                "seq": 1,
-                "agent_session_path": agent_session,
-                "session_start_source": "startup"
-            }
-        }),
-    ));
-    for (seq, state) in [(2, "working"), (3, "idle")] {
-        assert_ok(request(
-            &api_socket,
-            serde_json::json!({
-                "id": format!("test:agent:report:{state}"),
-                "method": "pane.report_agent",
-                "params": {
-                    "pane_id": pane_id,
-                    "source": "herdr:pi",
-                    "agent": "pi",
-                    "state": state,
-                    "seq": seq,
-                    "agent_session_path": agent_session
-                }
-            }),
-        ));
+    let agent_session = base.join("session.jsonl").display().to_string();
+    pi.ok(&[
+        "pane",
+        "report-agent-session",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--seq",
+        "1",
+        "--agent-session-path",
+        &agent_session,
+        "--session-start-source",
+        "startup",
+    ]);
+    for (seq, state) in [("2", "working"), ("3", "idle")] {
+        pi.ok(&[
+            "pane",
+            "report-agent",
+            &pane_id,
+            "--source",
+            "herdr:pi",
+            "--agent",
+            "pi",
+            "--state",
+            state,
+            "--seq",
+            seq,
+            "--agent-session-path",
+            &agent_session,
+        ]);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let response = request(
@@ -2676,21 +2670,21 @@ fn live_handoff_keeps_an_unseen_completion_done() {
     );
     // The agent confirming it is still idle settles the restored pane: it is
     // the same unread completion, so it keeps that completion's age.
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent:report:idle-again",
-            "method": "pane.report_agent",
-            "params": {
-                "pane_id": pane_id,
-                "source": "herdr:pi",
-                "agent": "pi",
-                "state": "idle",
-                "seq": 4,
-                "agent_session_path": agent_session
-            }
-        }),
-    ));
+    pi.ok(&[
+        "pane",
+        "report-agent",
+        &pane_id,
+        "--source",
+        "herdr:pi",
+        "--agent",
+        "pi",
+        "--state",
+        "idle",
+        "--seq",
+        "4",
+        "--agent-session-path",
+        &agent_session,
+    ]);
     let deadline = Instant::now() + Duration::from_secs(5);
     let (status, changed_at, response) = loop {
         let observed = pane_status("settled");

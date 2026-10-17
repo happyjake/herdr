@@ -904,6 +904,60 @@ pub fn pane_shell_cwd(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FOREGROUND_ANCESTRY: usize = 16;
 
+/// Where a process sits: its controlling terminal and its parent chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessPlacement {
+    /// Controlling terminal device; `None` when the process has none.
+    pub tty: Option<u64>,
+    /// The process, then each parent up to init; `None` when a link in the
+    /// chain could not be read (a parent exited mid-climb, say).
+    pub ancestry: Option<Vec<u32>>,
+}
+
+/// Placement of a live process, or `None` when it cannot be read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn process_placement(pid: u32) -> Option<ProcessPlacement> {
+    let (parent, tty) = process_parent_and_tty(pid)?;
+    Some(ProcessPlacement {
+        tty,
+        ancestry: process_ancestry(pid, parent),
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_ancestry(pid: u32, parent: u32) -> Option<Vec<u32>> {
+    let mut chain = vec![pid];
+    let mut current = parent;
+    for _ in 0..MAX_PROCESS_ANCESTRY {
+        chain.push(current);
+        if current <= 1 {
+            return Some(chain);
+        }
+        current = process_parent_and_tty(current)?.0;
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_placement(_pid: u32) -> Option<ProcessPlacement> {
+    None
+}
+
+/// Controlling terminal device of a live process (outer `None`: unreadable;
+/// inner `None`: no controlling terminal).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn process_tty(pid: u32) -> Option<Option<u64>> {
+    process_parent_and_tty(pid).map(|(_, tty)| tty)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_tty(_pid: u32) -> Option<Option<u64>> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_PROCESS_ANCESTRY: usize = 64;
+
 /// A process group outlives its leader (a pipeline whose first command
 /// exited still holds the terminal), so the group id is not always a live
 /// pid. Leader first — the cheap, common case — then any live member.
@@ -1407,6 +1461,46 @@ mod tests {
             "member must be gone"
         );
         assert_ne!(live_foreground_group_member(leader), Some(member));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn process_placement_climbs_from_a_child_through_its_starter_to_init() {
+        let fixture = spawn_fixture("/bin/sleep", &["30"], None);
+        let placement = process_placement(fixture.pid()).expect("a live child is placed");
+
+        let ancestry = placement.ancestry.expect("every parent is readable");
+        assert_eq!(&ancestry[..2], &[fixture.pid(), std::process::id()]);
+        assert!(*ancestry.last().unwrap() <= 1, "{ancestry:?}");
+        assert_eq!(
+            Some(placement.tty),
+            process_tty(std::process::id()),
+            "a child shares its starter's controlling terminal"
+        );
+    }
+
+    /// A process left running by a parent that exited is adopted elsewhere,
+    /// so its parents no longer lead back to the process that started it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn process_placement_of_an_orphan_no_longer_leads_to_its_starter() {
+        let mut fixture = spawn_fixture("/bin/sh", &["-c", "sleep 30 & :"], None);
+        let leader = fixture.pid();
+        fixture.reap_root();
+        let orphan = live_foreground_group_member(leader).expect("the background job survives");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while process_parent_and_tty(orphan).is_some_and(|(ppid, _)| ppid == leader)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let ancestry = process_placement(orphan)
+            .and_then(|placement| placement.ancestry)
+            .expect("an adopted process is placed");
+        assert_eq!(ancestry[0], orphan);
+        assert!(!ancestry.contains(&leader), "{ancestry:?}");
+        assert!(!ancestry.contains(&std::process::id()), "{ancestry:?}");
     }
 
     #[test]

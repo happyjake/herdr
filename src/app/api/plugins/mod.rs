@@ -3476,6 +3476,7 @@ action = "missing"
                 agent_session_path: None,
                 resume_argv: None,
                 cancelled: false,
+                peer: None,
             },
         );
 

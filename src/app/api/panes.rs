@@ -1762,6 +1762,43 @@ impl App {
         )
     }
 
+    /// Herdr's own integrations report the agent running in the pane, and
+    /// every process that agent starts inherits the pane id. An agent started
+    /// from inside it in another terminal (a detached multiplexer session,
+    /// say) would report its own session into this pane and unseat the real
+    /// one, so a built-in report from a process outside the pane is refused.
+    /// A sender that cannot be placed is let through, as before.
+    fn refuse_integration_report_from_outside_pane(
+        &self,
+        id: &str,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        source: &str,
+        peer: Option<&crate::api::RequestPeer>,
+    ) -> Option<String> {
+        if !source.starts_with(BUILTIN_INTEGRATION_SOURCE_PREFIX) {
+            return None;
+        }
+        let peer = peer?;
+        let (runtime, _workspace_id) = self.lookup_runtime(ws_idx, pane_id)?;
+        let shell_pid = runtime.child_pid()?;
+        let pane_tty = crate::platform::process_tty(shell_pid).flatten();
+        if peer.in_pane(shell_pid, pane_tty) != crate::api::PeerInPane::Outside {
+            return None;
+        }
+        tracing::info!(
+            source,
+            peer_pid = peer.pid,
+            shell_pid,
+            "refused an agent report from a process outside its pane"
+        );
+        Some(encode_error(
+            id.to_string(),
+            "reporter_outside_pane",
+            format!("{source} reports must come from a process running in the pane"),
+        ))
+    }
+
     pub(super) fn handle_pane_report_agent(
         &mut self,
         id: String,
@@ -1770,6 +1807,15 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Some(refusal) = self.refuse_integration_report_from_outside_pane(
+            &id,
+            ws_idx,
+            pane_id,
+            &params.source,
+            params.peer.as_ref(),
+        ) {
+            return refusal;
+        }
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
@@ -1816,6 +1862,15 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Some(refusal) = self.refuse_integration_report_from_outside_pane(
+            &id,
+            ws_idx,
+            pane_id,
+            &params.source,
+            params.peer.as_ref(),
+        ) {
+            return refusal;
+        }
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
@@ -2380,6 +2435,9 @@ fn normalize_state_labels(
         .filter_map(Result::transpose)
         .collect()
 }
+
+/// Report sources in this namespace belong to herdr's built-in integrations.
+const BUILTIN_INTEGRATION_SOURCE_PREFIX: &str = "herdr:";
 
 fn pane_not_found(id: String, pane_id: &str) -> String {
     encode_error(id, "pane_not_found", format!("pane {pane_id} not found"))
@@ -2991,30 +3049,45 @@ mod tests {
 
     #[tokio::test]
     async fn api_pane_send_mouse_clamps_sgr_pixel_click_to_cell_bounds() {
-        let (mut app, pane_id, mut rx) =
-            app_with_mouse_runtime(b"\x1b[?1000h\x1b[?1006h\x1b[?1016h", 1);
-        let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
-            "id": "req",
-            "method": "pane.send_mouse",
-            "params": {
-                "pane_id": pane_id,
-                "action": "click",
-                "row": u32::MAX,
-                "col": u32::MAX
+        for (modes, expected) in [
+            (
+                &b"\x1b[?1000h\x1b[?1006h"[..],
+                &b"\x1b[<0;80;24M\x1b[<0;80;24m"[..],
+            ),
+            (
+                &b"\x1b[?1000h\x1b[?1006h\x1b[?1016h"[..],
+                &b"\x1b[<0;795;470M\x1b[<0;795;470m"[..],
+            ),
+        ] {
+            let (mut app, pane_id, mut rx) = app_with_mouse_runtime(modes, 1);
+            let request = || {
+                serde_json::from_value::<crate::api::schema::Request>(serde_json::json!({
+                "id": "req", "method": "pane.send_mouse",
+                "params": { "pane_id": pane_id, "action": "click", "row": u32::MAX, "col": u32::MAX }
+            })).unwrap()
+            };
+            let internal_id = app.state.workspaces[0].tabs[0].root_pane;
+            if modes.ends_with(b"\x1b[?1016h") {
+                let response: serde_json::Value =
+                    serde_json::from_str(&app.handle_api_request(request())).unwrap();
+                assert_eq!(
+                    response["result"]["delivered"], false,
+                    "pixel reports require known geometry"
+                );
+                assert_eq!(response["result"]["routing"], "mouse_report");
+                assert!(rx.try_recv().is_err());
             }
-        }))
-        .unwrap();
-
-        let response: serde_json::Value =
-            serde_json::from_str(&app.handle_api_request(request)).unwrap();
-
-        assert_eq!(response["result"]["delivered"], true);
-        assert_eq!(response["result"]["routing"], "mouse_report");
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            bytes::Bytes::from_static(b"\x1b[<0;80;24M\x1b[<0;80;24m")
-        );
-        assert!(rx.try_recv().is_err());
+            // The same live terminal now has geometry: the negative could be positive.
+            app.lookup_runtime_sender(0, internal_id)
+                .unwrap()
+                .resize(24, 80, 10, 20);
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request())).unwrap();
+            assert_eq!(response["result"]["delivered"], true);
+            assert_eq!(response["result"]["routing"], "mouse_report");
+            assert_eq!(rx.try_recv().unwrap().as_ref(), expected);
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

@@ -135,6 +135,150 @@ pub fn wait_for_file(path: &Path, timeout: Duration) {
     panic!("file did not appear at {}", path.display());
 }
 
+/// Commands for a stand-in agent to run from inside its pane, as herdr's own
+/// integrations report: the server refuses a built-in integration's report
+/// from a process outside the pane. The agent runs `N.cmd` files in order,
+/// leaving each one's output in `N.out` and its exit status in `N.status`.
+#[allow(dead_code)]
+pub struct PaneCommandInbox {
+    dir: PathBuf,
+    socket: PathBuf,
+    next: std::cell::Cell<usize>,
+}
+
+#[allow(dead_code)]
+impl PaneCommandInbox {
+    /// An inbox at `dir` whose `herdr` commands target `socket`.
+    pub fn new(dir: &Path, socket: &Path) -> Self {
+        fs::create_dir_all(dir).unwrap();
+        Self {
+            dir: dir.to_path_buf(),
+            socket: socket.to_path_buf(),
+            next: std::cell::Cell::new(0),
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Runs `herdr <args>` from inside the pane; returns the exit status and
+    /// combined output.
+    pub fn run(&self, args: &[&str]) -> (i32, String) {
+        let n = self.next.get();
+        self.next.set(n + 1);
+        let mut line = format!(
+            "HERDR_SOCKET_PATH={} exec {}",
+            shell_quote(&self.socket.display().to_string()),
+            shell_quote(env!("CARGO_BIN_EXE_herdr"))
+        );
+        for arg in args {
+            line.push(' ');
+            line.push_str(&shell_quote(arg));
+        }
+        line.push('\n');
+        let pending = self.dir.join(format!("{n}.pending"));
+        fs::write(&pending, line).unwrap();
+        fs::rename(&pending, self.dir.join(format!("{n}.cmd"))).unwrap();
+        let status = self.dir.join(format!("{n}.status"));
+        wait_for_file(&status, Duration::from_secs(10));
+        let code = fs::read_to_string(&status).unwrap().trim().parse().unwrap();
+        let output = fs::read_to_string(self.dir.join(format!("{n}.out"))).unwrap_or_default();
+        (code, output)
+    }
+
+    /// Runs `herdr <args>` from inside the pane and asserts it succeeded.
+    pub fn ok(&self, args: &[&str]) -> String {
+        let (code, output) = self.run(args);
+        assert_eq!(code, 0, "herdr {args:?} failed in the pane: {output}");
+        output
+    }
+}
+
+/// A stand-in agent that serves a [`PaneCommandInbox`]: started in a pane
+/// under the agent's name, so the pane detects that agent.
+#[allow(dead_code)]
+pub struct InPaneReporter {
+    script: PathBuf,
+    started: PathBuf,
+    stop: PathBuf,
+    inbox: PaneCommandInbox,
+}
+
+#[allow(dead_code)]
+impl InPaneReporter {
+    /// Writes the stand-in for `agent` under `dir`, reporting to `socket`.
+    pub fn write(dir: &Path, agent: &str, socket: &Path) -> Self {
+        Self::write_showing(dir, agent, socket, "")
+    }
+
+    /// Like [`Self::write`], with `screen` printed when the stand-in starts
+    /// (what a screen detector would read).
+    pub fn write_showing(dir: &Path, agent: &str, socket: &Path, screen: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let inbox = PaneCommandInbox::new(&dir.join(format!("{agent}-inbox")), socket);
+        let started = dir.join(format!("{agent}-started"));
+        let stop = dir.join(format!("{agent}-stop"));
+        let script = dir.join(agent);
+        let body = r#"#!/bin/sh
+export HERDR_AGENT=@AGENT@
+inbox=@INBOX@
+[ -n @SCREEN@ ] && printf '%s\n' @SCREEN@
+echo started > @STARTED@
+n=0
+while [ ! -f @STOP@ ]; do
+  if [ -f "$inbox/$n.cmd" ]; then
+    /bin/sh "$inbox/$n.cmd" > "$inbox/$n.out" 2>&1
+    echo $? > "$inbox/$n.tmp" && mv "$inbox/$n.tmp" "$inbox/$n.status"
+    n=$((n + 1))
+  else
+    /bin/sleep 0.05
+  fi
+done
+"#
+        .replace("@AGENT@", agent)
+        .replace("@INBOX@", &shell_quote(&inbox.dir().display().to_string()))
+        .replace("@STARTED@", &shell_quote(&started.display().to_string()))
+        .replace("@STOP@", &shell_quote(&stop.display().to_string()))
+        .replace("@SCREEN@", &shell_quote(screen));
+        fs::write(&script, body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        Self {
+            script,
+            started,
+            stop,
+            inbox,
+        }
+    }
+
+    /// Ends the stand-in, as the agent exiting.
+    pub fn stop(&self) {
+        fs::write(&self.stop, "stop").unwrap();
+    }
+
+    /// The command line that starts the stand-in in a pane.
+    pub fn command(&self) -> String {
+        self.script.display().to_string()
+    }
+
+    pub fn wait_until_started(&self, timeout: Duration) {
+        wait_for_file(&self.started, timeout);
+    }
+
+    pub fn run(&self, args: &[&str]) -> (i32, String) {
+        self.inbox.run(args)
+    }
+
+    pub fn ok(&self, args: &[&str]) -> String {
+        self.inbox.ok(args)
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn encode_varint_u32(v: u32) -> Vec<u8> {
     if v < 251 {
         vec![v as u8]

@@ -433,9 +433,10 @@ fn handle_connection_with_stop(
         return Ok(());
     };
 
-    let Some(request) = parse_api_request(&mut stream, &line)? else {
+    let Some(mut request) = parse_api_request(&mut stream, &line)? else {
         return Ok(());
     };
+    attach_request_peer(&mut request.method, &stream);
 
     // An SSH agent registration lives exactly as long as this local
     // connection, so it needs the owned local stream and stays outside the
@@ -462,6 +463,21 @@ fn handle_connection_with_stop(
             credentials,
         ),
     }
+}
+
+/// Agent lifecycle reports describe the agent running in a pane, so the app
+/// checks where their sender runs. Read the sender while it is connected:
+/// it may exit as soon as it has its answer.
+fn attach_request_peer(method: &mut Method, stream: &LocalStream) {
+    let peer = match method {
+        Method::PaneReportAgent(params) => &mut params.peer,
+        Method::PaneReportAgentSession(params) => &mut params.peer,
+        _ => return,
+    };
+    *peer = crate::ipc::local_stream_peer_pid(stream).and_then(|pid| {
+        crate::platform::process_placement(pid)
+            .map(|placement| crate::api::RequestPeer { pid, placement })
+    });
 }
 
 #[cfg(unix)]
@@ -1211,7 +1227,7 @@ fn stream_subscriptions<T: ApiTransport>(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    // Every subscription starts from the live sequence (upstream #1270).
+    // Every subscription starts from the live sequence.
     // `params.live_only` remains an accepted request field: clients that
     // opted out of ring replay when replay existed now get this default,
     // and the flag must keep parsing so their subscribes keep working.
@@ -1938,7 +1954,7 @@ mod tests {
             None,
             None,
             None,
-            &crate::api::SharedServerName::new("home-box".to_string()),
+            &crate::api::SharedServerName::new("test-server".to_string()),
             &undeclared_server_reach(),
             &undeclared_advertised_endpoint(),
             &test_credentials(),
@@ -1947,7 +1963,7 @@ mod tests {
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "req_1");
         match parsed.result {
-            ResponseResult::Pong { name, .. } => assert_eq!(name.as_deref(), Some("home-box")),
+            ResponseResult::Pong { name, .. } => assert_eq!(name.as_deref(), Some("test-server")),
             other => panic!("expected pong, got {other:?}"),
         }
     }
@@ -2046,7 +2062,7 @@ mod tests {
     #[test]
     fn pong_publishes_the_advertised_endpoint_only_once_one_is_declared() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let server_name = crate::api::SharedServerName::new("home-box".to_string());
+        let server_name = crate::api::SharedServerName::new("test-server".to_string());
         let server_reach = undeclared_server_reach();
         let advertised_endpoint = undeclared_advertised_endpoint();
         let ping = |id: &str| {
@@ -2093,7 +2109,7 @@ mod tests {
         // The addition is additive: the fields a client already reads keep
         // their names, their values, and the protocol version.
         assert!(declared.contains(r#""type":"pong""#), "{declared}");
-        assert!(declared.contains(r#""name":"home-box""#), "{declared}");
+        assert!(declared.contains(r#""name":"test-server""#), "{declared}");
         assert!(
             declared.contains(&format!(
                 r#""protocol":{}"#,

@@ -527,6 +527,11 @@ crate::cli::projection::cli_params! {
         /// `agent_report_cancelled`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub cancelled: bool => Field::new(false),
+        /// The local-socket sender, filled in by the server; never read from
+        /// or written to the wire.
+        #[serde(skip)]
+        #[schemars(skip)]
+        pub peer: Option<crate::api::RequestPeer> => Field::new(None::<crate::api::RequestPeer>),
     }
 }
 
@@ -548,6 +553,11 @@ crate::cli::projection::cli_params! {
         /// first element must be a plain command name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub resume_argv: Option<Vec<String>> => Field::new(None).input(binding::resume()),
+        /// The local-socket sender, filled in by the server; never read from
+        /// or written to the wire.
+        #[serde(skip)]
+        #[schemars(skip)]
+        pub peer: Option<crate::api::RequestPeer> => Field::new(None::<crate::api::RequestPeer>),
     }
 }
 

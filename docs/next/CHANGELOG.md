@@ -11,6 +11,13 @@
 - Added `pane.send_mouse` to the socket API with live mouse-report and alternate-scroll routing, plus `PaneInfo.mouse_tracking` for clients that need to choose input behavior.
 - Added `PaneInfo.alternate_screen` so API clients can distinguish live alternate-screen panes from primary-screen prompts.
 
+### Changed
+- `PaneInfo.agent_status_changed_at` now dates every change of a pane's reported status later than anything that pane reported before, so two changes inside one second (an agent finishing a turn and starting the next) no longer share a date, and a client that names transitions by their date can tell them apart. A burst of changes can run the date a few seconds ahead of the wall clock until the clock passes it. A live handoff carries the latest reported date (`agent_status_reported_through` in the session snapshot), so the new process dates after it; older servers ignore the field.
+
+### Fixed
+- A built-in integration's report from a process outside its pane is now refused with `reporter_outside_pane` instead of being applied. Every process an agent starts inherits its pane's id, so a second agent started from the first in another terminal (a detached `tmux` session, for example) reported its own session into the pane; from then on the pane ignored its own agent's reports and kept the state it had, such as working long after the turn ended. Checked on Linux and macOS for `pane.report_agent` and `pane.report_agent_session` under `herdr:` sources; other sources are unaffected.
+- A working state that only an agent's terminal title shows, over a screen that has not changed, no longer starts a turn until it has lasted 15 seconds. Codex spins its title while it boots a tool server, for example after refreshing its sign-in, with the screen unchanged; reporting that as working made the idle that followed read as a newly finished turn, so panes nobody had touched were reported done again with a fresh `agent_status_changed_at`. A turn that draws its working status or its answer on screen still reports working at once, and so does any other change to the screen text during the spin. `herdr agent explain` shows `working_from_title_only` for such a reading.
+
 ## [0.9.5] - 2026-10-14
 
 This is a hotfix release for v0.9.4. See the v0.9.4 notes for the full feature release: https://github.com/herdrdev/herdr/releases/tag/v0.9.4
@@ -133,10 +140,8 @@ This is a hotfix release for v0.9.2. See the v0.9.2 notes for the full feature r
 - After `herdr update`, Herdr lists which running servers are still on the old version, with the exact commands to restart each one, and reminds you to update your saved SSH machines.
 
 ### Changed
-- `PaneInfo.agent_status_changed_at` now dates every change of a pane's reported status later than anything that pane reported before, so two changes inside one second (an agent finishing a turn and starting the next) no longer share a date, and a client that names transitions by their date can tell them apart. A burst of changes can run the date a few seconds ahead of the wall clock until the clock passes it. A live handoff carries the latest reported date (`agent_status_reported_through` in the session snapshot), so the new process dates after it; older servers ignore the field.
 
 ### Fixed
-- A working state that only an agent's terminal title shows, over a screen that has not changed, no longer starts a turn until it has lasted 15 seconds. Codex spins its title while it boots a tool server, for example after refreshing its sign-in, with the screen unchanged; reporting that as working made the idle that followed read as a newly finished turn, so panes nobody had touched were reported done again with a fresh `agent_status_changed_at`. A turn that draws its working status or its answer on screen still reports working at once, and so does any other change to the screen text during the spin. `herdr agent explain` shows `working_from_title_only` for such a reading.
 
 ## [0.9.1] - 2026-09-16
 

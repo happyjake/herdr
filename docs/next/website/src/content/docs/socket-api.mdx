@@ -1036,6 +1036,17 @@ notification or sound. Servers that support this declare
 the field and treat the report as a finished run, so send `cancelled` only to a
 server that declares it.
 
+Sources beginning with `herdr:` belong to Herdr's built-in integrations, which
+report the agent running in the pane. On Linux and macOS, a
+`pane.report_agent` or `pane.report_agent_session` request under such a source
+is refused with `reporter_outside_pane` when it arrives over the local socket
+from a process outside the pane: one on another terminal, or one without a
+terminal whose parents do not lead back to the pane's shell. Every process an
+agent starts inherits the pane's id, including an agent it starts in another
+terminal (a detached `tmux` session, for example); that agent's reports would
+otherwise take over the pane and leave its own agent unable to change its
+state. Other sources are not checked.
+
 Session-only official integrations report native session references with `pane.report_agent_session`. State-reporting integrations can still include native session references in `pane.report_agent`. State-independent session reports do not affect waits, notifications, or rollups.
 
 ```json
