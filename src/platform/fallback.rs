@@ -126,6 +126,13 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+pub(super) fn file_change_time_platform(_path: &std::path::Path) -> std::io::Result<i128> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file change time is not supported on this platform",
+    ))
+}
+
 pub(super) fn executable_file_identity_platform(
     _path: &std::path::Path,
 ) -> std::io::Result<super::ExecutableFileIdentity> {

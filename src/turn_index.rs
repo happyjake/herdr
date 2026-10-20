@@ -54,7 +54,13 @@ fn parse(mut reader: impl BufRead, revision: String) -> Result<TurnIndex, Prompt
         }
         let parsed: Value = match serde_json::from_slice(&line) {
             Ok(parsed) => parsed,
-            Err(_) if consumed - before == line.len() as u64 => {
+            Err(error)
+                if consumed - before == line.len() as u64
+                    && match std::str::from_utf8(&line) {
+                        Ok(_) => error.is_eof(),
+                        Err(error) => error.error_len().is_none(),
+                    } =>
+            {
                 partial = true;
                 break;
             }
@@ -233,6 +239,7 @@ struct Fingerprint {
     identity: crate::platform::ExecutableFileIdentity,
     bytes: u64,
     modified: std::time::SystemTime,
+    changed_ns: i128,
 }
 
 impl Fingerprint {
@@ -250,6 +257,8 @@ impl Fingerprint {
             identity: crate::platform::executable_file_identity(path)
                 .map_err(|_| PromptTrailReason::Unreadable)?,
             bytes: metadata.len(),
+            changed_ns: crate::platform::file_change_time(path)
+                .map_err(|_| PromptTrailReason::Unreadable)?,
             modified: metadata
                 .modified()
                 .map_err(|_| PromptTrailReason::Unreadable)?,
@@ -266,9 +275,33 @@ struct Cached {
 #[derive(Default)]
 struct CacheState {
     entries: std::collections::VecDeque<Cached>,
-    // Weak gates outlive eviction while a caller holds one. Evicting a
-    // cached value therefore cannot start a second read of the same path.
-    gates: HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<()>>>,
+    // Only active flights live here. Existing waiters retain the outcome
+    // after removal, while later callers start a fresh flight.
+    flights: HashMap<std::path::PathBuf, std::sync::Arc<Flight>>,
+}
+
+#[derive(Default)]
+struct Flight {
+    result: std::sync::Mutex<Option<Result<TurnIndex, PromptTrailReason>>>,
+    ready: std::sync::Condvar,
+}
+
+impl Flight {
+    fn wait(&self) -> Result<TurnIndex, PromptTrailReason> {
+        let mut result = self
+            .result
+            .lock()
+            .map_err(|_| PromptTrailReason::Unreadable)?;
+        loop {
+            if let Some(result) = result.as_ref() {
+                return result.clone();
+            }
+            result = self
+                .ready
+                .wait(result)
+                .map_err(|_| PromptTrailReason::Unreadable)?;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -276,6 +309,10 @@ struct Cache {
     state: std::sync::Mutex<CacheState>,
     #[cfg(test)]
     parses: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    joined: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    before_parse: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Cache {
@@ -283,25 +320,50 @@ impl Cache {
         let path = path
             .canonicalize()
             .map_err(|_| PromptTrailReason::NoRecord)?;
-        let gate = {
+        let (flight, leader) = {
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| PromptTrailReason::Unreadable)?;
-            state.gates.retain(|_, gate| gate.strong_count() > 0);
-            match state.gates.get(&path).and_then(std::sync::Weak::upgrade) {
-                Some(gate) => gate,
+            match state.flights.get(&path) {
+                Some(flight) => (std::sync::Arc::clone(flight), false),
                 None => {
-                    let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+                    let flight = std::sync::Arc::new(Flight::default());
                     state
-                        .gates
-                        .insert(path.clone(), std::sync::Arc::downgrade(&gate));
-                    gate
+                        .flights
+                        .insert(path.clone(), std::sync::Arc::clone(&flight));
+                    (flight, true)
                 }
             }
         };
-        let _reading = gate.lock().map_err(|_| PromptTrailReason::Unreadable)?;
-        let fingerprint = Fingerprint::at(&path)?;
+        #[cfg(test)]
+        self.joined
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !leader {
+            return flight.wait();
+        }
+
+        let outcome = self.read_record(&path);
+        {
+            // Publishing and removal are atomic with respect to admission.
+            // Joined callers receive this outcome, including failures; a
+            // caller arriving after completion never reuses a failed flight.
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| PromptTrailReason::Unreadable)?;
+            *flight
+                .result
+                .lock()
+                .map_err(|_| PromptTrailReason::Unreadable)? = Some(outcome.clone());
+            state.flights.remove(&path);
+        }
+        flight.ready.notify_all();
+        outcome
+    }
+
+    fn read_record(&self, path: &std::path::Path) -> Result<TurnIndex, PromptTrailReason> {
+        let fingerprint = Fingerprint::at(path)?;
         {
             let mut state = self
                 .state
@@ -317,7 +379,7 @@ impl Cache {
                 }
             }
         }
-        let file = std::fs::File::open(&path).map_err(|_| PromptTrailReason::Unreadable)?;
+        let file = std::fs::File::open(path).map_err(|_| PromptTrailReason::Unreadable)?;
         // Hash metadata rather than exposing the path or file identity.
         // A revision still names the same record version after eviction
         // or a server restart.
@@ -328,10 +390,14 @@ impl Cache {
         #[cfg(test)]
         self.parses
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        if let Some(before_parse) = &self.before_parse {
+            before_parse();
+        }
         let index = parse(std::io::BufReader::new(file), revision)?;
         // An append or replacement during the read must not be cached
         // under the old fingerprint. The next request will read it whole.
-        if Fingerprint::at(&path).as_ref() == Ok(&fingerprint) {
+        if Fingerprint::at(path).as_ref() == Ok(&fingerprint) {
             let mut state = self
                 .state
                 .lock()
@@ -340,7 +406,7 @@ impl Cache {
                 state.entries.pop_front();
             }
             state.entries.push_back(Cached {
-                path,
+                path: path.to_path_buf(),
                 fingerprint,
                 index: index.clone(),
             });
@@ -797,5 +863,120 @@ mod tests {
         );
         let changed = Cache::default().read(&path).unwrap();
         assert_ne!(first.revision, changed.revision);
+    }
+    #[test]
+    fn turn_index_cache_detects_same_size_rewrite_with_restored_mtime() {
+        let fixture = Fixture::new();
+        let first = record(&[message("u", None, "user", "First", "")]);
+        let second = record(&[message("u", None, "user", "Other", "")]);
+        assert_eq!(first.len(), second.len());
+        let path = fixture.write("record.jsonl", &first);
+        let cache = Cache::default();
+        let old = cache.read(&path).unwrap();
+        let before = Fingerprint::at(&path).unwrap();
+        std::fs::write(&path, second).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(before.modified))
+            .unwrap();
+        let after = Fingerprint::at(&path).unwrap();
+        assert_eq!(before.identity, after.identity);
+        assert_eq!(before.bytes, after.bytes);
+        assert_eq!(before.modified, after.modified);
+        assert_ne!(before.changed_ns, after.changed_ns);
+        let rewritten = cache.read(&path).unwrap();
+        assert_eq!(rewritten.turns[0].prompt.as_deref(), Some("Other"));
+        assert_ne!(rewritten.revision, old.revision);
+        assert_eq!(cache.parses.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn turn_index_eof_distinguishes_corruption_from_incomplete_json_and_utf8() {
+        let whole = record(&[
+            message("u", None, "user", "Explain", ""),
+            message("a", Some("u"), "assistant", "Ready", "stop"),
+        ]);
+        for tail in [
+            b"{broken}".as_slice(),
+            b"{broken}\n",
+            b"{\"text\":\"\xff",
+            b"{\"id\":\"unfinished\n",
+        ] {
+            let mut source = whole.as_bytes().to_vec();
+            source.extend_from_slice(tail);
+            assert_eq!(
+                parse(source.as_slice(), "r".into()),
+                Err(PromptTrailReason::Unreadable)
+            );
+        }
+        for tail in [b"{\"id\":\"unfinished".as_slice(), b"{\"text\":\"\xe2\x82"] {
+            let mut source = whole.as_bytes().to_vec();
+            source.extend_from_slice(tail);
+            let index = parse(source.as_slice(), "r".into()).unwrap();
+            assert!(index.partial);
+            assert_eq!(index.leaf_id.as_deref(), Some("a"));
+            assert_eq!(index.turns[0].end, TurnEnd::Open);
+            assert_eq!(index.turns[0].answer, None);
+            assert_eq!(index.turns[0].answer_id, None);
+        }
+        let complete = parse(whole.trim_end().as_bytes(), "r".into()).unwrap();
+        assert!(!complete.partial);
+        assert_eq!(complete.turns[0].answer.as_deref(), Some("Ready"));
+    }
+    #[test]
+    fn turn_index_overlapping_failed_reads_share_the_flight_but_later_reads_retry() {
+        use std::sync::{atomic::Ordering, mpsc, Arc};
+        use std::time::{Duration, Instant};
+        let fixture = Fixture::new();
+        let path = fixture.write("malformed.jsonl", "{broken}\n");
+        let (started, observed) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let held = std::sync::Mutex::new(Some(held));
+        let cache = Arc::new(Cache {
+            before_parse: Some(Box::new(move || {
+                if let Some(held) = held.lock().unwrap().take() {
+                    started.send(()).unwrap();
+                    held.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+            })),
+            ..Cache::default()
+        });
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let path = path.clone();
+            std::thread::spawn(move || cache.read(&path))
+        };
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            let path = path.clone();
+            std::thread::spawn(move || cache.read(&path))
+        };
+        // Observe admission to the flight, not elapsed time or thread start.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while cache.joined.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let joined = cache.joined.load(Ordering::SeqCst);
+        release.send(()).unwrap();
+        let leader_result = leader.join().unwrap();
+        let waiter_result = waiter.join().unwrap();
+        assert_eq!(joined, 2, "the waiter must overlap the held leader");
+        assert_eq!(leader_result, Err(PromptTrailReason::Unreadable));
+        assert_eq!(waiter_result, Err(PromptTrailReason::Unreadable));
+        assert_eq!(cache.parses.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.read(&path), Err(PromptTrailReason::Unreadable));
+        assert_eq!(cache.parses.load(Ordering::SeqCst), 2);
+        fixture.write(
+            "malformed.jsonl",
+            &record(&[message("u", None, "user", "Repaired", "")]),
+        );
+        assert_eq!(
+            cache.read(&path).unwrap().turns[0].prompt.as_deref(),
+            Some("Repaired")
+        );
+        assert_eq!(cache.parses.load(Ordering::SeqCst), 3);
     }
 }
