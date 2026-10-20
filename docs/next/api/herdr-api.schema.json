@@ -6550,6 +6550,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.turn_index",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.focus",
               "type": "string"
             },
@@ -8563,6 +8579,50 @@
           "required": [
             "max_bytes",
             "chunk_bytes"
+          ],
+          "type": "object"
+        },
+        "IndexedTurn": {
+          "properties": {
+            "answer": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "answer_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "at": {
+              "description": "Start time in unix seconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "end": {
+              "$ref": "#/schemas/success_response/$defs/TurnEnd"
+            },
+            "id": {
+              "type": "string"
+            },
+            "prompt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "start": {
+              "$ref": "#/schemas/success_response/$defs/TurnStart"
+            }
+          },
+          "required": [
+            "id",
+            "at",
+            "start",
+            "end"
           ],
           "type": "object"
         },
@@ -11120,6 +11180,47 @@
               "type": "object"
             },
             {
+              "description": "Bounded pi turn index, or exactly one prompt-trail refusal reason.",
+              "properties": {
+                "index": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/TurnIndex"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "reason": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/PromptTrailReason"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "turn_index",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "terminal_id"
+              ],
+              "type": "object"
+            },
+            {
               "properties": {
                 "pane": {
                   "$ref": "#/schemas/success_response/$defs/PaneInfo"
@@ -12139,6 +12240,11 @@
               "default": false,
               "description": "Whether this server supports explicit client-shell surface interest.",
               "type": "boolean"
+            },
+            "turn_index": {
+              "default": false,
+              "description": "Supports `pane.turn_index` for pi session records.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -12565,6 +12671,68 @@
             "text"
           ],
           "type": "object"
+        },
+        "TurnEnd": {
+          "enum": [
+            "answered",
+            "aborted",
+            "error",
+            "open"
+          ],
+          "type": "string"
+        },
+        "TurnIndex": {
+          "description": "Recent turns on a pi record's last-recorded branch. All nullable fields\nare serialized so absence is distinct from an unsupported capability.",
+          "properties": {
+            "agent": {
+              "$ref": "#/schemas/success_response/$defs/TurnIndexAgent"
+            },
+            "leaf_id": {
+              "description": "Null in a record containing only its header.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "revision": {
+              "description": "Opaque record revision, for equality comparisons only.",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "turns": {
+              "description": "At most the last 64 turns, oldest first.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/IndexedTurn"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "agent",
+            "session_id",
+            "revision",
+            "partial",
+            "turns"
+          ],
+          "type": "object"
+        },
+        "TurnIndexAgent": {
+          "enum": [
+            "pi"
+          ],
+          "type": "string"
+        },
+        "TurnStart": {
+          "enum": [
+            "prompt",
+            "wake"
+          ],
+          "type": "string"
         },
         "WorkspaceInfo": {
           "properties": {

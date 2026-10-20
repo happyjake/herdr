@@ -501,7 +501,7 @@ fn element_end(inside: &str) -> Option<usize> {
 
 /// One prompt as a row of text: whitespace runs become one space, control
 /// characters go, and what is left is trimmed.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     let mut cleaned = String::with_capacity(text.len());
     let mut pending_space = false;
     for character in text.chars() {
@@ -673,7 +673,7 @@ fn safe_file_stem(value: &str) -> bool {
 /// Written out rather than borrowed: the one shape that matters here is a
 /// date, a time and an offset, and a time before the epoch is no time a
 /// prompt was asked at.
-fn unix_seconds_from_rfc3339(text: &str) -> Option<u64> {
+pub(crate) fn unix_seconds_from_rfc3339(text: &str) -> Option<u64> {
     let bytes = text.as_bytes();
     if bytes.len() < 19 {
         return None;

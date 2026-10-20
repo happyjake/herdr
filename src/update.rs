@@ -2860,6 +2860,7 @@ mod tests {
                 file_attachments: None,
                 agent_report_cancelled: false,
                 agent_prompt_expectations: false,
+                turn_index: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2941,6 +2942,7 @@ mod tests {
                     file_attachments: None,
                     agent_report_cancelled: false,
                     agent_prompt_expectations: false,
+                    turn_index: false,
                 }),
             },
         };
@@ -3206,6 +3208,7 @@ mod tests {
                     file_attachments: None,
                     agent_report_cancelled: false,
                     agent_prompt_expectations: false,
+                    turn_index: false,
                 }),
             },
         };

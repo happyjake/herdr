@@ -64,6 +64,7 @@ pub fn server_capabilities() -> crate::api::schema::ServerCapabilities {
         file_attachments: Some(attachment::file_attachments_capability()),
         agent_report_cancelled: true,
         agent_prompt_expectations: true,
+        turn_index: true,
     }
 }
 

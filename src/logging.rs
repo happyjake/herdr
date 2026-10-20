@@ -107,6 +107,7 @@ fn is_routine_api_method(method: &str) -> bool {
         method,
         "pane.get"
             | "pane.prompt_trail"
+            | "pane.turn_index"
             | "pane.read"
             | "pane.list"
             | "workspace.list"

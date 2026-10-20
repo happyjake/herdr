@@ -956,3 +956,52 @@ pub struct PaneLinkRegion {
     pub start_col: u16,
     pub end_col: u16,
 }
+
+/// Recent turns on a pi record's last-recorded branch. All nullable fields
+/// are serialized so absence is distinct from an unsupported capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TurnIndex {
+    pub agent: TurnIndexAgent,
+    pub session_id: String,
+    /// Null in a record containing only its header.
+    pub leaf_id: Option<String>,
+    /// Opaque record revision, for equality comparisons only.
+    pub revision: String,
+    pub partial: bool,
+    /// At most the last 64 turns, oldest first.
+    pub turns: Vec<IndexedTurn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnIndexAgent {
+    Pi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct IndexedTurn {
+    pub id: String,
+    /// Start time in unix seconds.
+    pub at: u64,
+    pub start: TurnStart,
+    pub prompt: Option<String>,
+    pub end: TurnEnd,
+    pub answer: Option<String>,
+    pub answer_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStart {
+    Prompt,
+    Wake,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEnd {
+    Answered,
+    Aborted,
+    Error,
+    Open,
+}

@@ -1569,6 +1569,7 @@ fn success_response_round_trips() {
                 }),
                 agent_report_cancelled: false,
                 agent_prompt_expectations: true,
+                turn_index: true,
             }),
             name: Some("home-box".into()),
             reach: Some("home-box".into()),
@@ -2348,4 +2349,32 @@ fn pane_link_resolve_round_trips() {
         serde_json::from_value::<ResponseResult>(json).unwrap(),
         result
     );
+}
+
+#[test]
+fn turn_index_request_and_response_round_trip() {
+    let request =
+        serde_json::json!({"id":"req", "method":"pane.turn_index", "params":{"pane_id":"p"}});
+    let decoded: Request = serde_json::from_value(request.clone()).unwrap();
+    assert!(matches!(decoded.method, Method::PaneTurnIndex(_)));
+    assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+    let response = serde_json::json!({"id":"req", "result": {
+        "type":"turn_index", "pane_id":"p", "terminal_id":"t", "reason":null,
+        "index":{"agent":"pi", "session_id":"session", "leaf_id":"a", "revision":"opaque", "partial":false,
+            "turns":[{"id":"u", "at":1772615700, "start":"prompt", "prompt":"Explain", "end":"answered", "answer":"Ready", "answer_id":"a"}]}
+    }});
+    let decoded: SuccessResponse = serde_json::from_value(response.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), response);
+    for reason in ["no_session", "unsupported_agent", "no_record", "unreadable"] {
+        let response = serde_json::json!({"id":"req", "result":{"type":"turn_index", "pane_id":"p", "terminal_id":"t", "index":null, "reason":reason}});
+        let decoded: SuccessResponse = serde_json::from_value(response.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), response);
+    }
+}
+
+#[test]
+fn turn_index_capability_is_advertised_and_defaults_to_absent() {
+    assert!(crate::api::server_capabilities().turn_index);
+    let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+    assert!(!old.turn_index);
 }

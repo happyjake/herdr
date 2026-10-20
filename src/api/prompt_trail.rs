@@ -1,4 +1,4 @@
-//! Serving `pane.prompt_trail`.
+//! Serving `pane.prompt_trail` and `pane.turn_index` through one bounded read.
 //!
 //! Reading a session record means opening a file, walking it and parsing
 //! it, which is not work the app thread — driving PTYs, rendering, and
@@ -29,7 +29,7 @@ use tokio::sync::Semaphore;
 
 use crate::api::schema::{
     AgentSessionInfo, ErrorResponse, Method, PaneTarget, PromptTrail, PromptTrailAgent,
-    PromptTrailReason, Request, ResponseResult, SuccessResponse,
+    PromptTrailReason, Request, ResponseResult, SuccessResponse, TurnIndex,
 };
 use crate::api::ApiRequestSender;
 
@@ -49,7 +49,7 @@ const PANE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Production fills this from the running server and the real home; a test
 /// hands over a fixture, which is what keeps the tests off the machine's
 /// own desk.
-pub(super) struct Sources {
+pub(super) struct Sources<T = PromptTrail> {
     /// Asks the app which pane this is and what session it reports, as the
     /// raw response the app answered with. Held as something still to do,
     /// not something already done, because asking the app blocks and every
@@ -61,7 +61,7 @@ pub(super) struct Sources {
     /// Reads one record into a trail. Production walks the file; a test
     /// hands over a reader it controls, so a read that outlives the
     /// deadline can be staged without a record the size of the bound.
-    pub record: RecordReader,
+    pub record: RecordReader<T>,
 }
 
 /// Which pane a request turned out to be about.
@@ -79,17 +79,16 @@ struct PaneIdentity {
 type SeenPane = Arc<std::sync::Mutex<Option<PaneIdentity>>>;
 
 /// Reads one record into a trail.
-type RecordReader = Box<
-    dyn FnOnce(&std::path::Path, PromptTrailAgent) -> Result<PromptTrail, PromptTrailReason> + Send,
->;
+type RecordReader<T = PromptTrail> =
+    Box<dyn FnOnce(&std::path::Path, PromptTrailAgent) -> Result<T, PromptTrailReason> + Send>;
 
 /// What one request has to say, before it is encoded.
-enum Answer {
+enum Answer<T = PromptTrail> {
     /// The pane, and its trail or the reason it has none.
     Trail {
         pane_id: String,
         terminal_id: String,
-        trail: Option<PromptTrail>,
+        trail: Option<T>,
         reason: Option<PromptTrailReason>,
     },
     /// The request could not be answered at all: an unknown pane, or an
@@ -122,23 +121,18 @@ pub(super) fn handle_prompt_trail(
     respond(request_id, sources)
 }
 
-fn respond(request_id: String, sources: Sources) -> String {
+fn respond<T: RecordOutput>(request_id: String, sources: Sources<T>) -> String {
     encode(request_id, blocking_trail(TRAIL_DEADLINE, sources))
 }
 
-fn encode(request_id: String, answer: Answer) -> String {
+fn encode<T: RecordOutput>(request_id: String, answer: Answer<T>) -> String {
     let result = match answer {
         Answer::Trail {
             pane_id,
             terminal_id,
             trail,
             reason,
-        } => ResponseResult::PromptTrail {
-            pane_id,
-            terminal_id,
-            trail,
-            reason,
-        },
+        } => T::response(pane_id, terminal_id, trail, reason),
         Answer::Refused { code, message } => {
             return crate::api::server::error_response_json(request_id, &code, message)
         }
@@ -205,7 +199,7 @@ fn permits() -> &'static Arc<Semaphore> {
 ///
 /// The deadline starts here and covers everything: waiting for a turn,
 /// asking the app, and reading the record.
-fn blocking_trail(deadline: Duration, sources: Sources) -> Answer {
+fn blocking_trail<T: RecordOutput>(deadline: Duration, sources: Sources<T>) -> Answer<T> {
     let Some(runtime) = runtime() else {
         return unavailable("no runtime to read a prompt trail on");
     };
@@ -224,11 +218,11 @@ fn blocking_trail(deadline: Duration, sources: Sources) -> Answer {
 /// could not read in the time it allows itself, which is one of the
 /// ordinary reasons a pane has no trail. Before that, the request never
 /// learned which pane it was about, and there is nothing to answer for.
-async fn within_deadline(
+async fn within_deadline<T>(
     deadline: Duration,
-    work: impl std::future::Future<Output = Answer>,
+    work: impl std::future::Future<Output = Answer<T>>,
     seen: &SeenPane,
-) -> Answer {
+) -> Answer<T> {
     match tokio::time::timeout(deadline, work).await {
         Ok(answer) => answer,
         Err(_) => match seen.lock().ok().and_then(|pane| pane.clone()) {
@@ -243,14 +237,14 @@ async fn within_deadline(
     }
 }
 
-fn unavailable(message: &str) -> Answer {
+fn unavailable<T>(message: &str) -> Answer<T> {
     Answer::Refused {
         code: "server_unavailable".into(),
         message: message.into(),
     }
 }
 
-async fn trail(sources: Sources, seen: SeenPane) -> Answer {
+async fn trail<T: RecordOutput>(sources: Sources<T>, seen: SeenPane) -> Answer<T> {
     // A queue rather than a refusal: a caller that arrives third waits its
     // turn instead of adding to the load, and gives up when the deadline
     // above says so.
@@ -268,11 +262,11 @@ async fn trail(sources: Sources, seen: SeenPane) -> Answer {
 /// was counted in stays taken until the read itself is over, which is what
 /// keeps the number of reads in flight at the bound instead of the number
 /// of requests still waiting.
-async fn read(
+async fn read<T: RecordOutput>(
     permit: tokio::sync::OwnedSemaphorePermit,
-    sources: Sources,
+    sources: Sources<T>,
     seen: SeenPane,
-) -> Answer {
+) -> Answer<T> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let Sources { pane, home, record } = sources;
@@ -283,12 +277,12 @@ async fn read(
 }
 
 /// Turn the app's answer about a pane into this request's answer.
-fn answer_from(
+fn answer_from<T: RecordOutput>(
     pane_response: &str,
     home: Option<&std::path::Path>,
-    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<PromptTrail, PromptTrailReason>,
+    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<T, PromptTrailReason>,
     seen: &SeenPane,
-) -> Answer {
+) -> Answer<T> {
     let pane = match serde_json::from_str::<SuccessResponse>(pane_response) {
         Ok(response) => match response.result {
             ResponseResult::PaneInfo { pane } => pane,
@@ -329,14 +323,17 @@ fn answer_from(
 }
 
 /// The trail one pane's reported session leads to, or why there is none.
-fn trail_for(
+fn trail_for<T: RecordOutput>(
     session: Option<&AgentSessionInfo>,
     home: Option<&std::path::Path>,
-    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<PromptTrail, PromptTrailReason>,
-) -> Result<PromptTrail, PromptTrailReason> {
+    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<T, PromptTrailReason>,
+) -> Result<T, PromptTrailReason> {
     let session = session.ok_or(PromptTrailReason::NoSession)?;
     let agent = crate::prompt_trail::trail_agent(&session.agent)
         .ok_or(PromptTrailReason::UnsupportedAgent)?;
+    if !T::supports(agent) {
+        return Err(PromptTrailReason::UnsupportedAgent);
+    }
     let path = crate::prompt_trail::record_path(
         home,
         agent,
@@ -346,6 +343,81 @@ fn trail_for(
     )
     .ok_or(PromptTrailReason::NoRecord)?;
     record(&path, agent)
+}
+
+/// Output-specific policy, sharing lookup, deadline, runtime and permits.
+trait RecordOutput: Send + 'static {
+    fn supports(agent: PromptTrailAgent) -> bool;
+    fn response(
+        pane_id: String,
+        terminal_id: String,
+        value: Option<Self>,
+        reason: Option<PromptTrailReason>,
+    ) -> ResponseResult
+    where
+        Self: Sized;
+}
+
+impl RecordOutput for PromptTrail {
+    fn supports(_: PromptTrailAgent) -> bool {
+        true
+    }
+    fn response(
+        pane_id: String,
+        terminal_id: String,
+        trail: Option<Self>,
+        reason: Option<PromptTrailReason>,
+    ) -> ResponseResult {
+        ResponseResult::PromptTrail {
+            pane_id,
+            terminal_id,
+            trail,
+            reason,
+        }
+    }
+}
+
+impl RecordOutput for TurnIndex {
+    fn supports(agent: PromptTrailAgent) -> bool {
+        agent == PromptTrailAgent::Pi
+    }
+    fn response(
+        pane_id: String,
+        terminal_id: String,
+        index: Option<Self>,
+        reason: Option<PromptTrailReason>,
+    ) -> ResponseResult {
+        ResponseResult::TurnIndex {
+            pane_id,
+            terminal_id,
+            index,
+            reason,
+        }
+    }
+}
+
+pub(super) fn handle_turn_index(
+    request_id: String,
+    params: &PaneTarget,
+    api_tx: &ApiRequestSender,
+) -> String {
+    if params.pane_id.trim().is_empty() {
+        return crate::api::server::error_response_json(
+            request_id,
+            "invalid_params",
+            "pane_id must not be empty".into(),
+        );
+    }
+    let api_tx = api_tx.clone();
+    let pane_id = params.pane_id.clone();
+    respond(
+        request_id,
+        Sources {
+            pane: Box::new(move || ask_for_pane(&pane_id, &api_tx)),
+            home: crate::worktree::home_dir(),
+            record: Box::new(|path, _| crate::turn_index::read(path)),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -946,5 +1018,202 @@ mod tests {
             "a freed permit lets the next trail through"
         );
         drop(second);
+    }
+    #[test]
+    fn turn_index_handler_resolves_the_pane_and_reads_its_record() {
+        let fixture = Fixture::new();
+        let path = fixture.write("record.jsonl", concat!(
+            "{\"type\":\"session\",\"id\":\"session\",\"version\":3}\n",
+            "{\"type\":\"message\",\"id\":\"u\",\"parentId\":null,\"timestamp\":\"2026-03-04T09:15:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Explain the relay\"}}\n"
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let message = rx.blocking_recv().expect("pane request");
+            assert!(matches!(message.request.method, Method::PaneGet(_)));
+            message
+                .respond_to
+                .send(pane_response(pane(Some(session(
+                    "pi",
+                    AgentSessionRefKind::Path,
+                    path.to_str().unwrap(),
+                )))))
+                .unwrap();
+        });
+        let response = handle_turn_index(
+            "request".into(),
+            &PaneTarget {
+                pane_id: "wG4:p1".into(),
+            },
+            &tx,
+        );
+        drop(tx);
+        responder.join().unwrap();
+        let result = answered(&response);
+        match result {
+            ResponseResult::TurnIndex {
+                pane_id,
+                terminal_id,
+                index,
+                reason,
+            } => {
+                assert_eq!(pane_id, "wG4:p1");
+                assert_eq!(terminal_id, "term_beacon");
+                assert_eq!(reason, None);
+                assert_eq!(
+                    index.unwrap().turns[0].prompt.as_deref(),
+                    Some("Explain the relay")
+                );
+            }
+            other => panic!("expected turn index, got {other:?}"),
+        }
+    }
+    fn index_sources(fixture: &Fixture, response: String) -> Sources<TurnIndex> {
+        Sources {
+            pane: Box::new(move || response),
+            home: Some(fixture.root.clone()),
+            record: Box::new(|path, _| crate::turn_index::read(path)),
+        }
+    }
+
+    #[test]
+    fn turn_index_handler_reuses_refusals_and_rejects_other_agents_before_lookup() {
+        let fixture = Fixture::new();
+        for (session, expected) in [
+            (None, PromptTrailReason::NoSession),
+            (
+                Some(session("claude", AgentSessionRefKind::Id, "absent")),
+                PromptTrailReason::UnsupportedAgent,
+            ),
+            (
+                Some(session("codex", AgentSessionRefKind::Id, "absent")),
+                PromptTrailReason::UnsupportedAgent,
+            ),
+            (
+                Some(session(
+                    "pi",
+                    AgentSessionRefKind::Path,
+                    fixture.root.join("absent.jsonl").to_str().unwrap(),
+                )),
+                PromptTrailReason::NoRecord,
+            ),
+        ] {
+            let response = respond(
+                "request".into(),
+                index_sources(&fixture, pane_response(pane(session))),
+            );
+            match answered(&response) {
+                ResponseResult::TurnIndex { index, reason, .. } => {
+                    assert_eq!(index, None);
+                    assert_eq!(reason, Some(expected));
+                }
+                other => panic!("expected turn index, got {other:?}"),
+            }
+        }
+        let refusal = crate::api::server::error_response_json(
+            "internal".into(),
+            "pane_not_found",
+            "unknown pane".into(),
+        );
+        let response = respond("request".into(), index_sources(&fixture, refusal));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "pane_not_found");
+        assert_eq!(error.id, "request");
+        let (tx, _) = mpsc::unbounded_channel();
+        let error: ErrorResponse = serde_json::from_str(&handle_turn_index(
+            "blank".into(),
+            &PaneTarget {
+                pane_id: " ".into(),
+            },
+            &tx,
+        ))
+        .unwrap();
+        assert_eq!(error.error.code, "invalid_params");
+    }
+
+    #[test]
+    fn turn_index_handler_uses_reported_record_and_reports_unreadable() {
+        let fixture = Fixture::new();
+        let path = fixture.write(
+            "reported.jsonl",
+            "{\"type\":\"session\",\"id\":\"reported\"}\n",
+        );
+        let mut identity = session("pi", AgentSessionRefKind::Path, "absent.jsonl");
+        identity.record_path = Some(path.to_str().unwrap().into());
+        let response = respond(
+            "request".into(),
+            index_sources(&fixture, pane_response(pane(Some(identity.clone())))),
+        );
+        match answered(&response) {
+            ResponseResult::TurnIndex { index, reason, .. } => {
+                let index = index.unwrap();
+                assert_eq!(index.session_id, "reported");
+                assert_eq!(index.leaf_id, None);
+                assert!(index.turns.is_empty());
+                assert_eq!(reason, None);
+            }
+            other => panic!("expected turn index, got {other:?}"),
+        }
+        fixture.write("reported.jsonl", "not a record\n");
+        let response = respond(
+            "request".into(),
+            index_sources(&fixture, pane_response(pane(Some(identity)))),
+        );
+        assert!(matches!(
+            answered(&response),
+            ResponseResult::TurnIndex {
+                index: None,
+                reason: Some(PromptTrailReason::Unreadable),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn turn_index_shares_prompt_trail_permits_and_deadline() {
+        let fixture = Fixture::new();
+        let first = permits().clone().try_acquire_owned().unwrap();
+        let second = permits().clone().try_acquire_owned().unwrap();
+        let sources = Sources::<TurnIndex> {
+            pane: Box::new(|| panic!("a read started without a shared permit")),
+            home: None,
+            record: Box::new(|_, _| panic!("record read without a permit")),
+        };
+        let start = std::time::Instant::now();
+        let answer = blocking_trail(Duration::from_millis(100), sources);
+        assert!(matches!(answer, Answer::Refused { .. }));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(first);
+        drop(second);
+        let path = fixture.write("record.jsonl", "");
+        let response = pane_response(pane(Some(session(
+            "pi",
+            AgentSessionRefKind::Path,
+            path.to_str().unwrap(),
+        ))));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (finished, completion) = std::sync::mpsc::channel::<()>();
+        let mut sources = index_sources(&fixture, response);
+        sources.record = Box::new(move |_, _| {
+            let _ = held.recv_timeout(Duration::from_secs(3));
+            finished.send(()).unwrap();
+            Err(PromptTrailReason::NoRecord)
+        });
+        let start = std::time::Instant::now();
+        let response = encode(
+            "request".into(),
+            blocking_trail(Duration::from_millis(100), sources),
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            answered(&response),
+            ResponseResult::TurnIndex {
+                index: None,
+                reason: Some(PromptTrailReason::Unreadable),
+                ..
+            }
+        ));
+        assert_eq!(permits().available_permits(), 1);
+        release.send(()).unwrap();
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
     }
 }

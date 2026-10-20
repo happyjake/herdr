@@ -104,7 +104,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.prompt_trail`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.prompt_trail`, `pane.turn_index`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -320,6 +320,45 @@ pane identity, or running-session evidence cannot be read, the method returns
 `server_unavailable`. Older servers refuse the
 unknown method with `invalid_request`; no capability flag or protocol bump is
 required.
+
+
+`pane.turn_index {pane_id}` returns `{type:"turn_index", pane_id,
+terminal_id, index, reason}` for a pi pane. Exactly one of `index` and
+`reason` is set. It uses the prompt trail's pane and record lookup and its
+reasons: `no_session`, `unsupported_agent`, `no_record`, `unreadable`.
+Claude and codex are unsupported. Unknown panes return `pane_not_found`.
+A supporting server advertises `capabilities.turn_index: true` in its pong;
+an absent capability means the verb is unavailable.
+
+The index is `{agent:"pi", session_id, leaf_id, revision, partial, turns}`.
+The session id comes from the header; the leaf is the last recorded entry
+(or null for a header-only record). `revision` is opaque and changes when
+the record changes. Turns follow only that leaf's parent chain, oldest
+first, limited to the last 64. A missing parent or cycle is `unreadable`.
+An incomplete final JSON line sets `partial: true` and makes the newest
+turn `open`.
+
+Each turn is `{id, at, start, prompt, end, answer, answer_id}`. It starts
+at a user message (including a steer or follow-up), or a displayed
+`wake` custom message. `id` names that entry, `at` is its unix time in
+seconds, and `start` is `prompt` or `wake`. A wake's prompt is null.
+Hidden extension messages and other metadata neither start nor end turns.
+The last assistant message decides `end`: `stop` is `answered`,
+`aborted` is `aborted`, `error` or `length` is `error`, and a tool
+call, pending message, or tool result without a later assistant is `open`.
+
+Prompt and answer heads use the first non-blank text line, whitespace
+collapsed and controls removed, cut to 160 code points with a word-boundary
+cut where possible and an appended `…`. Answer heads skip code-fence
+opening and closing lines. `answer` and `answer_id` are both null unless
+the turn is answered with non-blank text. Thinking, tool traffic, hidden
+messages, and error text are never returned or logged.
+
+Reads share the prompt trail's two-read concurrency limit, five-second
+whole-request deadline, 64 MiB record cap and 16 MiB line cap. A bounded
+in-memory LRU holds 32 parsed indexes, keyed by path, file identity, size,
+and modification time. Requests for one path share a single read; an
+unchanged record is not parsed again, and a changed record is re-read whole.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 

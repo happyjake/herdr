@@ -224,6 +224,8 @@ pub enum Method {
     // refusal as the trail's absence.
     #[serde(rename = "pane.prompt_trail")]
     PanePromptTrail(PaneTarget),
+    #[serde(rename = "pane.turn_index")]
+    PaneTurnIndex(PaneTarget),
     #[serde(rename = "pane.focus")]
     PaneFocus(PaneTarget),
     #[serde(rename = "pane.input.set")]
