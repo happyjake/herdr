@@ -268,6 +268,12 @@ pub(crate) fn executable_file_identity(
     executable_file_identity_platform(path)
 }
 
+/// File status change time in nanoseconds from the platform's epoch.
+/// Unlike modification time, ordinary file timestamp setters cannot restore it.
+pub(crate) fn file_change_time(path: &std::path::Path) -> std::io::Result<i128> {
+    file_change_time_platform(path)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detach_server_daemon_command(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;

@@ -357,8 +357,9 @@ messages, and error text are never returned or logged.
 Reads share the prompt trail's two-read concurrency limit, five-second
 whole-request deadline, 64 MiB record cap and 16 MiB line cap. A bounded
 in-memory LRU holds 32 parsed indexes, keyed by path, file identity, size,
-and modification time. Requests for one path share a single read; an
-unchanged record is not parsed again, and a changed record is re-read whole.
+modification time, and status change time. Requests for one path share a
+single read; an unchanged record is not parsed again, and a changed record
+is re-read whole.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 

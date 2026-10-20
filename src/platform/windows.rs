@@ -796,6 +796,29 @@ static FOREGROUND_PROCESS_SNAPSHOT_CACHE: Mutex<ProcessSnapshotCache> =
 static FOREGROUND_SELECTION_CACHE: LazyLock<Mutex<ForegroundSelectionCache>> =
     LazyLock::new(|| Mutex::new(ForegroundSelectionCache::default()));
 
+pub(super) fn file_change_time_platform(path: &std::path::Path) -> std::io::Result<i128> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+    };
+
+    let file = std::fs::File::open(path)?;
+    let mut information = FILE_BASIC_INFO::default();
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            std::ptr::addr_of_mut!(information).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Windows reports status change time in 100-nanosecond intervals.
+    Ok(i128::from(information.ChangeTime) * 100)
+}
+
 pub(super) fn executable_file_identity_platform(
     path: &std::path::Path,
 ) -> std::io::Result<super::ExecutableFileIdentity> {

@@ -172,6 +172,13 @@ pub(crate) fn write_config_temporary(
 const PROC_PGRP_ONLY: u32 = 2;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
+pub(super) fn file_change_time_platform(path: &std::path::Path) -> std::io::Result<i128> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(path)?;
+    Ok(i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()))
+}
+
 pub(super) fn executable_file_identity_platform(
     path: &Path,
 ) -> std::io::Result<super::ExecutableFileIdentity> {
