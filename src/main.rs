@@ -62,6 +62,7 @@ mod terminal_modes;
 mod terminal_notify;
 mod terminal_theme;
 mod thread_spawn;
+mod turn_index;
 mod ui;
 mod update;
 mod workspace;

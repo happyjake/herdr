@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.prompt_trail`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.prompt_trail`、`pane.turn_index`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -128,6 +128,37 @@ Claude 的 `<project>/<sessionId>/subagents/agent-*.jsonl`、Codex 的 `session_
 命中行的 `why` 包含 `field`、匹配的 `line` 和 `terms`；浏览时为 `why: null`。提示中超出预览截断长度的内容仍可搜索。折叠后代的命中会传递到所有祖先，采用最高分；继承的解释保留 `field`，并在 `line` 前加上 `Subagent:`。硬筛选条件应用于返回的祖先行。提示提取和标题判断复用 `pane.prompt_trail` 的规则，排除助手输出、工具通信和注入文本。Codex 名称取自会话索引，最后一条优先，并支持 `.jsonl.zst` 归档记录和可跳过的元数据帧；拒绝解码窗口超过 16 MiB 的记录。只读取智能体文件，不写入。
 
 后台目录按路径、修改时间和大小复用记录，每 30 秒刷新。后台通过类型化读取器流式读取已变化的日志簿，并缓存折叠后的元数据。查询使用缓存快照，约 2 秒的预算包含等待两个并发名额之一和请求应用的活动会话快照。目录尚未完成或扫描超时，会返回已找到的行及 `partial: true`。无法读取的记录会被单独跳过，并将结果标为部分结果；无关的历史行仍可直接返回，无需等待下一次刷新。超时工作在真正结束前仍占用名额。应用不能提供窗格身份或无法读取运行会话信息时返回 `server_unavailable`。旧服务器按未知方法返回 `invalid_request`，无需能力标志或协议版本升级。
+
+
+`pane.turn_index {pane_id}` 为 pi 窗格返回
+`{type:"turn_index", pane_id, terminal_id, index, reason}`。
+`index` 和 `reason` 恰有一个非空。窗格、记录查找及原因与 prompt trail 共用：
+`no_session`、`unsupported_agent`、`no_record`、`unreadable`。
+Claude 和 codex 不受支持。未知窗格返回 `pane_not_found`。
+支持此方法的服务器在 pong 中声明 `capabilities.turn_index: true`。
+
+索引为 `{agent:"pi", session_id, leaf_id, revision, partial, turns}`。
+会话 ID 来自头部，leaf 是最后记录的条目（只有头部时为 null）。
+`revision` 是记录变化时随之变化的不透明值。只沿该 leaf 的父链读取，
+按从旧到新返回最近最多 64 个回合。父条目缺失或循环返回 `unreadable`。
+最后一行 JSON 尚未写完时，`partial: true`，最新回合为 `open`。
+
+每个回合为 `{id, at, start, prompt, end, answer, answer_id}`。
+用户消息（包括中途指令和追问）或可见的 `wake` 自定义消息才会开始回合。
+`id` 是起始条目 ID，`at` 为 Unix 秒，`start` 为 `prompt` 或 `wake`。
+wake 的 prompt 为 null。隐藏扩展消息及其他元数据既不开始也不结束回合。
+只由最后一条 assistant 消息决定结束状态：`stop` → `answered`，
+`aborted` → `aborted`，`error`/`length` → `error`。
+工具调用、pending，以及后面没有 assistant 的工具结果均为 `open`。
+
+prompt 和 answer 是首个非空文本行，合并空白、移除控制字符，并尽可能在单词边界
+截到 160 个码点后加 `…`。answer 跳过代码围栏行。
+除有非空回答的 `answered` 回合外，`answer` 和 `answer_id` 均为 null。
+思考、工具通信、隐藏消息和错误文本不会返回或写入日志。
+
+读取与 prompt trail 共用两个并发名额、五秒整请求期限、64 MiB 记录上限及
+16 MiB 单行上限。内存 LRU 最多缓存 32 个索引，以路径、文件标识、大小和修改时间
+为键，同一路径同时只读一次。记录未变则不重新解析；有变化则完整重读。
 
 `workspace.move_block` 会将有序的 `workspace_ids` 原子地移动到 `before_workspace_id` 之前;省略锚点则将该块移动到末尾。id 必须唯一,且锚点不能属于被移动的块。响应包含服务器确认的有序工作区列表。
 

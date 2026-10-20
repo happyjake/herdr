@@ -2251,6 +2251,7 @@ mod tests {
             file_attachments: Some(crate::api::attachment::file_attachments_capability()),
             agent_report_cancelled: false,
             agent_prompt_expectations: false,
+            turn_index: false,
         }));
         let mut websocket = connect_authorized(&server);
 

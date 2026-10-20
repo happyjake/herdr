@@ -11,7 +11,7 @@ use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
     PaneMouseRouting, PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult,
     PaneResizeResult, PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult, PromptTrail,
-    PromptTrailReason,
+    PromptTrailReason, TurnIndex,
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
@@ -195,6 +195,13 @@ pub enum ResponseResult {
         pane_id: String,
         terminal_id: String,
         trail: Option<PromptTrail>,
+        reason: Option<PromptTrailReason>,
+    },
+    /// Bounded pi turn index, or exactly one prompt-trail refusal reason.
+    TurnIndex {
+        pane_id: String,
+        terminal_id: String,
+        index: Option<TurnIndex>,
         reason: Option<PromptTrailReason>,
     },
     PaneCurrent {

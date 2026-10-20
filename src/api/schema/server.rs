@@ -224,4 +224,7 @@ pub struct ServerCapabilities {
     /// (false) in pongs of servers that predate it.
     #[serde(default)]
     pub agent_prompt_expectations: bool,
+    /// Supports `pane.turn_index` for pi session records.
+    #[serde(default)]
+    pub turn_index: bool,
 }

@@ -971,6 +971,9 @@ fn handle_request(
         Method::PanePromptTrail(params) => {
             crate::api::prompt_trail::handle_prompt_trail(request.id, &params, api_tx)
         }
+        Method::PaneTurnIndex(params) => {
+            crate::api::prompt_trail::handle_turn_index(request.id, &params, api_tx)
+        }
         Method::AttachmentBegin(params) => {
             crate::api::attachment::handle_begin(request.id, &params)
         }
@@ -1950,6 +1953,7 @@ mod tests {
                 file_attachments: Some(crate::api::attachment::file_attachments_capability()),
                 agent_report_cancelled: false,
                 agent_prompt_expectations: false,
+                turn_index: false,
             }),
             None,
             None,
