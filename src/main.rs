@@ -48,6 +48,9 @@ mod prompt_trail;
 mod protocol;
 mod pty;
 mod raw_input;
+// Only tests reach these readers until the preface read is wired to them.
+#[allow(dead_code)]
+mod record_turns;
 mod release_notes;
 mod remote;
 mod render_prof;

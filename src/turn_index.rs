@@ -19,11 +19,6 @@ const HEAD_CHARS: usize = 160;
 
 /// Only heads and branch links survive parsing a line. Tool, system,
 /// thinking and extension payloads never enter the index or its cache.
-struct Entry {
-    parent: Option<String>,
-    kind: EntryKind,
-}
-
 enum EntryKind {
     Start(IndexedTurn),
     Assistant {
@@ -35,7 +30,23 @@ enum EntryKind {
     Other,
 }
 
-fn parse(mut reader: impl BufRead, revision: String) -> Result<TurnIndex, PromptTrailReason> {
+/// One record's last-recorded branch: its entries from root to leaf, each
+/// reduced by the caller to whatever it keeps of a line.
+pub(crate) struct Branch<K> {
+    pub(crate) session_id: String,
+    pub(crate) leaf_id: Option<String>,
+    /// The record's last line was cut mid-write.
+    pub(crate) partial: bool,
+    /// Oldest first.
+    pub(crate) entries: Vec<K>,
+}
+
+/// Walk a pi record to its last-recorded branch. `kind_of` sees every entry
+/// after the session header, with its id, and decides what survives of it.
+pub(crate) fn last_branch<K>(
+    mut reader: impl BufRead,
+    mut kind_of: impl FnMut(&Value, &str) -> Result<K, PromptTrailReason>,
+) -> Result<Branch<K>, PromptTrailReason> {
     let mut entries = HashMap::new();
     let mut session_id = None;
     let mut leaf_id = None;
@@ -79,8 +90,8 @@ fn parse(mut reader: impl BufRead, revision: String) -> Result<TurnIndex, Prompt
             Some(Value::String(parent)) => Some(parent.clone()),
             _ => return Err(PromptTrailReason::Unreadable),
         };
-        let kind = entry_kind(&parsed, &id)?;
-        if entries.insert(id.clone(), Entry { parent, kind }).is_some() {
+        let kind = kind_of(&parsed, &id)?;
+        if entries.insert(id.clone(), (parent, kind)).is_some() {
             return Err(PromptTrailReason::Unreadable);
         }
         leaf_id = Some(id);
@@ -89,12 +100,26 @@ fn parse(mut reader: impl BufRead, revision: String) -> Result<TurnIndex, Prompt
     let mut next = leaf_id.clone();
     while let Some(id) = next {
         // Removing each visited entry also rejects cycles.
-        let entry = entries.remove(&id).ok_or(PromptTrailReason::Unreadable)?;
-        next = entry.parent;
-        branch.push(entry.kind);
+        let (parent, kind) = entries.remove(&id).ok_or(PromptTrailReason::Unreadable)?;
+        next = parent;
+        branch.push(kind);
     }
+    branch.reverse();
+    Ok(Branch {
+        session_id: session_id.ok_or(PromptTrailReason::Unreadable)?,
+        leaf_id,
+        partial,
+        entries: branch,
+    })
+}
+
+pub(crate) fn parse(
+    reader: impl BufRead,
+    revision: String,
+) -> Result<TurnIndex, PromptTrailReason> {
+    let branch = last_branch(reader, entry_kind)?;
     let mut turns: std::collections::VecDeque<IndexedTurn> = std::collections::VecDeque::new();
-    for entry in branch.into_iter().rev() {
+    for entry in branch.entries {
         match entry {
             EntryKind::Start(turn) => {
                 if turns.len() == MAX_TURNS {
@@ -117,17 +142,17 @@ fn parse(mut reader: impl BufRead, revision: String) -> Result<TurnIndex, Prompt
             EntryKind::Other => {}
         }
     }
-    if partial {
+    if branch.partial {
         if let Some(turn) = turns.back_mut() {
             open(turn);
         }
     }
     Ok(TurnIndex {
         agent: TurnIndexAgent::Pi,
-        session_id: session_id.ok_or(PromptTrailReason::Unreadable)?,
-        leaf_id,
+        session_id: branch.session_id,
+        leaf_id: branch.leaf_id,
         revision,
-        partial,
+        partial: branch.partial,
         turns: turns.into(),
     })
 }
@@ -140,25 +165,48 @@ fn required_string(value: &Value, field: &str) -> Result<String, PromptTrailReas
         .ok_or(PromptTrailReason::Unreadable)
 }
 
+/// How a pi entry starts a turn, when it does: a person's message, or a
+/// wake the harness displayed.
+pub(crate) fn turn_start(value: &Value) -> Option<TurnStart> {
+    if value["type"] == "message" && value["message"]["role"] == "user" {
+        return Some(TurnStart::Prompt);
+    }
+    (value["type"] == "custom_message" && value["customType"] == "wake" && value["display"] == true)
+        .then_some(TurnStart::Wake)
+}
+
+/// When a turn starting at `value` began. A start with no time is a record
+/// this cannot read.
+pub(crate) fn start_at(value: &Value) -> Result<u64, PromptTrailReason> {
+    value["timestamp"]
+        .as_str()
+        .and_then(unix_seconds_from_rfc3339)
+        .ok_or(PromptTrailReason::Unreadable)
+}
+
+/// How a pi assistant message leaves its turn: only a `stop` with no tool
+/// call answers it.
+pub(crate) fn assistant_end(message: &Value) -> TurnEnd {
+    let has_tool_call = message["content"]
+        .as_array()
+        .is_some_and(|parts| parts.iter().any(|part| part["type"] == "toolCall"));
+    match message["stopReason"].as_str() {
+        Some("stop") if !has_tool_call => TurnEnd::Answered,
+        Some("aborted") => TurnEnd::Aborted,
+        Some("error" | "length") => TurnEnd::Error,
+        _ => TurnEnd::Open,
+    }
+}
+
 fn entry_kind(value: &Value, id: &str) -> Result<EntryKind, PromptTrailReason> {
     let message = &value["message"];
-    let prompt = value["type"] == "message" && message["role"] == "user";
-    let wake = value["type"] == "custom_message"
-        && value["customType"] == "wake"
-        && value["display"] == true;
-    if prompt || wake {
-        let at = value["timestamp"]
-            .as_str()
-            .and_then(unix_seconds_from_rfc3339)
-            .ok_or(PromptTrailReason::Unreadable)?;
+    if let Some(start) = turn_start(value) {
+        let at = start_at(value)?;
+        let prompt = start == TurnStart::Prompt;
         return Ok(EntryKind::Start(IndexedTurn {
             id: id.into(),
             at,
-            start: if prompt {
-                TurnStart::Prompt
-            } else {
-                TurnStart::Wake
-            },
+            start,
             prompt: if prompt {
                 head(&message["content"], false)
             } else {
@@ -178,15 +226,7 @@ fn entry_kind(value: &Value, id: &str) -> Result<EntryKind, PromptTrailReason> {
     if message["role"] != "assistant" {
         return Ok(EntryKind::Other);
     }
-    let has_tool_call = message["content"]
-        .as_array()
-        .is_some_and(|parts| parts.iter().any(|part| part["type"] == "toolCall"));
-    let end = match message["stopReason"].as_str() {
-        Some("stop") if !has_tool_call => TurnEnd::Answered,
-        Some("aborted") => TurnEnd::Aborted,
-        Some("error" | "length") => TurnEnd::Error,
-        _ => TurnEnd::Open,
-    };
+    let end = assistant_end(message);
     Ok(EntryKind::Assistant {
         id: id.into(),
         end,

@@ -365,14 +365,19 @@ fn codex_prompt(line: &Value) -> Option<String> {
         payload.get("content")?.as_array()?,
         "input_text",
     ));
-    if CODEX_SKIPPED_PREFIXES
-        .iter()
-        .any(|prefix| text.starts_with(prefix))
-    {
+    if codex_injected(&text) {
         return None;
     }
     let text = clean(&replace_image_tags(&text));
     (!text.is_empty()).then_some(text)
+}
+
+/// Whether a codex user turn, cleaned, is one the harness wrote rather
+/// than one a person typed.
+pub(crate) fn codex_injected(text: &str) -> bool {
+    CODEX_SKIPPED_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
 }
 
 fn pi_prompt(line: &Value) -> Option<String> {
@@ -418,7 +423,7 @@ fn block_kind(block: &Value) -> Option<&str> {
     block.get("type").and_then(Value::as_str)
 }
 
-fn join_text_blocks(blocks: &[Value], kind: &str) -> String {
+pub(crate) fn join_text_blocks(blocks: &[Value], kind: &str) -> String {
     blocks
         .iter()
         .filter(|block| block_kind(block) == Some(kind))
@@ -448,7 +453,7 @@ const IMAGE_TAG_CLOSE: &str = "</image>";
 /// Each image is read on its own. One left open followed by a complete one
 /// is two images with the person's words between them, never one image
 /// reaching forward to a closing tag that was never its own.
-fn replace_image_tags(text: &str) -> String {
+pub(crate) fn replace_image_tags(text: &str) -> String {
     let mut replaced = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = next_image_tag(rest) {
