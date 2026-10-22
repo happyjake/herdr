@@ -16,11 +16,16 @@ impl Session {
     }
 
     fn with_config(config: &str) -> Self {
+        Self::with_agent_setup(config, |_| {})
+    }
+
+    fn with_agent_setup(config: &str, setup: impl FnOnce(&Path)) -> Self {
         let base = unique_test_dir();
         fs::create_dir_all(&base).unwrap();
         create_committed_repo(&base.join("repo"));
         let socket = base.join("runtime/herdr.sock");
         let agent = InPaneReporter::write(&base, "pi", &socket);
+        setup(&base);
         let server = spawn_herdr_with_config(
             &base.join("config"),
             &base.join("runtime"),
@@ -108,6 +113,48 @@ impl Drop for Session {
 #[test]
 fn started_by_tab_create_from_agent_pane() {
     Session::new().create(&["tab", "create"], "root_pane");
+}
+
+#[test]
+fn started_by_nested_pty_command_runner_keeps_the_agent_starter() {
+    let session = Session::with_agent_setup("onboarding = false\n", |base| {
+        let runner = base.join("nested-runner.sh");
+        fs::write(&runner, "tty > \"$1.inner-tty\"\nexec /bin/sh \"$1\"\n").unwrap();
+        let command = format!(
+            "/bin/sh {} \"$inbox/$n.cmd\"",
+            shell_quote(runner.to_str().unwrap())
+        );
+        #[cfg(target_os = "linux")]
+        let command = format!("script -q -c {} /dev/null", shell_quote(&command));
+        #[cfg(not(target_os = "linux"))]
+        let command = format!("script -q /dev/null {command}");
+        let script = base.join("pi");
+        let body = fs::read_to_string(&script).unwrap();
+        let direct = "/bin/sh \"$inbox/$n.cmd\"";
+        assert!(body.contains(direct));
+        fs::write(
+            &script,
+            body.replace(
+                direct,
+                &format!("export inbox n\n    tty > \"$inbox/$n.cmd.outer-tty\"\n    {command}"),
+            ),
+        )
+        .unwrap();
+    });
+    let child: Value = serde_json::from_str(&session.agent.ok(&["tab", "create"])).unwrap();
+    let outer = fs::read_to_string(session.base.join("pi-inbox/0.cmd.outer-tty")).unwrap();
+    let inner = fs::read_to_string(session.base.join("pi-inbox/0.cmd.inner-tty")).unwrap();
+    assert!(outer.trim().starts_with("/dev/"), "{outer}");
+    assert!(inner.trim().starts_with("/dev/"), "{inner}");
+    assert_ne!(
+        inner, outer,
+        "the command runner must actually allocate another PTY"
+    );
+    assert_eq!(
+        child["result"]["root_pane"]["started_by"],
+        json!({"pane_id":session.starter}),
+        "{child}"
+    );
 }
 
 #[test]

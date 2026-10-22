@@ -159,7 +159,8 @@ pub struct PaneSnapshot {
     /// existed restores every pane unpinned instead of failing the session.
     #[serde(default)]
     pub pinned: bool,
-    #[serde(default)]
+    // Keep legacy layout fingerprints stable when the pane has no starter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_by: Option<crate::api::schema::PaneStartedBy>,
     #[serde(default)]
     pub flag: Option<crate::api::schema::PaneFlag>,

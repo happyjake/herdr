@@ -3828,6 +3828,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_keeps_history_from_snapshot_without_started_by() {
+        use sha2::{Digest, Sha256};
+
+        let (snapshot, mut history) = snapshot_with_saved_pane_history();
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy["workspaces"][0]["tabs"][0]["panes"]["0"]
+            .as_object_mut()
+            .unwrap()
+            .remove("started_by");
+        // Hash the old document before the current Rust type can supply any
+        // defaults: this is the fingerprint its saved history carries.
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        history.layout_fingerprint = Some(format!("{:x}", Sha256::digest(legacy_json.as_bytes())));
+        let snapshot = super::super::snapshot::parse_snapshot(&legacy_json).unwrap();
+        let (events, _events_rx) = mpsc::channel(8);
+        let (_, _, runtimes) = restore(
+            &snapshot,
+            Some(&history),
+            5,
+            40,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let restored_text = runtimes.values().next().unwrap().recent_unwrapped_text(10);
+        for (_, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        assert!(
+            restored_text.contains("RESTORED_HISTORY 👨‍👩‍👧 LINK"),
+            "a snapshot without started_by must retain its saved history: {restored_text:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_without_history_snapshot_keeps_pane_contents_empty() {
         let (snapshot, _history) = snapshot_with_saved_pane_history();
         let (events, _events_rx) = mpsc::channel(8);

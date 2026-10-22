@@ -32,7 +32,15 @@ impl App {
         let (runtime, _) = self.lookup_runtime(ws_idx, pane_id)?;
         let shell_pid = runtime.child_pid()?;
         let pane_tty = crate::platform::process_tty(shell_pid).flatten();
-        if peer.in_pane(shell_pid, pane_tty) != PeerInPane::Inside {
+        // Agent command runners can allocate a nested PTY. For creation,
+        // verified descent still identifies the starter despite a different
+        // controlling terminal; agent reports retain their stricter check.
+        let descends_from_pane = peer
+            .placement
+            .ancestry
+            .as_ref()
+            .is_some_and(|parents| parents.contains(&shell_pid));
+        if !descends_from_pane && peer.in_pane(shell_pid, pane_tty) != PeerInPane::Inside {
             return None;
         }
         Some(PaneStartedBy::Pane {
