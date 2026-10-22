@@ -36,6 +36,7 @@ impl FileKind {
             PromptTrailAgent::Claude => "claude",
             PromptTrailAgent::Codex => "codex",
             PromptTrailAgent::Pi => "pi",
+            PromptTrailAgent::Agy => "agy",
         }
     }
 }

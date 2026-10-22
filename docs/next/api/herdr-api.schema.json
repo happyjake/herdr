@@ -10971,7 +10971,8 @@
           "enum": [
             "claude",
             "codex",
-            "pi"
+            "pi",
+            "agy"
           ],
           "type": "string"
         },
@@ -12749,7 +12750,7 @@
             },
             "turn_index": {
               "default": false,
-              "description": "Supports `pane.turn_index` for pi session records.",
+              "description": "Supports `pane.turn_index` for pi session records, and for agy\nconversation transcripts on servers that read them.",
               "type": "boolean"
             }
           },
@@ -13188,13 +13189,14 @@
           "type": "string"
         },
         "TurnIndex": {
-          "description": "Recent turns on a pi record's last-recorded branch. All nullable fields\nare serialized so absence is distinct from an unsupported capability.",
+          "description": "Recent turns in a session record: a pi record's last-recorded branch,\nor an agy conversation transcript. All nullable fields are serialized\nso absence is distinct from an unsupported capability.",
           "properties": {
             "agent": {
-              "$ref": "#/schemas/success_response/$defs/TurnIndexAgent"
+              "description": "The harness that wrote the record, such as `pi` or `agy`.",
+              "type": "string"
             },
             "leaf_id": {
-              "description": "Null in a record containing only its header.",
+              "description": "The last recorded entry: null in a record with no entries.",
               "type": [
                 "string",
                 "null"
@@ -13226,12 +13228,6 @@
             "turns"
           ],
           "type": "object"
-        },
-        "TurnIndexAgent": {
-          "enum": [
-            "pi"
-          ],
-          "type": "string"
         },
         "TurnStart": {
           "oneOf": [

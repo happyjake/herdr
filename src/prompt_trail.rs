@@ -96,6 +96,7 @@ pub(crate) fn trail_agent(agent: &str) -> Option<PromptTrailAgent> {
         "claude" => Some(PromptTrailAgent::Claude),
         "codex" => Some(PromptTrailAgent::Codex),
         "pi" => Some(PromptTrailAgent::Pi),
+        "agy" => Some(PromptTrailAgent::Agy),
         _ => None,
     }
 }
@@ -116,7 +117,10 @@ pub(crate) fn record_path(
     reported: Option<&str>,
 ) -> Option<PathBuf> {
     if let Some(reported) = reported.and_then(|reported| reported_record(home, reported)) {
-        return Some(reported);
+        return Some(match agent {
+            PromptTrailAgent::Agy => agy_full_transcript(reported),
+            _ => reported,
+        });
     }
 
     match (agent, kind) {
@@ -126,6 +130,7 @@ pub(crate) fn record_path(
         }
         (PromptTrailAgent::Claude, AgentSessionRefKind::Id) => claude_record(home?, value),
         (PromptTrailAgent::Codex, AgentSessionRefKind::Id) => codex_record(home?, value),
+        (PromptTrailAgent::Agy, AgentSessionRefKind::Id) => agy_record(home?, value),
         _ => None,
     }
 }
@@ -289,6 +294,7 @@ pub(crate) fn prompt_text(agent: PromptTrailAgent, line: &Value) -> Option<Strin
         PromptTrailAgent::Claude => claude_prompt(line),
         PromptTrailAgent::Codex => codex_prompt(line),
         PromptTrailAgent::Pi => pi_prompt(line),
+        PromptTrailAgent::Agy => None,
     }
 }
 
@@ -618,6 +624,40 @@ fn claude_record(home: &Path, id: &str) -> Option<PathBuf> {
     }
     None
 }
+
+/// The agy transcript for one conversation id. agy keeps two transcripts
+/// side by side; only `transcript_full.jsonl` holds every step whole.
+fn agy_record(home: &Path, id: &str) -> Option<PathBuf> {
+    if !safe_file_stem(id) {
+        return None;
+    }
+    let path = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("brain")
+        .join(id)
+        .join(".system_generated")
+        .join("logs")
+        .join(AGY_FULL_TRANSCRIPT);
+    path.is_file().then_some(path)
+}
+
+/// A reported agy transcript, moved from the truncated `transcript.jsonl`
+/// to its whole sibling when that sibling is there.
+fn agy_full_transcript(reported: PathBuf) -> PathBuf {
+    if reported
+        .file_name()
+        .is_some_and(|name| name == "transcript.jsonl")
+    {
+        let full = reported.with_file_name(AGY_FULL_TRANSCRIPT);
+        if full.is_file() {
+            return full;
+        }
+    }
+    reported
+}
+
+const AGY_FULL_TRANSCRIPT: &str = "transcript_full.jsonl";
 
 /// The codex record for one thread id: a rollout filed under the date it
 /// was started, its name carrying the id.
@@ -1558,6 +1598,7 @@ pub(crate) mod tests {
         assert_eq!(trail_agent("claude"), Some(PromptTrailAgent::Claude));
         assert_eq!(trail_agent("codex"), Some(PromptTrailAgent::Codex));
         assert_eq!(trail_agent("pi"), Some(PromptTrailAgent::Pi));
+        assert_eq!(trail_agent("agy"), Some(PromptTrailAgent::Agy));
         for other in ["omp", "copilot", "droid", "", "Claude"] {
             assert_eq!(trail_agent(other), None, "agent {other:?}");
         }

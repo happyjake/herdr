@@ -811,6 +811,8 @@ pub enum PromptTrailAgent {
     Claude,
     Codex,
     Pi,
+    // Read for turn indexes only; agy panes have no prompt trail.
+    Agy,
 }
 
 /// Why a pane has no trail. Never an error: a pane with no trail is an
@@ -1050,25 +1052,21 @@ pub struct PaneLinkRegion {
     pub end_col: u16,
 }
 
-/// Recent turns on a pi record's last-recorded branch. All nullable fields
-/// are serialized so absence is distinct from an unsupported capability.
+/// Recent turns in a session record: a pi record's last-recorded branch,
+/// or an agy conversation transcript. All nullable fields are serialized
+/// so absence is distinct from an unsupported capability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TurnIndex {
-    pub agent: TurnIndexAgent,
+    /// The harness that wrote the record, such as `pi` or `agy`.
+    pub agent: String,
     pub session_id: String,
-    /// Null in a record containing only its header.
+    /// The last recorded entry: null in a record with no entries.
     pub leaf_id: Option<String>,
     /// Opaque record revision, for equality comparisons only.
     pub revision: String,
     pub partial: bool,
     /// At most the last 64 turns, oldest first.
     pub turns: Vec<IndexedTurn>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnIndexAgent {
-    Pi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

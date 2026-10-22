@@ -366,8 +366,8 @@ pub(super) trait RecordOutput: Send + 'static {
 
 impl RecordOutput for PromptTrail {
     type Reason = PromptTrailReason;
-    fn supports(_: PromptTrailAgent) -> bool {
-        true
+    fn supports(agent: PromptTrailAgent) -> bool {
+        agent != PromptTrailAgent::Agy
     }
     fn response(
         pane_id: String,
@@ -387,7 +387,7 @@ impl RecordOutput for PromptTrail {
 impl RecordOutput for TurnIndex {
     type Reason = PromptTrailReason;
     fn supports(agent: PromptTrailAgent) -> bool {
-        agent == PromptTrailAgent::Pi
+        matches!(agent, PromptTrailAgent::Pi | PromptTrailAgent::Agy)
     }
     fn response(
         pane_id: String,
@@ -423,7 +423,7 @@ pub(super) fn handle_turn_index(
         Sources {
             pane: Box::new(move || ask_for_pane(&pane_id, &api_tx)),
             home: crate::worktree::home_dir(),
-            record: Box::new(|path, _| crate::turn_index::read(path)),
+            record: Box::new(crate::turn_index::read),
         },
     )
 }
@@ -1261,7 +1261,7 @@ mod tests {
         Sources {
             pane: Box::new(move || response),
             home: Some(fixture.root.clone()),
-            record: Box::new(|path, _| crate::turn_index::read(path)),
+            record: Box::new(crate::turn_index::read),
         }
     }
 
@@ -1318,6 +1318,181 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(error.error.code, "invalid_params");
+    }
+
+    const AGY_CONVERSATION: &str = "5d0c7a52-agy-conversation";
+    const AGY_LOGS: &str =
+        ".gemini/antigravity-cli/brain/5d0c7a52-agy-conversation/.system_generated/logs";
+
+    fn agy_session(record_path: Option<std::path::PathBuf>) -> AgentSessionInfo {
+        let mut identity = session("agy", AgentSessionRefKind::Id, AGY_CONVERSATION);
+        identity.source = "herdr:antigravity_cli".into();
+        identity.record_path = record_path.map(|path| path.to_str().unwrap().into());
+        identity
+    }
+
+    fn index_of(response: &str) -> TurnIndex {
+        match answered(response) {
+            ResponseResult::TurnIndex {
+                pane_id,
+                terminal_id,
+                index,
+                reason,
+            } => {
+                assert_eq!(pane_id, "wG4:p1");
+                assert_eq!(terminal_id, "term_beacon");
+                assert_eq!(reason, None);
+                index.expect("an index")
+            }
+            other => panic!("expected turn index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_index_handler_answers_an_agy_pane_from_its_full_transcript() {
+        let fixture = Fixture::new();
+        let full = fixture.write(
+            &format!("{AGY_LOGS}/transcript_full.jsonl"),
+            include_str!("../../tests/fixtures/session-record/agy/transcript_full.jsonl"),
+        );
+        // The truncated sibling agy keeps beside it is never what is read.
+        let truncated = fixture.write(
+            &format!("{AGY_LOGS}/transcript.jsonl"),
+            "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\
+             \"status\":\"DONE\",\"created_at\":\"2026-03-04T09:15:00Z\",\
+             \"content\":\"<USER_REQUEST>\\ntruncated copy\\n</USER_REQUEST>\"}\n",
+        );
+        for reported in [Some(full), Some(truncated), None] {
+            let response = respond(
+                "request".into(),
+                index_sources(
+                    &fixture,
+                    pane_response(pane(Some(agy_session(reported.clone())))),
+                ),
+            );
+            let index = index_of(&response);
+            assert_eq!(index.agent, "agy", "reported {reported:?}");
+            assert_eq!(index.session_id, AGY_CONVERSATION);
+            assert_eq!(index.leaf_id.as_deref(), Some("27"));
+            assert!(!index.partial);
+            let heads: Vec<_> = index
+                .turns
+                .iter()
+                .map(|turn| {
+                    (
+                        turn.id.as_str(),
+                        turn.start,
+                        turn.prompt.as_deref(),
+                        turn.end,
+                        turn.answer.as_deref(),
+                        turn.answer_id.as_deref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                heads,
+                [
+                    (
+                        "0",
+                        TurnStart::Prompt,
+                        Some("Explain the relay"),
+                        TurnEnd::Answered,
+                        Some("The relay waits for the build."),
+                        Some("6"),
+                    ),
+                    (
+                        "7",
+                        TurnStart::Task,
+                        None,
+                        TurnEnd::Answered,
+                        Some("## The build passed"),
+                        Some("10"),
+                    ),
+                    (
+                        "11",
+                        TurnStart::Prompt,
+                        Some("Rename the beacon"),
+                        TurnEnd::Open,
+                        None,
+                        None,
+                    ),
+                    (
+                        "12",
+                        TurnStart::Prompt,
+                        Some("Rename the beacon to lighthouse instead"),
+                        TurnEnd::Answered,
+                        Some("Renamed the beacon to lighthouse."),
+                        Some("19"),
+                    ),
+                    (
+                        "20",
+                        TurnStart::Prompt,
+                        Some("Ship the lighthouse"),
+                        TurnEnd::Error,
+                        None,
+                        None,
+                    ),
+                    (
+                        "25",
+                        TurnStart::Prompt,
+                        Some("Try shipping again"),
+                        TurnEnd::Open,
+                        None,
+                        None,
+                    ),
+                ],
+                "reported {reported:?}"
+            );
+            assert_eq!(index.turns[0].at, 1772615700);
+        }
+    }
+
+    #[test]
+    fn agy_panes_have_a_turn_index_but_no_prompt_trail() {
+        let fixture = Fixture::new();
+        let response = respond(
+            "request".into(),
+            index_sources(&fixture, pane_response(pane(Some(agy_session(None))))),
+        );
+        assert!(matches!(
+            answered(&response),
+            ResponseResult::TurnIndex {
+                index: None,
+                reason: Some(PromptTrailReason::NoRecord),
+                ..
+            }
+        ));
+        for unsafe_id in ["../escape", "a/b", ""] {
+            let mut identity = agy_session(None);
+            identity.value = unsafe_id.into();
+            let response = respond(
+                "request".into(),
+                index_sources(&fixture, pane_response(pane(Some(identity)))),
+            );
+            assert!(
+                matches!(
+                    answered(&response),
+                    ResponseResult::TurnIndex {
+                        reason: Some(PromptTrailReason::NoRecord),
+                        ..
+                    }
+                ),
+                "id {unsafe_id:?}"
+            );
+        }
+
+        fixture.write(
+            &format!("{AGY_LOGS}/transcript_full.jsonl"),
+            include_str!("../../tests/fixtures/session-record/agy/transcript_full.jsonl"),
+        );
+        let response = respond(
+            "request".into(),
+            fixture.sources(pane_response(pane(Some(agy_session(None))))),
+        );
+        assert_eq!(
+            reason_of(&response),
+            Some(PromptTrailReason::UnsupportedAgent)
+        );
     }
 
     #[test]

@@ -345,15 +345,17 @@ required.
 
 
 `pane.turn_index {pane_id}` returns `{type:"turn_index", pane_id,
-terminal_id, index, reason}` for a pi pane. Exactly one of `index` and
-`reason` is set. It uses the prompt trail's pane and record lookup and its
-reasons: `no_session`, `unsupported_agent`, `no_record`, `unreadable`.
+terminal_id, index, reason}` for a pi or agy pane. Exactly one of `index`
+and `reason` is set. It uses the prompt trail's pane and record lookup and
+its reasons: `no_session`, `unsupported_agent`, `no_record`, `unreadable`.
 Claude and codex are unsupported. Unknown panes return `pane_not_found`.
 A supporting server advertises `capabilities.turn_index: true` in its pong;
 an absent capability means the verb is unavailable.
 
-The index is `{agent:"pi", session_id, leaf_id, revision, partial, turns}`.
-The session id comes from the header; the leaf is the last recorded entry
+The index is `{agent, session_id, leaf_id, revision, partial, turns}`, where
+`agent` is a string naming the harness (`"pi"` or `"agy"`); clients should
+ignore indexes from harnesses they do not know. For pi, the session id comes
+from the header; the leaf is the last recorded entry
 (or null for a header-only record). `revision` is opaque and changes when
 the record changes. Turns follow only that leaf's parent chain, oldest
 first, limited to the last 64. A missing parent or cycle is `unreadable`.
@@ -401,11 +403,27 @@ server never logs a prompt or an answer. A supporting server advertises
 Each turn is `{id, at, start, prompt, end, answer, answer_id}`. It starts
 at a user message (including a steer or follow-up), or a displayed
 `wake` custom message. `id` names that entry, `at` is its unix time in
-seconds, and `start` is `prompt` or `wake`. A wake's prompt is null.
+seconds, and `start` is `prompt`, `wake`, or `task`. A wake or task turn's
+prompt is null.
 Hidden extension messages and other metadata neither start nor end turns.
 The last assistant message decides `end`: `stop` is `answered`,
 `aborted` is `aborted`, `error` or `length` is `error`, and a tool
 call, pending message, or tool result without a later assistant is `open`.
+
+For agy, the record is the conversation's `transcript_full.jsonl`; a
+reported path naming the truncated `transcript.jsonl` beside it reads its
+`transcript_full.jsonl` sibling instead, and agy's SQLite store is never
+read. The session id is the conversation id, the leaf is the last whole
+step's `step_index`, and turn and answer ids are step indexes. A turn starts
+at a `USER_INPUT` step whose source is `USER_EXPLICIT` (its prompt is the
+text inside agy's request block, without the metadata blocks agy appends),
+or at a `SYSTEM_MESSAGE` that arrives while the previous turn has ended,
+which starts a `task` turn with a null prompt. Other inputs, a system message
+while the agent is still working, and compaction checkpoints neither start
+nor end turns. A planner response with text and no tool calls is `answered`;
+a later tool call or tool step makes the turn `open` again, and an error
+message after the last response makes it `error`. The 64-turn limit and the
+incomplete-final-line rule apply as for pi.
 
 Prompt and answer heads use the first non-blank text line, whitespace
 collapsed and controls removed, cut to 160 code points with a word-boundary

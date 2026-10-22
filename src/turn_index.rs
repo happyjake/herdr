@@ -1,4 +1,5 @@
-//! Bounded turn indexes from the last-recorded branch of a pi session.
+//! Bounded turn indexes from the last-recorded branch of a pi session, or
+//! from an agy conversation transcript.
 
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -7,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::api::schema::{
-    IndexedTurn, PromptTrailReason, TurnEnd, TurnIndex, TurnIndexAgent, TurnStart,
+    IndexedTurn, PromptTrailAgent, PromptTrailReason, TurnEnd, TurnIndex, TurnStart,
 };
 use crate::prompt_trail::{
     clean, cut, read_line_bounded, unix_seconds_from_rfc3339, LineRead, MAX_LINE_BYTES,
@@ -184,13 +185,56 @@ pub(crate) fn parse(
         }
     }
     Ok(TurnIndex {
-        agent: TurnIndexAgent::Pi,
+        agent: "pi".into(),
         session_id: branch.session_id,
         leaf_id: branch.leaf_id,
         revision,
         partial: branch.partial,
         turns: turns.into(),
     })
+}
+
+/// The index of an agy transcript: the reader's turns, as heads.
+fn parse_agy(
+    reader: impl BufRead,
+    session_id: String,
+    revision: String,
+) -> Result<TurnIndex, PromptTrailReason> {
+    let record = crate::agy_record::read_turns(reader)?;
+    let skip = record.turns.len().saturating_sub(MAX_TURNS);
+    Ok(TurnIndex {
+        agent: "agy".into(),
+        session_id,
+        leaf_id: record.last_step,
+        revision,
+        partial: record.partial,
+        turns: record
+            .turns
+            .into_iter()
+            .skip(skip)
+            .map(|turn| IndexedTurn {
+                id: turn.id,
+                at: turn.at,
+                start: turn.start,
+                prompt: turn.prompt_head,
+                end: turn.end,
+                answer: turn.answer_head,
+                answer_id: turn.answer_id,
+            })
+            .collect(),
+    })
+}
+
+/// An agy transcript is filed as
+/// `brain/<conversation id>/.system_generated/logs/transcript_full.jsonl`.
+fn agy_session_id(path: &std::path::Path) -> Result<String, PromptTrailReason> {
+    path.ancestors()
+        .nth(3)
+        .and_then(std::path::Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or(PromptTrailReason::Unreadable)
 }
 
 fn required_string(value: &Value, field: &str) -> Result<String, PromptTrailReason> {
@@ -281,21 +325,24 @@ fn open(turn: &mut IndexedTurn) {
 }
 
 fn head(content: &Value, skip_fence: bool) -> Option<String> {
-    let first_line = |text: &str| {
-        text.lines()
-            .map(clean)
-            .find(|line| !(line.is_empty() || skip_fence && bare_fence(line)))
-            .map(|line| cut(&line, HEAD_CHARS))
-    };
     match content {
-        Value::String(text) => first_line(text),
+        Value::String(text) => text_head(text, skip_fence),
         Value::Array(parts) => parts
             .iter()
             .filter(|part| part["type"] == "text")
             .filter_map(|part| part["text"].as_str())
-            .find_map(first_line),
+            .find_map(|text| text_head(text, skip_fence)),
         _ => None,
     }
+}
+
+/// A text's first line worth matching on screen: cleaned, cut, and past
+/// blank lines and, when asked, bare code fences.
+pub(crate) fn text_head(text: &str, skip_fence: bool) -> Option<String> {
+    text.lines()
+        .map(clean)
+        .find(|line| !(line.is_empty() || skip_fence && bare_fence(line)))
+        .map(|line| cut(&line, HEAD_CHARS))
 }
 
 fn bare_fence(line: &str) -> bool {
@@ -381,8 +428,17 @@ impl Flight {
     }
 }
 
+/// Which harness wrote the records one cache reads.
+#[derive(Default, Clone, Copy)]
+enum Format {
+    #[default]
+    Pi,
+    Agy,
+}
+
 #[derive(Default)]
 struct Cache {
+    format: Format,
     state: std::sync::Mutex<CacheState>,
     #[cfg(test)]
     parses: std::sync::atomic::AtomicUsize,
@@ -465,7 +521,11 @@ impl Cache {
         if let Some(before_parse) = &self.before_parse {
             before_parse();
         }
-        let index = parse(std::io::BufReader::new(file), revision)?;
+        let reader = std::io::BufReader::new(file);
+        let index = match self.format {
+            Format::Pi => parse(reader, revision)?,
+            Format::Agy => parse_agy(reader, agy_session_id(path)?, revision)?,
+        };
         // An append or replacement during the read must not be cached
         // under the old fingerprint. The next request will read it whole.
         if Fingerprint::at(path).as_ref() == Ok(&fingerprint) {
@@ -497,9 +557,24 @@ pub(crate) fn revision(path: &std::path::Path, fingerprint: &Fingerprint) -> Str
     )
 }
 
-pub(crate) fn read(path: &std::path::Path) -> Result<TurnIndex, PromptTrailReason> {
-    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
-    CACHE.get_or_init(Cache::default).read(path)
+pub(crate) fn read(
+    path: &std::path::Path,
+    agent: PromptTrailAgent,
+) -> Result<TurnIndex, PromptTrailReason> {
+    static PI: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    static AGY: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    match agent {
+        PromptTrailAgent::Pi => PI.get_or_init(Cache::default).read(path),
+        PromptTrailAgent::Agy => AGY
+            .get_or_init(|| Cache {
+                format: Format::Agy,
+                ..Cache::default()
+            })
+            .read(path),
+        PromptTrailAgent::Claude | PromptTrailAgent::Codex => {
+            Err(PromptTrailReason::UnsupportedAgent)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1060,5 +1135,68 @@ mod tests {
             Some("Repaired")
         );
         assert_eq!(cache.parses.load(Ordering::SeqCst), 3);
+    }
+
+    fn agy_step(index: usize, kind: &str, source: &str, content: &str) -> String {
+        json!({"step_index": index, "source": source, "type": kind, "status": "DONE",
+            "created_at": "2026-03-04T09:15:00Z", "content": content})
+        .to_string()
+            + "\n"
+    }
+
+    #[test]
+    fn turn_index_agy_keeps_the_latest_sixty_four_turns_as_heads() {
+        let fixture = Fixture::new();
+        let logs = fixture
+            .root
+            .join("brain/conversation-7/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let mut source = String::new();
+        for number in 0..70 {
+            source += &agy_step(
+                2 * number,
+                "USER_INPUT",
+                "USER_EXPLICIT",
+                &format!("<USER_REQUEST>\n\nPrompt {number}\nmore\n</USER_REQUEST>"),
+            );
+            source += &agy_step(
+                2 * number + 1,
+                "PLANNER_RESPONSE",
+                "MODEL",
+                &format!("```\nAnswer {number}\n```"),
+            );
+        }
+        let path = logs.join("transcript_full.jsonl");
+        std::fs::write(&path, &source).unwrap();
+        let cache = Cache {
+            format: Format::Agy,
+            ..Cache::default()
+        };
+        let index = cache.read(&path).unwrap();
+        assert_eq!(index.agent, "agy");
+        assert_eq!(index.session_id, "conversation-7");
+        assert_eq!(index.leaf_id.as_deref(), Some("139"));
+        assert_eq!(index.turns.len(), 64);
+        assert_eq!(index.turns[0].id, "12");
+        assert_eq!(index.turns[0].prompt.as_deref(), Some("Prompt 6"));
+        assert_eq!(index.turns[0].answer.as_deref(), Some("Answer 6"));
+        assert_eq!(index.turns[0].answer_id.as_deref(), Some("13"));
+        assert_eq!(index.turns[63].id, "138");
+        assert!(index.turns.iter().all(|t| t.end == TurnEnd::Answered));
+        assert_eq!(cache.read(&path).unwrap(), index);
+        assert_eq!(cache.parses.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A pi record is not an agy transcript, and a pi index never reads
+        // an agy one.
+        let pi = fixture.write("pi.jsonl", &record(&[]));
+        assert_eq!(cache.read(&pi), Err(PromptTrailReason::Unreadable));
+        assert_eq!(
+            Cache::default().read(&path),
+            Err(PromptTrailReason::Unreadable)
+        );
+        assert_eq!(
+            read(&path, PromptTrailAgent::Claude),
+            Err(PromptTrailReason::UnsupportedAgent)
+        );
     }
 }

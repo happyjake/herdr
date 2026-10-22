@@ -130,15 +130,16 @@ Claude 的 `<project>/<sessionId>/subagents/agent-*.jsonl`、Codex 的 `session_
 后台目录按路径、修改时间和大小复用记录，每 30 秒刷新。后台通过类型化读取器流式读取已变化的日志簿，并缓存折叠后的元数据。查询使用缓存快照，约 2 秒的预算包含等待两个并发名额之一和请求应用的活动会话快照。目录尚未完成或扫描超时，会返回已找到的行及 `partial: true`。无法读取的记录会被单独跳过，并将结果标为部分结果；无关的历史行仍可直接返回，无需等待下一次刷新。超时工作在真正结束前仍占用名额。应用不能提供窗格身份或无法读取运行会话信息时返回 `server_unavailable`。旧服务器按未知方法返回 `invalid_request`，无需能力标志或协议版本升级。
 
 
-`pane.turn_index {pane_id}` 为 pi 窗格返回
+`pane.turn_index {pane_id}` 为 pi 或 agy 窗格返回
 `{type:"turn_index", pane_id, terminal_id, index, reason}`。
 `index` 和 `reason` 恰有一个非空。窗格、记录查找及原因与 prompt trail 共用：
 `no_session`、`unsupported_agent`、`no_record`、`unreadable`。
 Claude 和 codex 不受支持。未知窗格返回 `pane_not_found`。
 支持此方法的服务器在 pong 中声明 `capabilities.turn_index: true`。
 
-索引为 `{agent:"pi", session_id, leaf_id, revision, partial, turns}`。
-会话 ID 来自头部，leaf 是最后记录的条目（只有头部时为 null）。
+索引为 `{agent, session_id, leaf_id, revision, partial, turns}`，
+`agent` 是标明 harness 的字符串（`"pi"` 或 `"agy"`）；客户端应忽略不认识的 harness 的索引。
+对 pi，会话 ID 来自头部，leaf 是最后记录的条目（只有头部时为 null）。
 `revision` 是记录变化时随之变化的不透明值。只沿该 leaf 的父链读取，
 按从旧到新返回最近最多 64 个回合。父条目缺失或循环返回 `unreadable`。
 最后一行 JSON 尚未写完时，`partial: true`，最新回合为 `open`。
@@ -155,11 +156,21 @@ Claude 和 codex 不受支持。未知窗格返回 `pane_not_found`。
 
 每个回合为 `{id, at, start, prompt, end, answer, answer_id}`。
 用户消息（包括中途指令和追问）或可见的 `wake` 自定义消息才会开始回合。
-`id` 是起始条目 ID，`at` 为 Unix 秒，`start` 为 `prompt` 或 `wake`。
-wake 的 prompt 为 null。隐藏扩展消息及其他元数据既不开始也不结束回合。
+`id` 是起始条目 ID，`at` 为 Unix 秒，`start` 为 `prompt`、`wake` 或 `task`。
+wake 和 task 回合的 prompt 为 null。隐藏扩展消息及其他元数据既不开始也不结束回合。
 只由最后一条 assistant 消息决定结束状态：`stop` → `answered`，
 `aborted` → `aborted`，`error`/`length` → `error`。
 工具调用、pending，以及后面没有 assistant 的工具结果均为 `open`。
+
+对 agy，记录是该对话的 `transcript_full.jsonl`；上报路径若指向旁边被截断的
+`transcript.jsonl`，则改读同目录的 `transcript_full.jsonl`，从不读取 agy 的 SQLite 存储。
+会话 ID 是对话 ID，leaf 是最后一个完整步骤的 `step_index`，回合与回答的 ID 均为步骤序号。
+来源为 `USER_EXPLICIT` 的 `USER_INPUT` 步骤开始回合（prompt 是 agy 请求块内的文本，
+不含 agy 追加的元数据块）；上一回合已结束时到达的 `SYSTEM_MESSAGE` 开始一个
+prompt 为 null 的 `task` 回合。其他输入、智能体仍在工作时的系统消息以及压缩检查点
+既不开始也不结束回合。带文本且无工具调用的 planner 回复为 `answered`；之后的工具调用或
+工具步骤使回合重新变为 `open`，最后一次回复之后的错误消息使其为 `error`。
+64 回合上限及最后一行未写完的规则与 pi 相同。
 
 prompt 和 answer 是首个非空文本行，合并空白、移除控制字符，并尽可能在单词边界
 截到 160 个码点后加 `…`。answer 跳过代码围栏行。

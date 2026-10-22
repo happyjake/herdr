@@ -158,6 +158,7 @@ pub(crate) fn reader_for(agent: PromptTrailAgent) -> Option<Box<dyn Reader>> {
         PromptTrailAgent::Claude => Some(Box::new(claude::ClaudeReader::default())),
         PromptTrailAgent::Codex => Some(Box::new(codex::CodexReader::default())),
         PromptTrailAgent::Pi => Some(Box::new(pi::PiReader::default())),
+        PromptTrailAgent::Agy => None,
     }
 }
 
@@ -167,6 +168,7 @@ pub(crate) fn agent_name(agent: PromptTrailAgent) -> &'static str {
         PromptTrailAgent::Claude => "claude",
         PromptTrailAgent::Codex => "codex",
         PromptTrailAgent::Pi => "pi",
+        PromptTrailAgent::Agy => "agy",
     }
 }
 
