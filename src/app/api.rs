@@ -738,7 +738,13 @@ impl App {
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         let updates = self.state.clear_agent_identity_after_respawn(&terminal_id);
-        self.emit_agent_status_resolutions(updates);
+        if updates.is_empty() {
+            // Replacing a command with its shell can clear agent identity
+            // without changing Unknown status. Publish that identity change.
+            self.emit_pane_updated(ws_idx, pane_id);
+        } else {
+            self.emit_agent_status_resolutions(updates);
+        }
         if focus_pane {
             self.state.focus_pane_in_workspace(ws_idx, pane_id);
         }
@@ -798,9 +804,18 @@ impl App {
         };
         let workspace_id = self.public_workspace_id(update.ws_idx);
 
+        // Exit detection can first release an idle agent, then classify its
+        // shell as Unknown. Publish the date of that final status as well.
+        let ended_status_changed = update.previous_reported_status != update.reported_status
+            && self
+                .state
+                .terminal_id_for_pane(update.ws_idx, update.pane_id)
+                .and_then(|id| self.state.terminals.get(&id))
+                .is_some_and(|terminal| terminal.ended_agent.is_some());
         if update.agent_name_changed
             || update.previous_agent_label != update.agent_label
             || update.agent_released
+            || ended_status_changed
         {
             self.emit_pane_updated(update.ws_idx, update.pane_id);
         }

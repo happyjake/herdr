@@ -294,6 +294,174 @@ async fn next_pane_event(
     .unwrap_or_else(|_| panic!("missing {event} for {id}"))
 }
 
+async fn subscribe_to_updates(session: &Session) -> BufReader<UnixStream> {
+    let mut stream = UnixStream::connect(&session.socket).unwrap();
+    writeln!(stream, "{}", json!({"id":"updates","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.updated"}]}})).unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let mut events = BufReader::new(stream);
+    let ack = tokio::time::timeout(Duration::from_secs(10), read_event(&mut events))
+        .await
+        .unwrap();
+    assert_eq!(ack["result"]["type"], "subscription_started");
+    events
+}
+
+async fn last_update_before_barrier(
+    session: &Session,
+    events: &mut BufReader<UnixStream>,
+) -> Value {
+    // A different pane's update bounds the stream without changing the pane
+    // under test or relying on a quiet interval to infer that delivery finished.
+    let created = run_cli_json(&session.socket, &["tab", "create"]);
+    let barrier = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let titled = run_cli(
+        &session.socket,
+        &[
+            "pane",
+            "run",
+            barrier,
+            "printf '\\033]0;event-barrier\\007'",
+        ],
+    );
+    assert!(titled.status.success(), "{titled:?}");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut last = Value::Null;
+        loop {
+            let event = read_event(events).await;
+            assert_eq!(event["event"], "pane_updated");
+            let pane = &event["data"]["pane"];
+            if pane["pane_id"] == barrier && pane["terminal_title"] == "event-barrier" {
+                return last;
+            }
+            if pane["pane_id"] == session.pane_id {
+                last = pane.clone();
+            }
+        }
+    })
+    .await
+    .expect("missing barrier pane update")
+}
+
+#[tokio::test]
+async fn ended_agent_exit_update_carries_the_final_shell_timestamp() {
+    let session = Session::new();
+    let agent = session.agent("pi", "idle-agent");
+    let active = session.wait_for(|pane| pane["agent_status"] == "idle");
+    assert!(active["label"].is_null());
+    let mut events = subscribe_to_updates(&session).await;
+    agent.stop();
+    let ended =
+        session.wait_for(|pane| pane["agent"].is_null() && pane["agent_status"] == "unknown");
+    assert_eq!(ended["ended_agent"], "pi");
+    assert!(
+        ended["agent_status_changed_at"].as_u64().unwrap()
+            > active["agent_status_changed_at"].as_u64().unwrap()
+    );
+    let last = last_update_before_barrier(&session, &mut events).await;
+    assert_eq!(last["ended_agent"], "pi");
+    assert_eq!(
+        last["agent_status_changed_at"],
+        session.pane()["agent_status_changed_at"]
+    );
+    assert_eq!(last["agent_status"], "unknown");
+}
+
+#[tokio::test]
+async fn ended_agent_command_respawn_publishes_identity_without_a_status_change() {
+    let mut session = Session::new();
+    let reporter = InPaneReporter::write(&session.base, "custom-command", &session.socket);
+    let mut stream = UnixStream::connect(&session.socket).unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({
+            "id":"command-pane", "method":"layout.apply",
+            "params":{"root":{"type":"pane", "command":["/bin/sh", reporter.command()]}}
+        })
+    )
+    .unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(10),
+        read_event(&mut BufReader::new(stream)),
+    )
+    .await
+    .unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    session.pane_id = response["result"]["layout"]["root"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    reporter.wait_until_started(Duration::from_secs(10));
+
+    let handoff = run_cli(&session.socket, &["server", "live-handoff"]);
+    assert!(handoff.status.success(), "{handoff:?}");
+    drop(session.server.take());
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || {
+            run_cli(&session.socket, &["pane", "get", &session.pane_id])
+                .status
+                .success()
+        }
+    ));
+    reporter.ok(&[
+        "pane",
+        "report-agent",
+        &session.pane_id,
+        "--source",
+        "custom:command",
+        "--agent",
+        "custom-kind",
+        "--state",
+        "unknown",
+    ]);
+    let active = session.wait_for(|pane| pane["agent"] == "custom-kind");
+    assert_eq!(active["agent_status"], "unknown");
+    assert_eq!(active.get("ended_agent"), Some(&Value::Null));
+    let mut events = subscribe_to_updates(&session).await;
+    reporter.stop();
+    let ended =
+        session.wait_for(|pane| pane["agent"].is_null() && pane["ended_agent"] == "custom-kind");
+    assert_eq!(ended["agent_status"], "unknown");
+    assert_eq!(
+        ended["agent_status_changed_at"],
+        active["agent_status_changed_at"]
+    );
+
+    let output = run_cli(
+        &session.socket,
+        &[
+            "pane",
+            "run",
+            &session.pane_id,
+            "printf '%s%s\\n' RESPAWNED_ SHELL",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || { pane_read_recent_contains(&session.socket, &session.pane_id, "RESPAWNED_SHELL") }
+    ));
+    let last = last_update_before_barrier(&session, &mut events).await;
+    assert_eq!(last["ended_agent"], "custom-kind");
+    assert!(last["agent"].is_null());
+    assert_eq!(last["agent_status"], "unknown");
+    assert_eq!(
+        last["agent_status_changed_at"],
+        session.pane()["agent_status_changed_at"]
+    );
+
+    let next = session.agent("pi", "next");
+    let cleared = last_update_before_barrier(&session, &mut events).await;
+    assert_eq!(cleared.get("ended_agent"), Some(&Value::Null));
+    assert_eq!(cleared["agent"], "pi");
+    next.stop();
+    session.stop();
+}
+
 #[tokio::test]
 async fn ended_agent_is_explicit_in_created_list_snapshot_and_updated_payloads() {
     let session = Session::new();
