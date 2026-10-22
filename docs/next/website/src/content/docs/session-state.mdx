@@ -124,6 +124,8 @@ A successful handoff preserves long-lived server-owned session state: pane PTYs 
 
 Updated Unix servers can send more than 64 panes in one handoff by transferring them in batches. The sending server must already contain this support: an older running server still enforces its 64-pane limit on the first upgrade. That limit may require a normal server restart, which ends pane processes. Batching does not change update installation order or remove other handoff compatibility requirements.
 
+When both servers support scrollback frames, a handoff carries each pane's full scrollback — up to the terminal's own byte cap — instead of the newest slice that fits a budget shared across panes. A handoff toward an older server keeps the old shared budget, so rolling back to a previous server loses no more history than that server would have kept. The terminal's scrollback byte cap itself is unchanged.
+
 Live handoff is experimental and opt-in:
 
 ```bash

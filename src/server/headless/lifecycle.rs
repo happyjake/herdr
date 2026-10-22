@@ -144,13 +144,13 @@ impl HeadlessServer {
             return Err(err);
         }
 
-        let mut stream = match crate::server::handoff::accept_and_validate_on(
+        let (mut stream, replay_transport) = match crate::server::handoff::accept_and_validate_on(
             listener,
             &socket_path,
             &token,
             &manifest,
         ) {
-            Ok(stream) => stream,
+            Ok(accepted) => accepted,
             Err(err) => {
                 for fd in fds {
                     let _ = unsafe { libc::close(fd) };
@@ -161,7 +161,68 @@ impl HeadlessServer {
             }
         };
 
-        let send_result = crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds);
+        let send_result = match replay_transport {
+            crate::server::handoff::ReplayTransport::InlineLegacy => {
+                let inline_replay_bytes: usize = handoff_entries
+                    .iter()
+                    .map(|(_, runtime)| runtime.initial_history_ansi.as_deref().map_or(0, str::len))
+                    .sum();
+                let send_result =
+                    crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds);
+                if send_result.is_ok() {
+                    info!(
+                        panes = handoff_entries.len(),
+                        replay_bytes = inline_replay_bytes,
+                        transport = "inline-legacy",
+                        "live handoff replay exported"
+                    );
+                }
+                send_result
+            }
+            crate::server::handoff::ReplayTransport::ReplayFrames => {
+                // The manifest already carried a legacy-budget replay inline;
+                // the importer that acknowledged frames replaces it with each
+                // pane's full scrollback. Pane readers stay paused for the
+                // whole handoff, so rendering frame by frame here cannot
+                // capture content past the snapshot. One pane's frame is
+                // materialized at a time instead of every pane's at once, and
+                // frames go before the descriptors so no plain bytes follow a
+                // descriptor batch on the stream (see receive).
+                let frame_budget = crate::server::handoff::replay_frame_budget(
+                    self.app.state.pane_scrollback_limit_bytes,
+                );
+                let send_frames = (|| {
+                    let mut replay_bytes = 0usize;
+                    for (index, (terminal_id, _)) in handoff_entries.iter().enumerate() {
+                        let history = self
+                            .app
+                            .terminal_runtimes
+                            .get(terminal_id)
+                            .and_then(|runtime| runtime.handoff_history_ansi(frame_budget));
+                        replay_bytes += history.as_deref().map_or(0, str::len);
+                        crate::server::handoff::send_replay_frame(
+                            &mut stream,
+                            index as u32,
+                            history.as_deref(),
+                        )?;
+                    }
+                    crate::server::handoff::send_fds(&stream, &fds)?;
+                    crate::server::handoff::wait_restored(
+                        &mut stream,
+                        crate::server::handoff::replay_restored_timeout(replay_bytes),
+                    )?;
+                    Ok::<usize, io::Error>(replay_bytes)
+                })();
+                send_frames.map(|replay_bytes| {
+                    info!(
+                        panes = handoff_entries.len(),
+                        replay_bytes,
+                        transport = "frames",
+                        "live handoff replay exported"
+                    );
+                })
+            }
+        };
         for fd in fds {
             let _ = unsafe { libc::close(fd) };
         }

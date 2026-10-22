@@ -45,6 +45,71 @@ pub(crate) const MAX_MANIFEST_LINE_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(unix)]
 pub(crate) const COMMIT_TIMEOUT: Duration = READY_TIMEOUT;
 
+/// Manifest extension advertising that the exporter can carry each pane's
+/// replay as a per-pane frame after the descriptor transfer instead of
+/// inline under the legacy budgets. The manifest keeps its legacy shape —
+/// version, inline replay, and all — so an importer that predates frames
+/// ignores the unknown field, answers with a plain `validated`, and gets a
+/// legacy export; an importer that understands frames answers
+/// `validated replay-frames` and the frames follow. The handshake cannot
+/// negotiate in the other direction: the importer speaks first with a token
+/// line a legacy exporter exact-matches, so any importer-initiated
+/// capability byte would desync a legacy exporter's `validated` read.
+#[cfg(unix)]
+pub(crate) const EXTENSION_REPLAY_FRAMES: &str = "replay-frames";
+/// The validation reply that acknowledges the replay-frames extension. Any
+/// change to the frame format needs a new extension name: this ack is the
+/// whole negotiation.
+#[cfg(unix)]
+const VALIDATED_REPLAY_FRAMES: &str = "validated replay-frames";
+/// Importer-side sanity cap for one pane's replay frame. A frame larger than
+/// this is a corrupt stream, not history: the frame budget an exporter
+/// computes is clamped to this value, so a legitimate frame never exceeds it.
+#[cfg(unix)]
+pub(crate) const MAX_REPLAY_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Replay frame wire format: magic, pane index (its position in
+/// `manifest.panes`), payload length, payload. The index lets the importer
+/// catch a desync that a small garbage length would otherwise hide.
+#[cfg(unix)]
+const REPLAY_FRAME_MAGIC: [u8; 8] = *b"HRD-RPL1";
+#[cfg(unix)]
+const REPLAY_FRAME_HEADER_BYTES: usize = 8 + 4 + 8;
+
+/// How one handoff carries pane replay, settled when the importer answers
+/// the manifest: it either validated the legacy inline replay or
+/// acknowledged the frame extension.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayTransport {
+    /// Replay rides inline in the manifest under the legacy budgets.
+    InlineLegacy,
+    /// Replay follows the descriptor transfer as one frame per pane.
+    ReplayFrames,
+}
+
+/// The per-pane replay budget for a frame export. Rendered ANSI runs larger
+/// than the raw scrollback text the terminal's byte cap counts (style
+/// sequences per run), so the budget gives that rendering headroom, never
+/// drops below the legacy per-pane floor, and never exceeds what the
+/// importer accepts.
+#[cfg(unix)]
+pub(crate) fn replay_frame_budget(scrollback_limit_bytes: usize) -> usize {
+    scrollback_limit_bytes
+        .saturating_mul(4)
+        .clamp(MAX_REPLAY_BYTES_PER_PANE, MAX_REPLAY_FRAME_BYTES)
+}
+
+/// The importer replays every frame through its terminal parsers before it
+/// reports restored, so the exporter's wait scales with what it sent on top
+/// of a floor that covers the legacy-sized restores. A generous scale costs
+/// nothing: a dead importer surfaces as end-of-file, not as a timeout, and a
+/// spurious timeout is safe because the importer never touches the pane
+/// descriptors before a commit it will not receive.
+#[cfg(unix)]
+pub(crate) fn replay_restored_timeout(replay_bytes: usize) -> Duration {
+    READY_TIMEOUT + Duration::from_secs((replay_bytes / (8 * 1024 * 1024)) as u64)
+}
+
 #[cfg(unix)]
 #[derive(Serialize, Deserialize)]
 pub(crate) struct HandoffManifest {
@@ -64,6 +129,13 @@ pub(crate) struct HandoffManifest {
     /// committed. Absent from manifests written before this field existed.
     #[serde(default)]
     pub host_shutdown_intent: Option<crate::platform::HostShutdownIntent>,
+    /// Capabilities of the exporter the importer may opt into in its
+    /// validation reply. Unknown to importers that predate it, and serde
+    /// ignores it there, so a legacy importer still sees a legacy manifest.
+    /// That tolerance is the rollback contract: this struct must never gain
+    /// `deny_unknown_fields`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
 }
 
 #[cfg(unix)]
@@ -166,7 +238,7 @@ pub(crate) fn accept_and_validate_on(
     socket_path: &Path,
     token: &str,
     manifest: &HandoffManifest,
-) -> io::Result<UnixStream> {
+) -> io::Result<(UnixStream, ReplayTransport)> {
     let (mut stream, _) = accept_with_timeout(&listener, READY_TIMEOUT)?;
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
@@ -185,23 +257,114 @@ pub(crate) fn accept_and_validate_on(
 
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
     let validated = read_line_unbuffered(&mut stream)?;
-    if validated.trim_end() != "validated" {
-        return Err(io::Error::other("handoff import did not validate manifest"));
-    }
+    let transport = match validated.trim_end() {
+        "validated" => ReplayTransport::InlineLegacy,
+        VALIDATED_REPLAY_FRAMES => {
+            if !manifest
+                .extensions
+                .iter()
+                .any(|extension| extension == EXTENSION_REPLAY_FRAMES)
+            {
+                return Err(io::Error::other(
+                    "handoff import acknowledged replay frames the manifest never advertised",
+                ));
+            }
+            ReplayTransport::ReplayFrames
+        }
+        _ => return Err(io::Error::other("handoff import did not validate manifest")),
+    };
     let _ = std::fs::remove_file(socket_path);
-    Ok(stream)
+    Ok((stream, transport))
 }
 
 #[cfg(unix)]
 pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd]) -> io::Result<()> {
     send_fds(stream, fds)?;
 
-    stream.set_read_timeout(Some(READY_TIMEOUT))?;
+    wait_restored(stream, READY_TIMEOUT)
+}
+
+#[cfg(unix)]
+pub(crate) fn wait_restored(stream: &mut UnixStream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
     let restored = read_line_unbuffered(&mut *stream)?;
     if restored.trim_end() != "restored" {
         return Err(io::Error::other(
             "handoff import did not report restored runtimes",
         ));
+    }
+    Ok(())
+}
+
+/// One pane's replay as a frame after the descriptor transfer. An empty or
+/// absent history travels as a zero-length payload.
+#[cfg(unix)]
+pub(crate) fn send_replay_frame(
+    stream: &mut UnixStream,
+    pane_index: u32,
+    payload: Option<&str>,
+) -> io::Result<()> {
+    let payload = payload.unwrap_or_default();
+    let mut header = [0u8; REPLAY_FRAME_HEADER_BYTES];
+    header[..8].copy_from_slice(&REPLAY_FRAME_MAGIC);
+    header[8..12].copy_from_slice(&pane_index.to_le_bytes());
+    header[12..20].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+    stream.write_all(&header)?;
+    stream.write_all(payload.as_bytes())?;
+    Ok(())
+}
+
+/// Read one frame per pane, in manifest order, and replace each pane's
+/// inline replay with the frame's fuller history.
+#[cfg(unix)]
+fn recv_replay_frames(
+    stream: &UnixStream,
+    panes: &mut [crate::handoff_runtime::HandoffRuntimeState],
+) -> io::Result<()> {
+    let mut stream = stream;
+    for (index, pane) in panes.iter_mut().enumerate() {
+        let mut header = [0u8; REPLAY_FRAME_HEADER_BYTES];
+        stream.read_exact(&mut header)?;
+        if header[..8] != REPLAY_FRAME_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("handoff replay frame {index} had a bad magic"),
+            ));
+        }
+        let pane_index = u32::from_le_bytes(
+            header[8..12]
+                .try_into()
+                .expect("header slice has four bytes"),
+        );
+        if pane_index as usize != index {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("handoff replay frame {index} arrived out of order as {pane_index}"),
+            ));
+        }
+        let length = u64::from_le_bytes(
+            header[12..20]
+                .try_into()
+                .expect("header slice has eight bytes"),
+        );
+        if length > MAX_REPLAY_FRAME_BYTES as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("handoff replay frame {index} announced {length} bytes"),
+            ));
+        }
+        let mut payload = vec![0u8; length as usize];
+        stream.read_exact(&mut payload)?;
+        // A bigger budget never legitimately renders less than the inline
+        // legacy replay the manifest already carried, so an empty frame means
+        // the exporter lost the pane mid-handoff: keep the inline replay
+        // rather than clear it.
+        if payload.is_empty() {
+            continue;
+        }
+        let history = String::from_utf8(payload)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        pane.initial_history_ansi = Some(history);
     }
     Ok(())
 }
@@ -250,7 +413,7 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     stream.flush()?;
 
     let manifest_line = read_line_unbuffered(&mut stream)?;
-    let manifest: HandoffManifest =
+    let mut manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
     if manifest.version != HANDOFF_VERSION {
         return Err(io::Error::other(format!(
@@ -279,8 +442,28 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
             crate::build_info::version()
         )));
     }
-    stream.write_all(b"validated\n")?;
+    // A manifest that advertises replay frames gets them: the ack names the
+    // extension so the exporter knows which transport to use. An exporter
+    // that predates frames never advertises and gets the plain legacy ack.
+    let replay_frames = manifest
+        .extensions
+        .iter()
+        .any(|extension| extension == EXTENSION_REPLAY_FRAMES);
+    if replay_frames {
+        stream
+            .write_all(VALIDATED_REPLAY_FRAMES.as_bytes())
+            .and_then(|()| stream.write_all(b"\n"))?;
+    } else {
+        stream.write_all(b"validated\n")?;
+    }
     stream.flush()?;
+    // Frames travel before the descriptors: a descriptor batch is delivered
+    // by recvmsg, which on macOS can glue bytes that follow it onto the
+    // record the fd reader consumes — so nothing may follow the batches.
+    // Frames are read with exact lengths and can be over-read into nothing.
+    if replay_frames {
+        recv_replay_frames(&stream, &mut manifest.panes)?;
+    }
     let fds = recv_fds(&stream, manifest.panes.len())?;
     Ok(ReceivedHandoff {
         manifest,
@@ -336,6 +519,7 @@ pub(crate) fn manifest_for(
         panes,
         api_window_title,
         host_shutdown_intent,
+        extensions: vec![EXTENSION_REPLAY_FRAMES.to_string()],
     }
 }
 
@@ -436,7 +620,7 @@ fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
 }
 
 #[cfg(unix)]
-fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
+pub(crate) fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
     for batch in fds.chunks(FDS_PER_MESSAGE) {
         send_fd_batch(stream, batch)?;
     }
@@ -872,5 +1056,330 @@ mod tests {
     #[test]
     fn replay_budget_fits_manifest_frame_limit() {
         const { assert!(MAX_REPLAY_BYTES_TOTAL * 2 + 2 * 1024 * 1024 <= MAX_MANIFEST_LINE_BYTES) }
+    }
+
+    #[test]
+    fn a_handoff_manifest_advertises_replay_frames() {
+        let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        assert!(manifest
+            .extensions
+            .iter()
+            .any(|extension| extension == EXTENSION_REPLAY_FRAMES));
+    }
+
+    #[test]
+    fn a_manifest_written_before_extensions_still_loads() {
+        let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
+        value
+            .as_object_mut()
+            .expect("manifest should be a json object")
+            .remove("extensions");
+
+        let older: HandoffManifest =
+            serde_json::from_value(value).expect("a pre-extensions manifest should still load");
+
+        assert!(older.extensions.is_empty());
+    }
+
+    /// Rollback safety pinned: the manifest as an importer that predates
+    /// replay frames decodes it. The extension advertisement must stay
+    /// invisible to it, inline replay and all.
+    #[test]
+    fn a_legacy_importer_ignores_the_replay_frames_advertisement() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)] // Only decoding is under test.
+        struct LegacyManifest {
+            version: u32,
+            source_version: String,
+            source_protocol: u32,
+            expected_version: Option<String>,
+            expected_protocol: Option<u32>,
+            snapshot: crate::persist::SessionSnapshot,
+            panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+            #[serde(default)]
+            api_window_title: Option<String>,
+            #[serde(default)]
+            host_shutdown_intent: Option<crate::platform::HostShutdownIntent>,
+        }
+
+        let manifest = manifest_for(
+            empty_snapshot(),
+            vec![manifest_pane(1, false, Some("legacy inline replay"))],
+            None,
+            None,
+            None,
+            None,
+        );
+        let encoded = serde_json::to_vec(&manifest).expect("manifest should serialize");
+
+        let legacy: LegacyManifest =
+            serde_json::from_slice(&encoded).expect("a legacy importer should still load it");
+
+        assert_eq!(legacy.version, HANDOFF_VERSION);
+        assert_eq!(
+            legacy.panes[0].initial_history_ansi.as_deref(),
+            Some("legacy inline replay"),
+        );
+    }
+
+    /// Short unique socket paths: macOS caps a unix socket path at 104
+    /// bytes and the default temp directory is already long.
+    fn test_socket_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "hho-{}-{}-{tag}.sock",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// Play the importer side of the accept handshake: connect, token, read
+    /// the manifest, answer with `reply`.
+    fn scripted_importer(socket_path: PathBuf, token: String, reply: &'static str) -> String {
+        let mut stream = UnixStream::connect(socket_path).expect("importer should connect");
+        stream.write_all(token.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        let _manifest_line = read_line_unbuffered(&mut stream).expect("manifest line");
+        stream.write_all(reply.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+        // The exporter answers a bad reply by hanging up; a good reply keeps
+        // the stream open for what follows.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => "closed".to_string(),
+            Ok(_) => "data".to_string(),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => "open".to_string(),
+            Err(err) => panic!("unexpected importer read error: {err}"),
+        }
+    }
+
+    fn accept_with_scripted_reply(
+        manifest: &HandoffManifest,
+        reply: &'static str,
+    ) -> (io::Result<ReplayTransport>, String) {
+        let socket_path = test_socket_path("accept");
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = bind_listener(&socket_path).expect("listener should bind");
+        let token = "test-token".to_string();
+        let importer = {
+            let socket_path = socket_path.clone();
+            let token = token.clone();
+            std::thread::spawn(move || scripted_importer(socket_path, token, reply))
+        };
+        let accepted = accept_and_validate_on(listener, &socket_path, &token, manifest);
+        let outcome = importer.join().expect("importer thread should finish");
+        let _ = std::fs::remove_file(&socket_path);
+        (accepted.map(|(_, transport)| transport), outcome)
+    }
+
+    fn advertise_manifest() -> HandoffManifest {
+        manifest_for(empty_snapshot(), Vec::new(), None, None, None, None)
+    }
+
+    #[test]
+    fn a_plain_validated_answer_keeps_the_legacy_inline_transport() {
+        let (accepted, outcome) = accept_with_scripted_reply(&advertise_manifest(), "validated");
+        assert_eq!(
+            accepted.expect("a plain validated answer should be accepted"),
+            ReplayTransport::InlineLegacy
+        );
+        assert_eq!(outcome, "open");
+    }
+
+    #[test]
+    fn a_replay_frames_answer_switches_to_the_frame_transport() {
+        let (accepted, outcome) =
+            accept_with_scripted_reply(&advertise_manifest(), "validated replay-frames");
+        assert_eq!(
+            accepted.expect("a replay-frames answer should be accepted"),
+            ReplayTransport::ReplayFrames
+        );
+        assert_eq!(outcome, "open");
+    }
+
+    #[test]
+    fn a_replay_frames_answer_without_the_advertisement_fails_the_handoff() {
+        // An importer that acknowledges frames the manifest never offered is
+        // not a negotiating peer; it is a broken one.
+        let mut manifest = advertise_manifest();
+        manifest.extensions.clear();
+        let (accepted, _) = accept_with_scripted_reply(&manifest, "validated replay-frames");
+        assert!(accepted.is_err());
+    }
+
+    #[test]
+    fn an_unexpected_validation_answer_fails_the_handoff() {
+        let (accepted, outcome) =
+            accept_with_scripted_reply(&advertise_manifest(), "validated anything-else");
+        assert!(accepted.is_err());
+        assert_eq!(outcome, "closed");
+    }
+
+    #[test]
+    fn replay_frames_round_trip_overlays_each_panes_history() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair");
+        // A read timeout turns a regression that waits for one frame too many
+        // into a failure instead of a hung test binary.
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut panes = vec![
+            manifest_pane(1, false, Some("legacy cut")),
+            manifest_pane(2, false, None),
+            manifest_pane(3, false, Some("legacy cut")),
+        ];
+        let frames: [Option<&str>; 3] =
+            [Some("full history one"), None, Some("full history three")];
+        for (index, frame) in frames.iter().enumerate() {
+            send_replay_frame(&mut sender, index as u32, *frame).expect("frame should send");
+        }
+        drop(sender);
+
+        recv_replay_frames(&receiver, &mut panes).expect("frames should receive");
+
+        assert_eq!(
+            panes[0].initial_history_ansi.as_deref(),
+            Some("full history one")
+        );
+        assert_eq!(panes[1].initial_history_ansi, None);
+        assert_eq!(
+            panes[2].initial_history_ansi.as_deref(),
+            Some("full history three")
+        );
+    }
+
+    #[test]
+    fn an_empty_frame_keeps_the_inline_legacy_replay() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut panes = vec![manifest_pane(1, false, Some("legacy cut"))];
+        send_replay_frame(&mut sender, 0, None).expect("frame should send");
+        drop(sender);
+
+        recv_replay_frames(&receiver, &mut panes).expect("frames should receive");
+
+        // A bigger budget never legitimately renders less than the inline
+        // legacy replay, so an empty frame must not clear it.
+        assert_eq!(panes[0].initial_history_ansi.as_deref(), Some("legacy cut"));
+    }
+
+    #[test]
+    fn replay_frames_reject_a_bad_magic() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut panes = vec![manifest_pane(1, false, None)];
+        let mut header = [0u8; REPLAY_FRAME_HEADER_BYTES];
+        header[..8].copy_from_slice(b"HRD-RPL9");
+        sender.write_all(&header).unwrap();
+        drop(sender);
+
+        let err = recv_replay_frames(&receiver, &mut panes).expect_err("bad magic must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_frames_reject_an_out_of_order_pane() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut panes = vec![manifest_pane(1, false, None), manifest_pane(2, false, None)];
+        send_replay_frame(&mut sender, 1, Some("pane two first")).unwrap();
+        drop(sender);
+
+        let err = recv_replay_frames(&receiver, &mut panes).expect_err("out of order must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_frames_reject_an_oversize_payload_before_reading_it() {
+        let (mut sender, receiver) = UnixStream::pair().expect("socket pair");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut panes = vec![manifest_pane(1, false, None)];
+        let mut header = [0u8; REPLAY_FRAME_HEADER_BYTES];
+        header[..8].copy_from_slice(&REPLAY_FRAME_MAGIC);
+        header[12..20].copy_from_slice(&((MAX_REPLAY_FRAME_BYTES as u64) + 1).to_le_bytes());
+        sender.write_all(&header).unwrap();
+        drop(sender);
+        // No payload follows: a reader that accepted the length would block
+        // until the sender closed.
+
+        let err = recv_replay_frames(&receiver, &mut panes).expect_err("oversize must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn replay_frame_budget_clamps_to_the_wire_cap() {
+        assert_eq!(
+            replay_frame_budget(crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES),
+            crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES * 4
+        );
+        assert_eq!(replay_frame_budget(1), MAX_REPLAY_BYTES_PER_PANE);
+        assert_eq!(replay_frame_budget(usize::MAX), MAX_REPLAY_FRAME_BYTES);
+    }
+
+    #[test]
+    fn replay_restored_timeout_grows_with_the_replay_size() {
+        assert_eq!(replay_restored_timeout(0), READY_TIMEOUT);
+        assert!(replay_restored_timeout(256 * 1024 * 1024) > READY_TIMEOUT);
+    }
+
+    /// The importer side, played by receive() against a scripted exporter:
+    /// a manifest without the extension gets the plain legacy ack and no
+    /// frames follow; a manifest with it gets the frames ack. Zero panes
+    /// keep both flows inside the socket exchange.
+    fn receive_against_exporter(tag: &str, extensions: &[&str]) -> (String, HandoffManifest) {
+        let socket_path = test_socket_path(tag);
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("listener should bind");
+        let manifest = {
+            let mut manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
+            manifest.extensions = extensions
+                .iter()
+                .map(|extension| extension.to_string())
+                .collect();
+            serde_json::to_string(&manifest).expect("manifest should serialize")
+        };
+        let exporter = {
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("exporter should accept");
+                let token_line = read_line_unbuffered(&mut stream).expect("token line");
+                assert_eq!(token_line.trim_end(), "test-token");
+                stream.write_all(manifest.as_bytes()).unwrap();
+                stream.write_all(b"\n").unwrap();
+                stream.flush().unwrap();
+                let ack = read_line_unbuffered(&mut stream).expect("ack line");
+                ack.trim_end().to_string()
+            })
+        };
+
+        let received = receive(&socket_path, "test-token").expect("receive should succeed");
+        let ack = exporter.join().expect("exporter thread should finish");
+        let _ = std::fs::remove_file(&socket_path);
+        (ack, received.manifest)
+    }
+
+    #[test]
+    fn an_importer_answers_a_manifest_without_extensions_with_the_legacy_ack() {
+        let (ack, _) = receive_against_exporter("plain", &[]);
+        assert_eq!(ack, "validated");
+    }
+
+    #[test]
+    fn an_importer_answers_a_manifest_with_replay_frames_with_the_frames_ack() {
+        let (ack, _) = receive_against_exporter("frames", &[EXTENSION_REPLAY_FRAMES]);
+        assert_eq!(ack, VALIDATED_REPLAY_FRAMES);
     }
 }

@@ -467,6 +467,48 @@ fn wait_for_read_source_contains(
     );
 }
 
+/// Page a pane's unwrapped history at an explicit offset from the bottom;
+/// an offset past the top clamps to the oldest window.
+fn wait_for_read_offset_contains(
+    socket_path: &Path,
+    pane_id: &str,
+    offset_from_bottom: u64,
+    needle: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_text = String::new();
+    let mut last_response = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        let response = request(
+            socket_path,
+            serde_json::json!({
+                "id": "test:pane:read",
+                "method": "pane.read",
+                "params": {
+                    "pane_id": pane_id,
+                    "source": "recent_unwrapped",
+                    "lines": 1000,
+                    "offset_from_bottom": offset_from_bottom,
+                    "format": "text",
+                    "strip_ansi": true
+                }
+            }),
+        );
+        last_response = response.clone();
+        let text = response["result"]["read"]["text"]
+            .as_str()
+            .unwrap_or_default();
+        last_text = text.to_string();
+        if text.contains(needle) {
+            return last_text;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "pane offset read did not contain {needle:?}; last text was {last_text:?}; last response was {last_response}"
+    );
+}
+
 fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
     let mut last_text = String::new();
@@ -3571,6 +3613,439 @@ fn live_handoff_moves_websocket_listener_to_replacement_server() {
         &api_socket,
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
     );
+    drop(spawned);
+    cleanup_test_base(&base);
+}
+
+/// The legacy replay contract a pre-frames importer enforces: replay rides
+/// inline in the one-line manifest under a shared total and a per-pane cap,
+/// and the manifest line itself is frame-capped. These numbers are the
+/// frozen legacy contract — they must not follow the modern limits upward.
+const LEGACY_MAX_REPLAY_BYTES_PER_PANE: usize = 256 * 1024;
+const LEGACY_MAX_REPLAY_BYTES_TOTAL: usize = 6 * 1024 * 1024;
+const LEGACY_MAX_MANIFEST_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+fn pane_fill_script(base: &Path) -> PathBuf {
+    let script = base.join("fill-scrollback.py");
+    fs::write(
+        &script,
+        r##"import pathlib
+import sys
+import time
+
+tag = sys.argv[1]
+done = sys.argv[2]
+rows = int(sys.argv[3])
+for n in range(1, rows + 1):
+    line = f"FH-{tag}-ROW-{n:05}-"
+    line += "#" * max(0, 76 - len(line))
+    print(line)
+sys.stdout.flush()
+pathlib.Path(done).write_text("done")
+while True:
+    time.sleep(60)
+"##,
+    )
+    .unwrap();
+    script
+}
+
+fn pane_fill_row(tag: &str, row: usize) -> String {
+    format!("FH-{tag}-ROW-{row:05}")
+}
+
+/// A handoff of many panes must carry every pane's full scrollback to the
+/// replacement server, far beyond the legacy shared budget (~100 KiB per
+/// pane at this pane count), and report what it moved.
+#[test]
+fn live_handoff_carries_full_scrollback_across_many_panes() {
+    const PANES: usize = 60;
+    const ROWS: usize = 2_500;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    fs::create_dir_all(&base).unwrap();
+    let fill = pane_fill_script(&base);
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let server_pid = spawned
+        .child
+        .process_id()
+        .expect("test server should expose pid");
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for index in 1..PANES {
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": format!("test:tab:create-{index}"),
+                "method": "tab.create",
+                "params": {"workspace_id": workspace_id, "focus": false}
+            }),
+        ));
+    }
+    wait_for_server_ptmx_fd_count(server_pid, PANES, Duration::from_secs(60));
+
+    let panes = request(
+        &api_socket,
+        serde_json::json!({"id":"test:pane:list","method":"pane.list","params":{}}),
+    );
+    let pane_ids: Vec<String> = panes["result"]["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pane| pane["pane_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(pane_ids.len(), PANES);
+
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        let tag = format!("{index:02}");
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": format!("test:pane:fill-{index}"),
+                "method": "pane.send_input",
+                "params": {
+                    "pane_id": pane_id,
+                    "text": format!(
+                        "python3 {} {} {} {}",
+                        fill.display(),
+                        tag,
+                        base.join(format!("fill-done-{tag}")).display(),
+                        ROWS
+                    ),
+                    "keys": ["Enter"]
+                }
+            }),
+        ));
+    }
+    for index in 0..PANES {
+        support::wait_for_file(
+            &base.join(format!("fill-done-{index:02}")),
+            Duration::from_secs(60),
+        );
+    }
+    // The done file only proves the child flushed; wait until the terminal
+    // actually shows the last row before snapshotting for handoff.
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        wait_for_output(
+            &api_socket,
+            pane_id,
+            &pane_fill_row(&format!("{index:02}"), ROWS),
+        );
+    }
+
+    let started = Instant::now();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    let handoff_elapsed = started.elapsed();
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(30));
+
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        let tag = format!("{index:02}");
+        // pane.read caps a window at 1,000 rows, so page: a far offset clamps
+        // to the oldest window, the zero-offset read anchors at the newest.
+        let oldest =
+            wait_for_read_offset_contains(&api_socket, pane_id, 1_000_000, &pane_fill_row(&tag, 1));
+        let newest = wait_for_read_source_contains(
+            &api_socket,
+            pane_id,
+            "recent_unwrapped",
+            1000,
+            &pane_fill_row(&tag, ROWS),
+        );
+        assert!(
+            !oldest.is_empty() && !newest.is_empty(),
+            "pane {tag} should hold its first and last fill rows after the handoff"
+        );
+    }
+
+    let mut replay_report = String::new();
+    for log in [
+        config_home.join("herdr-dev/herdr-server.log"),
+        config_home.join("herdr/herdr-server.log"),
+    ] {
+        let Ok(text) = fs::read_to_string(&log) else {
+            continue;
+        };
+        if let Some(line) = text
+            .lines()
+            .rev()
+            .find(|line| line.contains("handoff replay"))
+        {
+            replay_report = line.to_string();
+            break;
+        }
+    }
+    assert!(
+        !replay_report.is_empty(),
+        "the exporting server should log the replay it carried"
+    );
+    eprintln!(
+        "handoff measurement: panes={PANES} rows_per_pane={ROWS} elapsed={handoff_elapsed:?} report={replay_report}"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+/// Rollback safety: an export toward an importer that predates replay frames
+/// must look exactly like a legacy export — one manifest line within the
+/// legacy frame cap, replay inline within the legacy per-pane and total
+/// budgets, and no replay frames on the wire. This mock plays the legacy
+/// importer end to end: it never acknowledges frame support, enforces every
+/// legacy limit, and fails if any byte besides the commit line follows the
+/// descriptor transfer.
+#[test]
+fn live_handoff_export_to_a_legacy_importer_stays_within_legacy_limits() {
+    const PANES: usize = 3;
+    const ROWS: usize = 4_000;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    fs::create_dir_all(&base).unwrap();
+    let fill = pane_fill_script(&base);
+    let verdict = base.join("legacy-importer-verdict.json");
+    let importer = base.join("legacy-importer.py");
+
+    fs::write(
+        &importer,
+        format!(
+            r#"#!/usr/bin/env python3
+import json
+import socket
+import struct
+import sys
+
+VERDICT = {verdict:?}
+LEGACY_PER_PANE = {legacy_per_pane}
+LEGACY_TOTAL = {legacy_total}
+LEGACY_LINE = {legacy_line}
+
+
+def fail(message):
+    with open(VERDICT, "w") as handle:
+        json.dump({{"ok": False, "error": message}}, handle)
+    sys.exit(1)
+
+
+def read_line_capped(sock, cap):
+    line = bytearray()
+    while True:
+        chunk = sock.recv(1)
+        if not chunk:
+            fail("handoff stream closed while reading a line")
+        line += chunk
+        if chunk == b"\n":
+            return bytes(line)
+        if len(line) > cap:
+            fail(f"manifest line exceeded the legacy cap: {{len(line)}} bytes")
+
+
+try:
+    socket_path = sys.argv[3]
+    token = sys.argv[4]
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(socket_path)
+    sock.sendall(token.encode() + b"\n")
+
+    raw_line = read_line_capped(sock, LEGACY_LINE)
+    if len(raw_line) > LEGACY_LINE:
+        fail(f"manifest line exceeded the legacy cap: {{len(raw_line)}} bytes")
+    manifest = json.loads(raw_line.decode())
+    if manifest["version"] != 1:
+        fail(f"legacy importers only accept manifest version 1, got {{manifest['version']}}")
+    if "replay-frames" not in manifest.get("extensions", []):
+        fail("the exporter did not advertise replay-frames in the manifest")
+    panes = manifest["panes"]
+    pane_bytes = []
+    total = 0
+    per_pane_cap = min(LEGACY_PER_PANE, LEGACY_TOTAL // max(len(panes), 1))
+    for pane in panes:
+        history = pane.get("initial_history_ansi") or ""
+        pane_bytes.append(len(history))
+        total += len(history)
+        if len(history) > per_pane_cap:
+            fail(
+                f"pane {{pane['pane_id']}} carried {{len(history)}} inline replay bytes, "
+                f"over the legacy per-pane budget {{per_pane_cap}}"
+            )
+    if total > LEGACY_TOTAL:
+        fail(f"inline replay total {{total}} over the legacy budget {{LEGACY_TOTAL}}")
+
+    sock.sendall(b"validated\n")
+
+    fds = []
+    while len(fds) < len(panes):
+        _, ancdata, _, _ = sock.recvmsg(1, socket.CMSG_SPACE(64 * 4))
+        batch = []
+        for level, ctype, cdata in ancdata:
+            if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
+                for offset in range(0, len(cdata) - len(cdata) % 4, 4):
+                    batch.append(struct.unpack("i", cdata[offset:offset + 4])[0])
+        if not batch:
+            fail("descriptor batch missing SCM_RIGHTS")
+        fds.extend(batch)
+
+    sock.sendall(b"restored\n")
+    sock.sendall(b"ready\n")
+    committed = read_line_capped(sock, 4096)
+    if committed != b"committed\n":
+        fail(f"expected the commit line right after the descriptors, got {{committed[:64]!r}}")
+    sock.sendall(b"owned\n")
+
+    with open(VERDICT, "w") as handle:
+        json.dump({{"ok": True, "line_bytes": len(raw_line), "pane_bytes": pane_bytes}}, handle)
+except SystemExit:
+    raise
+except Exception as error:
+    fail(str(error))
+"#,
+            verdict = verdict.display().to_string(),
+            legacy_per_pane = LEGACY_MAX_REPLAY_BYTES_PER_PANE,
+            legacy_total = LEGACY_MAX_REPLAY_BYTES_TOTAL,
+            legacy_line = LEGACY_MAX_MANIFEST_LINE_BYTES,
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&importer, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let first_pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut pane_ids = vec![first_pane_id.clone()];
+    for index in 1..PANES {
+        let split = request(
+            &api_socket,
+            serde_json::json!({
+                "id": format!("test:pane:split-{index}"),
+                "method": "pane.split",
+                "params": {
+                    "target_pane_id": pane_ids.last().unwrap(),
+                    "direction": "right",
+                    "focus": false
+                }
+            }),
+        );
+        assert_ok(split.clone());
+        pane_ids.push(
+            split["result"]["pane"]["pane_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    // Each pane ends up with more scrollback than the legacy per-pane budget,
+    // so the export must cut at the budget instead of waving everything
+    // through.
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        let tag = format!("{index:02}");
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": format!("test:pane:fill-{index}"),
+                "method": "pane.send_input",
+                "params": {
+                    "pane_id": pane_id,
+                    "text": format!(
+                        "python3 {} {} {} {}",
+                        fill.display(),
+                        tag,
+                        base.join(format!("fill-done-{tag}")).display(),
+                        ROWS
+                    ),
+                    "keys": ["Enter"]
+                }
+            }),
+        ));
+    }
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        support::wait_for_file(
+            &base.join(format!("fill-done-{index:02}")),
+            Duration::from_secs(30),
+        );
+        wait_for_output(
+            &api_socket,
+            pane_id,
+            &pane_fill_row(&format!("{index:02}"), ROWS),
+        );
+    }
+
+    let importer_string = importer.display().to_string();
+    let handoff = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:handoff-legacy",
+            "method": "server.live_handoff",
+            "params": {
+                "import_exe": importer_string,
+                "expected_version": "0.9.4"
+            }
+        }),
+    );
+    assert_ok(handoff);
+
+    let verdict: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&verdict).expect("the legacy importer should record a verdict"),
+    )
+    .expect("verdict should be json");
+    assert_eq!(verdict["ok"], true, "legacy importer verdict: {verdict}");
+    let pane_bytes: Vec<usize> = verdict["pane_bytes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_u64().unwrap() as usize)
+        .collect();
+    for bytes in &pane_bytes {
+        assert!(
+            *bytes >= LEGACY_MAX_REPLAY_BYTES_PER_PANE / 2,
+            "a pane with more history than the legacy budget should fill the budget, not undercut it: {pane_bytes:?}"
+        );
+    }
+    eprintln!("legacy handoff measurement: {verdict}");
+
     drop(spawned);
     cleanup_test_base(&base);
 }
