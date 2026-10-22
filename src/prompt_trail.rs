@@ -642,25 +642,34 @@ fn agy_record(home: &Path, id: &str) -> Option<PathBuf> {
         .join("logs")
         .join(AGY_FULL_TRANSCRIPT);
     // A link anywhere along the derived path is held to the same home
-    // boundary as a reported path.
-    reported_record(Some(home), path)
+    // boundary as a reported path, and must still lead to a whole
+    // transcript.
+    reported_record(Some(home), path).filter(|path| agy_full_name(path))
 }
 
 /// A reported agy transcript, moved from the truncated `transcript.jsonl`
-/// to its whole sibling when that sibling is there. The sibling is held to
-/// the home boundary again, since it may be a link the report was not; one
-/// that fails it discredits the report.
+/// to its whole sibling. The sibling is held to the home boundary again,
+/// since it may be a link the report was not. The truncated transcript
+/// replaces long texts with placeholders, so it is never read in the
+/// sibling's place: a report with no whole transcript to move to, or one
+/// that fails the boundary, discredits the report.
 fn agy_full_transcript(home: Option<&Path>, reported: PathBuf) -> Option<PathBuf> {
-    if reported
+    let full = if reported
         .file_name()
         .is_some_and(|name| name == "transcript.jsonl")
     {
-        let full = reported.with_file_name(AGY_FULL_TRANSCRIPT);
-        if std::fs::symlink_metadata(&full).is_ok() {
-            return reported_record(home, full);
-        }
-    }
-    Some(reported)
+        reported_record(home, reported.with_file_name(AGY_FULL_TRANSCRIPT))?
+    } else {
+        reported
+    };
+    agy_full_name(&full).then_some(full)
+}
+
+/// Whether a resolved record is agy's whole transcript by name, so a link
+/// named for it that leads to the truncated one is not taken for it.
+fn agy_full_name(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == AGY_FULL_TRANSCRIPT)
 }
 
 const AGY_FULL_TRANSCRIPT: &str = "transcript_full.jsonl";

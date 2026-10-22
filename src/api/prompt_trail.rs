@@ -1519,6 +1519,69 @@ mod tests {
         );
     }
 
+    /// What both reads answer for an agy pane: the turn index's reason, and
+    /// the preface's.
+    fn agy_reasons(
+        fixture: &Fixture,
+        identity: AgentSessionInfo,
+    ) -> (Option<PromptTrailReason>, PrefaceReason) {
+        let response = respond(
+            "request".into(),
+            index_sources(fixture, pane_response(pane(Some(identity.clone())))),
+        );
+        let index = match answered(&response) {
+            ResponseResult::TurnIndex { index, reason, .. } => {
+                assert_eq!(index, None, "the truncated transcript was read");
+                reason
+            }
+            other => panic!("expected turn index, got {other:?}"),
+        };
+        let (result, _) = ask_preface(
+            fixture,
+            pane(Some(identity)),
+            FakeScreen::new(agy_screen_of(2..6, 3)),
+            &preface_params(None, 50),
+        );
+        (index, preface_reason(result))
+    }
+
+    /// agy's truncated transcript in place of long texts, as agy writes it.
+    const AGY_TRUNCATED: &str = "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\
+        \"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-03-04T09:15:00Z\",\
+        \"content\":\"<USER_REQUEST>\\nExplain the relay\\n</USER_REQUEST>\"}\n\
+        {\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\
+        \"status\":\"DONE\",\"created_at\":\"2026-03-04T09:15:05Z\",\
+        \"content\":\"<truncated 1672 bytes>\"}\n";
+
+    #[test]
+    fn agy_truncated_transcript_without_its_full_sibling_is_no_record() {
+        let fixture = Fixture::new();
+        let truncated = fixture.write(&format!("{AGY_LOGS}/transcript.jsonl"), AGY_TRUNCATED);
+        assert_eq!(
+            agy_reasons(&fixture, agy_session(Some(truncated))),
+            (Some(PromptTrailReason::NoRecord), PrefaceReason::NoRecord)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_full_transcript_linked_to_the_truncated_one_is_no_record() {
+        let fixture = Fixture::new();
+        let truncated = fixture.write(&format!("{AGY_LOGS}/transcript.jsonl"), AGY_TRUNCATED);
+        std::os::unix::fs::symlink(
+            &truncated,
+            truncated.with_file_name("transcript_full.jsonl"),
+        )
+        .expect("a link to the truncated transcript");
+        for reported in [None, Some(truncated.clone())] {
+            assert_eq!(
+                agy_reasons(&fixture, agy_session(reported.clone())),
+                (Some(PromptTrailReason::NoRecord), PrefaceReason::NoRecord),
+                "reported {reported:?}"
+            );
+        }
+    }
+
     #[test]
     fn agy_panes_have_a_turn_index_but_no_prompt_trail() {
         let fixture = Fixture::new();
