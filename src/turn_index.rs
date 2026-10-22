@@ -234,8 +234,9 @@ fn bare_fence(line: &str) -> bool {
 
 const CACHE_RECORDS: usize = 32;
 
+/// What a record's metadata says about which version of it is on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Fingerprint {
+pub(crate) struct Fingerprint {
     identity: crate::platform::ExecutableFileIdentity,
     bytes: u64,
     modified: std::time::SystemTime,
@@ -243,7 +244,7 @@ struct Fingerprint {
 }
 
 impl Fingerprint {
-    fn at(path: &std::path::Path) -> Result<Self, PromptTrailReason> {
+    pub(crate) fn at(path: &std::path::Path) -> Result<Self, PromptTrailReason> {
         let metadata = std::fs::metadata(path).map_err(|_| PromptTrailReason::NoRecord)?;
         if !metadata.is_file() {
             return Err(PromptTrailReason::NoRecord);
@@ -380,13 +381,7 @@ impl Cache {
             }
         }
         let file = std::fs::File::open(path).map_err(|_| PromptTrailReason::Unreadable)?;
-        // Hash metadata rather than exposing the path or file identity.
-        // A revision still names the same record version after eviction
-        // or a server restart.
-        let revision = format!(
-            "{:x}",
-            Sha256::digest(format!("{path:?}:{fingerprint:?}").as_bytes())
-        );
+        let revision = revision(path, &fingerprint);
         #[cfg(test)]
         self.parses
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -413,6 +408,17 @@ impl Cache {
         }
         Ok(index)
     }
+}
+
+/// An opaque name for one version of a record.
+///
+/// Hashes metadata rather than exposing the path or file identity, and
+/// still names the same record version after eviction or a server restart.
+pub(crate) fn revision(path: &std::path::Path, fingerprint: &Fingerprint) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("{path:?}:{fingerprint:?}").as_bytes())
+    )
 }
 
 pub(crate) fn read(path: &std::path::Path) -> Result<TurnIndex, PromptTrailReason> {

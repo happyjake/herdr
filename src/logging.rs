@@ -108,6 +108,7 @@ fn is_routine_api_method(method: &str) -> bool {
         "pane.get"
             | "pane.prompt_trail"
             | "pane.turn_index"
+            | "pane.preface"
             | "pane.read"
             | "pane.list"
             | "workspace.list"
@@ -116,6 +117,19 @@ fn is_routine_api_method(method: &str) -> bool {
             | "pane.report_agent_session"
             | "pane.report_metadata"
     )
+}
+
+/// How one preface request ended: a reason code or a count of turns, never
+/// a word of what any of them said.
+pub(crate) fn api_preface_answered(reason: Option<&'static str>, turns: usize, omitted: u32) {
+    tracing::debug!(
+        event = "api.preface",
+        subsystem = "api",
+        outcome = reason.unwrap_or("preface"),
+        turns,
+        omitted,
+        "preface answered"
+    );
 }
 
 pub(crate) fn api_request_failed(request_id: &str, method: &'static str, err: &str) {

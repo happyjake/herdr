@@ -280,4 +280,9 @@ pub struct ServerCapabilities {
     /// Supports `server.agent_settings` for user-level agent defaults.
     #[serde(default)]
     pub agent_settings: bool,
+    /// Supports `pane.preface`: a pane's earlier turns quoted from its
+    /// session record. Additive: absent (false) in pongs of servers that
+    /// predate it.
+    #[serde(default)]
+    pub preface: bool,
 }

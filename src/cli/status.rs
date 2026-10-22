@@ -433,6 +433,7 @@ mod tests {
                 agent_prompt_expectations: false,
                 turn_index: false,
                 agent_settings: false,
+                preface: false,
             }),
         }
     }

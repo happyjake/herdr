@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ワークスペース | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | タブ | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.prompt_trail`、`pane.turn_index`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| ペイン | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.prompt_trail`、`pane.turn_index`、`pane.preface`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -144,6 +144,18 @@ prompt trail と共通です。Claude と codex は未対応です。不明な�
 leaf の親チェーンだけを辿り、古い順で最新 64 ターンまで返します。
 親の欠落や循環は `unreadable`。最後の JSON 行が未完なら `partial: true`
 となり、最新ターンは `open` になります。
+
+`pane.preface {pane_id, top_offset, top_line, max_turns}` は
+`{type:"preface", pane_id, terminal_id, preface, reason}` を返します。
+クライアントが画面上に保持している最も古いプロンプトより前のセッション記録の
+ターン（プロンプトと最終回答）です。`preface` と `reason` の一方だけが設定されます。
+`top_offset` はクライアントが保持する最も古い行の `offset_from_bottom`
+（`recent_unwrapped` のオフセットページと同じ数え方）、`top_line` はその行の
+テキストで、画面の先頭を保持している場合は両方 null です。`max_turns`（最大 200）
+件のプロンプトのターンを新しい順に保持し、`omitted` は送られなかった古いターンの
+数です。理由は prompt trail と共通のものに加えて `seam_not_found` と
+`nothing_above` です。Claude ペインに対応し、本文はログに書かれません。
+対応サーバーは pong で `capabilities.preface: true` を通知します。
 
 ターンは `{id, at, start, prompt, end, answer, answer_id}`。
 ユーザーメッセージ（途中の指示や追記を含む）、または表示される `wake`

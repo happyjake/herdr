@@ -162,6 +162,7 @@ operations::define_operations! {
     AttachmentCommit(AttachmentCommitParams) => "attachment.commit", false, false;
     PanePromptTrail(PaneTarget) => "pane.prompt_trail", false, false;
     PaneTurnIndex(PaneTarget) => "pane.turn_index", false, false;
+    PanePreface(PanePrefaceParams) => "pane.preface", false, false;
     ServerSearchSessions(ServerSearchSessionsParams) => "server.search_sessions", false, false;
     PaneSetFlag(PaneSetFlagParams) => "pane.set_flag", false, false;
     PaneClearFlag(PaneTarget) => "pane.clear_flag", false, false;

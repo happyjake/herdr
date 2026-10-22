@@ -3735,3 +3735,126 @@ fn subscribed_client_receives_coalesced_pane_cwd_and_workspace_label_updates_wit
 
     cleanup_spawned_herdr(server.child, server.base);
 }
+
+/// `pane.preface` end to end: a real pane whose screen was printed over its
+/// PTY, a record planted under the server's home and reported the way the
+/// harness integration reports it, and the server placing the seam between
+/// the two.
+#[test]
+fn preface_places_the_seam_between_a_real_screen_and_a_reported_record() {
+    let _lock = test_lock();
+    const SESSION: &str = "0f6e0c2a-5b1d-4c8e-9a7f-3e2d1c0b9a88";
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let home = PathBuf::from(format!("/tmp/hwsh-{}-{nanos}", std::process::id()));
+    let record = home.join(format!(
+        ".claude/projects/-invented-harbour/{SESSION}.jsonl"
+    ));
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    fs::write(
+        &record,
+        include_str!("../src/preface/fixtures/claude-record.jsonl"),
+    )
+    .unwrap();
+    let server = start_ws_test_server_with_env(&[("HOME", home.to_str().unwrap())]);
+    let mut ws = WsClient::connect(server.ws_addr, TEST_TOKEN);
+
+    let pong = ws.request(r#"{"id":"pf_ping","method":"ping","params":{}}"#);
+    assert_eq!(pong["result"]["capabilities"]["preface"], true, "{pong}");
+
+    let create = |ws: &mut WsClient, id: &str| {
+        let created = ws.request(&format!(
+            r#"{{"id":"{id}","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            server.base.display()
+        ));
+        assert_eq!(created["result"]["type"], "workspace_created", "{created}");
+        created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let pane_id = create(&mut ws, "pf_create");
+
+    // The rows a Claude pane leaves for its newest turns, printed by the
+    // pane's own shell. The marker is split so the typed command line never
+    // matches it.
+    let sent = ws.request(
+        &serde_json::json!({"id":"pf_send", "method":"pane.send_text", "params":{
+            "pane_id": pane_id,
+            "text": "printf '%s\\n' '\u{276f} also keep the old pier names' '\u{23fa} Chunked by pier.' '\u{276f} ship the pier map' '  with the legend' '\u{23fa} Section 1.' '\u{276f} and print it for the harbour office'; printf '%s-%s\\n' seeded done",
+        }})
+        .to_string(),
+    );
+    assert_eq!(sent["result"]["type"], "ok", "{sent}");
+    let entered = ws.request(&format!(
+        r#"{{"id":"pf_enter","method":"pane.send_keys","params":{{"pane_id":"{pane_id}","keys":["Enter"]}}}}"#
+    ));
+    assert_eq!(entered["result"]["type"], "ok");
+    ws.send(&format!(
+        r#"{{"id":"pf_wait","method":"pane.wait_for_output","params":{{"pane_id":"{pane_id}","source":"recent","lines":40,"match":{{"type":"substring","value":"seeded-done"}},"timeout_ms":10000}}}}"#
+    ));
+    assert_eq!(
+        ws.read_json(Duration::from_secs(11))["result"]["type"],
+        "output_matched"
+    );
+
+    let reported = ws.request(
+        &serde_json::json!({"id":"pf_report", "method":"pane.report_agent_session", "params":{
+            "pane_id": pane_id,
+            "source": "herdr:claude",
+            "agent": "claude",
+            "seq": 1,
+            "agent_session_id": SESSION,
+            "agent_session_path": record.to_str().unwrap(),
+        }})
+        .to_string(),
+    );
+    assert_eq!(reported["result"]["type"], "ok", "{reported}");
+
+    let preface = ws.request(&format!(
+        r#"{{"id":"pf_preface","method":"pane.preface","params":{{"pane_id":"{pane_id}","top_offset":null,"top_line":null,"max_turns":50}}}}"#
+    ));
+    let result = &preface["result"];
+    assert_eq!(result["type"], "preface", "{preface}");
+    assert_eq!(result["pane_id"], pane_id.as_str());
+    assert_eq!(result["reason"], serde_json::Value::Null, "{preface}");
+    let turns = result["preface"]["turns"].as_array().expect("turns");
+    // The oldest prompt on the screen is the record's sixth turn, so the
+    // five before it are the preface, oldest first.
+    assert_eq!(turns.len(), 5, "{preface}");
+    assert_eq!(
+        turns[0]["prompt"],
+        "trace why the ferry timetable importer drops the last sailing of the day\nkeep the fix small"
+    );
+    assert_eq!(turns[0]["end"], "answered");
+    assert_eq!(turns[3]["start"], "task");
+    assert_eq!(turns[4]["prompt"], "now chunk the timetable by pier");
+    assert_eq!(result["preface"]["agent"], "claude");
+    assert_eq!(result["preface"]["session_id"], SESSION);
+    assert_eq!(result["preface"]["omitted"], 0);
+
+    // A shell pane reporting a harness this server has no reader for.
+    let shell_id = create(&mut ws, "pf_create_shell");
+    let reported = ws.request(
+        &serde_json::json!({"id":"pf_report_shell", "method":"pane.report_agent_session", "params":{
+            "pane_id": shell_id,
+            "source": "herdr:codex",
+            "agent": "codex",
+            "seq": 1,
+            "agent_session_id": "0199f3c2b7d84a1e9c05",
+        }})
+        .to_string(),
+    );
+    assert_eq!(reported["result"]["type"], "ok", "{reported}");
+    let refused = ws.request(&format!(
+        r#"{{"id":"pf_shell","method":"pane.preface","params":{{"pane_id":"{shell_id}","top_offset":null,"top_line":null,"max_turns":50}}}}"#
+    ));
+    assert_eq!(refused["result"]["type"], "preface", "{refused}");
+    assert_eq!(refused["result"]["preface"], serde_json::Value::Null);
+    assert_eq!(refused["result"]["reason"], "unsupported_agent");
+
+    cleanup_spawned_herdr(server.child, server.base);
+    let _ = fs::remove_dir_all(&home);
+}

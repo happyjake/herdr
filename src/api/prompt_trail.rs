@@ -1,4 +1,5 @@
-//! Serving `pane.prompt_trail` and `pane.turn_index` through one bounded read.
+//! Serving `pane.prompt_trail`, `pane.turn_index` and `pane.preface`
+//! through one bounded read.
 //!
 //! Reading a session record means opening a file, walking it and parsing
 //! it, which is not work the app thread — driving PTYs, rendering, and
@@ -28,8 +29,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 
 use crate::api::schema::{
-    AgentSessionInfo, ErrorResponse, Method, PaneTarget, PromptTrail, PromptTrailAgent,
-    PromptTrailReason, Request, ResponseResult, SuccessResponse, TurnIndex,
+    AgentSessionInfo, ErrorResponse, Method, PanePrefaceParams, PaneReadParams, PaneTarget,
+    Preface, PrefaceReason, PromptTrail, PromptTrailAgent, PromptTrailReason, ReadFormat,
+    ReadSource, Request, ResponseResult, SuccessResponse, TurnIndex,
 };
 use crate::api::ApiRequestSender;
 
@@ -49,7 +51,7 @@ const PANE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Production fills this from the running server and the real home; a test
 /// hands over a fixture, which is what keeps the tests off the machine's
 /// own desk.
-pub(super) struct Sources<T = PromptTrail> {
+pub(super) struct Sources<T: RecordOutput = PromptTrail> {
     /// Asks the app which pane this is and what session it reports, as the
     /// raw response the app answered with. Held as something still to do,
     /// not something already done, because asking the app blocks and every
@@ -79,17 +81,18 @@ struct PaneIdentity {
 type SeenPane = Arc<std::sync::Mutex<Option<PaneIdentity>>>;
 
 /// Reads one record into a trail.
-type RecordReader<T = PromptTrail> =
-    Box<dyn FnOnce(&std::path::Path, PromptTrailAgent) -> Result<T, PromptTrailReason> + Send>;
+type RecordReader<T = PromptTrail> = Box<
+    dyn FnOnce(&std::path::Path, PromptTrailAgent) -> Result<T, <T as RecordOutput>::Reason> + Send,
+>;
 
 /// What one request has to say, before it is encoded.
-enum Answer<T = PromptTrail> {
+enum Answer<T: RecordOutput = PromptTrail> {
     /// The pane, and its trail or the reason it has none.
     Trail {
         pane_id: String,
         terminal_id: String,
         trail: Option<T>,
-        reason: Option<PromptTrailReason>,
+        reason: Option<T::Reason>,
     },
     /// The request could not be answered at all: an unknown pane, or an
     /// app that never spoke.
@@ -218,7 +221,7 @@ fn blocking_trail<T: RecordOutput>(deadline: Duration, sources: Sources<T>) -> A
 /// could not read in the time it allows itself, which is one of the
 /// ordinary reasons a pane has no trail. Before that, the request never
 /// learned which pane it was about, and there is nothing to answer for.
-async fn within_deadline<T>(
+async fn within_deadline<T: RecordOutput>(
     deadline: Duration,
     work: impl std::future::Future<Output = Answer<T>>,
     seen: &SeenPane,
@@ -230,14 +233,14 @@ async fn within_deadline<T>(
                 pane_id: pane.pane_id,
                 terminal_id: pane.terminal_id,
                 trail: None,
-                reason: Some(PromptTrailReason::Unreadable),
+                reason: Some(PromptTrailReason::Unreadable.into()),
             },
             None => unavailable("timed out reading the prompt trail"),
         },
     }
 }
 
-fn unavailable<T>(message: &str) -> Answer<T> {
+fn unavailable<T: RecordOutput>(message: &str) -> Answer<T> {
     Answer::Refused {
         code: "server_unavailable".into(),
         message: message.into(),
@@ -280,7 +283,7 @@ async fn read<T: RecordOutput>(
 fn answer_from<T: RecordOutput>(
     pane_response: &str,
     home: Option<&std::path::Path>,
-    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<T, PromptTrailReason>,
+    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<T, T::Reason>,
     seen: &SeenPane,
 ) -> Answer<T> {
     let pane = match serde_json::from_str::<SuccessResponse>(pane_response) {
@@ -326,13 +329,13 @@ fn answer_from<T: RecordOutput>(
 fn trail_for<T: RecordOutput>(
     session: Option<&AgentSessionInfo>,
     home: Option<&std::path::Path>,
-    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<T, PromptTrailReason>,
-) -> Result<T, PromptTrailReason> {
+    record: impl FnOnce(&std::path::Path, PromptTrailAgent) -> Result<T, T::Reason>,
+) -> Result<T, T::Reason> {
     let session = session.ok_or(PromptTrailReason::NoSession)?;
     let agent = crate::prompt_trail::trail_agent(&session.agent)
         .ok_or(PromptTrailReason::UnsupportedAgent)?;
     if !T::supports(agent) {
-        return Err(PromptTrailReason::UnsupportedAgent);
+        return Err(PromptTrailReason::UnsupportedAgent.into());
     }
     let path = crate::prompt_trail::record_path(
         home,
@@ -346,19 +349,23 @@ fn trail_for<T: RecordOutput>(
 }
 
 /// Output-specific policy, sharing lookup, deadline, runtime and permits.
-trait RecordOutput: Send + 'static {
+pub(super) trait RecordOutput: Send + 'static {
+    /// Why a pane has none of this output: the prompt trail's reasons, or
+    /// more of an output's own.
+    type Reason: From<PromptTrailReason> + Send + 'static;
     fn supports(agent: PromptTrailAgent) -> bool;
     fn response(
         pane_id: String,
         terminal_id: String,
         value: Option<Self>,
-        reason: Option<PromptTrailReason>,
+        reason: Option<Self::Reason>,
     ) -> ResponseResult
     where
         Self: Sized;
 }
 
 impl RecordOutput for PromptTrail {
+    type Reason = PromptTrailReason;
     fn supports(_: PromptTrailAgent) -> bool {
         true
     }
@@ -378,6 +385,7 @@ impl RecordOutput for PromptTrail {
 }
 
 impl RecordOutput for TurnIndex {
+    type Reason = PromptTrailReason;
     fn supports(agent: PromptTrailAgent) -> bool {
         agent == PromptTrailAgent::Pi
     }
@@ -420,11 +428,159 @@ pub(super) fn handle_turn_index(
     )
 }
 
+impl RecordOutput for Preface {
+    type Reason = PrefaceReason;
+    fn supports(agent: PromptTrailAgent) -> bool {
+        crate::preface::reader_for(agent).is_some()
+    }
+    fn response(
+        pane_id: String,
+        terminal_id: String,
+        preface: Option<Self>,
+        reason: Option<PrefaceReason>,
+    ) -> ResponseResult {
+        crate::logging::api_preface_answered(
+            reason.map(prefacereason_code),
+            preface.as_ref().map_or(0, |preface| preface.turns.len()),
+            preface.as_ref().map_or(0, |preface| preface.omitted),
+        );
+        ResponseResult::Preface {
+            pane_id,
+            terminal_id,
+            preface,
+            reason,
+        }
+    }
+}
+
+/// The wire name of a reason, which is all a log ever says about a preface
+/// besides how many turns it carried.
+fn prefacereason_code(reason: PrefaceReason) -> &'static str {
+    match reason {
+        PrefaceReason::NoSession => "no_session",
+        PrefaceReason::UnsupportedAgent => "unsupported_agent",
+        PrefaceReason::NoRecord => "no_record",
+        PrefaceReason::Unreadable => "unreadable",
+        PrefaceReason::SeamNotFound => "seam_not_found",
+        PrefaceReason::NothingAbove => "nothing_above",
+    }
+}
+
+/// Answer `pane.preface` for one request.
+pub(super) fn handle_preface(
+    request_id: String,
+    params: &PanePrefaceParams,
+    api_tx: &ApiRequestSender,
+) -> String {
+    if params.pane_id.trim().is_empty() {
+        return crate::api::server::error_response_json(
+            request_id,
+            "invalid_params",
+            "pane_id must not be empty".into(),
+        );
+    }
+    if params.top_offset.is_some() != params.top_line.is_some() {
+        return crate::api::server::error_response_json(
+            request_id,
+            "invalid_params",
+            "top_offset and top_line must both be set or both be null".into(),
+        );
+    }
+    respond(
+        request_id,
+        preface_sources(params, api_tx, crate::worktree::home_dir()),
+    )
+}
+
+/// Where one preface is read from: the app for the pane and its screen,
+/// and the records filed under `home`.
+fn preface_sources(
+    params: &PanePrefaceParams,
+    api_tx: &ApiRequestSender,
+    home: Option<PathBuf>,
+) -> Sources<Preface> {
+    let pane_api_tx = api_tx.clone();
+    let read_api_tx = api_tx.clone();
+    let pane_id = params.pane_id.clone();
+    let read_pane_id = params.pane_id.clone();
+    let params = params.clone();
+    Sources {
+        pane: Box::new(move || ask_for_pane(&pane_id, &pane_api_tx)),
+        home,
+        record: Box::new(move |path, agent| {
+            preface_from(path, agent, &params, |offset| {
+                ask_for_page(&read_pane_id, offset, &read_api_tx)
+            })
+        }),
+    }
+}
+
+/// The preface one record and one screen give.
+fn preface_from(
+    path: &std::path::Path,
+    agent: PromptTrailAgent,
+    params: &PanePrefaceParams,
+    page: impl FnMut(u64) -> Option<crate::preface::seam::Page>,
+) -> Result<Preface, PrefaceReason> {
+    let read = crate::preface::read(path, agent)?;
+    let fallback_session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    crate::preface::seam::preface(
+        crate::preface::agent_name(agent),
+        fallback_session_id,
+        &read,
+        crate::preface::seam::Top {
+            offset: params.top_offset,
+            line: params.top_line.as_deref(),
+        },
+        params.max_turns,
+        page,
+    )
+}
+
+/// Ask the app for one page of the pane's screen, read the way a client
+/// pages it. Anything but a page is no screen to place a seam on.
+fn ask_for_page(
+    pane_id: &str,
+    offset: u64,
+    api_tx: &ApiRequestSender,
+) -> Option<crate::preface::seam::Page> {
+    let response = crate::api::server::dispatch_to_app_with_timeout(
+        Request {
+            id: "internal:preface:read".into(),
+            method: Method::PaneRead(PaneReadParams {
+                pane_id: pane_id.to_string(),
+                source: ReadSource::RecentUnwrapped,
+                lines: Some(crate::preface::seam::PAGE_LINES),
+                format: ReadFormat::Text,
+                strip_ansi: true,
+                intent: crate::api::schema::ReadIntent::Passive,
+                offset_from_bottom: Some(offset),
+            }),
+        },
+        api_tx,
+        Some(PANE_TIMEOUT),
+    );
+    match serde_json::from_str::<SuccessResponse>(&response)
+        .ok()?
+        .result
+    {
+        ResponseResult::PaneRead { read } => Some(crate::preface::seam::Page {
+            text: read.text,
+            effective_offset: read.effective_offset?,
+            has_more: read.has_more?,
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent_resume::AgentSessionRefKind;
-    use crate::api::schema::{AgentStatus, PaneInfo, PromptTrailAgent};
+    use crate::api::schema::{AgentStatus, PaneInfo, PromptTrailAgent, TurnEnd, TurnStart};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
@@ -1217,5 +1373,654 @@ mod tests {
         assert_eq!(permits().available_permits(), 1);
         release.send(()).unwrap();
         completion.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    // ---- pane.preface ----
+
+    const PREFACE_SESSION: &str = "0f6e0c2a-5b1d-4c8e-9a7f-3e2d1c0b9a88";
+
+    /// A screen the fake app pages, the way `recent_unwrapped` offset
+    /// reads page one: `rows` top first, and lines appended at the bottom
+    /// once a given number of reads has been served.
+    struct FakeScreen {
+        rows: Vec<String>,
+        grow: Option<(usize, Vec<String>)>,
+    }
+
+    impl FakeScreen {
+        fn new(rows: Vec<String>) -> Self {
+            Self { rows, grow: None }
+        }
+
+        /// The offset a client counts for the row at `index` from the top.
+        fn offset_of(&self, index: usize) -> u64 {
+            (self.rows.len() - 1 - index) as u64
+        }
+
+        fn page(&self, offset: u64, lines: u32) -> crate::api::schema::PaneReadResult {
+            let total = self.rows.len();
+            let landed = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(total.saturating_sub(1));
+            let bottom = total - landed;
+            let top = bottom.saturating_sub(lines.min(1000) as usize);
+            crate::api::schema::PaneReadResult {
+                pane_id: "wG4:p1".into(),
+                workspace_id: "wG4".into(),
+                tab_id: "wG4:t1".into(),
+                source: ReadSource::RecentUnwrapped,
+                format: ReadFormat::Text,
+                text: self.rows[top..bottom].join("\n") + "\n",
+                revision: 0,
+                truncated: top > 0,
+                effective_offset: Some(landed as u64),
+                has_more: Some(top > 0),
+            }
+        }
+    }
+
+    /// An app that knows one pane and its screen, and says which methods it
+    /// was asked.
+    fn fake_app(
+        pane: PaneInfo,
+        screen: FakeScreen,
+    ) -> (ApiRequestSender, std::thread::JoinHandle<Vec<String>>) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut screen = screen;
+            let mut asked = Vec::new();
+            let mut reads = 0;
+            while let Some(message) = rx.blocking_recv() {
+                let response = match &message.request.method {
+                    Method::PaneGet(_) => {
+                        asked.push("pane.get".to_string());
+                        pane_response(pane.clone())
+                    }
+                    Method::PaneRead(params) => {
+                        assert_eq!(params.source, ReadSource::RecentUnwrapped);
+                        assert_eq!(params.intent, crate::api::schema::ReadIntent::Passive);
+                        asked.push(format!(
+                            "pane.read@{}",
+                            params.offset_from_bottom.expect("an offset read")
+                        ));
+                        let read = screen.page(
+                            params.offset_from_bottom.unwrap_or(0),
+                            params.lines.unwrap_or(80),
+                        );
+                        reads += 1;
+                        if screen
+                            .grow
+                            .as_ref()
+                            .is_some_and(|(after, _)| *after == reads)
+                        {
+                            let (_, grown) = screen.grow.take().expect("growth");
+                            screen.rows.extend(grown);
+                        }
+                        serde_json::to_string(&SuccessResponse {
+                            id: message.request.id.clone(),
+                            result: ResponseResult::PaneRead { read },
+                        })
+                        .expect("a read response")
+                    }
+                    other => panic!(
+                        "the preface asked the app for {}",
+                        crate::api::server::api_method_name_for_test(other)
+                    ),
+                };
+                let _ = message.respond_to.send(response);
+            }
+            asked
+        });
+        (tx, responder)
+    }
+
+    fn claude_pane() -> PaneInfo {
+        pane(Some(session(
+            "claude",
+            AgentSessionRefKind::Id,
+            PREFACE_SESSION,
+        )))
+    }
+
+    fn planted_record(fixture: &Fixture) -> PathBuf {
+        fixture.write(
+            &format!(".claude/projects/-invented-harbour/{PREFACE_SESSION}.jsonl"),
+            include_str!("../preface/fixtures/claude-record.jsonl"),
+        )
+    }
+
+    /// Rows the way the harness draws a prompt: its glyph, the person's
+    /// words wrapped at the harness's own width, continuation indented.
+    fn prompt_rows(text: &str, width: usize) -> Vec<String> {
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            let mut row = String::new();
+            for word in line.split(' ') {
+                if !row.is_empty() && row.len() + 1 + word.len() > width {
+                    rows.push(std::mem::take(&mut row));
+                }
+                if !row.is_empty() {
+                    row.push(' ');
+                }
+                row.push_str(word);
+            }
+            rows.push(row);
+        }
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                if index == 0 {
+                    format!("\u{276f} {row}")
+                } else {
+                    format!("  {row}")
+                }
+            })
+            .collect()
+    }
+
+    fn agent_rows(lines: &[&str]) -> Vec<String> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if index == 0 {
+                    format!("\u{23fa} {line}")
+                } else {
+                    format!("  {line}")
+                }
+            })
+            .chain(std::iter::once(String::new()))
+            .collect()
+    }
+
+    fn work_rows(tool: &str) -> Vec<String> {
+        vec![
+            format!("\u{23fa} {tool}(invented command)"),
+            "  \u{23bf}  invented tool output".into(),
+            String::new(),
+        ]
+    }
+
+    /// The rows the fixture record's turn at `index` leaves on a screen.
+    fn turn_rows(index: usize) -> Vec<String> {
+        let blocks: Vec<Vec<String>> = match index {
+            0 => vec![
+                prompt_rows("trace why the ferry timetable importer drops the last sailing of the day\nkeep the fix small", 40),
+                work_rows("Bash"),
+                agent_rows(&["Checking the importer first."]),
+                work_rows("Read"),
+                agent_rows(&[
+                    "The importer drops the last sailing because the window ends at midnight.",
+                    "",
+                    "| sailing | time |",
+                    "|---|---|",
+                    "| last | 23:40 |",
+                ]),
+                agent_rows(&["Fixed by making the window inclusive: https://example.invalid/pull/7"]),
+            ],
+            1 => vec![
+                prompt_rows("/review the harbour schedule parser\nand its tests", 60),
+                work_rows("Grep"),
+                vec!["  \u{23bf}  Interrupted \u{b7} What should Claude do instead?".into()],
+            ],
+            2 => vec![
+                prompt_rows("summarise the tide tables for the north pier", 60),
+                vec!["  \u{23bf}  API Error: invented failure".into(), String::new()],
+            ],
+            3 => vec![agent_rows(&["The background export finished cleanly."])],
+            4 => vec![prompt_rows("now chunk the timetable by pier", 60), work_rows("Edit")],
+            5 => vec![
+                prompt_rows("also keep the old pier names", 60),
+                agent_rows(&["Chunked by pier, and the old pier names are kept."]),
+            ],
+            6 => vec![agent_rows(&["The export queue is empty."])],
+            7 => vec![
+                prompt_rows("ship the pier map\nwith the legend", 60),
+                agent_rows(&["Section 1. The pier map ships with its legend.", "", "Section 2. And so on."]),
+            ],
+            8 => vec![prompt_rows("and print it for the harbour office", 60), work_rows("Bash")],
+            _ => unreachable!(),
+        };
+        blocks.concat()
+    }
+
+    /// The harness's input box and footer, always at the bottom.
+    fn footer_rows() -> Vec<String> {
+        vec![
+            "\u{2500}".repeat(40),
+            "\u{276f} ".into(),
+            "\u{2500}".repeat(40),
+            "  \u{23f5}\u{23f5} auto mode on".into(),
+        ]
+    }
+
+    /// A screen holding the rows of the given turns, under some rows of
+    /// older tool output the screen kept and no turn to place them in.
+    fn screen_of(turns: std::ops::Range<usize>, older_rows: usize) -> Vec<String> {
+        (0..older_rows)
+            .map(|row| format!("  older tool output {row}"))
+            .chain(turns.flat_map(turn_rows))
+            .chain(footer_rows())
+            .collect()
+    }
+
+    fn preface_params(top: Option<(u64, &str)>, max_turns: u32) -> PanePrefaceParams {
+        PanePrefaceParams {
+            pane_id: "wG4:p1".into(),
+            top_offset: top.map(|(offset, _)| offset),
+            top_line: top.map(|(_, line)| line.to_string()),
+            max_turns,
+        }
+    }
+
+    /// One `pane.preface` through the handler, against the fake app.
+    fn ask_preface(
+        fixture: &Fixture,
+        pane: PaneInfo,
+        screen: FakeScreen,
+        params: &PanePrefaceParams,
+    ) -> (ResponseResult, Vec<String>) {
+        let (tx, responder) = fake_app(pane, screen);
+        let response = respond(
+            "req_preface".into(),
+            preface_sources(params, &tx, Some(fixture.root.clone())),
+        );
+        drop(tx);
+        let asked = responder.join().expect("the fake app");
+        (answered(&response), asked)
+    }
+
+    fn preface_of(result: ResponseResult) -> Preface {
+        match result {
+            ResponseResult::Preface {
+                pane_id,
+                terminal_id,
+                preface,
+                reason,
+            } => {
+                assert_eq!(pane_id, "wG4:p1");
+                assert_eq!(terminal_id, "term_beacon");
+                assert_eq!(reason, None, "a preface and a reason both answered");
+                preface.expect("a preface")
+            }
+            other => panic!("expected a preface, got: {other:?}"),
+        }
+    }
+
+    fn preface_reason(result: ResponseResult) -> PrefaceReason {
+        match result {
+            ResponseResult::Preface {
+                preface, reason, ..
+            } => {
+                assert_eq!(preface, None, "a preface and a reason both answered");
+                reason.expect("a reason")
+            }
+            other => panic!("expected a preface, got: {other:?}"),
+        }
+    }
+
+    fn prompts_of(preface: &Preface) -> Vec<Option<&str>> {
+        preface
+            .turns
+            .iter()
+            .map(|turn| turn.prompt.as_deref())
+            .collect()
+    }
+
+    /// The row index on `rows` of the first one equal to `row`.
+    fn row_index(rows: &[String], row: &str) -> usize {
+        rows.iter()
+            .position(|candidate| candidate == row)
+            .unwrap_or_else(|| panic!("no row {row:?}"))
+    }
+
+    #[test]
+    fn preface_quotes_every_turn_above_the_oldest_held_prompt_and_a_cut_turn_whole() {
+        let fixture = Fixture::new();
+        planted_record(&fixture);
+        // The screen still has turns 2 to 8; the client holds it from a row
+        // of turn 4's tool output down, so turn 4's prompt is above what it
+        // holds and turn 5's is the oldest prompt it has.
+        let rows = screen_of(2..9, 12);
+        let held_from = row_index(&rows, "  \u{23bf}  invented tool output");
+        let held_from = rows
+            .iter()
+            .enumerate()
+            .skip(row_index(&rows, "\u{276f} now chunk the timetable by pier"))
+            .find(|(_, row)| row.contains("invented tool output"))
+            .map(|(index, _)| index)
+            .unwrap_or(held_from);
+        let screen = FakeScreen::new(rows.clone());
+        let top = (screen.offset_of(held_from), rows[held_from].as_str());
+        let (result, asked) = ask_preface(
+            &fixture,
+            claude_pane(),
+            screen,
+            &preface_params(Some(top), 50),
+        );
+        let preface = preface_of(result);
+
+        assert_eq!(preface.agent, "claude");
+        assert_eq!(preface.session_id, PREFACE_SESSION);
+        assert!(!preface.revision.is_empty());
+        assert_eq!(preface.omitted, 0);
+        assert_eq!(
+            prompts_of(&preface),
+            vec![
+                Some("trace why the ferry timetable importer drops the last sailing of the day\nkeep the fix small"),
+                Some("/review the harbour schedule parser\nand its tests"),
+                Some("summarise the tide tables for the north pier"),
+                None,
+                Some("now chunk the timetable by pier"),
+            ]
+        );
+        let ends: Vec<_> = preface.turns.iter().map(|turn| turn.end).collect();
+        assert_eq!(
+            ends,
+            vec![
+                TurnEnd::Answered,
+                TurnEnd::Aborted,
+                TurnEnd::Error,
+                TurnEnd::Answered,
+                // Cut by the seam and quoted whole; the record left it open
+                // when a prompt typed mid-run took over, and an older open
+                // turn is kept.
+                TurnEnd::Open,
+            ]
+        );
+        assert_eq!(preface.turns[3].start, TurnStart::Task);
+        assert!(preface.turns[0]
+            .answer
+            .as_deref()
+            .is_some_and(|answer| answer.ends_with("https://example.invalid/pull/7")));
+        assert!(preface.turns.windows(2).all(|pair| pair[0].at < pair[1].at));
+        // The screen was paged the way a client pages it, from the bottom.
+        assert_eq!(asked, vec!["pane.get", "pane.read@0"]);
+    }
+
+    #[test]
+    fn preface_quotes_an_answered_turn_the_seam_cuts_with_its_prompt() {
+        let fixture = Fixture::new();
+        planted_record(&fixture);
+        let rows = screen_of(0..9, 0);
+        // The client's oldest line is the middle of turn 0's answer.
+        let held_from = row_index(&rows, "  | sailing | time |");
+        let screen = FakeScreen::new(rows.clone());
+        let top = (screen.offset_of(held_from), rows[held_from].as_str());
+        let preface = preface_of(
+            ask_preface(
+                &fixture,
+                claude_pane(),
+                screen,
+                &preface_params(Some(top), 50),
+            )
+            .0,
+        );
+        assert_eq!(preface.turns.len(), 1);
+        assert_eq!(
+            preface.turns[0].prompt.as_deref(),
+            Some("trace why the ferry timetable importer drops the last sailing of the day\nkeep the fix small")
+        );
+        assert!(preface.turns[0]
+            .answer
+            .as_deref()
+            .is_some_and(|answer| answer.starts_with("The importer drops the last sailing")));
+    }
+
+    #[test]
+    fn preface_re_anchors_a_top_offset_the_tail_has_grown_past() {
+        let fixture = Fixture::new();
+        planted_record(&fixture);
+        let rows = screen_of(0..8, 0);
+        // The client's oldest line is the last line of turn 0's answer, just
+        // above turn 1's prompt: it holds turn 1 and everything after.
+        let held_from = row_index(
+            &rows,
+            "\u{23fa} Fixed by making the window inclusive: https://example.invalid/pull/7",
+        );
+        let offset = FakeScreen::new(rows.clone()).offset_of(held_from);
+        let top_line = rows[held_from].clone();
+
+        // Since the client read it, the agent printed more: every line the
+        // client counted is now further from the bottom.
+        let mut grown = rows.clone();
+        let footer = grown.split_off(grown.len() - footer_rows().len());
+        grown.extend(turn_rows(8));
+        grown.extend((0..40).map(|row| format!("  newer tool output {row}")));
+        grown.extend(footer);
+        let preface = preface_of(
+            ask_preface(
+                &fixture,
+                claude_pane(),
+                FakeScreen::new(grown),
+                &preface_params(Some((offset, &top_line)), 50),
+            )
+            .0,
+        );
+        // Read at the stale offset, the anchor would land below turn 1's
+        // and turn 2's prompts and quote them as though the client had lost
+        // them.
+        assert_eq!(
+            prompts_of(&preface),
+            vec![Some("trace why the ferry timetable importer drops the last sailing of the day\nkeep the fix small")]
+        );
+    }
+
+    #[test]
+    fn preface_reads_a_screen_taller_than_a_page_and_rereads_one_that_moved() {
+        let fixture = Fixture::new();
+        planted_record(&fixture);
+        // Turns 0 and 1 above two and a half pages of tool output, and the
+        // client's oldest line inside it, two pages up.
+        let rows: Vec<String> = (0..2)
+            .flat_map(turn_rows)
+            .chain((0..2_500).map(|row| format!("  older tool output {row}")))
+            .chain((2..9).flat_map(turn_rows))
+            .chain(footer_rows())
+            .collect();
+        let held_from = row_index(&rows, "  older tool output 1200");
+        let mut screen = FakeScreen::new(rows.clone());
+        let top = (screen.offset_of(held_from), rows[held_from].as_str());
+        // The agent prints between the first page and the second, so the
+        // two no longer meet and the screen is read again.
+        screen.grow = Some((1, vec!["  a line printed mid-read".into()]));
+        let (result, asked) = ask_preface(
+            &fixture,
+            claude_pane(),
+            screen,
+            &preface_params(Some(top), 50),
+        );
+        let preface = preface_of(result);
+        assert_eq!(preface.turns.len(), 2);
+        assert_eq!(
+            preface.turns[1].prompt.as_deref(),
+            Some("/review the harbour schedule parser\nand its tests")
+        );
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|method| *method == "pane.read@0")
+                .count(),
+            2,
+            "the moved screen is read again from the bottom: {asked:?}"
+        );
+        assert!(asked.iter().any(|method| method == "pane.read@999"));
+    }
+
+    #[test]
+    fn preface_with_no_top_offset_takes_the_screens_top_as_the_clients() {
+        let fixture = Fixture::new();
+        planted_record(&fixture);
+        // A screen that forgot everything before turn 5.
+        let (result, _) = ask_preface(
+            &fixture,
+            claude_pane(),
+            FakeScreen::new(screen_of(5..9, 3)),
+            &preface_params(None, 50),
+        );
+        let preface = preface_of(result);
+        assert_eq!(preface.turns.len(), 5);
+        assert_eq!(
+            preface.turns[4].prompt.as_deref(),
+            Some("now chunk the timetable by pier")
+        );
+    }
+
+    #[test]
+    fn preface_keeps_the_newest_max_turns_prompted_turns_and_counts_the_rest() {
+        let fixture = Fixture::new();
+        planted_record(&fixture);
+        let (result, _) = ask_preface(
+            &fixture,
+            claude_pane(),
+            FakeScreen::new(screen_of(5..9, 0)),
+            &preface_params(None, 2),
+        );
+        let preface = preface_of(result);
+        // The two newest prompted turns, and the task turn between them.
+        assert_eq!(
+            prompts_of(&preface),
+            vec![
+                Some("summarise the tide tables for the north pier"),
+                None,
+                Some("now chunk the timetable by pier"),
+            ]
+        );
+        assert_eq!(preface.omitted, 2);
+    }
+
+    #[test]
+    fn preface_with_nothing_above_the_screen_says_so() {
+        let fixture = Fixture::new();
+        planted_record(&fixture);
+        let (result, _) = ask_preface(
+            &fixture,
+            claude_pane(),
+            FakeScreen::new(screen_of(0..9, 0)),
+            &preface_params(None, 50),
+        );
+        assert_eq!(preface_reason(result), PrefaceReason::NothingAbove);
+    }
+
+    #[test]
+    fn preface_that_cannot_place_its_seam_answers_none_rather_than_a_guess() {
+        let fixture = Fixture::new();
+        planted_record(&fixture);
+
+        // The client's oldest line is on no row of this screen.
+        let (result, _) = ask_preface(
+            &fixture,
+            claude_pane(),
+            FakeScreen::new(screen_of(3..9, 0)),
+            &preface_params(Some((5, "a line this screen never showed")), 50),
+        );
+        assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
+
+        // The line is there, but none of the record's prompts are below it.
+        let rows: Vec<String> = (0..30)
+            .map(|row| format!("  unrelated output {row}"))
+            .collect();
+        let screen = FakeScreen::new(rows.clone());
+        let top = (screen.offset_of(4), rows[4].as_str());
+        let (result, _) = ask_preface(
+            &fixture,
+            claude_pane(),
+            screen,
+            &preface_params(Some(top), 50),
+        );
+        assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
+    }
+
+    #[test]
+    fn preface_reasons_reuse_the_prompt_trails_refusals() {
+        let fixture = Fixture::new();
+        let screen = || FakeScreen::new(screen_of(5..9, 0));
+
+        assert_eq!(
+            preface_reason(
+                ask_preface(&fixture, pane(None), screen(), &preface_params(None, 50)).0
+            ),
+            PrefaceReason::NoSession
+        );
+        // Harnesses this server has no preface reader for, until it does.
+        for (agent, kind, value) in [
+            ("codex", AgentSessionRefKind::Id, "0199f3c2b7d84a1e9c05"),
+            ("pi", AgentSessionRefKind::Path, "/invented/pi.jsonl"),
+            ("droid", AgentSessionRefKind::Id, "droid-session"),
+        ] {
+            let (result, asked) = ask_preface(
+                &fixture,
+                pane(Some(session(agent, kind, value))),
+                screen(),
+                &preface_params(None, 50),
+            );
+            assert_eq!(
+                preface_reason(result),
+                PrefaceReason::UnsupportedAgent,
+                "{agent}"
+            );
+            assert_eq!(
+                asked,
+                vec!["pane.get"],
+                "the screen is never read for {agent}"
+            );
+        }
+        assert_eq!(
+            preface_reason(
+                ask_preface(&fixture, claude_pane(), screen(), &preface_params(None, 50)).0
+            ),
+            PrefaceReason::NoRecord
+        );
+        fixture.write(
+            &format!(".claude/projects/-invented-harbour/{PREFACE_SESSION}.jsonl"),
+            "not a record\n",
+        );
+        assert_eq!(
+            preface_reason(
+                ask_preface(&fixture, claude_pane(), screen(), &preface_params(None, 50)).0
+            ),
+            PrefaceReason::Unreadable
+        );
+    }
+
+    #[test]
+    fn preface_params_are_checked_before_the_app_is_asked() {
+        // The receiver is dropped, so any dispatch to the app would fail.
+        let (tx, _) = mpsc::unbounded_channel();
+        for params in [
+            PanePrefaceParams {
+                pane_id: " ".into(),
+                ..preface_params(None, 50)
+            },
+            PanePrefaceParams {
+                top_line: Some("a line".into()),
+                ..preface_params(None, 50)
+            },
+            PanePrefaceParams {
+                top_line: None,
+                ..preface_params(Some((3, "a line")), 50)
+            },
+        ] {
+            let response = handle_preface("req".into(), &params, &tx);
+            let parsed: ErrorResponse = serde_json::from_str(&response)
+                .unwrap_or_else(|_| panic!("expected an error response, got: {response}"));
+            assert_eq!(parsed.error.code, "invalid_params");
+        }
+    }
+
+    #[test]
+    fn preface_response_is_the_shape_a_client_reads() {
+        let fixture = Fixture::new();
+        let (tx, responder) = fake_app(pane(None), FakeScreen::new(Vec::new()));
+        let response = respond(
+            "req_preface".into(),
+            preface_sources(&preface_params(None, 50), &tx, Some(fixture.root.clone())),
+        );
+        drop(tx);
+        responder.join().unwrap();
+        assert_eq!(
+            response,
+            r#"{"id":"req_preface","result":{"type":"preface","pane_id":"wG4:p1","terminal_id":"term_beacon","preface":null,"reason":"no_session"}}"#
+        );
     }
 }

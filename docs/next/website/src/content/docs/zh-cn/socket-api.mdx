@@ -99,7 +99,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | 工作区 | `workspace.create`、`workspace.list`、`workspace.get`、`workspace.focus`、`workspace.rename`、`workspace.move`、`workspace.move_block`、`workspace.report_metadata`、`workspace.close` |
 | Worktree | `worktree.list`、`worktree.create`、`worktree.open`、`worktree.remove` |
 | 标签页 | `tab.create`、`tab.list`、`tab.get`、`tab.focus`、`tab.rename`、`tab.move`、`tab.close` |
-| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.prompt_trail`、`pane.turn_index`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
+| 窗格 | `pane.split`、`pane.swap`、`pane.move`、`pane.zoom`、`pane.layout`、`pane.process_info`、`pane.neighbor`、`pane.edges`、`pane.focus_direction`、`pane.resize`、`pane.list`、`pane.current`、`pane.get`、`pane.prompt_trail`、`pane.turn_index`、`pane.preface`、`pane.rename`、`pane.send_text`、`pane.send_keys`、`pane.send_input`、`pane.read`、`pane.report_agent`、`pane.report_agent_session`、`pane.report_metadata`、`pane.clear_agent_authority`、`pane.release_agent`、`pane.close`、`pane.wait_for_output` |
 | 弹窗 | `popup.close` |
 | 布局 | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | 智能体 | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
@@ -142,6 +142,16 @@ Claude 和 codex 不受支持。未知窗格返回 `pane_not_found`。
 `revision` 是记录变化时随之变化的不透明值。只沿该 leaf 的父链读取，
 按从旧到新返回最近最多 64 个回合。父条目缺失或循环返回 `unreadable`。
 最后一行 JSON 尚未写完时，`partial: true`，最新回合为 `open`。
+
+`pane.preface {pane_id, top_offset, top_line, max_turns}` 返回
+`{type:"preface", pane_id, terminal_id, preface, reason}`：会话记录中早于客户端
+屏幕上所保留的最旧提示的轮次，每轮包含提示及其最终回答。`preface` 和 `reason`
+恰有一个非空。`top_offset` 是客户端保留的最旧屏幕行的 `offset_from_bottom`
+（与 `recent_unwrapped` 偏移分页的计数方式相同），`top_line` 是该行文本；
+客户端保留了屏幕顶部时两者均为 null。保留最新的 `max_turns`（最多 200）个提示轮次，
+`omitted` 统计未发送的更早轮次。原因与 prompt trail 共用，另加 `seam_not_found`
+和 `nothing_above`。支持 Claude 窗格，服务器从不记录提示或回答正文。
+支持此方法的服务器在 pong 中声明 `capabilities.preface: true`。
 
 每个回合为 `{id, at, start, prompt, end, answer, answer_id}`。
 用户消息（包括中途指令和追问）或可见的 `wake` 自定义消息才会开始回合。

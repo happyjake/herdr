@@ -427,7 +427,7 @@ fn join_text_blocks(blocks: &[Value], kind: &str) -> String {
         .join("\n")
 }
 
-fn tag_contents<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+pub(crate) fn tag_contents<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let start = text.find(&format!("<{tag}>"))? + tag.len() + 2;
     let end = text[start..].find(&format!("</{tag}>"))? + start;
     Some(&text[start..end])
@@ -740,7 +740,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

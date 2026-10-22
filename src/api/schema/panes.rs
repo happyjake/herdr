@@ -1085,6 +1085,8 @@ pub struct IndexedTurn {
 pub enum TurnStart {
     Prompt,
     Wake,
+    /// A background task finishing. The pi reader never emits it.
+    Task,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1094,4 +1096,83 @@ pub enum TurnEnd {
     Aborted,
     Error,
     Open,
+}
+
+/// `pane.preface` parameters: where the client's oldest held screen line is,
+/// and how many prompted turns it has room for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PanePrefaceParams {
+    pub pane_id: String,
+    /// `offset_from_bottom` of the oldest screen line the client holds,
+    /// counted as `recent_unwrapped` offset pages count; null when the
+    /// client holds the screen's top.
+    pub top_offset: Option<u64>,
+    /// That line's text, which the server re-anchors near `top_offset` in
+    /// case the tail has grown since. Null exactly when `top_offset` is.
+    pub top_line: Option<String>,
+    /// Prompted turns the client has room for, at most 200. Wake and task
+    /// turns inside the kept span ride along under a separate server cap.
+    pub max_turns: u32,
+}
+
+/// The turns of a pane's session record older than the oldest prompt the
+/// client holds on screen, each a prompt and its final answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Preface {
+    pub agent: String,
+    pub session_id: String,
+    /// Opaque record revision, for equality comparisons only.
+    pub revision: String,
+    /// Oldest first.
+    pub turns: Vec<PrefaceTurn>,
+    /// Turns older than the seam that were not sent.
+    pub omitted: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PrefaceTurn {
+    pub id: String,
+    /// Start time in unix seconds.
+    pub at: u64,
+    pub start: TurnStart,
+    /// The whole prompt up to the server's byte cap; null for wake and
+    /// task turns.
+    pub prompt: Option<String>,
+    pub end: TurnEnd,
+    /// The whole final answer up to the server's byte cap; null unless
+    /// the turn was answered.
+    pub answer: Option<String>,
+    /// Present and true when the byte cap cut the prompt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prompt_cut: bool,
+    /// Present and true when the byte cap cut the answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answer_cut: bool,
+}
+
+/// Why a pane has no preface: the prompt trail's reasons, plus the two a
+/// seam adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefaceReason {
+    NoSession,
+    UnsupportedAgent,
+    NoRecord,
+    Unreadable,
+    /// The client's oldest held line, or any record prompt below it, could
+    /// not be found on the screen.
+    SeamNotFound,
+    /// The screen already reaches the record's first turn.
+    NothingAbove,
+}
+
+impl From<PromptTrailReason> for PrefaceReason {
+    fn from(reason: PromptTrailReason) -> Self {
+        match reason {
+            PromptTrailReason::NoSession => Self::NoSession,
+            PromptTrailReason::UnsupportedAgent => Self::UnsupportedAgent,
+            PromptTrailReason::NoRecord => Self::NoRecord,
+            PromptTrailReason::Unreadable => Self::Unreadable,
+        }
+    }
 }

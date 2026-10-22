@@ -10,8 +10,8 @@ use super::integrations::{
 use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
     PaneMouseRouting, PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult,
-    PaneResizeResult, PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult, PromptTrail,
-    PromptTrailReason, TurnIndex,
+    PaneResizeResult, PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult, Preface,
+    PrefaceReason, PromptTrail, PromptTrailReason, TurnIndex,
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
@@ -208,6 +208,13 @@ pub enum ResponseResult {
         terminal_id: String,
         index: Option<TurnIndex>,
         reason: Option<PromptTrailReason>,
+    },
+    /// A pane's preface, or exactly one reason it has none.
+    Preface {
+        pane_id: String,
+        terminal_id: String,
+        preface: Option<Preface>,
+        reason: Option<PrefaceReason>,
     },
     PaneCurrent {
         pane: PaneInfo,

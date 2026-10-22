@@ -979,6 +979,9 @@ fn handle_request(
         Method::PaneTurnIndex(params) => {
             crate::api::prompt_trail::handle_turn_index(request.id, &params, api_tx)
         }
+        Method::PanePreface(params) => {
+            crate::api::prompt_trail::handle_preface(request.id, &params, api_tx)
+        }
         Method::AttachmentBegin(params) => {
             crate::api::attachment::handle_begin(request.id, &params)
         }
@@ -1962,6 +1965,7 @@ mod tests {
                 agent_prompt_expectations: false,
                 turn_index: false,
                 agent_settings: false,
+                preface: false,
             }),
             None,
             None,
@@ -2718,5 +2722,152 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
+    }
+
+    /// A preface carries a pane's prompts and answers to the client that
+    /// asked, and to nowhere else: not a word of either reaches the API's
+    /// tracing, at any level, on any thread the request ran on.
+    #[test]
+    fn preface_bodies_never_reach_api_tracing() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+        .expect("this test owns its process's tracing");
+
+        // The request reads records filed under the operator's home, so the
+        // test gives the process one of its own.
+        const SESSION: &str = "0f6e0c2a-5b1d-4c8e-9a7f-3e2d1c0b9a88";
+        let home = unique_test_path("preface-home");
+        let record = home.join(format!(
+            ".claude/projects/-invented-harbour/{SESSION}.jsonl"
+        ));
+        fs::create_dir_all(record.parent().unwrap()).unwrap();
+        fs::write(
+            &record,
+            include_str!("../preface/fixtures/claude-record.jsonl"),
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+
+        let screen = [
+            "\u{276f} also keep the old pier names",
+            "\u{23fa} Chunked by pier, and the old pier names are kept.",
+            "\u{276f} ship the pier map",
+            "  with the legend",
+            "\u{23fa} Section 1. The pier map ships with its legend.",
+            "\u{276f} and print it for the harbour office",
+            "\u{276f} ",
+        ]
+        .join("\n");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            while let Some(msg) = api_rx.blocking_recv() {
+                let result = match msg.request.method {
+                    Method::PaneGet(_) => {
+                        let mut pane = pane_info("pane_1", crate::api::schema::AgentStatus::Idle);
+                        pane.agent_session = Some(crate::api::schema::AgentSessionInfo {
+                            source: "herdr:claude".into(),
+                            agent: "claude".into(),
+                            kind: crate::agent_resume::AgentSessionRefKind::Id,
+                            value: SESSION.into(),
+                            record_path: None,
+                        });
+                        ResponseResult::PaneInfo { pane }
+                    }
+                    Method::PaneRead(params) => ResponseResult::PaneRead {
+                        read: crate::api::schema::PaneReadResult {
+                            pane_id: params.pane_id,
+                            workspace_id: "ws_1".into(),
+                            tab_id: "tab_1".into(),
+                            source: params.source,
+                            format: params.format,
+                            text: screen.clone(),
+                            revision: 0,
+                            truncated: false,
+                            effective_offset: Some(0),
+                            has_more: Some(false),
+                        },
+                    },
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                msg.respond_to
+                    .send(
+                        serde_json::to_string(&SuccessResponse {
+                            id: msg.request.id,
+                            result,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+        });
+
+        let (mut client, server, _path) = local_stream_pair("preface-tracing");
+        client
+            .write_all(br#"{"id":"req_preface","method":"pane.preface","params":{"pane_id":"pane_1","top_offset":null,"top_line":null,"max_turns":50}}"#)
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let event_hub = EventHub::default();
+        let connection = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &event_hub, &running, None)
+        });
+        let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+        drop(client);
+        connection.join().unwrap().unwrap();
+        responder.join().unwrap();
+
+        let ResponseResult::Preface {
+            preface: Some(preface),
+            ..
+        } = response.result
+        else {
+            panic!("expected a preface, got {:?}", response.result);
+        };
+        let bodies: Vec<String> = preface
+            .turns
+            .iter()
+            .flat_map(|turn| [turn.prompt.clone(), turn.answer.clone()])
+            .flatten()
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            6,
+            "the preface served its prompts and answers"
+        );
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        // The capture saw this very request, so its silence about the
+        // bodies is evidence rather than an empty instrument.
+        assert!(
+            log.contains("pane.preface"),
+            "the request was traced: {log}"
+        );
+        assert!(log.contains("api.preface"), "the outcome was traced: {log}");
+        for body in &bodies {
+            for line in body.lines().filter(|line| line.len() >= 12) {
+                let probe: String = line.chars().take(24).collect();
+                assert!(!log.contains(&probe), "a body reached tracing: {probe:?}");
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
     }
 }

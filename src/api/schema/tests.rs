@@ -1596,6 +1596,7 @@ fn success_response_round_trips() {
                 agent_prompt_expectations: true,
                 turn_index: true,
                 agent_settings: true,
+                preface: true,
             }),
             name: Some("test-server".into()),
             reach: Some("test-server".into()),
@@ -2476,4 +2477,54 @@ fn agent_settings_schema_requires_nullable_keys() {
             assert!(nullable, "schema forbids null for {name}.{key}");
         }
     }
+}
+
+#[test]
+fn preface_request_and_response_round_trip() {
+    let request = serde_json::json!({"id":"req", "method":"pane.preface", "params":{
+        "pane_id":"p", "top_offset":412, "top_line":"a line", "max_turns":40}});
+    let decoded: Request = serde_json::from_value(request.clone()).unwrap();
+    assert!(matches!(&decoded.method, Method::PanePreface(params)
+        if params.top_offset == Some(412) && params.max_turns == 40));
+    assert!(!crate::api::request_changes_ui(&decoded));
+    assert!(!crate::server::client_commands::supports_client_shell_method(&decoded.method));
+    assert!(!crate::server::client_commands::supports_client_shell_method_name("pane.preface"));
+    assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+    let held_top = serde_json::json!({"id":"req", "method":"pane.preface", "params":{
+        "pane_id":"p", "top_offset":null, "top_line":null, "max_turns":40}});
+    let decoded: Request = serde_json::from_value(held_top.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), held_top);
+
+    let response = serde_json::json!({"id":"req", "result": {
+        "type":"preface", "pane_id":"p", "terminal_id":"t", "reason":null,
+        "preface":{"agent":"claude", "session_id":"s", "revision":"opaque", "omitted":3, "turns":[
+            {"id":"u1", "at":1772615700, "start":"prompt", "prompt":"Explain", "end":"answered",
+             "answer":"Ready", "answer_cut":true},
+            {"id":"u2", "at":1772615760, "start":"task", "prompt":null, "end":"open", "answer":null},
+            {"id":"u3", "at":1772615820, "start":"wake", "prompt":null, "end":"aborted", "answer":null},
+            {"id":"u4", "at":1772615880, "start":"prompt", "prompt":"More", "end":"error",
+             "answer":null, "prompt_cut":true}]}
+    }});
+    let decoded: SuccessResponse = serde_json::from_value(response.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), response);
+    for reason in [
+        "no_session",
+        "unsupported_agent",
+        "no_record",
+        "unreadable",
+        "seam_not_found",
+        "nothing_above",
+    ] {
+        let response = serde_json::json!({"id":"req", "result":{"type":"preface", "pane_id":"p",
+            "terminal_id":"t", "preface":null, "reason":reason}});
+        let decoded: SuccessResponse = serde_json::from_value(response.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), response);
+    }
+}
+
+#[test]
+fn preface_capability_is_advertised_and_defaults_to_absent() {
+    assert!(crate::api::server_capabilities().preface);
+    let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+    assert!(!old.preface);
 }

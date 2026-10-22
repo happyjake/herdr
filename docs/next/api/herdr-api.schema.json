@@ -3270,6 +3270,41 @@
           ],
           "type": "object"
         },
+        "PanePrefaceParams": {
+          "description": "`pane.preface` parameters: where the client's oldest held screen line is,\nand how many prompted turns it has room for.",
+          "properties": {
+            "max_turns": {
+              "description": "Prompted turns the client has room for, at most 200. Wake and task\nturns inside the kept span ride along under a separate server cap.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "top_line": {
+              "description": "That line's text, which the server re-anchors near `top_offset` in\ncase the tail has grown since. Null exactly when `top_offset` is.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "top_offset": {
+              "description": "`offset_from_bottom` of the oldest screen line the client holds,\ncounted as `recent_unwrapped` offset pages count; null when the\nclient holds the screen's top.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id",
+            "max_turns"
+          ],
+          "type": "object"
+        },
         "PaneProcessInfoParams": {
           "properties": {
             "pane_id": {
@@ -7198,6 +7233,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.preface",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PanePrefaceParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "server.search_sessions",
               "type": "string"
             },
@@ -10749,6 +10800,114 @@
             }
           ]
         },
+        "Preface": {
+          "description": "The turns of a pane's session record older than the oldest prompt the\nclient holds on screen, each a prompt and its final answer.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "omitted": {
+              "description": "Turns older than the seam that were not sent.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "revision": {
+              "description": "Opaque record revision, for equality comparisons only.",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "turns": {
+              "description": "Oldest first.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PrefaceTurn"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "agent",
+            "session_id",
+            "revision",
+            "turns",
+            "omitted"
+          ],
+          "type": "object"
+        },
+        "PrefaceReason": {
+          "description": "Why a pane has no preface: the prompt trail's reasons, plus the two a\nseam adds.",
+          "oneOf": [
+            {
+              "enum": [
+                "no_session",
+                "unsupported_agent",
+                "no_record",
+                "unreadable"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "seam_not_found",
+              "description": "The client's oldest held line, or any record prompt below it, could\nnot be found on the screen.",
+              "type": "string"
+            },
+            {
+              "const": "nothing_above",
+              "description": "The screen already reaches the record's first turn.",
+              "type": "string"
+            }
+          ]
+        },
+        "PrefaceTurn": {
+          "properties": {
+            "answer": {
+              "description": "The whole final answer up to the server's byte cap; null unless\nthe turn was answered.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "answer_cut": {
+              "description": "Present and true when the byte cap cut the answer.",
+              "type": "boolean"
+            },
+            "at": {
+              "description": "Start time in unix seconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "end": {
+              "$ref": "#/schemas/success_response/$defs/TurnEnd"
+            },
+            "id": {
+              "type": "string"
+            },
+            "prompt": {
+              "description": "The whole prompt up to the server's byte cap; null for wake and\ntask turns.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "prompt_cut": {
+              "description": "Present and true when the byte cap cut the prompt.",
+              "type": "boolean"
+            },
+            "start": {
+              "$ref": "#/schemas/success_response/$defs/TurnStart"
+            }
+          },
+          "required": [
+            "id",
+            "at",
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
         "PromptTrail": {
           "description": "What a pane's session record says was asked of it.\n\nRead from the harness's own file of the conversation, never from the\nscreen: the person's words, or a supervising agent's, and never the\nagent's tool traffic, its results, or what the harness injected on the\nperson's behalf. Every field is always serialized, so a client reads a\nnull as a real absence rather than as a server that has nothing to say.",
           "properties": {
@@ -11503,6 +11662,47 @@
                 },
                 "type": {
                   "const": "turn_index",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "terminal_id"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A pane's preface, or exactly one reason it has none.",
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "preface": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/Preface"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "reason": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/PrefaceReason"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "preface",
                   "type": "string"
                 }
               },
@@ -12519,6 +12719,11 @@
             "live_handoff": {
               "type": "boolean"
             },
+            "preface": {
+              "default": false,
+              "description": "Supports `pane.preface`: a pane's earlier turns quoted from its\nsession record. Additive: absent (false) in pongs of servers that\npredate it.",
+              "type": "boolean"
+            },
             "send_affirm": {
               "default": false,
               "description": "Whether `pane.send_input` dedupes by `send_id`, so a client may\nsafely re-issue an unacked send after a reconnect. Additive: absent\n(false) in pongs of servers that predate it.",
@@ -13026,11 +13231,20 @@
           "type": "string"
         },
         "TurnStart": {
-          "enum": [
-            "prompt",
-            "wake"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "prompt",
+                "wake"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "task",
+              "description": "A background task finishing. The pi reader never emits it.",
+              "type": "string"
+            }
+          ]
         },
         "WorkspaceInfo": {
           "properties": {

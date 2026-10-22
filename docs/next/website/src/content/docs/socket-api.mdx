@@ -104,7 +104,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.prompt_trail`, `pane.turn_index`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.prompt_trail`, `pane.turn_index`, `pane.preface`, `pane.rename`, `pane.set_pinned`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.send_mouse`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -359,6 +359,38 @@ the record changes. Turns follow only that leaf's parent chain, oldest
 first, limited to the last 64. A missing parent or cycle is `unreadable`.
 An incomplete final JSON line sets `partial: true` and makes the newest
 turn `open`.
+
+`pane.preface {pane_id, top_offset, top_line, max_turns}` returns
+`{type:"preface", pane_id, terminal_id, preface, reason}`: the turns of the
+pane's session record older than the oldest prompt the client still holds on
+screen, each the prompt and its final answer. Exactly one of `preface` and
+`reason` is set. `top_offset` is the `offset_from_bottom` of the oldest
+screen line the client holds, counted as `recent_unwrapped` offset pages
+count, and `top_line` is that line's text; both are null when the client
+holds the screen's top. The server pages the screen the same way, looks for
+`top_line` near `top_offset` (the tail may have grown since), and matches
+the record's prompts against the rows from there down, newest first. The
+oldest prompt that lines up is the first turn the client holds; every older
+turn is the preface, so a turn the client's oldest line cuts through is
+quoted whole. `max_turns` (at most 200) is how many prompted turns the
+client has room for: the newest are kept, with the wake and task turns among
+them under a separate cap, and `omitted` counts the older turns not sent.
+Prompts are cut at 4 KiB and answers at 16 KiB, with `prompt_cut` or
+`answer_cut` set when they were. The record's newest turn is never sent
+while it is still open; an older turn the record left open is kept with
+`end: "open"`.
+
+The preface is `{agent, session_id, revision, turns, omitted}`. Each turn is
+`{id, at, start, prompt, end, answer}` with `at` in unix seconds, `start` one
+of `prompt`, `wake` or `task` (a background task finishing; wake and task
+turns have no prompt), and `end` one of `answered`, `aborted`, `error` or
+`open`. Reasons are the prompt trail's (`no_session`, `unsupported_agent`,
+`no_record`, `unreadable`), plus `seam_not_found` when the client's oldest
+line or any record prompt below it cannot be found on the screen, and
+`nothing_above` when the screen already reaches the record's first turn.
+Claude panes are supported; other harnesses answer `unsupported_agent`. The
+server never logs a prompt or an answer. A supporting server advertises
+`capabilities.preface: true` in its pong.
 
 Each turn is `{id, at, start, prompt, end, answer, answer_id}`. It starts
 at a user message (including a steer or follow-up), or a displayed
