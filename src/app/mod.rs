@@ -25,6 +25,7 @@ mod popup;
 mod runtime;
 mod send_affirm;
 mod session;
+mod started_by;
 pub mod state;
 mod tab_bar_status;
 mod terminal_targets;
@@ -550,6 +551,7 @@ impl App {
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
             pending_agent_status_resolutions: Vec::new(),
+            pending_started_by_updates: Vec::new(),
             outer_terminal_focus: None,
             prefix_keys,
             headless_size: config.headless_size(),

@@ -274,6 +274,9 @@ impl App {
         }
 
         let logbook_events = self.state.logbook_tab_close_events(ws_idx, tab_idx);
+        let closing_starters = self
+            .state
+            .closing_starters(ws_idx, pane_ids.iter().copied());
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return tab_not_found(id, &target.tab_id);
         };
@@ -285,6 +288,7 @@ impl App {
             );
         }
         self.state.enqueue_logbook_events(logbook_events);
+        self.state.retire_starters(closing_starters);
         self.state.remove_plugin_pane_records(pane_ids);
         self.state.remove_unattached_terminal_ids(terminal_ids);
         self.shutdown_detached_terminal_runtimes();

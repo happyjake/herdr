@@ -1405,6 +1405,10 @@ impl App {
         let Some(pane) = self.pane_info(target_ws_idx, moved_pane_id) else {
             return encode_error(id, "pane_move_failed", "moved pane is unavailable");
         };
+        if cross_workspace {
+            self.state
+                .retarget_starter(&previous_pane_id, pane.pane_id.clone());
+        }
         let source_layout = if closed_workspace_id.is_none() {
             self.parse_tab_id(&previous_tab_id)
                 .and_then(|(ws_idx, tab_idx)| self.pane_layout_snapshot(ws_idx, tab_idx))
@@ -2340,6 +2344,7 @@ impl App {
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         if !self.state.close_pane_would_close_workspace(ws_idx, pane_id) {
             self.state.record_logbook_close(ws_idx, pane_id);
+            self.state.retire_starter(ws_idx, pane_id);
         }
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {

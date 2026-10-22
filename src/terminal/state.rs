@@ -166,6 +166,10 @@ pub struct TerminalState {
     /// nothing about the label, the agent, or anything the terminal does.
     pub pinned: bool,
     pub started_by: Option<crate::api::schema::PaneStartedBy>,
+    /// Whether an agent session report has reached this terminal. Only the
+    /// first one can re-root a started pane, so a restored agent resuming its
+    /// own conversation keeps its link.
+    pub session_reported: bool,
     pub flag: Option<crate::api::schema::PaneFlag>,
     /// Retained after clearing so a later flag never reuses an earlier date.
     pub flag_set_through: Option<u64>,
@@ -225,6 +229,7 @@ impl TerminalState {
             label_at: None,
             pinned: false,
             started_by: None,
+            session_reported: false,
             flag: None,
             flag_set_through: None,
             agent_name: None,

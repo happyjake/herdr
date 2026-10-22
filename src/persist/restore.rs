@@ -452,6 +452,7 @@ fn unavailable_restored_terminal(
         terminal.manual_label = pane.label.clone();
         terminal.restore_flag(pane.flag.clone(), pane.flag_set_through);
         terminal.started_by = pane.started_by.clone();
+        terminal.session_reported = pane.session_reported;
         terminal.launch_argv = pane.launch_argv.clone();
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
@@ -671,6 +672,7 @@ fn restore_tab(
             terminal.set_pinned(saved_pinned);
             terminal.restore_flag(saved_flag, saved_flag_set_through);
             terminal.started_by = saved_pane.and_then(|pane| pane.started_by.clone());
+            terminal.session_reported = saved_pane.is_some_and(|pane| pane.session_reported);
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
             }
@@ -772,6 +774,7 @@ fn restore_tab(
                 terminal.set_pinned(saved_pinned);
                 terminal.restore_flag(saved_flag, saved_flag_set_through);
                 terminal.started_by = saved_pane.and_then(|pane| pane.started_by.clone());
+                terminal.session_reported = saved_pane.is_some_and(|pane| pane.session_reported);
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
@@ -1688,6 +1691,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
@@ -1853,6 +1857,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -1961,6 +1966,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: Some("beacon relay".into()),
                             agent_name: None,
@@ -2085,6 +2091,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2179,6 +2186,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -2307,6 +2315,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             // A detected agent nothing ever minted a name or a
@@ -2440,6 +2449,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2539,6 +2549,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2626,6 +2637,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2718,6 +2730,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -2798,6 +2811,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2892,6 +2906,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2983,6 +2998,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -3074,6 +3090,7 @@ mod tests {
                             10,
                             super::super::snapshot::PaneSnapshot {
                                 started_by: None,
+                                session_reported: false,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -3098,6 +3115,7 @@ mod tests {
                             20,
                             super::super::snapshot::PaneSnapshot {
                                 started_by: None,
+                                session_reported: false,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -3164,6 +3182,7 @@ mod tests {
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
                     started_by: None,
+                    session_reported: false,
                     cwd: cwd.clone(),
                     label: None,
                     agent_name: None,
@@ -3187,6 +3206,7 @@ mod tests {
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
             started_by: None,
+            session_reported: false,
             cwd: cwd.clone(),
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
@@ -3352,6 +3372,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
+                            session_reported: false,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -3954,6 +3975,7 @@ mod tests {
             0,
             super::super::snapshot::PaneSnapshot {
                 started_by: None,
+                session_reported: false,
                 cwd: cwd.clone(),
                 label: None,
                 agent_name: None,

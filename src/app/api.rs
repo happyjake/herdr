@@ -510,6 +510,7 @@ impl App {
 
         self.sync_toast_deadline(previous_toast);
         self.shutdown_detached_terminal_runtimes();
+        self.flush_started_by_updates();
         pane_updates.extend(worktree_restore_updates);
         pane_updates
     }
@@ -958,6 +959,35 @@ impl App {
         }
     }
 
+    /// Publishes panes whose started-by link was rewritten, after the move,
+    /// close or report that rewrote them.
+    pub(crate) fn flush_started_by_updates(&mut self) {
+        let terminal_ids = std::mem::take(&mut self.state.pending_started_by_updates);
+        let mut published = Vec::new();
+        for terminal_id in terminal_ids {
+            let Some(pane) = self
+                .state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(ws_idx, ws)| {
+                    ws.tabs.iter().find_map(|tab| {
+                        tab.panes
+                            .iter()
+                            .find(|(_, pane)| pane.attached_terminal_id == terminal_id)
+                            .map(|(pane_id, _)| (ws_idx, *pane_id))
+                    })
+                })
+            else {
+                continue;
+            };
+            if !published.contains(&pane) {
+                published.push(pane);
+                self.emit_pane_updated(pane.0, pane.1);
+            }
+        }
+    }
+
     pub(crate) fn flush_agent_status_resolutions(&mut self) -> bool {
         let updates = std::mem::take(&mut self.state.pending_agent_status_resolutions);
         let changed = !updates.is_empty();
@@ -990,6 +1020,7 @@ impl App {
 
     pub(crate) fn sync_focus_events(&mut self) {
         self.flush_agent_status_resolutions();
+        self.flush_started_by_updates();
         self.sync_focus_events_with_outer_event(None);
     }
 
@@ -1105,6 +1136,12 @@ impl App {
         &mut self,
         request: crate::api::schema::Request,
     ) -> String {
+        let response = self.dispatch_api_request(request);
+        self.flush_started_by_updates();
+        response
+    }
+
+    fn dispatch_api_request(&mut self, request: crate::api::schema::Request) -> String {
         self.sync_pending_terminal_titles();
         // Catch any status move that reached a pane through a path with no
         // event of its own, so a snapshot never reports a stale transition.

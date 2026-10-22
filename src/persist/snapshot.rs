@@ -162,6 +162,8 @@ pub struct PaneSnapshot {
     // Keep legacy layout fingerprints stable when the pane has no starter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_by: Option<crate::api::schema::PaneStartedBy>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_reported: bool,
     #[serde(default)]
     pub flag: Option<crate::api::schema::PaneFlag>,
     /// Latest flag date, retained even when the flag has been cleared.
@@ -515,6 +517,7 @@ fn capture_tab(
                 agent_status_captured_pair_reported,
                 pinned,
                 started_by: terminal.and_then(|terminal| terminal.started_by.clone()),
+                session_reported: terminal.is_some_and(|terminal| terminal.session_reported),
                 flag: terminal.and_then(|terminal| terminal.flag.clone()),
                 flag_set_through: terminal.and_then(|terminal| terminal.flag_set_through),
                 label_source,
@@ -1231,6 +1234,7 @@ mod tests {
             0,
             PaneSnapshot {
                 started_by: None,
+                session_reported: false,
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
                 label: None,
                 agent_name: None,
@@ -1255,6 +1259,7 @@ mod tests {
             1,
             PaneSnapshot {
                 started_by: None,
+                session_reported: false,
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
                 agent_name: None,
@@ -2019,6 +2024,7 @@ mod tests {
             0,
             PaneSnapshot {
                 started_by: None,
+                session_reported: false,
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
                 label: None,
                 agent_name: None,
@@ -2043,6 +2049,7 @@ mod tests {
             1,
             PaneSnapshot {
                 started_by: None,
+                session_reported: false,
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),

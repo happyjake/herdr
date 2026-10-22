@@ -958,10 +958,12 @@ impl AppState {
 
         let mut terminal_ids = Vec::new();
         let mut pane_ids = Vec::new();
+        let mut closing_starters = Vec::new();
         for idx in &close_indices {
             for pane_id in self.pane_ids_for_workspace(*idx) {
                 self.record_logbook_close(*idx, pane_id);
             }
+            closing_starters.extend(self.closing_starters(*idx, self.pane_ids_for_workspace(*idx)));
             terminal_ids.extend(self.terminal_ids_for_workspace(*idx));
             pane_ids.extend(self.pane_ids_for_workspace(*idx));
             if let Some(workspace_id) = self.workspaces.get(*idx).map(|ws| ws.id.clone()) {
@@ -973,6 +975,7 @@ impl AppState {
             .and_then(|idx| self.workspaces.get(idx))
             .map(|ws| ws.id.clone());
         self.remove_plugin_pane_records(pane_ids);
+        self.retire_starters(closing_starters);
         for idx in close_indices.iter().rev() {
             self.workspaces.remove(*idx);
         }
@@ -1863,6 +1866,12 @@ impl AppState {
                 let parent = matches!(session_start_source.as_deref(), Some("fork" | "branch"))
                     .then(|| self.logbook_key(pane_id))
                     .flatten();
+                if session_ref.is_some() {
+                    self.note_session_report(
+                        pane_id,
+                        session_start_source.as_deref().unwrap_or(""),
+                    );
+                }
                 let mut unchanged_session_accepted = false;
                 let updates = self
                     .update_terminal_state(
@@ -2475,6 +2484,7 @@ impl AppState {
         };
 
         self.record_logbook_close(ws_idx, pane_id);
+        self.retire_starter(ws_idx, pane_id);
         let pane_terminal_id = self.terminal_id_for_pane(ws_idx, pane_id);
         let workspace_terminal_ids = self.terminal_ids_for_workspace(ws_idx);
         self.pane_id_aliases.retain(|_, alias| *alias != pane_id);
