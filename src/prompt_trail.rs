@@ -116,11 +116,13 @@ pub(crate) fn record_path(
     value: &str,
     reported: Option<&str>,
 ) -> Option<PathBuf> {
-    if let Some(reported) = reported.and_then(|reported| reported_record(home, reported)) {
-        return Some(match agent {
-            PromptTrailAgent::Agy => agy_full_transcript(reported),
-            _ => reported,
-        });
+    let reported = reported.and_then(|reported| reported_record(home, reported));
+    let reported = match agent {
+        PromptTrailAgent::Agy => reported.and_then(|reported| agy_full_transcript(home, reported)),
+        _ => reported,
+    };
+    if let Some(reported) = reported {
+        return Some(reported);
     }
 
     match (agent, kind) {
@@ -149,9 +151,9 @@ pub(crate) fn record_path(
 /// configuration directory has been moved reports a legitimate path that
 /// no fixed root would recognise, and refusing it would cost a real trail
 /// to catch what the home boundary already catches.
-fn reported_record(home: Option<&Path>, reported: &str) -> Option<PathBuf> {
+fn reported_record(home: Option<&Path>, reported: impl AsRef<Path>) -> Option<PathBuf> {
     let home = home?.canonicalize().ok()?;
-    let path = Path::new(reported).canonicalize().ok()?;
+    let path = reported.as_ref().canonicalize().ok()?;
     (path.starts_with(&home)
         && path
             .extension()
@@ -639,22 +641,26 @@ fn agy_record(home: &Path, id: &str) -> Option<PathBuf> {
         .join(".system_generated")
         .join("logs")
         .join(AGY_FULL_TRANSCRIPT);
-    path.is_file().then_some(path)
+    // A link anywhere along the derived path is held to the same home
+    // boundary as a reported path.
+    reported_record(Some(home), path)
 }
 
 /// A reported agy transcript, moved from the truncated `transcript.jsonl`
-/// to its whole sibling when that sibling is there.
-fn agy_full_transcript(reported: PathBuf) -> PathBuf {
+/// to its whole sibling when that sibling is there. The sibling is held to
+/// the home boundary again, since it may be a link the report was not; one
+/// that fails it discredits the report.
+fn agy_full_transcript(home: Option<&Path>, reported: PathBuf) -> Option<PathBuf> {
     if reported
         .file_name()
         .is_some_and(|name| name == "transcript.jsonl")
     {
         let full = reported.with_file_name(AGY_FULL_TRANSCRIPT);
-        if full.is_file() {
-            return full;
+        if std::fs::symlink_metadata(&full).is_ok() {
+            return reported_record(home, full);
         }
     }
-    reported
+    Some(reported)
 }
 
 const AGY_FULL_TRANSCRIPT: &str = "transcript_full.jsonl";

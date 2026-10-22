@@ -1447,6 +1447,73 @@ mod tests {
         }
     }
 
+    /// A transcript outside the fixture home, which a link inside it can
+    /// lead to.
+    #[cfg(unix)]
+    fn outside_agy_transcript() -> (Fixture, PathBuf) {
+        let outside = Fixture::new();
+        let full = outside.write(
+            "conversation/.system_generated/logs/transcript_full.jsonl",
+            include_str!("../../tests/fixtures/session-record/agy/transcript_full.jsonl"),
+        );
+        (outside, full)
+    }
+
+    #[cfg(unix)]
+    fn index_reason(fixture: &Fixture, identity: AgentSessionInfo) -> Option<PromptTrailReason> {
+        let response = respond(
+            "request".into(),
+            index_sources(fixture, pane_response(pane(Some(identity)))),
+        );
+        match answered(&response) {
+            ResponseResult::TurnIndex { index, reason, .. } => {
+                assert_eq!(index, None, "a transcript outside home was read");
+                reason
+            }
+            other => panic!("expected turn index, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_full_sibling_linked_out_of_home_is_not_read() {
+        let fixture = Fixture::new();
+        let (_outside, outside_full) = outside_agy_transcript();
+        let truncated = fixture.write(
+            &format!("{AGY_LOGS}/transcript.jsonl"),
+            "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\
+             \"status\":\"DONE\",\"created_at\":\"2026-03-04T09:15:00Z\",\
+             \"content\":\"<USER_REQUEST>\\ntruncated copy\\n</USER_REQUEST>\"}\n",
+        );
+        std::os::unix::fs::symlink(
+            &outside_full,
+            truncated.with_file_name("transcript_full.jsonl"),
+        )
+        .expect("a link out of home");
+        assert_eq!(
+            index_reason(&fixture, agy_session(Some(truncated))),
+            Some(PromptTrailReason::NoRecord)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_conversation_linked_out_of_home_is_not_read() {
+        let fixture = Fixture::new();
+        let (outside, _) = outside_agy_transcript();
+        let brain = fixture.root.join(".gemini/antigravity-cli/brain");
+        std::fs::create_dir_all(&brain).unwrap();
+        std::os::unix::fs::symlink(
+            outside.root.join("conversation"),
+            brain.join(AGY_CONVERSATION),
+        )
+        .expect("a link out of home");
+        assert_eq!(
+            index_reason(&fixture, agy_session(None)),
+            Some(PromptTrailReason::NoRecord)
+        );
+    }
+
     #[test]
     fn agy_panes_have_a_turn_index_but_no_prompt_trail() {
         let fixture = Fixture::new();
