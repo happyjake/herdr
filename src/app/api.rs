@@ -101,15 +101,17 @@ fn pane_read_window(
     use crate::api::schema::{ReadFormat, ReadSource};
 
     if let Some(span) = span {
-        if offset_from_bottom.is_some()
-            || source != ReadSource::RecentUnwrapped
-            || format != ReadFormat::Text
-        {
-            return Err("a span read is a recent_unwrapped text read from the bottom");
+        if offset_from_bottom.is_some() || source != ReadSource::RecentUnwrapped {
+            return Err("a span read is a recent_unwrapped read from the bottom");
         }
         let page_lines = lines.unwrap_or(1000).min(1000) as usize;
         let read = pane
-            .recent_read_span(page_lines, span.min_lines, span.max_lines)
+            .recent_read_span(
+                page_lines,
+                span.min_lines,
+                span.max_lines,
+                matches!(format, ReadFormat::Ansi),
+            )
             .ok_or("this pane's history cannot be read as one span")?;
         return Ok((read.text, read.has_more, Some(0), Some(read.has_more)));
     }

@@ -15,9 +15,12 @@
 //! conversation does not hold.
 //!
 //! pi sets a prompt apart on its screen by a background colour alone, with
-//! no glyph a screen's text can show, so this reader declares no prompt
-//! marker and a pi pane's seam is never placed: its prefaces answer
-//! `seam_not_found` until pi draws one.
+//! no glyph a screen's text can show, so this reader declares that colour
+//! instead of a marker: the dark theme's prompt background, the one the
+//! phone's pi shapes key a prompt on (`isPiPrompt`, `#213b49`). Under any
+//! other theme no row carries it, and the seam is not found rather than
+//! guessed. A screen that holds only wake blocks has no prompt row to place
+//! the seam on either, and answers `seam_not_found` too.
 
 use serde_json::Value;
 
@@ -41,7 +44,15 @@ pub(crate) struct PiReader {
     broken: bool,
 }
 
+/// pi's dark-theme prompt background, `#213b49`; the phone's pi shapes
+/// key a prompt on the same colour.
+const PROMPT_BACKGROUND: [u8; 3] = [0x21, 0x3b, 0x49];
+
 impl super::Reader for PiReader {
+    fn prompt_background(&self) -> Option<[u8; 3]> {
+        Some(PROMPT_BACKGROUND)
+    }
+
     fn accept(&mut self, line: &Value) {
         if !self.broken && self.walk.accept(line, step).is_err() {
             self.broken = true;

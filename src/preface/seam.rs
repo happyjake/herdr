@@ -68,6 +68,18 @@ pub(crate) struct Top<'a> {
     pub lines: Option<&'a [String]>,
 }
 
+/// What marks a prompt row on one harness's screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PromptEvidence<'a> {
+    /// What the harness draws at column 0 ahead of a prompt (see
+    /// [`super::Reader::prompt_markers`]).
+    pub markers: &'a [&'a str],
+    /// The background the harness lays under a prompt (see
+    /// [`super::Reader::prompt_background`]); when set, the screen is read
+    /// with its styling and the background is the evidence.
+    pub background: Option<[u8; 3]>,
+}
+
 /// A screen as far up as it was read: `rows[i]` is the line `i` lines up
 /// from the bottom.
 #[derive(Debug, Default)]
@@ -75,13 +87,16 @@ struct Screen {
     rows: Vec<String>,
     /// Whether the read reached the screen's top.
     top: bool,
+    /// Whether `rows[i]` is a prompt row by its background; empty unless
+    /// the harness sets a prompt apart by one.
+    prompts: Vec<bool>,
 }
 
 /// The preface one request asks for.
 ///
-/// `prompt_markers` are what the harness draws at column 0 ahead of a
-/// prompt (see [`super::Reader::prompt_markers`]). `span` reads the screen:
-/// asked for more than a number of lines (or the whole screen, up to
+/// `evidence` is what marks a prompt row on the harness's screen. `span`
+/// reads the screen, styled when `evidence` names a background: asked for
+/// more than a number of lines (or the whole screen, up to
 /// [`MAX_SCREEN_LINES`]), it answers one span, or nothing when the screen
 /// cannot be read that way.
 pub(crate) fn preface(
@@ -90,11 +105,11 @@ pub(crate) fn preface(
     read: &ReadTurns,
     top: Top<'_>,
     max_turns: u32,
-    prompt_markers: &[&str],
+    evidence: PromptEvidence<'_>,
     span: impl FnOnce(usize) -> Option<Span>,
 ) -> Result<Preface, PrefaceReason> {
     let turns = &read.turns.turns;
-    if prompt_markers.is_empty() {
+    if evidence.markers.is_empty() && evidence.background.is_none() {
         return Err(PrefaceReason::SeamNotFound);
     }
     let want = top.offset.map_or(MAX_SCREEN_LINES, |offset| {
@@ -104,14 +119,19 @@ pub(crate) fn preface(
             .min(MAX_SCREEN_LINES)
     });
     let screen = span(want)
-        .map(screen_of)
+        .map(|span| screen_of(span, evidence.background))
         .ok_or(PrefaceReason::SeamNotFound)?;
     let anchor = anchor(&screen, top).ok_or(PrefaceReason::SeamNotFound)?;
-    let seam = place(
-        turns,
-        prompt_markers,
-        screen.rows[..=anchor].iter().map(String::as_str),
-    )
+    let held = &screen.rows[..=anchor];
+    let seam = match evidence.background {
+        Some(_) => place_prompts(
+            turns,
+            held.iter()
+                .zip(&screen.prompts)
+                .map(|(row, prompt)| prompt.then(|| crate::prompt_trail::clean(row))),
+        ),
+        None => place(turns, evidence.markers, held.iter().map(String::as_str)),
+    }
     .ok_or(PrefaceReason::SeamNotFound)?;
     let (kept, omitted) = select(turns, seam, max_turns.min(MAX_TURNS));
     if kept.is_empty() && omitted == 0 {
@@ -143,25 +163,172 @@ fn wire_turn(turn: &Turn) -> PrefaceTurn {
     }
 }
 
-/// A span's lines, bottom first, split the way a client splits them.
-fn screen_of(span: Span) -> Screen {
+/// A span's lines, bottom first, split the way a client splits them; with
+/// a prompt background, which of them are prompt rows by it.
+fn screen_of(span: Span, background: Option<[u8; 3]>) -> Screen {
     let text = span.text.strip_suffix('\n').unwrap_or(&span.text);
-    let mut rows: Vec<String> = if text.is_empty() {
+    let lines: Vec<&str> = if text.is_empty() {
         Vec::new()
     } else {
-        text.split('\n').map(row).collect()
+        text.split('\n').collect()
     };
+    let mut prompts = background.map_or_else(Vec::new, |background| {
+        prompt_rows_by_background(&lines, background)
+    });
+    prompts.reverse();
+    let mut rows: Vec<String> = lines.into_iter().map(row).collect();
     rows.reverse();
     Screen {
         rows,
         top: !span.has_more,
+        prompts,
+    }
+}
+
+/// Which of a screen's styled lines, top first, are prompt rows by their
+/// background: a row whose every visible cell is under `background`, and
+/// the first such row of its block. A block is a run of rows in that
+/// colour — text rows and the padding rows the harness draws around them —
+/// so a prompt's later lines are no prompt rows of their own.
+fn prompt_rows_by_background(lines: &[&str], background: [u8; 3]) -> Vec<bool> {
+    let mut block_has_text = false;
+    lines
+        .iter()
+        .map(|line| match shade(line, background) {
+            Shade::Text { under: true } => !std::mem::replace(&mut block_has_text, true),
+            Shade::Blank { coloured: true } => false,
+            Shade::Text { under: false } | Shade::Blank { coloured: false } => {
+                block_has_text = false;
+                false
+            }
+        })
+        .collect()
+}
+
+/// How one styled line sits against a background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shade {
+    /// It shows text; `under` when every visible cell is in the background.
+    Text { under: bool },
+    /// It shows none; `coloured` when any of its cells is in the background.
+    Blank { coloured: bool },
+}
+
+fn shade(line: &str, background: [u8; 3]) -> Shade {
+    let mut current: Option<[u8; 3]> = None;
+    let mut visible = false;
+    let mut under = true;
+    let mut coloured = false;
+    let mut chars = line.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    let mut params = String::new();
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            if next == 'm' {
+                                apply_sgr_background(&params, &mut current);
+                            }
+                            break;
+                        }
+                        params.push(next);
+                    }
+                }
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if character.is_control() {
+            continue;
+        }
+        let in_background = current == Some(background);
+        if character.is_whitespace() {
+            coloured |= in_background;
+        } else {
+            visible = true;
+            under &= in_background;
+        }
+    }
+    if visible {
+        Shade::Text { under }
+    } else {
+        Shade::Blank { coloured }
+    }
+}
+
+/// Follow one SGR sequence's effect on the background: a truecolour one is
+/// kept, and anything else that sets or resets it is no colour this
+/// compares against. Colour arguments of the other attributes are stepped
+/// over so they are never read as codes of their own.
+fn apply_sgr_background(params: &str, current: &mut Option<[u8; 3]>) {
+    let codes: Vec<&str> = params.split(';').collect();
+    let mut index = 0;
+    while index < codes.len() {
+        let code = codes[index];
+        index += 1;
+        if code.contains(':') {
+            let parts: Vec<&str> = code.split(':').collect();
+            if parts[0] == "48" {
+                *current = (parts.get(1) == Some(&"2") && parts.len() >= 5)
+                    .then(|| rgb(&parts[parts.len() - 3..]))
+                    .flatten();
+            }
+            continue;
+        }
+        match code {
+            "" | "0" | "49" => *current = None,
+            "38" | "48" | "58" => {
+                let set = match codes.get(index) {
+                    Some(&"2") => {
+                        let colour = codes.get(index + 1..index + 4).and_then(rgb);
+                        index += 4;
+                        colour
+                    }
+                    Some(&"5") => {
+                        index += 2;
+                        None
+                    }
+                    _ => None,
+                };
+                if code == "48" {
+                    *current = set;
+                }
+            }
+            _ => {
+                if matches!(code.parse::<u16>(), Ok(40..=47 | 100..=107)) {
+                    *current = None;
+                }
+            }
+        }
+    }
+}
+
+fn rgb(parts: &[&str]) -> Option<[u8; 3]> {
+    match parts {
+        [r, g, b] => Some([r.parse().ok()?, g.parse().ok()?, b.parse().ok()?]),
+        _ => None,
     }
 }
 
 /// One screen line as the two sides compare it: no styling, no carriage
 /// returns, no trailing blanks.
 fn row(line: &str) -> String {
-    strip_ansi(line).replace('\r', "").trim_end().to_string()
+    crate::pane::strip_ansi(line)
+        .replace('\r', "")
+        .trim_end()
+        .to_string()
 }
 
 /// Where in the screen the client's oldest held line is now.
@@ -209,6 +376,18 @@ fn place<'a>(
     markers: &[&str],
     held_bottom_first: impl Iterator<Item = &'a str>,
 ) -> Option<usize> {
+    place_prompts(
+        turns,
+        held_bottom_first.map(|line| prompt_row(line, markers)),
+    )
+}
+
+/// [`place`] over rows already judged: each held row, bottom first, is its
+/// words as a prompt when it is a prompt row and nothing otherwise.
+fn place_prompts(
+    turns: &[Turn],
+    held_bottom_first: impl Iterator<Item = Option<String>>,
+) -> Option<usize> {
     let prompted: Vec<usize> = turns
         .iter()
         .enumerate()
@@ -222,7 +401,7 @@ fn place<'a>(
         if remaining == 0 {
             break;
         }
-        let Some(line) = prompt_row(line, markers) else {
+        let Some(line) = line else {
             continue;
         };
         if line.is_empty() {
@@ -307,46 +486,10 @@ fn select(turns: &[Turn], seam: usize, max_turns: u32) -> (Vec<&Turn>, usize) {
     (kept, omitted)
 }
 
-/// A line without its escape sequences.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character != '\u{1b}' {
-            out.push(character);
-            continue;
-        }
-        match chars.next() {
-            // A control sequence ends at its final byte.
-            Some('[') => {
-                for next in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&next) {
-                        break;
-                    }
-                }
-            }
-            // An operating-system command ends at a bell or a string
-            // terminator.
-            Some(']') => {
-                while let Some(next) = chars.next() {
-                    if next == '\u{7}' {
-                        break;
-                    }
-                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pane::strip_ansi;
 
     #[test]
     fn styling_is_no_part_of_a_line() {
@@ -498,12 +641,23 @@ mod tests {
         top: Top<'_>,
     ) -> Result<Vec<String>, PrefaceReason> {
         let text = rows.join("\n");
-        preface("claude", "s", read, top, MAX_TURNS, &MARKERS, |_| {
-            Some(Span {
-                text,
-                has_more: false,
-            })
-        })
+        preface(
+            "claude",
+            "s",
+            read,
+            top,
+            MAX_TURNS,
+            PromptEvidence {
+                markers: &MARKERS,
+                background: None,
+            },
+            |_| {
+                Some(Span {
+                    text,
+                    has_more: false,
+                })
+            },
+        )
         .map(|preface| {
             preface
                 .turns
@@ -678,7 +832,7 @@ mod tests {
                     lines: None
                 },
                 MAX_TURNS,
-                &[],
+                PromptEvidence::default(),
                 |_| { panic!("the screen is not read when it cannot be lined up") }
             ),
             Err(PrefaceReason::SeamNotFound)

@@ -46,6 +46,7 @@ use self::background_agent::{AgentJobStatus, AgentJobTracker};
 #[cfg(test)]
 pub(crate) use self::state::RESTORE_DEADLINE_PROBE_SECS;
 pub(crate) use self::state::{AgentStatusProjection, PaneDeliverySnapshot};
+pub(crate) use self::terminal::strip_ansi;
 #[cfg(test)]
 pub(crate) use self::terminal::test_encode_key_for_app;
 #[cfg(unix)]
@@ -3820,9 +3821,10 @@ impl PaneRuntime {
         page_lines: usize,
         min_lines: usize,
         max_lines: usize,
+        ansi: bool,
     ) -> Option<RecentReadSpan> {
         self.terminal
-            .recent_read_span(page_lines, min_lines, max_lines)
+            .recent_read_span(page_lines, min_lines, max_lines, ansi)
     }
 
     pub fn snapshot_history(&self) -> Option<String> {

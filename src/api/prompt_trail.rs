@@ -522,8 +522,8 @@ fn preface_sources(
         pane: Box::new(move || ask_for_pane(&pane_id, &pane_api_tx)),
         home,
         record: Box::new(move |path, agent| {
-            preface_from(path, agent, &params, |min_lines| {
-                ask_for_span(&read_pane_id, min_lines, &read_api_tx)
+            preface_from(path, agent, &params, |min_lines, styled| {
+                ask_for_span(&read_pane_id, min_lines, styled, &read_api_tx)
             })
         }),
     }
@@ -534,11 +534,14 @@ fn preface_from(
     path: &std::path::Path,
     agent: PromptTrailAgent,
     params: &PanePrefaceParams,
-    span: impl FnOnce(usize) -> Option<crate::preface::seam::Span>,
+    span: impl FnOnce(usize, bool) -> Option<crate::preface::seam::Span>,
 ) -> Result<Preface, PrefaceReason> {
     let read = crate::preface::read(path, agent)?;
-    let markers = crate::preface::reader_for(agent)
-        .map(|reader| reader.prompt_markers())
+    let evidence = crate::preface::reader_for(agent)
+        .map(|reader| crate::preface::seam::PromptEvidence {
+            markers: reader.prompt_markers(),
+            background: reader.prompt_background(),
+        })
         .unwrap_or_default();
     let fallback_session_id = path
         .file_stem()
@@ -553,17 +556,20 @@ fn preface_from(
             lines: params.top_lines.as_deref(),
         },
         params.max_turns,
-        markers,
-        span,
+        evidence,
+        |min_lines| span(min_lines, evidence.background.is_some()),
     )
 }
 
 /// Ask the app for the pane's recent history as one span: the offset pages
 /// a client reads, read by the app from one state of the terminal. Anything
 /// but such a read is no screen to place a seam on.
+/// `styled` keeps the screen's styling, for a harness whose prompts are
+/// told apart by it.
 fn ask_for_span(
     pane_id: &str,
     min_lines: usize,
+    styled: bool,
     api_tx: &ApiRequestSender,
 ) -> Option<crate::preface::seam::Span> {
     let response = crate::api::server::dispatch_to_app_with_timeout(
@@ -573,8 +579,12 @@ fn ask_for_span(
                 pane_id: pane_id.to_string(),
                 source: ReadSource::RecentUnwrapped,
                 lines: Some(crate::preface::seam::PAGE_LINES),
-                format: ReadFormat::Text,
-                strip_ansi: true,
+                format: if styled {
+                    ReadFormat::Ansi
+                } else {
+                    ReadFormat::Text
+                },
+                strip_ansi: !styled,
                 intent: crate::api::schema::ReadIntent::Passive,
                 span: Some(crate::api::schema::ReadSpan {
                     min_lines,
@@ -1419,18 +1429,27 @@ mod tests {
             (self.rows.len() - 1 - index) as u64
         }
 
-        /// The newest lines of the screen as one span, from its state now.
-        fn span(&self, span: crate::api::schema::ReadSpan) -> crate::api::schema::PaneReadResult {
+        /// The newest lines of the screen as one span, from its state now:
+        /// styled for an ANSI read, as plain text otherwise.
+        fn span(
+            &self,
+            span: crate::api::schema::ReadSpan,
+            format: ReadFormat,
+        ) -> crate::api::schema::PaneReadResult {
             let total = self.rows.len();
             let take = total.min(span.max_lines.min(span.min_lines.saturating_add(1)));
             let top = total - take;
+            let rows = self.rows[top..].iter().map(|row| match format {
+                ReadFormat::Ansi => row.clone(),
+                _ => crate::pane::strip_ansi(row),
+            });
             crate::api::schema::PaneReadResult {
                 pane_id: "wG4:p1".into(),
                 workspace_id: "wG4".into(),
                 tab_id: "wG4:t1".into(),
                 source: ReadSource::RecentUnwrapped,
-                format: ReadFormat::Text,
-                text: self.rows[top..].join("\n"),
+                format,
+                text: rows.collect::<Vec<_>>().join("\n"),
                 revision: 0,
                 truncated: top > 0,
                 effective_offset: Some(0),
@@ -1485,8 +1504,11 @@ mod tests {
                             // as the app reads it under one hold of the
                             // terminal.
                             Some(span) => {
-                                asked.push("pane.read:span".to_string());
-                                screen.span(span)
+                                asked.push(match params.format {
+                                    ReadFormat::Ansi => "pane.read:span:ansi".to_string(),
+                                    _ => "pane.read:span".to_string(),
+                                });
+                                screen.span(span, params.format)
                             }
                             None => {
                                 asked.push(format!(
@@ -2191,51 +2213,111 @@ mod tests {
         )))
     }
 
-    /// The rows pi leaves for the fixture record's turns from the one that
-    /// added a test on. pi sets the person's words apart from the agent's
-    /// by a background colour alone, so as text a prompt row is the same
-    /// one-space-indented row as an answer's.
-    fn pi_screen() -> Vec<String> {
-        (0..6)
-            .map(|row| format!(" older tool output {row}"))
-            .chain(
-                [
-                    " Add a test.",
-                    "",
-                    " Test added.",
-                    "",
-                    " Ship it.",
-                    "",
-                    " Shipped.",
-                    "",
-                    " Watch the deploy.",
-                    "",
-                    " $ true",
-                    "",
-                    "\u{2500}".repeat(40).as_str(),
-                    "",
-                    "\u{2500}".repeat(40).as_str(),
-                    " ~/invented (main)",
-                ]
-                .map(String::from),
-            )
+    /// pi's prompt background as a capture of its screen writes it.
+    const PI_PROMPT_BG: &str = "48;2;33;59;73";
+
+    /// One row of a pi prompt block, the way pi draws it: a padded cell,
+    /// then the person's words, every cell under the block's background.
+    fn pi_prompt_row(text: &str, background: &str) -> String {
+        format!(
+            "\u{1b}[0m\u{1b}[{background}m \u{1b}[0m\u{1b}[38;2;222;224;225m\u{1b}[{background}m{text}  \u{1b}[0m"
+        )
+    }
+
+    /// The full-width padding row pi draws above and below a prompt block.
+    fn pi_padding_row(background: &str) -> String {
+        format!("\u{1b}[0m\u{1b}[{background}m{}\u{1b}[0m", " ".repeat(40))
+    }
+
+    /// A prompt block: padding, the prompt's rows, padding.
+    fn pi_prompt_block(lines: &[&str], background: &str) -> Vec<String> {
+        std::iter::once(pi_padding_row(background))
+            .chain(lines.iter().map(|line| pi_prompt_row(line, background)))
+            .chain(std::iter::once(pi_padding_row(background)))
             .collect()
     }
 
-    /// pi draws no marker a screen's text can show a prompt by, so its
-    /// record cannot be lined up with its screen: a pi pane whose record
-    /// reads answers that the seam was not found, held top or not, rather
-    /// than a preface placed by a guess.
+    fn pi_answer_rows(text: &str) -> Vec<String> {
+        vec![
+            String::new(),
+            format!("\u{1b}[0m\u{1b}[38;2;222;224;225m {text}\u{1b}[0m"),
+            String::new(),
+        ]
+    }
+
+    /// The rows pi leaves for the fixture record's turns from the one that
+    /// added a test on, under some older tool output, with every prompt
+    /// block drawn in `background`.
+    ///
+    /// How pi draws a skill invocation is in no capture; its block is drawn
+    /// here as one that lines up with no record prompt, which may stand for
+    /// one record prompt the screen shows no words of.
+    fn pi_screen(background: &str) -> Vec<String> {
+        let mut rows: Vec<String> = (0..6)
+            .map(|row| format!("\u{1b}[0m\u{1b}[48;2;37;65;49m older tool output {row}\u{1b}[0m"))
+            .collect();
+        for (prompt, answer) in [
+            (vec!["Add a test."], Some("Test added.")),
+            (vec!["Ship it."], Some("Shipped.")),
+            (
+                vec!["[skill] neutral-skill", "Draw the module map."],
+                Some("Map drawn."),
+            ),
+            (vec!["Watch the deploy."], None),
+        ] {
+            rows.extend(pi_prompt_block(&prompt, background));
+            if let Some(answer) = answer {
+                rows.extend(pi_answer_rows(answer));
+            }
+        }
+        rows.extend([
+            "\u{1b}[0m\u{1b}[48;2;37;65;49m $ true\u{1b}[0m".to_string(),
+            String::new(),
+            "\u{2500}".repeat(40),
+            String::new(),
+            "\u{2500}".repeat(40),
+            " ~/invented (main)".to_string(),
+        ]);
+        rows
+    }
+
+    /// The pi fixture's turns before the one that added a test.
+    const PI_TURNS_ABOVE: [(&str, TurnStart, TurnEnd); 5] = [
+        ("u1", TurnStart::Prompt, TurnEnd::Answered),
+        ("u2", TurnStart::Prompt, TurnEnd::Answered),
+        ("w3", TurnStart::Wake, TurnEnd::Answered),
+        ("u4", TurnStart::Prompt, TurnEnd::Aborted),
+        ("u5", TurnStart::Prompt, TurnEnd::Error),
+    ];
+
+    fn turn_summary(preface: &Preface) -> Vec<(&str, TurnStart, TurnEnd)> {
+        preface
+            .turns
+            .iter()
+            .map(|turn| (turn.id.as_str(), turn.start, turn.end))
+            .collect()
+    }
+
+    /// pi sets a prompt apart by its background alone, so the screen is
+    /// read styled and a prompt row is the first text row of a block in
+    /// pi's prompt colour.
     #[test]
-    fn preface_refuses_to_place_a_pi_panes_seam_without_a_prompt_marker() {
+    fn preface_quotes_a_pi_panes_turns_above_the_oldest_held_prompt_block() {
         let fixture = Fixture::new();
-        let rows = pi_screen();
-        let held_from = row_index(&rows, " older tool output 2");
+        let rows = pi_screen(PI_PROMPT_BG);
+        let held_from = rows
+            .iter()
+            .position(|row| crate::pane::strip_ansi(row) == " older tool output 2")
+            .expect("a held row");
         let screen = FakeScreen::new(rows.clone());
-        let top = (screen.offset_of(held_from), rows[held_from].as_str());
+        let top = (screen.offset_of(held_from), "");
+        let held_run: Vec<String> = held_run(&rows, held_from)
+            .iter()
+            .map(|row| crate::pane::strip_ansi(row))
+            .collect();
         for params in [
             PanePrefaceParams {
-                top_lines: Some(held_run(&rows, held_from)),
+                top_lines: Some(held_run.clone()),
                 ..preface_params(Some(top), 50)
             },
             preface_params(None, 50),
@@ -2246,17 +2328,138 @@ mod tests {
                 FakeScreen::new(rows.clone()),
                 &params,
             );
-            assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
-            assert_eq!(asked, vec!["pane.get"], "the screen is never read");
+            let preface = preface_of(result);
+            assert_eq!(preface.agent, "pi");
+            assert_eq!(preface.session_id, "session-1");
+            assert_eq!(preface.omitted, 0);
+            assert_eq!(turn_summary(&preface), PI_TURNS_ABOVE.to_vec());
+            assert_eq!(
+                prompts_of(&preface),
+                vec![
+                    Some("Explain   the relay\n\nin two lines."),
+                    Some("Check the build."),
+                    None,
+                    Some("Rewrite the parser."),
+                    Some("Try again."),
+                ]
+            );
+            assert_eq!(
+                preface.turns[2].answer.as_deref(),
+                Some("Still waiting on the job.")
+            );
+            assert_eq!(asked, vec!["pane.get", "pane.read:span:ansi"]);
         }
-        // The record itself reads: the refusal is the screen's, not the
-        // record's.
-        let read = crate::preface::read_turns(
-            include_str!("../preface/fixtures/pi-record.jsonl").as_bytes(),
-            PromptTrailAgent::Pi,
-        )
-        .expect("a pi record");
-        assert_eq!(read.turns.len(), 9);
+    }
+
+    /// Without pi's prompt colour under a prompt's words there is no
+    /// evidence a row is a prompt, and the seam is refused rather than
+    /// guessed: a screen whose styling is gone, prompts drawn in the tool
+    /// colour or another theme's, or prompt words with only a foreground.
+    #[test]
+    fn preface_refuses_a_pi_seam_without_pi_prompt_colour() {
+        let fixture = Fixture::new();
+        let plain_prompts: Vec<String> = pi_screen(PI_PROMPT_BG)
+            .iter()
+            .map(|row| row.replace(&format!("\u{1b}[{PI_PROMPT_BG}m"), ""))
+            .collect();
+        for (case, rows) in [
+            (
+                "no styling",
+                pi_screen(PI_PROMPT_BG)
+                    .iter()
+                    .map(|row| crate::pane::strip_ansi(row))
+                    .collect(),
+            ),
+            ("tool colour", pi_screen("48;2;37;65;49")),
+            ("light theme", pi_screen("48;2;225;234;245")),
+            ("foreground only", plain_prompts),
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|row| crate::pane::strip_ansi(row) == " Add a test.  "),
+                "{case}: the prompt's words are still on the screen"
+            );
+            let (result, _) = ask_preface(
+                &fixture,
+                pi_preface_pane(&fixture),
+                FakeScreen::new(rows),
+                &preface_params(None, 50),
+            );
+            assert_eq!(
+                preface_reason(result),
+                PrefaceReason::SeamNotFound,
+                "{case}"
+            );
+        }
+    }
+
+    /// Only a block's first row stands for its prompt. A later row of a
+    /// prompt that repeats an older prompt's words is no prompt row, so the
+    /// seam stays at the block that holds it.
+    #[test]
+    fn preface_places_a_pi_seam_on_a_prompt_blocks_first_row_only() {
+        let fixture = Fixture::new();
+        let message = |id: &str, parent: &str, at: &str, role: &str, text: &str| {
+            serde_json::json!({
+                "type": "message", "id": id, "parentId": parent, "timestamp": at,
+                "message": {
+                    "role": role,
+                    "content": [{"type": "text", "text": text}],
+                    "stopReason": "stop",
+                },
+            })
+            .to_string()
+        };
+        let record = [
+            r#"{"type":"session","version":3,"id":"session-2"}"#.to_string(),
+            message("p1", "", "2026-03-04T09:00:00Z", "user", "Add a test."),
+            message(
+                "a1",
+                "p1",
+                "2026-03-04T09:00:01Z",
+                "assistant",
+                "Test added.",
+            ),
+            message(
+                "p2",
+                "a1",
+                "2026-03-04T09:01:00Z",
+                "user",
+                "Ship it.\nAdd a test.",
+            ),
+            message("a2", "p2", "2026-03-04T09:01:01Z", "assistant", "Shipped."),
+            message(
+                "p3",
+                "a2",
+                "2026-03-04T09:02:00Z",
+                "user",
+                "Watch the deploy.",
+            ),
+        ]
+        .join("\n")
+        .replace(r#""parentId":"""#, r#""parentId":null"#);
+        let path = fixture.write(
+            ".pi/agent/sessions/--invented--/2026-03-04T09-00-00-000Z_session-2.jsonl",
+            &record,
+        );
+        let mut rows = pi_prompt_block(&["Ship it.", "Add a test."], PI_PROMPT_BG);
+        rows.extend(pi_answer_rows("Shipped."));
+        rows.extend(pi_prompt_block(&["Watch the deploy."], PI_PROMPT_BG));
+        let (result, _) = ask_preface(
+            &fixture,
+            pane(Some(session(
+                "pi",
+                AgentSessionRefKind::Path,
+                path.to_str().expect("a path"),
+            ))),
+            FakeScreen::new(rows),
+            &preface_params(None, 50),
+        );
+        let preface = preface_of(result);
+        assert_eq!(
+            turn_summary(&preface),
+            vec![("p1", TurnStart::Prompt, TurnEnd::Answered)]
+        );
     }
 
     #[test]

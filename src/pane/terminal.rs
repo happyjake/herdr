@@ -100,12 +100,24 @@ pub struct RecentReadSpan {
 /// line, except that a window whose top cuts a logical line mid-wrap holds
 /// only its tail; the fuller copy from the page above wins. Anything else
 /// means the offsets did not mean what they say, and there is no span.
+///
+/// With `ansi` the pages carry styling, and two copies of a line are
+/// compared by their text alone: a tail cut mid-wrap opens with the style
+/// in force where the cut fell, not the style its line opened with.
 fn stitch_recent_pages(
     page_lines: usize,
     min_lines: usize,
     max_lines: usize,
+    ansi: bool,
     mut page: impl FnMut(RecentReadRequest) -> Option<RecentReadWindow>,
 ) -> Option<RecentReadSpan> {
+    let visible = |line: &str| -> String {
+        if ansi {
+            strip_ansi(line)
+        } else {
+            line.to_string()
+        }
+    };
     let mut rows: Vec<String> = Vec::new();
     let mut offset = 0usize;
     loop {
@@ -113,14 +125,20 @@ fn stitch_recent_pages(
             lines: page_lines,
             offset_from_bottom: offset,
             unwrapped: true,
-            ansi: false,
+            ansi,
         })?;
         if window.offset_unsupported {
             return None;
         }
         let text = window.text.strip_suffix('\n').unwrap_or(&window.text);
+        // A styled page ends its lines with a carriage return as well, all
+        // but its last; a line is the same line either way.
         let lines: Vec<&str> = if text.is_empty() {
             Vec::new()
+        } else if ansi {
+            text.split('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                .collect()
         } else {
             text.split('\n').collect()
         };
@@ -128,10 +146,14 @@ fn stitch_recent_pages(
             let index = window.effective_offset + from_bottom;
             match index.cmp(&rows.len()) {
                 std::cmp::Ordering::Less if rows[index] == *line => {}
-                std::cmp::Ordering::Less if line.ends_with(rows[index].as_str()) => {
-                    rows[index] = (*line).to_string();
+                std::cmp::Ordering::Less => {
+                    let (held, seen) = (visible(&rows[index]), visible(line));
+                    if seen.ends_with(held.as_str()) {
+                        rows[index] = (*line).to_string();
+                    } else {
+                        return None;
+                    }
                 }
-                std::cmp::Ordering::Less => return None,
                 std::cmp::Ordering::Equal => rows.push((*line).to_string()),
                 std::cmp::Ordering::Greater => return None,
             }
@@ -149,6 +171,43 @@ fn stitch_recent_pages(
         }
         offset = next;
     }
+}
+
+/// A line without its escape sequences.
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            out.push(character);
+            continue;
+        }
+        match chars.next() {
+            // A control sequence ends at its final byte.
+            Some('[') => {
+                for next in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            // An operating-system command ends at a bell or a string
+            // terminator.
+            Some(']') => {
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -645,9 +704,10 @@ impl PaneTerminal {
         page_lines: usize,
         min_lines: usize,
         max_lines: usize,
+        ansi: bool,
     ) -> Option<RecentReadSpan> {
         self.ghostty
-            .recent_read_span(page_lines, min_lines, max_lines)
+            .recent_read_span(page_lines, min_lines, max_lines, ansi)
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -2454,9 +2514,10 @@ impl GhosttyPaneTerminal {
         page_lines: usize,
         min_lines: usize,
         max_lines: usize,
+        ansi: bool,
     ) -> Option<RecentReadSpan> {
         let core = self.core.lock().ok()?;
-        stitch_recent_pages(page_lines, min_lines, max_lines, |request| {
+        stitch_recent_pages(page_lines, min_lines, max_lines, ansi, |request| {
             ghostty_recent_read_at_offset(&core, request).ok()
         })
     }
@@ -6712,7 +6773,7 @@ mod tests {
         terminal.write(b"> ");
         let read = |request| ghostty_recent_read_at_offset_for_terminal(&terminal, request).ok();
 
-        let span = stitch_recent_pages(8, usize::MAX, usize::MAX, read).expect("a span");
+        let span = stitch_recent_pages(8, usize::MAX, usize::MAX, false, read).expect("a span");
         assert!(!span.has_more);
         let lines: Vec<&str> = span.text.split('\n').collect();
         for i in 0..20 {
@@ -6727,10 +6788,76 @@ mod tests {
 
         // Asked for fewer lines, it stops once it holds more than that,
         // saying history remains above.
-        let short = stitch_recent_pages(8, 5, usize::MAX, read).expect("a span");
+        let short = stitch_recent_pages(8, 5, usize::MAX, false, read).expect("a span");
         assert!(short.has_more);
         assert!(short.text.split('\n').count() > 5);
         assert!(span.text.ends_with(&short.text));
+    }
+
+    #[test]
+    fn a_styled_span_meets_a_wrap_cut_tail_by_its_text_not_its_styling() {
+        // The bottom page's top cuts the styled line mid-wrap, and its tail
+        // opens with the style in force at the cut, which is not how the
+        // whole line opens on the page above. Styled pages end their lines
+        // with a carriage return too, all but the last.
+        let whole = "\u{1b}[0m\u{1b}[31mL0-ab\u{1b}[32mcdef\u{1b}[0m";
+        let tail = "\u{1b}[0m\u{1b}[32mcdef\u{1b}[0m";
+        let pages = |above: &'static str| {
+            move |request: RecentReadRequest| {
+                assert!(request.ansi, "a styled span reads styled pages");
+                Some(match request.offset_from_bottom {
+                    0 => RecentReadWindow {
+                        text: format!("{tail}\r\nL1\r\nL2\r\n"),
+                        effective_offset: 0,
+                        has_more: true,
+                        offset_unsupported: false,
+                    },
+                    2 => RecentReadWindow {
+                        text: format!("L-1\r\n{above}"),
+                        effective_offset: 2,
+                        has_more: false,
+                        offset_unsupported: false,
+                    },
+                    other => panic!("no page at {other}"),
+                })
+            }
+        };
+        let span =
+            stitch_recent_pages(3, usize::MAX, usize::MAX, true, pages(whole)).expect("a span");
+        assert_eq!(span.text, format!("L-1\n{whole}\nL1\nL2"));
+        assert!(!span.has_more);
+
+        // A copy whose text differs is still a page that did not mean what
+        // its offset said.
+        let other = "\u{1b}[0m\u{1b}[31mL0-ab\u{1b}[32mcdeX\u{1b}[0m";
+        assert_eq!(
+            stitch_recent_pages(3, usize::MAX, usize::MAX, true, pages(other)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_styled_span_holds_every_logical_line_once_however_the_pages_cut_them() {
+        let mut terminal = crate::ghostty::Terminal::new(10, 4, 100_000).unwrap();
+        for i in 0..20 {
+            // Styled lines that soft-wrap, the style changing mid-line so a
+            // page that cuts one opens its tail in another style.
+            terminal.write(format!("\x1b[31mL{i:02}-ab\x1b[32mcdefgh\x1b[0m\r\n").as_bytes());
+        }
+        terminal.write(b"> ");
+        let read = |request| ghostty_recent_read_at_offset_for_terminal(&terminal, request).ok();
+
+        let span = stitch_recent_pages(8, usize::MAX, usize::MAX, true, read).expect("a span");
+        assert!(span.text.contains("\u{1b}["), "the span keeps its styling");
+        let lines: Vec<String> = span.text.split('\n').map(strip_ansi).collect();
+        for i in 0..20 {
+            let line = format!("L{i:02}-abcdefgh");
+            assert_eq!(
+                lines.iter().filter(|held| held.trim_end() == line).count(),
+                1,
+                "{line} held whole, once: {lines:?}"
+            );
+        }
     }
 
     #[test]

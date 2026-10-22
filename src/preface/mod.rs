@@ -141,6 +141,15 @@ pub(crate) trait Reader {
     fn prompt_markers(&self) -> &'static [&'static str] {
         &[]
     }
+
+    /// The background colour, as RGB, a harness lays under every visible
+    /// cell of a prompt on its screen, for a harness that sets a prompt
+    /// apart by colour rather than by a marker. A screen is then read with
+    /// its styling, and a prompt row is the first text row of a block in
+    /// that colour.
+    fn prompt_background(&self) -> Option<[u8; 3]> {
+        None
+    }
 }
 
 /// The reader for a harness, when this server has one.
