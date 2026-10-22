@@ -13,6 +13,11 @@
 //! A record whose entries do not form a branch the turn index can walk has
 //! no turns here: a preface placed on a guessed branch would quote turns the
 //! conversation does not hold.
+//!
+//! pi sets a prompt apart on its screen by a background colour alone, with
+//! no glyph a screen's text can show, so this reader declares no prompt
+//! marker and a pi pane's seam is never placed: its prefaces answer
+//! `seam_not_found` until pi draws one.
 
 use serde_json::Value;
 

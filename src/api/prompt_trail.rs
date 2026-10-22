@@ -2108,7 +2108,10 @@ mod tests {
             &fixture,
             codex_preface_pane(&fixture),
             screen,
-            &preface_params(Some(top), 50),
+            &PanePrefaceParams {
+                top_lines: Some(held_run(&rows, held_from)),
+                ..preface_params(Some(top), 50)
+            },
         );
         let preface = preface_of(result);
         assert_eq!(preface.agent, "codex");
@@ -2138,10 +2141,7 @@ mod tests {
             preface.turns[1].answer.as_deref(),
             Some("The first one is wider.")
         );
-        assert!(asked
-            .iter()
-            .all(|method| method == "pane.get" || method.starts_with("pane.read@")));
-        assert_eq!(asked[0], "pane.get");
+        assert_eq!(asked, vec!["pane.get", "pane.read:span"]);
 
         // Held from inside that turn's answer: its prompt is above what is
         // held, so it is quoted whole, and so is the goal turn after it.
@@ -2152,7 +2152,10 @@ mod tests {
             &fixture,
             codex_preface_pane(&fixture),
             screen,
-            &preface_params(Some(top), 50),
+            &PanePrefaceParams {
+                top_lines: Some(held_run(&rows, held_from)),
+                ..preface_params(Some(top), 50)
+            },
         );
         let preface = preface_of(result);
         assert_eq!(
@@ -2189,9 +2192,9 @@ mod tests {
     }
 
     /// The rows pi leaves for the fixture record's turns from the one that
-    /// added a test on: the person's words as they wrote them, the agent's
-    /// answers under them, a skill invocation drawn as pi collapses it, and
-    /// its editor and footer.
+    /// added a test on. pi sets the person's words apart from the agent's
+    /// by a background colour alone, so as text a prompt row is the same
+    /// one-space-indented row as an answer's.
     fn pi_screen() -> Vec<String> {
         (0..6)
             .map(|row| format!(" older tool output {row}"))
@@ -2204,11 +2207,6 @@ mod tests {
                     " Ship it.",
                     "",
                     " Shipped.",
-                    "",
-                    " [skill] neutral-skill",
-                    " Draw the module map.",
-                    "",
-                    " Map drawn.",
                     "",
                     " Watch the deploy.",
                     "",
@@ -2224,78 +2222,41 @@ mod tests {
             .collect()
     }
 
+    /// pi draws no marker a screen's text can show a prompt by, so its
+    /// record cannot be lined up with its screen: a pi pane whose record
+    /// reads answers that the seam was not found, held top or not, rather
+    /// than a preface placed by a guess.
     #[test]
-    fn preface_quotes_a_pi_panes_turns_above_the_oldest_held_prompt() {
+    fn preface_refuses_to_place_a_pi_panes_seam_without_a_prompt_marker() {
         let fixture = Fixture::new();
         let rows = pi_screen();
         let held_from = row_index(&rows, " older tool output 2");
         let screen = FakeScreen::new(rows.clone());
         let top = (screen.offset_of(held_from), rows[held_from].as_str());
-        let (result, asked) = ask_preface(
-            &fixture,
-            pi_preface_pane(&fixture),
-            screen,
-            &preface_params(Some(top), 50),
-        );
-        let preface = preface_of(result);
-        assert_eq!(preface.agent, "pi");
-        assert_eq!(preface.session_id, "session-1");
-        assert_eq!(preface.omitted, 0);
-        assert_eq!(
-            preface
-                .turns
-                .iter()
-                .map(|turn| (turn.id.as_str(), turn.start, turn.end))
-                .collect::<Vec<_>>(),
-            vec![
-                ("u1", TurnStart::Prompt, TurnEnd::Answered),
-                ("u2", TurnStart::Prompt, TurnEnd::Answered),
-                ("w3", TurnStart::Wake, TurnEnd::Answered),
-                ("u4", TurnStart::Prompt, TurnEnd::Aborted),
-                ("u5", TurnStart::Prompt, TurnEnd::Error),
-            ]
-        );
-        assert_eq!(
-            prompts_of(&preface),
-            vec![
-                Some("Explain   the relay\n\nin two lines."),
-                Some("Check the build."),
-                None,
-                Some("Rewrite the parser."),
-                Some("Try again."),
-            ]
-        );
-        assert_eq!(
-            preface.turns[2].answer.as_deref(),
-            Some("Still waiting on the job.")
-        );
-        assert_eq!(asked[0], "pane.get");
-
-        // Held from below the shipped turn's prompt: the oldest prompt held
-        // is now the deploy, so the skill turn above it is quoted too, as
-        // its invocation and request rather than the skill's body.
-        let held_from = row_index(&rows, " Shipped.");
-        let screen = FakeScreen::new(rows.clone());
-        let top = (screen.offset_of(held_from), rows[held_from].as_str());
-        let (result, _) = ask_preface(
-            &fixture,
-            pi_preface_pane(&fixture),
-            screen,
-            &preface_params(Some(top), 50),
-        );
-        let preface = preface_of(result);
-        assert_eq!(
-            preface
-                .turns
-                .iter()
-                .map(|turn| turn.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["u1", "u2", "w3", "u4", "u5", "u6", "u7", "u9"]
-        );
-        assert_eq!(
-            preface.turns[7].prompt.as_deref(),
-            Some("/skill:neutral-skill Draw the module map.")
-        );
+        for params in [
+            PanePrefaceParams {
+                top_lines: Some(held_run(&rows, held_from)),
+                ..preface_params(Some(top), 50)
+            },
+            preface_params(None, 50),
+        ] {
+            let (result, asked) = ask_preface(
+                &fixture,
+                pi_preface_pane(&fixture),
+                FakeScreen::new(rows.clone()),
+                &params,
+            );
+            assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
+            assert_eq!(asked, vec!["pane.get"], "the screen is never read");
+        }
+        // The record itself reads: the refusal is the screen's, not the
+        // record's.
+        let read = crate::preface::read_turns(
+            include_str!("../preface/fixtures/pi-record.jsonl").as_bytes(),
+            PromptTrailAgent::Pi,
+        )
+        .expect("a pi record");
+        assert_eq!(read.turns.len(), 9);
     }
 
     #[test]

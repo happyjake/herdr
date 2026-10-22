@@ -26,6 +26,9 @@ use crate::prompt_trail::{
     clean, codex_injected, join_text_blocks, replace_image_tags, unix_seconds_from_rfc3339,
 };
 
+/// What codex draws at column 0 ahead of a prompt on its screen.
+const PROMPT_MARKER: &str = "\u{203a}";
+
 /// The person's reply to a question the agent asked mid-turn. It answers
 /// the agent rather than starting anything, so it is no part of a prompt.
 const QUESTION_REPLY: &str = "<send_user_message_question_reply";
@@ -127,6 +130,12 @@ impl super::Reader for CodexReader {
             (Some("compacted"), _) => {}
             _ => {}
         }
+    }
+
+    /// codex marks the first row of a prompt with its prompt glyph at
+    /// column 0, its own messages with a bullet.
+    fn prompt_markers(&self) -> &'static [&'static str] {
+        &[PROMPT_MARKER]
     }
 
     fn finish(mut self: Box<Self>) -> RecordTurns {
