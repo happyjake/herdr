@@ -224,6 +224,7 @@ fn reply_to_probe_with_flag(
     let result = match request.request.method {
         Method::PaneGet(_) => ResponseResult::PaneInfo {
             pane: PaneInfo {
+                ended_agent: None,
                 started_by: None,
                 pane_id: "pane_1".into(),
                 terminal_id: "term_1".into(),

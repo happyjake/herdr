@@ -622,6 +622,9 @@ crate::cli::projection::cli_params! {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
+    /// Always serialized: the last agent's kind after exit, or null until an agent ends.
+    #[serde(default)]
+    pub ended_agent: Option<String>,
     /// Always serialized: null means no starter; absence means an older server.
     #[serde(default)]
     pub started_by: Option<PaneStartedBy>,

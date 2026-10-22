@@ -2145,7 +2145,8 @@ impl AppState {
                 pane.sync_delivery_snapshot();
             }
         }
-        if mutation.session_ref_changed || managed_changed || agent_name_changed {
+        // Agent identity changes also save the retained kind after an exit.
+        if completion_reset || managed_changed || agent_name_changed {
             self.mark_session_dirty();
         }
         if mutation.session_ref_changed {

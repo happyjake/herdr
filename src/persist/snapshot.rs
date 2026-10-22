@@ -159,6 +159,9 @@ pub struct PaneSnapshot {
     /// existed restores every pane unpinned instead of failing the session.
     #[serde(default)]
     pub pinned: bool,
+    // Omitting an absent ended agent preserves legacy history fingerprints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_agent: Option<String>,
     // Keep legacy layout fingerprints stable when the pane has no starter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_by: Option<crate::api::schema::PaneStartedBy>,
@@ -518,6 +521,7 @@ fn capture_tab(
                 agent_status_reported_through,
                 agent_status_captured_pair_reported,
                 pinned,
+                ended_agent: terminal.and_then(|terminal| terminal.ended_agent.clone()),
                 started_by: terminal.and_then(|terminal| terminal.started_by.clone()),
                 session_reported: terminal.is_some_and(|terminal| terminal.session_reported),
                 starter_label: terminal.and_then(|terminal| terminal.starter_label.clone()),
@@ -1236,6 +1240,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                ended_agent: None,
                 started_by: None,
                 session_reported: false,
                 starter_label: None,
@@ -1262,6 +1267,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                ended_agent: None,
                 started_by: None,
                 session_reported: false,
                 starter_label: None,
@@ -2028,6 +2034,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                ended_agent: None,
                 started_by: None,
                 session_reported: false,
                 starter_label: None,
@@ -2054,6 +2061,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                ended_agent: None,
                 started_by: None,
                 session_reported: false,
                 starter_label: None,

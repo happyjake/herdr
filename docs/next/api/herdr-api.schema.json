@@ -968,6 +968,14 @@
                 "null"
               ]
             },
+            "ended_agent": {
+              "default": null,
+              "description": "Always serialized: the last agent's kind after exit, or null until an agent ends.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "flag": {
               "anyOf": [
                 {
@@ -9205,6 +9213,14 @@
               ]
             },
             "display_agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ended_agent": {
+              "default": null,
+              "description": "Always serialized: the last agent's kind after exit, or null until an agent ends.",
               "type": [
                 "string",
                 "null"

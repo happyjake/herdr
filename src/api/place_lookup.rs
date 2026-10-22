@@ -288,6 +288,7 @@ mod tests {
 
     fn pane(cwd: &str, foreground_cwd: Option<&str>) -> PaneInfo {
         PaneInfo {
+            ended_agent: None,
             started_by: None,
             pane_id: "w1:p1".into(),
             terminal_id: "t1".into(),

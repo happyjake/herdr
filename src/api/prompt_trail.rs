@@ -499,6 +499,7 @@ mod tests {
 
     fn pane(session: Option<AgentSessionInfo>) -> PaneInfo {
         PaneInfo {
+            ended_agent: None,
             started_by: None,
             pane_id: "wG4:p1".into(),
             terminal_id: "term_beacon".into(),

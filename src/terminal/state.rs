@@ -142,6 +142,8 @@ pub struct TerminalState {
     pub id: TerminalId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
+    /// Last effective agent label after it leaves, until another agent takes over.
+    pub ended_agent: Option<String>,
     pub fallback_state: AgentState,
     fallback_visible_blocker: bool,
     fallback_observed_at: Option<Instant>,
@@ -217,6 +219,7 @@ impl TerminalState {
             id,
             cwd,
             detected_agent: None,
+            ended_agent: None,
             fallback_state: AgentState::Unknown,
             fallback_visible_blocker: false,
             fallback_observed_at: None,
@@ -2558,6 +2561,9 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        if let Some(agent) = self.effective_agent_label().map(str::to_string) {
+            self.ended_agent = Some(agent);
+        }
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -2658,6 +2664,12 @@ impl TerminalState {
 
         let presentation = self.effective_presentation_for_state_at(state, now);
         self.clear_expiry_pending_for_hidden_metadata();
+
+        if agent_label.is_some() {
+            self.ended_agent = None;
+        } else if previous_agent_label.is_some() {
+            self.ended_agent = previous_agent_label.clone();
+        }
 
         if previous_agent_label == agent_label
             && previous_state == state

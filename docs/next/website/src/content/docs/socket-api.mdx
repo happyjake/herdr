@@ -1184,6 +1184,22 @@ conversation after a restart, leave the link alone. Closed markers, the labels
 kept for them, and the first-report record survive cold restarts and live
 handoffs.
 
+`PaneInfo.ended_agent` keeps the last agent's kind after it exits and leaves
+the pane at its shell, using exactly the spelling of `PaneInfo.agent`. It is
+always serialized: a kind string such as `"pi"`, or `null` when no agent has
+ended or a new agent is running. An absent key identifies an older server
+without this capability. Detecting a new agent clears the retained kind,
+including when the new agent has the same kind as the previous one.
+
+The retained kind survives cold restores and live handoffs. The existing
+`agent_status_changed_at` dates the exit; there is no new wire status or clock.
+The field appears wherever `PaneInfo` appears: create responses,
+`pane.created`, `pane.get`, `pane.list`, `session.snapshot`, and `pane.updated`.
+Agent changes publish `pane.updated` so subscribers see the retained kind
+being set or cleared. Persisted snapshots omit an absent `ended_agent` to
+keep older snapshots' history fingerprints valid. This is an additive JSON
+field; the protocol version is unchanged.
+
 `pane.set_pinned` sets or clears a pane's pin and answers `pane_info`, the way
 `pane.rename` does, so the client that toggled it can fold the answer instead
 of waiting for its next snapshot:
