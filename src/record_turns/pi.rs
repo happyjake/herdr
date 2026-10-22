@@ -61,7 +61,9 @@ fn step(value: &Value, id: &str) -> Result<Step, PromptTrailReason> {
                 id.into(),
                 at,
                 RecordStart::Prompt,
-                text(&message["content"]),
+                text(&message["content"])
+                    .map(|text| typed(&text))
+                    .and_then(|text| quoted(&text)),
             ),
             // A wake's own text is the harness's reminder, not a prompt.
             TurnStart::Wake => RecordTurn::new(id.into(), at, RecordStart::Wake, None),
@@ -81,7 +83,7 @@ fn step(value: &Value, id: &str) -> Result<Step, PromptTrailReason> {
     Ok(Step::Assistant {
         end,
         answer: if end == TurnEnd::Answered {
-            text(&message["content"])
+            text(&message["content"]).and_then(|text| quoted(&text))
         } else {
             None
         },
@@ -97,9 +99,9 @@ fn reopen(turn: &mut RecordTurn) {
 /// its tool calls or its images.
 fn text(content: &Value) -> Option<String> {
     match content {
-        Value::String(text) => quoted(text),
-        Value::Array(parts) => quoted(
-            &parts
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => Some(
+            parts
                 .iter()
                 .filter(|part| part["type"] == "text")
                 .filter_map(|part| part["text"].as_str())
@@ -107,6 +109,48 @@ fn text(content: &Value) -> Option<String> {
                 .join("\n"),
         ),
         _ => None,
+    }
+}
+
+/// What the person typed into a message. Invoking a skill makes pi write
+/// the skill's whole body into the message ahead of the person's request;
+/// that body is the harness's instructions, so only the invocation and the
+/// request are kept, as `/skill:name request`.
+fn typed(text: &str) -> String {
+    match skill_block(text) {
+        Some((name, Some(request))) => format!("/skill:{name} {request}"),
+        Some((name, None)) => format!("/skill:{name}"),
+        None => text.to_string(),
+    }
+}
+
+/// A skill block's name and the request after it, read as pi's own
+/// `parseSkillBlock` reads one: the block is the whole message, or the
+/// whole message up to a blank line and a request. Its body ends at the
+/// first closing tag that leaves exactly that.
+fn skill_block(text: &str) -> Option<(&str, Option<&str>)> {
+    const CLOSE: &str = "\n</skill>";
+    let (name, rest) = text.strip_prefix("<skill name=\"")?.split_once('"')?;
+    let (location, rest) = rest.strip_prefix(" location=\"")?.split_once('"')?;
+    if name.is_empty() || location.is_empty() {
+        return None;
+    }
+    let body = rest.strip_prefix(">\n")?;
+    let mut from = 0;
+    loop {
+        let close = from + body[from..].find(CLOSE)?;
+        let after = &body[close + CLOSE.len()..];
+        if after.is_empty() {
+            return Some((name, None));
+        }
+        if let Some(request) = after
+            .strip_prefix("\n\n")
+            .filter(|request| !request.is_empty())
+        {
+            let request = request.trim();
+            return Some((name, (!request.is_empty()).then_some(request)));
+        }
+        from = close + 1;
     }
 }
 
@@ -201,6 +245,13 @@ mod tests {
                     Some("Shipped."),
                 ),
                 expect(
+                    "u9",
+                    RecordStart::Prompt,
+                    Some("/skill:neutral-skill Draw the module map."),
+                    TurnEnd::Answered,
+                    Some("Map drawn."),
+                ),
+                expect(
                     "u8",
                     RecordStart::Prompt,
                     Some("Watch the deploy."),
@@ -233,6 +284,10 @@ mod tests {
             "Neutral compaction summary",
             "abandoned",
             "Neutral system text",
+            "Injected skill body",
+            "References are relative",
+            "SKILL.md",
+            "<skill",
         ] {
             assert!(
                 quoted.iter().all(|text| !text.contains(leaked)),
@@ -258,6 +313,10 @@ mod tests {
             let source = &FIXTURE.as_bytes()[..cut_at];
             let turns = turns(source).unwrap_or_else(|error| panic!("cut {cut_at}: {error:?}"));
             let index = crate::turn_index::parse(source, "r".into()).unwrap();
+            let index_skill_head = Some(
+                r#"<skill name="neutral-skill" location="/skills/neutral-skill/SKILL.md">"#
+                    .to_string(),
+            );
             let indexed: Vec<_> = index
                 .turns
                 .iter()
@@ -284,12 +343,19 @@ mod tests {
                             })
                             .map(|line| cut(&line, 160))
                     };
+                    // The index heads a skill turn by its raw block; this
+                    // reader quotes the invocation instead.
+                    let prompt = if turn.id == "u9" {
+                        index_skill_head.clone()
+                    } else {
+                        head(&turn.prompt)
+                    };
                     (
                         turn.id.clone(),
                         turn.at,
                         turn.start == RecordStart::Wake,
                         turn.end,
-                        head(&turn.prompt),
+                        prompt,
                         head(&turn.answer),
                     )
                 })
@@ -301,6 +367,33 @@ mod tests {
                     "cut {cut_at}: an unanswered turn carries an answer"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn pi_record_turns_read_skill_blocks_as_pi_parses_them() {
+        let block = "<skill name=\"s\" location=\"/x\">\nBody\n</skill>";
+        assert_eq!(typed(block), "/skill:s");
+        assert_eq!(
+            typed(&format!("{block}\n\n  Ask this\nand that \n")),
+            "/skill:s Ask this\nand that"
+        );
+        assert_eq!(typed(&format!("{block}\n\n   ")), "/skill:s");
+        // The body runs to the first closing tag that leaves the rest of the
+        // message a request; a closing tag inside the body is body.
+        assert_eq!(
+            typed("<skill name=\"s\" location=\"/x\">\nA\n</skill>\nB\n</skill>\n\nAsk"),
+            "/skill:s Ask"
+        );
+        // Anything else is the person's own text, left as typed.
+        for own in [
+            format!("Please {block}"),
+            format!("{block}\nno blank line"),
+            "<skill name=\"\" location=\"/x\">\nBody\n</skill>".to_string(),
+            "<skill name=\"s\">\nBody\n</skill>".to_string(),
+            "<skill name=\"s\" location=\"/x\">\nunclosed".to_string(),
+        ] {
+            assert_eq!(typed(&own), own);
         }
     }
 
