@@ -190,8 +190,13 @@ fn screen_of(span: Span, background: Option<[u8; 3]>) -> Screen {
 /// the first such row of its block. A block is a run of rows in that
 /// colour — text rows and the padding rows the harness draws around them —
 /// so a prompt's later lines are no prompt rows of their own.
+///
+/// A block is known to start only below a row outside it. One that runs
+/// into the top of what was read may have lost its start to eviction or a
+/// handoff, so its first surviving row could be any line of the prompt,
+/// and none of its rows stands for a prompt.
 fn prompt_rows_by_background(lines: &[&str], background: [u8; 3]) -> Vec<bool> {
-    let mut block_has_text = false;
+    let mut block_has_text = true;
     lines
         .iter()
         .map(|line| match shade(line, background) {

@@ -2442,7 +2442,10 @@ mod tests {
             ".pi/agent/sessions/--invented--/2026-03-04T09-00-00-000Z_session-2.jsonl",
             &record,
         );
-        let mut rows = pi_prompt_block(&["Ship it.", "Add a test."], PI_PROMPT_BG);
+        // The older turn's answer above the block, so the block's start is
+        // on the screen.
+        let mut rows = pi_answer_rows("Test added.");
+        rows.extend(pi_prompt_block(&["Ship it.", "Add a test."], PI_PROMPT_BG));
         rows.extend(pi_answer_rows("Shipped."));
         rows.extend(pi_prompt_block(&["Watch the deploy."], PI_PROMPT_BG));
         let (result, _) = ask_preface(
@@ -2459,6 +2462,91 @@ mod tests {
         assert_eq!(
             turn_summary(&preface),
             vec![("p1", TurnStart::Prompt, TurnEnd::Answered)]
+        );
+    }
+
+    /// A screen whose history begins inside a prompt block holds no start
+    /// of that block: its first surviving row may be any line of the
+    /// prompt. Taken for a prompt start, a later line that repeats the
+    /// prompt's first would place the seam on that turn and leave it out of
+    /// the preface unseen.
+    #[test]
+    fn preface_never_starts_a_pi_prompt_in_a_block_cut_by_the_screens_top() {
+        let fixture = Fixture::new();
+        let message = |id: &str, parent: &str, at: &str, role: &str, text: &str| {
+            serde_json::json!({
+                "type": "message", "id": id, "parentId": parent, "timestamp": at,
+                "message": {
+                    "role": role,
+                    "content": [{"type": "text", "text": text}],
+                    "stopReason": "stop",
+                },
+            })
+            .to_string()
+        };
+        let record = [
+            r#"{"type":"session","version":3,"id":"session-3"}"#.to_string(),
+            message("p1", "", "2026-03-04T09:00:00Z", "user", "Add a test."),
+            message(
+                "a1",
+                "p1",
+                "2026-03-04T09:00:01Z",
+                "assistant",
+                "Test added.",
+            ),
+            message(
+                "p2",
+                "a1",
+                "2026-03-04T09:01:00Z",
+                "user",
+                "Read these files\n\nfile-a.ts contains essential context\n\nRead these files",
+            ),
+            message(
+                "a2",
+                "p2",
+                "2026-03-04T09:01:01Z",
+                "assistant",
+                "Read them.",
+            ),
+            message(
+                "p3",
+                "a2",
+                "2026-03-04T09:02:00Z",
+                "user",
+                "Watch the deploy.",
+            ),
+        ]
+        .join("\n")
+        .replace(r#""parentId":"""#, r#""parentId":null"#);
+        let path = fixture.write(
+            ".pi/agent/sessions/--invented--/2026-03-04T09-00-00-000Z_session-3.jsonl",
+            &record,
+        );
+        // History kept from the middle prompt's repeated last line on: the
+        // rest of its block, its answer, and the newest prompt.
+        let mut rows = vec![
+            pi_prompt_row("Read these files", PI_PROMPT_BG),
+            pi_padding_row(PI_PROMPT_BG),
+        ];
+        rows.extend(pi_answer_rows("Read them."));
+        rows.extend(pi_prompt_block(&["Watch the deploy."], PI_PROMPT_BG));
+        let (result, _) = ask_preface(
+            &fixture,
+            pane(Some(session(
+                "pi",
+                AgentSessionRefKind::Path,
+                path.to_str().expect("a path"),
+            ))),
+            FakeScreen::new(rows),
+            &preface_params(None, 50),
+        );
+        let preface = preface_of(result);
+        assert_eq!(
+            turn_summary(&preface),
+            vec![
+                ("p1", TurnStart::Prompt, TurnEnd::Answered),
+                ("p2", TurnStart::Prompt, TurnEnd::Answered),
+            ]
         );
     }
 
