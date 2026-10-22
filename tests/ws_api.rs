@@ -3814,7 +3814,7 @@ fn preface_places_the_seam_between_a_real_screen_and_a_reported_record() {
     assert_eq!(reported["result"]["type"], "ok", "{reported}");
 
     let preface = ws.request(&format!(
-        r#"{{"id":"pf_preface","method":"pane.preface","params":{{"pane_id":"{pane_id}","top_offset":null,"top_line":null,"max_turns":50}}}}"#
+        r#"{{"id":"pf_preface","method":"pane.preface","params":{{"pane_id":"{pane_id}","top_offset":null,"top_lines":null,"max_turns":50}}}}"#
     ));
     let result = &preface["result"];
     assert_eq!(result["type"], "preface", "{preface}");
@@ -3849,7 +3849,7 @@ fn preface_places_the_seam_between_a_real_screen_and_a_reported_record() {
     );
     assert_eq!(reported["result"]["type"], "ok", "{reported}");
     let refused = ws.request(&format!(
-        r#"{{"id":"pf_shell","method":"pane.preface","params":{{"pane_id":"{shell_id}","top_offset":null,"top_line":null,"max_turns":50}}}}"#
+        r#"{{"id":"pf_shell","method":"pane.preface","params":{{"pane_id":"{shell_id}","top_offset":null,"top_lines":null,"max_turns":50}}}}"#
     ));
     assert_eq!(refused["result"]["type"], "preface", "{refused}");
     assert_eq!(refused["result"]["preface"], serde_json::Value::Null);

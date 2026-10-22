@@ -466,6 +466,9 @@ fn prefacereason_code(reason: PrefaceReason) -> &'static str {
     }
 }
 
+/// Lines of the client's held screen a preface request may anchor with.
+const MAX_TOP_LINES: usize = 64;
+
 /// Answer `pane.preface` for one request.
 pub(super) fn handle_preface(
     request_id: String,
@@ -479,11 +482,22 @@ pub(super) fn handle_preface(
             "pane_id must not be empty".into(),
         );
     }
-    if params.top_offset.is_some() != params.top_line.is_some() {
+    if params.top_offset.is_some() != params.top_lines.is_some() {
         return crate::api::server::error_response_json(
             request_id,
             "invalid_params",
-            "top_offset and top_line must both be set or both be null".into(),
+            "top_offset and top_lines must both be set or both be null".into(),
+        );
+    }
+    if params
+        .top_lines
+        .as_ref()
+        .is_some_and(|lines| !(1..=MAX_TOP_LINES).contains(&lines.len()))
+    {
+        return crate::api::server::error_response_json(
+            request_id,
+            "invalid_params",
+            format!("top_lines must hold 1 to {MAX_TOP_LINES} lines"),
         );
     }
     respond(
@@ -536,7 +550,7 @@ fn preface_from(
         &read,
         crate::preface::seam::Top {
             offset: params.top_offset,
-            line: params.top_line.as_deref(),
+            lines: params.top_lines.as_deref(),
         },
         params.max_turns,
         markers,
@@ -1646,9 +1660,15 @@ mod tests {
         PanePrefaceParams {
             pane_id: "wG4:p1".into(),
             top_offset: top.map(|(offset, _)| offset),
-            top_line: top.map(|(_, line)| line.to_string()),
+            top_lines: top.map(|(_, line)| vec![line.to_string()]),
             max_turns,
         }
+    }
+
+    /// The run a client sends: its first held lines, from `held_from` down,
+    /// up to as many as it anchors with.
+    fn held_run(rows: &[String], held_from: usize) -> Vec<String> {
+        rows[held_from..].iter().take(16).cloned().collect()
     }
 
     /// One `pane.preface` through the handler, against the fake app.
@@ -1811,7 +1831,8 @@ mod tests {
             "\u{23fa} Fixed by making the window inclusive: https://example.invalid/pull/7",
         );
         let offset = FakeScreen::new(rows.clone()).offset_of(held_from);
-        let top_line = rows[held_from].clone();
+        let run = held_run(&rows, held_from);
+        assert_eq!(run.len(), 16);
 
         // Since the client read it, the agent printed more: every line the
         // client counted is now further from the bottom.
@@ -1825,7 +1846,10 @@ mod tests {
                 &fixture,
                 claude_pane(),
                 FakeScreen::new(grown),
-                &preface_params(Some((offset, &top_line)), 50),
+                &PanePrefaceParams {
+                    top_lines: Some(run),
+                    ..preface_params(Some((offset, "")), 50)
+                },
             )
             .0,
         );
@@ -2079,11 +2103,20 @@ mod tests {
                 ..preface_params(None, 50)
             },
             PanePrefaceParams {
-                top_line: Some("a line".into()),
+                top_lines: Some(vec!["a line".into()]),
                 ..preface_params(None, 50)
             },
             PanePrefaceParams {
-                top_line: None,
+                top_lines: None,
+                ..preface_params(Some((3, "a line")), 50)
+            },
+            // A run is never empty, and holds at most 64 lines.
+            PanePrefaceParams {
+                top_lines: Some(Vec::new()),
+                ..preface_params(Some((3, "a line")), 50)
+            },
+            PanePrefaceParams {
+                top_lines: Some(vec!["a line".into(); MAX_TOP_LINES + 1]),
                 ..preface_params(Some((3, "a line")), 50)
             },
         ] {

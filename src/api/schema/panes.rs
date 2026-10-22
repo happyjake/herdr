@@ -1110,9 +1110,11 @@ pub struct PanePrefaceParams {
     /// counted as `recent_unwrapped` offset pages count; null when the
     /// client holds the screen's top.
     pub top_offset: Option<u64>,
-    /// That line's text, which the server re-anchors near `top_offset` in
-    /// case the tail has grown since. Null exactly when `top_offset` is.
-    pub top_line: Option<String>,
+    /// The first lines the client holds, oldest first, beginning with the
+    /// line at `top_offset`: 1 to 64 of them. The server finds the whole
+    /// run near `top_offset` in case the tail has grown since, and requires
+    /// it there exactly once. Null exactly when `top_offset` is.
+    pub top_lines: Option<Vec<String>>,
     /// Prompted turns the client has room for, at most 200. Wake and task
     /// turns inside the kept span ride along under a separate server cap.
     pub max_turns: u32,

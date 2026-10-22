@@ -2482,7 +2482,7 @@ fn agent_settings_schema_requires_nullable_keys() {
 #[test]
 fn preface_request_and_response_round_trip() {
     let request = serde_json::json!({"id":"req", "method":"pane.preface", "params":{
-        "pane_id":"p", "top_offset":412, "top_line":"a line", "max_turns":40}});
+        "pane_id":"p", "top_offset":412, "top_lines":["a line", "", "the next line"], "max_turns":40}});
     let decoded: Request = serde_json::from_value(request.clone()).unwrap();
     assert!(matches!(&decoded.method, Method::PanePreface(params)
         if params.top_offset == Some(412) && params.max_turns == 40));
@@ -2491,7 +2491,7 @@ fn preface_request_and_response_round_trip() {
     assert!(!crate::server::client_commands::supports_client_shell_method_name("pane.preface"));
     assert_eq!(serde_json::to_value(decoded).unwrap(), request);
     let held_top = serde_json::json!({"id":"req", "method":"pane.preface", "params":{
-        "pane_id":"p", "top_offset":null, "top_line":null, "max_turns":40}});
+        "pane_id":"p", "top_offset":null, "top_lines":null, "max_turns":40}});
     let decoded: Request = serde_json::from_value(held_top.clone()).unwrap();
     assert_eq!(serde_json::to_value(decoded).unwrap(), held_top);
 

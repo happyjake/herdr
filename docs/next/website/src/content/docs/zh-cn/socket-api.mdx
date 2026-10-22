@@ -143,11 +143,11 @@ Claude 和 codex 不受支持。未知窗格返回 `pane_not_found`。
 按从旧到新返回最近最多 64 个回合。父条目缺失或循环返回 `unreadable`。
 最后一行 JSON 尚未写完时，`partial: true`，最新回合为 `open`。
 
-`pane.preface {pane_id, top_offset, top_line, max_turns}` 返回
+`pane.preface {pane_id, top_offset, top_lines, max_turns}` 返回
 `{type:"preface", pane_id, terminal_id, preface, reason}`：会话记录中早于客户端
 屏幕上所保留的最旧提示的轮次，每轮包含提示及其最终回答。`preface` 和 `reason`
 恰有一个非空。`top_offset` 是客户端保留的最旧屏幕行的 `offset_from_bottom`
-（与 `recent_unwrapped` 偏移分页的计数方式相同），`top_line` 是该行文本；
+（与 `recent_unwrapped` 偏移分页的计数方式相同），`top_lines` 是从该行开始、客户端保留的最前若干行（从旧到新，1 至 64 行），服务器要求这一整段在 `top_offset` 上方 500 行、下方 50 行范围内恰好出现一次；
 客户端保留了屏幕顶部时两者均为 null。保留最新的 `max_turns`（最多 200）个提示轮次，
 `omitted` 统计未发送的更早轮次。原因与 prompt trail 共用，另加 `seam_not_found`
 和 `nothing_above`。支持 Claude 窗格，服务器从不记录提示或回答正文。

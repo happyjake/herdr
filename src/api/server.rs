@@ -2821,7 +2821,7 @@ mod tests {
 
         let (mut client, server, _path) = local_stream_pair("preface-tracing");
         client
-            .write_all(br#"{"id":"req_preface","method":"pane.preface","params":{"pane_id":"pane_1","top_offset":null,"top_line":null,"max_turns":50}}"#)
+            .write_all(br#"{"id":"req_preface","method":"pane.preface","params":{"pane_id":"pane_1","top_offset":null,"top_lines":null,"max_turns":50}}"#)
             .unwrap();
         client.write_all(b"\n").unwrap();
         client.flush().unwrap();

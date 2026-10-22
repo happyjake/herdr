@@ -145,13 +145,14 @@ leaf の親チェーンだけを辿り、古い順で最新 64 ターンまで�
 親の欠落や循環は `unreadable`。最後の JSON 行が未完なら `partial: true`
 となり、最新ターンは `open` になります。
 
-`pane.preface {pane_id, top_offset, top_line, max_turns}` は
+`pane.preface {pane_id, top_offset, top_lines, max_turns}` は
 `{type:"preface", pane_id, terminal_id, preface, reason}` を返します。
 クライアントが画面上に保持している最も古いプロンプトより前のセッション記録の
 ターン（プロンプトと最終回答）です。`preface` と `reason` の一方だけが設定されます。
 `top_offset` はクライアントが保持する最も古い行の `offset_from_bottom`
-（`recent_unwrapped` のオフセットページと同じ数え方）、`top_line` はその行の
-テキストで、画面の先頭を保持している場合は両方 null です。`max_turns`（最大 200）
+（`recent_unwrapped` のオフセットページと同じ数え方）、`top_lines` はその行から始まる
+保持中の先頭行（古い順、1〜64 行）で、サーバーは `top_offset` の上 500 行・下 50 行の
+範囲で連続する行全体がちょうど一度現れることを求めます。画面の先頭を保持している場合は両方 null です。`max_turns`（最大 200）
 件のプロンプトのターンを新しい順に保持し、`omitted` は送られなかった古いターンの
 数です。理由は prompt trail と共通のものに加えて `seam_not_found` と
 `nothing_above` です。Claude ペインに対応し、本文はログに書かれません。

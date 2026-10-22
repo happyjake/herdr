@@ -360,16 +360,21 @@ first, limited to the last 64. A missing parent or cycle is `unreadable`.
 An incomplete final JSON line sets `partial: true` and makes the newest
 turn `open`.
 
-`pane.preface {pane_id, top_offset, top_line, max_turns}` returns
+`pane.preface {pane_id, top_offset, top_lines, max_turns}` returns
 `{type:"preface", pane_id, terminal_id, preface, reason}`: the turns of the
 pane's session record older than the oldest prompt the client still holds on
 screen, each the prompt and its final answer. Exactly one of `preface` and
 `reason` is set. `top_offset` is the `offset_from_bottom` of the oldest
 screen line the client holds, counted as `recent_unwrapped` offset pages
-count, and `top_line` is that line's text; both are null when the client
-holds the screen's top. The server pages the screen the same way, looks for
-`top_line` near `top_offset` (the tail may have grown since), and matches
-the record's prompts against the rows from there down, newest first. The
+count, and `top_lines` are the first lines the client holds, oldest first,
+beginning with that one (1 to 64; a client sends up to 16); both are null
+when the client holds the screen's top. The server reads the screen the
+same way, from one state of the terminal, looks for the whole run of
+`top_lines` within 500 lines above and 50 below `top_offset` (the tail may
+have grown since) with styling and trailing blanks stripped on both sides,
+and requires it there exactly once. From the run's first line down it
+matches the record's prompts against the rows that carry the harness's
+prompt marker, newest first. The
 oldest prompt that lines up is the first turn the client holds; every older
 turn is the preface, so a turn the client's oldest line cuts through is
 quoted whole. `max_turns` (at most 200) is how many prompted turns the

@@ -63,7 +63,9 @@ pub(crate) struct Span {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Top<'a> {
     pub offset: Option<u64>,
-    pub line: Option<&'a str>,
+    /// The client's first held lines, oldest first, from the one at
+    /// `offset` down.
+    pub lines: Option<&'a [String]>,
 }
 
 /// A screen as far up as it was read: `rows[i]` is the line `i` lines up
@@ -164,22 +166,29 @@ fn row(line: &str) -> String {
 
 /// Where in the screen the client's oldest held line is now.
 ///
-/// The line is looked for within a margin around its offset, and it must
-/// be there exactly once. A line that repeats nearby — a blank one, most
-/// often — names no one place: taking its nearest copy on a screen that
-/// moved would hand the client turns it already holds, or take from it
-/// turns it does not.
+/// The client's first held lines are looked for as one run, top line
+/// within a margin around its offset and each next line one row below, and
+/// the run must be there exactly once. A run that repeats nearby — blank
+/// lines, most often — names no one place: taking its nearest copy on a
+/// screen that moved would hand the client turns it already holds, or take
+/// from it turns it does not. The anchor is the run's first line.
 fn anchor(screen: &Screen, top: Top<'_>) -> Option<usize> {
     let Some(offset) = top.offset else {
         return (screen.top && !screen.rows.is_empty()).then(|| screen.rows.len() - 1);
     };
-    let wanted = row(top.line?);
+    let wanted: Vec<String> = top.lines?.iter().map(|line| row(line)).collect();
+    let below = wanted.len().checked_sub(1)?;
     let offset = usize::try_from(offset).ok()?;
-    let low = offset.saturating_sub(ANCHOR_BELOW);
+    let low = offset.saturating_sub(ANCHOR_BELOW).max(below);
     let high = offset
         .saturating_add(ANCHOR_ABOVE)
         .min(screen.rows.len().checked_sub(1)?);
-    let mut found = (low..=high).filter(|index| screen.rows[*index] == wanted);
+    let mut found = (low..=high).filter(|first| {
+        wanted
+            .iter()
+            .enumerate()
+            .all(|(step, line)| screen.rows[first - step] == *line)
+    });
     let only = found.next()?;
     found.next().is_none().then_some(only)
 }
@@ -504,10 +513,15 @@ mod tests {
         })
     }
 
+    fn run(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| line.to_string()).collect()
+    }
+
     /// The client's oldest line repeats near its offset, and the screen has
-    /// grown since: the copy now at the offset is not the client's.
+    /// grown since: the copy now at the offset is not the client's. Alone it
+    /// names no place; with the lines the client holds below it, it does.
     #[test]
-    fn an_anchor_line_that_repeats_near_its_offset_places_no_seam() {
+    fn an_anchor_run_must_occur_once_near_its_offset() {
         let read = prompted(&["prompt A", "prompt B", "prompt C"]);
         let before = [
             "❯ prompt A",
@@ -523,26 +537,76 @@ mod tests {
         // The client holds from the first blank row, offset 6, so it holds
         // prompt B and prompt C.
         assert_eq!(before.len() - 1 - 2, 6);
-        let top = Top {
-            offset: Some(6),
-            line: Some(""),
-        };
         // Three rows printed above the footer move the second blank row to
         // offset 6.
         let mut after = before[..8].to_vec();
         after.extend(["⏺ more", "⏺ more still", "⏺ and more"]);
         after.push("❯ ");
         assert_eq!(after[after.len() - 1 - 6], "");
+
+        let blank = run(&[""]);
+        let top = Top {
+            offset: Some(6),
+            lines: Some(&blank),
+        };
         assert_eq!(
             preface_of(&read, &after, top),
             Err(PrefaceReason::SeamNotFound)
         );
 
+        // The blank row and the prompt below it occur once.
+        let held = run(&["", "❯ prompt B"]);
+        let top = Top {
+            offset: Some(6),
+            lines: Some(&held),
+        };
+        assert_eq!(
+            preface_of(&read, &after, top),
+            Ok(vec!["prompt A".to_string()])
+        );
+        // Styling and trailing blanks are no part of either side.
+        let styled = run(&["  \u{1b}[0m", "\u{1b}[1m❯ prompt B\u{1b}[0m  "]);
+        let top = Top {
+            offset: Some(6),
+            lines: Some(&styled),
+        };
+        assert_eq!(
+            preface_of(&read, &after, top),
+            Ok(vec!["prompt A".to_string()])
+        );
+
+        // A run of nothing but blank rows that repeats still names no place.
+        let mut blanks = after[..3].to_vec();
+        blanks.extend([
+            "",
+            "❯ prompt B",
+            "⏺ answer B",
+            "",
+            "",
+            "❯ prompt C",
+            "⏺ answer C",
+            "❯ ",
+        ]);
+        let two_blank = run(&["", ""]);
+        let top = Top {
+            offset: Some(8),
+            lines: Some(&two_blank),
+        };
+        // The client's pair sits at offset 8; the same pair sits at 4.
+        assert_eq!(blanks.len() - 1 - 8, 2);
+        assert_eq!(&blanks[2..4], &["", ""]);
+        assert_eq!(&blanks[6..8], &["", ""]);
+        assert_eq!(
+            preface_of(&read, &blanks, top),
+            Err(PrefaceReason::SeamNotFound)
+        );
+
         // A line that appears once near its offset still anchors after the
         // same growth.
+        let unique = run(&["⏺ answer A"]);
         let top = Top {
             offset: Some(7),
-            line: Some("⏺ answer A"),
+            lines: Some(&unique),
         };
         assert_eq!(
             preface_of(&read, &after, top),
@@ -557,7 +621,7 @@ mod tests {
         let held = ["❯ continue", "⏺ Summary", "  continue", "❯ "];
         let top = Top {
             offset: None,
-            line: None,
+            lines: None,
         };
         // The client holds only the newest turn; both turns before it are
         // its preface, none left out.
@@ -574,7 +638,7 @@ mod tests {
         let read = prompted(&["map the piers", "chart the tides", "print the map"]);
         let top = Top {
             offset: None,
-            line: None,
+            lines: None,
         };
         // "chart the tides" is not on the screen at all.
         assert_eq!(
@@ -611,7 +675,7 @@ mod tests {
                 &read,
                 Top {
                     offset: None,
-                    line: None
+                    lines: None
                 },
                 MAX_TURNS,
                 &[],
