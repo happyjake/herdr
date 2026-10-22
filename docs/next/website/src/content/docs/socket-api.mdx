@@ -1141,6 +1141,30 @@ servers; derive the record from `value` in that case.
 
 `pane.get`, `pane.list`, `agent.get`, and `agent.list` also expose `foreground_cwd` when Herdr can resolve the cwd of the process currently controlling the pane PTY. The existing `cwd` field remains the pane/workspace cwd used for labels, follow-cwd behavior, and restored session state.
 
+`PaneInfo.started_by` records the agent pane that created a terminal. It is
+always serialized: `null` for a root, `{"pane_id":"w1:p1"}` for a starter,
+or `{"closed":{"label":"starter","started_by":{"pane_id":"w1:p1"}}}`
+for a closed starter in the wire type. The nested `started_by` is optional;
+create requests write only a live reference or `null`. An absent key identifies
+an older server without this capability.
+
+The CLI supplies `HERDR_PANE_ID` as the hidden `caller_pane_id` request field on
+`tab.create`, `pane.split`, `workspace.create`, and `worktree.create`. The server
+records it only when the local socket peer is positively verified inside that
+pane by its controlling terminal or process ancestry, and the pane currently
+runs an agent. The split target and destination workspace do not determine the
+starter. Missing, unverifiable, or outside callers still create the requested
+pane, with `started_by: null`. The TUI client-shell lane, plugin panes, WebSocket
+clients, remote-machine CLI calls, SSH forwards, and plain-shell callers create
+roots. Peer identity is server-owned and cannot be supplied in JSON.
+
+The link uses the public pane ID and is stored on the terminal. It is captured
+with the session and restored across cold restarts and live handoffs, including
+deferred worktree creation. It appears wherever `PaneInfo` appears, including
+create responses, `pane.created`, `pane.get`, `pane.list`, `session.snapshot`,
+and `pane.updated`. This is an additive JSON field; the protocol version is
+unchanged.
+
 `pane.set_pinned` sets or clears a pane's pin and answers `pane_info`, the way
 `pane.rename` does, so the client that toggled it can fold the answer instead
 of waiting for its next snapshot:

@@ -51,6 +51,8 @@ mod tests {
         assert_eq!(
             create,
             TabCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 workspace_id: None,
                 cwd: None,
                 focus: false,

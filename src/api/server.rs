@@ -465,11 +465,15 @@ fn handle_connection_with_stop(
     }
 }
 
-/// Agent lifecycle reports describe the agent running in a pane, so the app
-/// checks where their sender runs. Read the sender while it is connected:
+/// Agent lifecycle reports and create attribution depend on where the sender
+/// runs. Read the sender while it is connected:
 /// it may exit as soon as it has its answer.
 fn attach_request_peer(method: &mut Method, stream: &LocalStream) {
     let peer = match method {
+        Method::TabCreate(params) => &mut params.peer,
+        Method::PaneSplit(params) => &mut params.peer,
+        Method::WorkspaceCreate(params) => &mut params.peer,
+        Method::WorktreeCreate(params) => &mut params.peer,
         Method::PaneReportAgent(params) => &mut params.peer,
         Method::PaneReportAgentSession(params) => &mut params.peer,
         _ => return,
@@ -1627,6 +1631,7 @@ mod tests {
         agent_status: crate::api::schema::AgentStatus,
     ) -> crate::api::schema::PaneInfo {
         crate::api::schema::PaneInfo {
+            started_by: None,
             pane_id: pane_id.into(),
             terminal_id: "term_1".into(),
             workspace_id: "ws_1".into(),

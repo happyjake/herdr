@@ -21,6 +21,13 @@ pub enum PaneRightClickTarget {
 crate::cli::projection::cli_params! {
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
     pub struct PaneSplitParams => PaneSplitProjection {
+        /// Local CLI provenance, not part of the advertised client-shell contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(skip)]
+        pub caller_pane_id: Option<String> => Field::new(None::<String>),
+        #[serde(skip)]
+        #[schemars(skip)]
+        pub peer: Option<crate::api::RequestPeer> => Field::new(None::<crate::api::RequestPeer>),
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub workspace_id: Option<String> => Field::new(None::<String>),
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -615,6 +622,9 @@ crate::cli::projection::cli_params! {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
+    /// Always serialized: null means no starter; absence means an older server.
+    #[serde(default)]
+    pub started_by: Option<PaneStartedBy>,
     pub pane_id: String,
     pub terminal_id: String,
     pub workspace_id: String,
@@ -732,6 +742,21 @@ pub struct PaneInfo {
     #[serde(default)]
     pub label_at: Option<u64>,
     pub revision: u64,
+}
+
+/// The public pane that started this terminal, or a retained closed starter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PaneStartedBy {
+    Pane { pane_id: String },
+    Closed { closed: Box<ClosedPaneStarter> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ClosedPaneStarter {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<PaneStartedBy>,
 }
 
 /// What a pane's session record says was asked of it.

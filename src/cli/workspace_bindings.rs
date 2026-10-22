@@ -141,7 +141,9 @@ pub(crate) const LEAVES: [Leaf; 7] = [
         quiet: false,
         arguments: WorkspaceCreateProjection::arguments,
         method: |matches| {
-            WorkspaceCreateProjection::from_matches(matches).map(Method::WorkspaceCreate)
+            let mut params = WorkspaceCreateProjection::from_matches(matches)?;
+            params.caller_pane_id = crate::cli::target::caller_pane_id();
+            Ok(Method::WorkspaceCreate(params))
         },
     },
     Leaf {

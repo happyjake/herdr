@@ -944,6 +944,8 @@ fn navigation_highlight_ends_for_noop_focus_and_focused_creation() {
         for method in [
             crate::api::schema::Method::WorkspaceCreate(
                 crate::api::schema::WorkspaceCreateParams {
+                    caller_pane_id: None,
+                    peer: None,
                     source_workspace_id: None,
                     cwd: None,
                     focus,
@@ -952,6 +954,8 @@ fn navigation_highlight_ends_for_noop_focus_and_focused_creation() {
                 },
             ),
             crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 workspace_id: Some("ws_1".into()),
                 cwd: None,
                 focus,

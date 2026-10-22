@@ -142,6 +142,8 @@ fn write_send_input_segments(
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
+        let started_by =
+            self.verified_pane_starter(params.caller_pane_id.as_deref(), params.peer.as_ref());
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
             self.parse_pane_id(target_pane_id)
         } else if let Some(workspace_id) = params.workspace_id.as_deref() {
@@ -216,11 +218,12 @@ impl App {
                 params.focus,
             ),
         };
-        let (target_tab_idx, new_pane) = match split_result {
+        let (target_tab_idx, mut new_pane) = match split_result {
             Some(Ok(result)) => result,
             Some(Err(err)) => return encode_error(id, "pane_split_failed", err.to_string()),
             None => return encode_error(id, "pane_not_found", "pane not found"),
         };
+        new_pane.terminal.started_by = started_by;
         if let Some(pane) = self.state.workspaces[ws_idx].pane_state_mut(new_pane.pane_id) {
             pane.right_click_passthrough = matches!(
                 params.right_click,

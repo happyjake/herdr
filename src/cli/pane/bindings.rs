@@ -679,6 +679,7 @@ pub(super) const LEAVES: &[Leaf] = &[
         arguments: PaneSplitProjection::arguments,
         method: |matches| {
             let mut params = PaneSplitProjection::from_matches(matches)?;
+            params.caller_pane_id = crate::cli::target::caller_pane_id();
             params.target_pane_id = super::caller_target(
                 matches,
                 params.target_pane_id,

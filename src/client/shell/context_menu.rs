@@ -321,6 +321,8 @@ impl ClientShellState {
                 } else {
                     self.push_endpoint_method(
                         Method::TabCreate(crate::api::schema::TabCreateParams {
+                            caller_pane_id: None,
+                            peer: None,
                             workspace_id: Some(workspace_id),
                             cwd: None,
                             focus: true,
@@ -416,6 +418,8 @@ impl ClientShellState {
             ClientContextMenuAction::SplitRight | ClientContextMenuAction::SplitDown => {
                 self.push_endpoint_method(
                     Method::PaneSplit(PaneSplitParams {
+                        caller_pane_id: None,
+                        peer: None,
                         workspace_id: Some(workspace_id),
                         target_pane_id: Some(pane_id),
                         direction: if action == ClientContextMenuAction::SplitRight {

@@ -2605,6 +2605,8 @@ async fn public_background_tab_create_preserves_client_locations() {
         request: crate::api::schema::Request {
             id: "create-background-tab".into(),
             method: crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 workspace_id: Some(workspace_id),
                 cwd: None,
                 focus: false,

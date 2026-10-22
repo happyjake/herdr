@@ -51,6 +51,8 @@ fn request_uses_dot_method_names() {
     let request = Request {
         id: "req_1".into(),
         method: Method::WorkspaceCreate(WorkspaceCreateParams {
+            caller_pane_id: None,
+            peer: None,
             source_workspace_id: None,
             cwd: Some("/tmp".into()),
             focus: true,
@@ -136,6 +138,32 @@ fn pane_info_defaults_a_missing_pin_to_unpinned() {
         false,
         "this server always states it, so a client can tell the two apart"
     );
+}
+
+#[test]
+fn pane_info_started_by_is_explicit_and_round_trips_closed_chains() {
+    let legacy = serde_json::json!({
+        "pane_id": "w1:p1", "terminal_id": "term_1", "workspace_id": "w1",
+        "tab_id": "w1:t1", "focused": false, "agent_status": "unknown", "revision": 0
+    });
+    let pane: PaneInfo = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(pane).unwrap().get("started_by"),
+        Some(&serde_json::Value::Null)
+    );
+    for started_by in [
+        serde_json::json!({"pane_id":"w2:p3"}),
+        serde_json::json!({"closed":{"label":"starter"}}),
+        serde_json::json!({"closed":{"label":"helper","started_by":{"closed":{"label":"starter","started_by":{"pane_id":"w2:p3"}}}}}),
+    ] {
+        let mut input = legacy.clone();
+        input["started_by"] = started_by.clone();
+        let pane: PaneInfo = serde_json::from_value(input).unwrap();
+        assert_eq!(
+            serde_json::to_value(pane).unwrap()["started_by"],
+            started_by
+        );
+    }
 }
 
 #[test]
@@ -1689,6 +1717,7 @@ fn worktree_request_and_response_round_trip() {
                 agent_status: AgentStatus::Unknown,
             },
             root_pane: PaneInfo {
+                started_by: None,
                 pane_id: "w_1-1".into(),
                 terminal_id: "term_1".into(),
                 workspace_id: "w_1".into(),
@@ -2128,6 +2157,7 @@ fn create_response_round_trips_with_root_pane() {
                 agent_status: AgentStatus::Unknown,
             },
             root_pane: PaneInfo {
+                started_by: None,
                 pane_id: "w_1-3".into(),
                 terminal_id: "term_example".into(),
                 workspace_id: "w_1".into(),

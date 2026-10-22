@@ -9,6 +9,7 @@ mod panes;
 pub(crate) mod plugins;
 pub(super) mod responses;
 mod session;
+mod started_by;
 mod tabs;
 mod workspaces;
 mod worktrees;

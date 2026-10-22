@@ -110,6 +110,27 @@
           ],
           "type": "string"
         },
+        "ClosedPaneStarter": {
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "started_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/PaneStartedBy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "type": "object"
+        },
         "EventData": {
           "oneOf": [
             {
@@ -1030,6 +1051,18 @@
                 }
               ]
             },
+            "started_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/PaneStartedBy"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Always serialized: null means no starter; absence means an older server."
+            },
             "state_labels": {
               "additionalProperties": {
                 "type": "string"
@@ -1228,6 +1261,33 @@
             "viewport_rows"
           ],
           "type": "object"
+        },
+        "PaneStartedBy": {
+          "anyOf": [
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "closed": {
+                  "$ref": "#/schemas/event/$defs/ClosedPaneStarter"
+                }
+              },
+              "required": [
+                "closed"
+              ],
+              "type": "object"
+            }
+          ],
+          "description": "The public pane that started this terminal, or a retained closed starter."
         },
         "SplitDirection": {
           "enum": [
@@ -7771,6 +7831,27 @@
           ],
           "type": "string"
         },
+        "ClosedPaneStarter": {
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "started_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneStartedBy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "type": "object"
+        },
         "ConfigReloadStatus": {
           "enum": [
             "applied",
@@ -9212,6 +9293,18 @@
                 }
               ]
             },
+            "started_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneStartedBy"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Always serialized: null means no starter; absence means an older server."
+            },
             "state_labels": {
               "additionalProperties": {
                 "type": "string"
@@ -9745,6 +9838,33 @@
             "viewport_rows"
           ],
           "type": "object"
+        },
+        "PaneStartedBy": {
+          "anyOf": [
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "closed": {
+                  "$ref": "#/schemas/success_response/$defs/ClosedPaneStarter"
+                }
+              },
+              "required": [
+                "closed"
+              ],
+              "type": "object"
+            }
+          ],
+          "description": "The public pane that started this terminal, or a retained closed starter."
         },
         "PaneSwapReason": {
           "enum": [

@@ -264,6 +264,8 @@ impl ClientShellState {
         let workspace_id = create.source_workspace_id.clone();
         if !self.push_endpoint_method_with_kind(
             crate::api::schema::Method::WorktreeCreate(crate::api::schema::WorktreeCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 workspace_id: Some(workspace_id),
                 cwd: None,
                 branch: Some(branch),

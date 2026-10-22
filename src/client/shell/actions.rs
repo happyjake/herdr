@@ -87,6 +87,8 @@ impl ClientShellState {
                         self.push_endpoint_method(
                             crate::api::schema::Method::WorkspaceCreate(
                                 crate::api::schema::WorkspaceCreateParams {
+                                    caller_pane_id: None,
+                                    peer: None,
                                     source_workspace_id: self.workspace_action_id(),
                                     cwd: None,
                                     focus: true,
@@ -1020,6 +1022,8 @@ impl ClientShellState {
             }
             KeybindAction::NewTab if !self.config.prompt_new_tab_name => {
                 Some(Method::TabCreate(TabCreateParams {
+                    caller_pane_id: None,
+                    peer: None,
                     workspace_id: Some(focused_workspace),
                     cwd: None,
                     focus: true,
@@ -1047,6 +1051,8 @@ impl ClientShellState {
             })),
             KeybindAction::SplitVertical | KeybindAction::SplitHorizontal => {
                 Some(Method::PaneSplit(PaneSplitParams {
+                    caller_pane_id: None,
+                    peer: None,
                     workspace_id: Some(focused_workspace),
                     target_pane_id: focused_pane,
                     direction: if action == KeybindAction::SplitVertical {

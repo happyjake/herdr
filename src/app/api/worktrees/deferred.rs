@@ -103,6 +103,8 @@ impl App {
         params: WorktreeCreateParams,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
+        let started_by =
+            self.verified_pane_starter(params.caller_pane_id.as_deref(), params.peer.as_ref());
         let branch = params
             .branch
             .unwrap_or_else(|| {
@@ -177,6 +179,7 @@ impl App {
                 .and_then(|ws| ws.worktree_space().cloned())
         });
         let api_request = ApiWorktreeAddRequest {
+            started_by,
             id,
             operation_id,
             checkout_key,
@@ -486,6 +489,7 @@ impl App {
         }
         self.state.mark_session_dirty();
         if created_workspace {
+            self.set_workspace_root_starter(ws_idx, api.started_by);
             self.emit_workspace_open_events(ws_idx);
         }
         let Some(worktree) = self.worktree_info_for_workspace(ws_idx) else {

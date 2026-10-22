@@ -45,7 +45,11 @@ impl App {
     }
 
     pub(super) fn handle_tab_create(&mut self, id: String, params: TabCreateParams) -> String {
+        let started_by =
+            self.verified_pane_starter(params.caller_pane_id.as_deref(), params.peer.as_ref());
         let TabCreateParams {
+            caller_pane_id: _,
+            peer: _,
             workspace_id,
             cwd,
             focus,
@@ -92,7 +96,8 @@ impl App {
                 )
             });
         match result {
-            Ok((tab_idx, terminal, runtime)) => {
+            Ok((tab_idx, mut terminal, runtime)) => {
+                terminal.started_by = started_by;
                 self.terminal_runtimes.insert(terminal.id.clone(), runtime);
                 self.state.terminals.insert(terminal.id.clone(), terminal);
                 self.state.remove_alias_shadowed_by_new_pane(
@@ -462,6 +467,8 @@ mod tests {
         let response = app.handle_tab_create(
             "req".into(),
             TabCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 workspace_id: None,
                 cwd: None,
                 focus: false,

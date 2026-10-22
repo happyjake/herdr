@@ -30,7 +30,9 @@ const LEAVES: [Leaf; 4] = [
         id: "cli:worktree:create",
         arguments: WorktreeCreateProjection::arguments,
         method: |matches| {
-            WorktreeCreateProjection::from_matches(matches).map(Method::WorktreeCreate)
+            let mut params = WorktreeCreateProjection::from_matches(matches)?;
+            params.caller_pane_id = crate::cli::target::caller_pane_id();
+            Ok(Method::WorktreeCreate(params))
         },
     },
     Leaf {

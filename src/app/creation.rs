@@ -396,6 +396,7 @@ impl App {
             alternate_screen: false,
             agent_status_changed_at,
             pinned: terminal.pinned,
+            started_by: terminal.started_by.clone(),
             flag: terminal.flag.clone(),
             label_source: terminal.label_source,
             label_at: terminal.label_at,

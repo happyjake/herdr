@@ -26,7 +26,11 @@ const LEAVES: [Leaf; 6] = [
         about: "Create a tab",
         id: "cli:tab:create",
         arguments: TabCreateProjection::arguments,
-        method: |matches| TabCreateProjection::from_matches(matches).map(Method::TabCreate),
+        method: |matches| {
+            let mut params = TabCreateProjection::from_matches(matches)?;
+            params.caller_pane_id = crate::cli::target::caller_pane_id();
+            Ok(Method::TabCreate(params))
+        },
     },
     Leaf {
         name: "get",

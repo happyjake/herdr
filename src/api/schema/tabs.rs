@@ -24,6 +24,13 @@ pub(crate) fn tab_id() -> Input<String> {
 cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
     pub struct TabCreateParams => TabCreateProjection {
+        /// Local CLI provenance, not part of the advertised client-shell contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(skip)]
+        pub caller_pane_id: Option<String> => Field::new(None::<String>),
+        #[serde(skip)]
+        #[schemars(skip)]
+        pub peer: Option<crate::api::RequestPeer> => Field::new(None::<crate::api::RequestPeer>),
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub workspace_id: Option<String> => Field::new(None).input(workspace_option("WORKSPACE_ID").order(0)),
         #[serde(default, skip_serializing_if = "Option::is_none")]

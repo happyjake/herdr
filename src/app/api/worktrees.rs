@@ -1138,6 +1138,7 @@ mod tests {
         app.handle_api_worktree_add_finished(WorktreeAddResult {
             path: checkout.clone(),
             api_request: Some(ApiWorktreeAddRequest {
+                started_by: None,
                 id: "req".into(),
                 operation_id: 9,
                 checkout_key,
@@ -2440,6 +2441,8 @@ mod tests {
             Request {
                 id: "req".into(),
                 method: crate::api::schema::Method::WorktreeCreate(WorktreeCreateParams {
+                    caller_pane_id: None,
+                    peer: None,
                     workspace_id: None,
                     cwd: Some(repo.display().to_string()),
                     branch: Some("worktree/create-remove-in-flight".into()),

@@ -41,6 +41,8 @@ impl App {
         id: String,
         params: WorkspaceCreateParams,
     ) -> String {
+        let started_by =
+            self.verified_pane_starter(params.caller_pane_id.as_deref(), params.peer.as_ref());
         let source_workspace_index = if params.cwd.is_some() {
             None
         } else {
@@ -67,6 +69,7 @@ impl App {
         };
         match self.create_workspace_with_launch_env(cwd, params.focus, extra_env) {
             Ok(index) => {
+                self.set_workspace_root_starter(index, started_by);
                 if let Some(label) = params.label {
                     if let Some(workspace) = self.state.workspaces.get_mut(index) {
                         workspace.set_custom_name(label);
@@ -413,6 +416,8 @@ mod tests {
         let response = app.handle_tab_create(
             "tab".into(),
             crate::api::schema::TabCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 workspace_id: None,
                 cwd: None,
                 focus: true,
@@ -443,6 +448,8 @@ mod tests {
         let response = app.handle_workspace_create(
             "req".into(),
             WorkspaceCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 source_workspace_id: None,
                 cwd: None,
                 focus: false,
@@ -504,6 +511,8 @@ mod tests {
         let response = app.handle_workspace_create(
             "req".into(),
             WorkspaceCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 source_workspace_id: Some(source_workspace_id),
                 cwd: None,
                 focus: false,
@@ -524,6 +533,8 @@ mod tests {
         let invalid = app.handle_workspace_create(
             "invalid".into(),
             WorkspaceCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 source_workspace_id: Some("w_999".into()),
                 cwd: None,
                 focus: false,
@@ -537,6 +548,8 @@ mod tests {
         let captured = app.handle_workspace_create(
             "captured".into(),
             WorkspaceCreateParams {
+                caller_pane_id: None,
+                peer: None,
                 source_workspace_id: Some("w_999".into()),
                 cwd: Some(source_cwd.display().to_string()),
                 focus: false,

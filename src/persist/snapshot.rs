@@ -160,6 +160,8 @@ pub struct PaneSnapshot {
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
+    pub started_by: Option<crate::api::schema::PaneStartedBy>,
+    #[serde(default)]
     pub flag: Option<crate::api::schema::PaneFlag>,
     /// Latest flag date, retained even when the flag has been cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -511,6 +513,7 @@ fn capture_tab(
                 agent_status_reported_through,
                 agent_status_captured_pair_reported,
                 pinned,
+                started_by: terminal.and_then(|terminal| terminal.started_by.clone()),
                 flag: terminal.and_then(|terminal| terminal.flag.clone()),
                 flag_set_through: terminal.and_then(|terminal| terminal.flag_set_through),
                 label_source,
@@ -1226,6 +1229,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                started_by: None,
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
                 label: None,
                 agent_name: None,
@@ -1249,6 +1253,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                started_by: None,
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
                 agent_name: None,
@@ -2012,6 +2017,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                started_by: None,
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
                 label: None,
                 agent_name: None,
@@ -2035,6 +2041,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                started_by: None,
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),

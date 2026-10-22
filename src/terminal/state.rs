@@ -165,6 +165,7 @@ pub struct TerminalState {
     /// set only by an explicit request, persists with the session, and says
     /// nothing about the label, the agent, or anything the terminal does.
     pub pinned: bool,
+    pub started_by: Option<crate::api::schema::PaneStartedBy>,
     pub flag: Option<crate::api::schema::PaneFlag>,
     /// Retained after clearing so a later flag never reuses an earlier date.
     pub flag_set_through: Option<u64>,
@@ -223,6 +224,7 @@ impl TerminalState {
             label_source: None,
             label_at: None,
             pinned: false,
+            started_by: None,
             flag: None,
             flag_set_through: None,
             agent_name: None,
