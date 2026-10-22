@@ -223,7 +223,7 @@ impl App {
             Some(Err(err)) => return encode_error(id, "pane_split_failed", err.to_string()),
             None => return encode_error(id, "pane_not_found", "pane not found"),
         };
-        new_pane.terminal.started_by = started_by;
+        crate::app::started_by::StarterLink::attach(started_by, &mut new_pane.terminal);
         if let Some(pane) = self.state.workspaces[ws_idx].pane_state_mut(new_pane.pane_id) {
             pane.right_click_passthrough = matches!(
                 params.right_click,

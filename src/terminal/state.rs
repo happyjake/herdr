@@ -170,6 +170,9 @@ pub struct TerminalState {
     /// first one can re-root a started pane, so a restored agent resuming its
     /// own conversation keeps its link.
     pub session_reported: bool,
+    /// The label the live starter in `started_by` had when the link was made;
+    /// it names that starter if it closes.
+    pub starter_label: Option<String>,
     pub flag: Option<crate::api::schema::PaneFlag>,
     /// Retained after clearing so a later flag never reuses an earlier date.
     pub flag_set_through: Option<u64>,
@@ -230,6 +233,7 @@ impl TerminalState {
             pinned: false,
             started_by: None,
             session_reported: false,
+            starter_label: None,
             flag: None,
             flag_set_through: None,
             agent_name: None,

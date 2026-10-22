@@ -165,6 +165,20 @@ impl PaneCommandInbox {
     /// Runs `herdr <args>` from inside the pane; returns the exit status and
     /// combined output.
     pub fn run(&self, args: &[&str]) -> (i32, String) {
+        self.submit(args, "")
+    }
+
+    /// Starts `herdr <args>` from inside the pane without waiting for it to
+    /// finish; the pane goes on serving later commands meanwhile.
+    pub fn start(&self, args: &[&str]) {
+        let (code, output) = self.submit(args, " &");
+        assert_eq!(
+            code, 0,
+            "herdr {args:?} did not start in the pane: {output}"
+        );
+    }
+
+    fn submit(&self, args: &[&str], suffix: &str) -> (i32, String) {
         let n = self.next.get();
         self.next.set(n + 1);
         let mut line = format!(
@@ -176,6 +190,7 @@ impl PaneCommandInbox {
             line.push(' ');
             line.push_str(&shell_quote(arg));
         }
+        line.push_str(suffix);
         line.push('\n');
         let pending = self.dir.join(format!("{n}.pending"));
         fs::write(&pending, line).unwrap();
@@ -272,6 +287,10 @@ done
 
     pub fn ok(&self, args: &[&str]) -> String {
         self.inbox.ok(args)
+    }
+
+    pub fn start(&self, args: &[&str]) {
+        self.inbox.start(args)
     }
 }
 

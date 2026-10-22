@@ -166,6 +166,9 @@ impl App {
         let operation_id = self.next_api_worktree_operation_id();
         self.pending_api_worktree_creates
             .insert(checkout_key.clone(), operation_id);
+        if let Some(link) = started_by {
+            self.state.pending_starter_links.insert(operation_id, link);
+        }
 
         let parent_dir = checkout_path.parent().map(Path::to_path_buf);
         let source_workspace_id = source
@@ -179,7 +182,6 @@ impl App {
                 .and_then(|ws| ws.worktree_space().cloned())
         });
         let api_request = ApiWorktreeAddRequest {
-            started_by,
             id,
             operation_id,
             checkout_key,
@@ -413,6 +415,8 @@ impl App {
         let Some(api) = result.api_request.take() else {
             return;
         };
+        // Taken on every outcome; moves and closes kept it current meanwhile.
+        let started_by = self.state.pending_starter_links.remove(&api.operation_id);
         let checkout_key = api.checkout_key.clone();
         let operation_matches = self
             .pending_api_worktree_creates
@@ -489,7 +493,7 @@ impl App {
         }
         self.state.mark_session_dirty();
         if created_workspace {
-            self.set_workspace_root_starter(ws_idx, api.started_by);
+            self.set_workspace_root_starter(ws_idx, started_by);
             self.emit_workspace_open_events(ws_idx);
         }
         let Some(worktree) = self.worktree_info_for_workspace(ws_idx) else {

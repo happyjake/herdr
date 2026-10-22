@@ -741,6 +741,7 @@ mod tests {
                     crate::persist::PaneSnapshot {
                         started_by: None,
                         session_reported: false,
+                        starter_label: None,
                         cwd: "/tmp".into(),
                         label: None,
                         agent_name: None,

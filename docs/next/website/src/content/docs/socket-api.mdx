@@ -1169,15 +1169,20 @@ The server keeps the link true. When a starter moves to another workspace,
 which gives it a new pane ID, every pane it started is rewritten to the new ID.
 When a starter closes, by request or because its process exited, each
 reference becomes `{"closed":{"label":...,"started_by":...}}`: the label is the
-starter's pane label, or its tab label when it has none, and the nested
+starter's pane label, or its tab label when it had none, as it was when that
+link was made; renaming the starter later does not change it. The nested
 `started_by` is the closed starter's own link, so a chain of starters survives
 any of them closing. References nested inside closed markers are rewritten the
-same way. Every rewritten pane is published as `pane.updated` right after the
-move or close event that caused it. When a started pane's first agent session
-report carries `session_start_source: "resume"`, its link is cleared and the
-pane becomes a root; later reports, including an agent resuming its own
-conversation after a restart, leave the link alone. Closed markers and the
-first-report record survive cold restarts and live handoffs.
+same way, and so is the link of a worktree create still in flight, which lands
+with the moved ID or the closed chain. Every rewritten pane is published as
+`pane.updated` right after the move or close event that caused it. When the
+first agent session report a started pane applies carries
+`session_start_source: "resume"`, its link is cleared and the pane becomes a
+root. A refused report, such as one older than the pane's last report, decides
+nothing; later applied reports, including an agent resuming its own
+conversation after a restart, leave the link alone. Closed markers, the labels
+kept for them, and the first-report record survive cold restarts and live
+handoffs.
 
 `pane.set_pinned` sets or clears a pane's pin and answers `pane_info`, the way
 `pane.rename` does, so the client that toggled it can fold the answer instead

@@ -552,6 +552,7 @@ impl App {
             pending_agent_notifications: std::collections::HashMap::new(),
             pending_agent_status_resolutions: Vec::new(),
             pending_started_by_updates: Vec::new(),
+            pending_starter_links: std::collections::HashMap::new(),
             outer_terminal_focus: None,
             prefix_keys,
             headless_size: config.headless_size(),

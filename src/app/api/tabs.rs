@@ -97,7 +97,7 @@ impl App {
             });
         match result {
             Ok((tab_idx, mut terminal, runtime)) => {
-                terminal.started_by = started_by;
+                crate::app::started_by::StarterLink::attach(started_by, &mut terminal);
                 self.terminal_runtimes.insert(terminal.id.clone(), runtime);
                 self.state.terminals.insert(terminal.id.clone(), terminal);
                 self.state.remove_alias_shadowed_by_new_pane(

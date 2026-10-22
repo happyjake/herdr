@@ -1866,12 +1866,18 @@ impl AppState {
                 let parent = matches!(session_start_source.as_deref(), Some("fork" | "branch"))
                     .then(|| self.logbook_key(pane_id))
                     .flatten();
-                if session_ref.is_some() {
-                    self.note_session_report(
-                        pane_id,
-                        session_start_source.as_deref().unwrap_or(""),
-                    );
-                }
+                // Provenance is decided only by a report this pane applies,
+                // judged as the API judges it: newer than the last, and its
+                // session current afterwards.
+                let report_is_newer = self
+                    .terminal_for_pane(pane_id)
+                    .is_some_and(|terminal| terminal.hook_report_is_newer(&source, seq));
+                let reported = session_ref.clone().map(|session_ref| {
+                    (
+                        session_ref,
+                        session_start_source.clone().unwrap_or_default(),
+                    )
+                });
                 let mut unchanged_session_accepted = false;
                 let updates = self
                     .update_terminal_state(
@@ -1907,6 +1913,15 @@ impl AppState {
                 }
                 if let Some(parent) = parent {
                     self.record_logbook_parent(pane_id, parent);
+                }
+                if let Some((session_ref, session_start_source)) = reported {
+                    if report_is_newer
+                        && self
+                            .terminal_for_pane(pane_id)
+                            .is_some_and(|terminal| terminal.session_ref_is_current(&session_ref))
+                    {
+                        self.note_session_report(pane_id, &session_start_source);
+                    }
                 }
                 updates
             }

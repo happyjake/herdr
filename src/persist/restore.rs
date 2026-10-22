@@ -453,6 +453,7 @@ fn unavailable_restored_terminal(
         terminal.restore_flag(pane.flag.clone(), pane.flag_set_through);
         terminal.started_by = pane.started_by.clone();
         terminal.session_reported = pane.session_reported;
+        terminal.starter_label = pane.starter_label.clone();
         terminal.launch_argv = pane.launch_argv.clone();
         if let Some(session) = restored_terminal_agent_session(pane.agent_session.as_ref(), false) {
             terminal.set_persisted_agent_session(session);
@@ -673,6 +674,7 @@ fn restore_tab(
             terminal.restore_flag(saved_flag, saved_flag_set_through);
             terminal.started_by = saved_pane.and_then(|pane| pane.started_by.clone());
             terminal.session_reported = saved_pane.is_some_and(|pane| pane.session_reported);
+            terminal.starter_label = saved_pane.and_then(|pane| pane.starter_label.clone());
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
             }
@@ -775,6 +777,7 @@ fn restore_tab(
                 terminal.restore_flag(saved_flag, saved_flag_set_through);
                 terminal.started_by = saved_pane.and_then(|pane| pane.started_by.clone());
                 terminal.session_reported = saved_pane.is_some_and(|pane| pane.session_reported);
+                terminal.starter_label = saved_pane.and_then(|pane| pane.starter_label.clone());
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
                 }
@@ -1692,6 +1695,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
@@ -1858,6 +1862,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -1967,6 +1972,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: Some("beacon relay".into()),
                             agent_name: None,
@@ -2092,6 +2098,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2187,6 +2194,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -2316,6 +2324,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             // A detected agent nothing ever minted a name or a
@@ -2450,6 +2459,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2550,6 +2560,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2638,6 +2649,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2731,6 +2743,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -2812,6 +2825,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2907,6 +2921,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: Some("reviewer".into()),
@@ -2999,6 +3014,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -3091,6 +3107,7 @@ mod tests {
                             super::super::snapshot::PaneSnapshot {
                                 started_by: None,
                                 session_reported: false,
+                                starter_label: None,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -3116,6 +3133,7 @@ mod tests {
                             super::super::snapshot::PaneSnapshot {
                                 started_by: None,
                                 session_reported: false,
+                                starter_label: None,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -3183,6 +3201,7 @@ mod tests {
                 super::super::snapshot::PaneSnapshot {
                     started_by: None,
                     session_reported: false,
+                    starter_label: None,
                     cwd: cwd.clone(),
                     label: None,
                     agent_name: None,
@@ -3207,6 +3226,7 @@ mod tests {
         let final_pane = super::super::snapshot::PaneSnapshot {
             started_by: None,
             session_reported: false,
+            starter_label: None,
             cwd: cwd.clone(),
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
@@ -3373,6 +3393,7 @@ mod tests {
                         super::super::snapshot::PaneSnapshot {
                             started_by: None,
                             session_reported: false,
+                            starter_label: None,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -3976,6 +3997,7 @@ mod tests {
             super::super::snapshot::PaneSnapshot {
                 started_by: None,
                 session_reported: false,
+                starter_label: None,
                 cwd: cwd.clone(),
                 label: None,
                 agent_name: None,

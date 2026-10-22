@@ -1,18 +1,15 @@
 use crate::api::schema::PaneStartedBy;
 use crate::api::{PeerInPane, RequestPeer};
+use crate::app::started_by::StarterLink;
 use crate::app::App;
 
 impl App {
-    pub(super) fn set_workspace_root_starter(
-        &mut self,
-        ws_idx: usize,
-        started_by: Option<PaneStartedBy>,
-    ) {
+    pub(super) fn set_workspace_root_starter(&mut self, ws_idx: usize, link: Option<StarterLink>) {
         let ws = &self.state.workspaces[ws_idx];
         let root = ws.tabs[ws.active_tab].root_pane;
         if let Some(pane) = ws.pane_state(root) {
             if let Some(terminal) = self.state.terminals.get_mut(&pane.attached_terminal_id) {
-                terminal.started_by = started_by;
+                StarterLink::attach(link, terminal);
             }
         }
     }
@@ -23,7 +20,7 @@ impl App {
         &self,
         caller_pane_id: Option<&str>,
         peer: Option<&RequestPeer>,
-    ) -> Option<PaneStartedBy> {
+    ) -> Option<StarterLink> {
         let peer = peer?;
         let (ws_idx, pane_id) = self.parse_pane_id(caller_pane_id?)?;
         let pane = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
@@ -43,8 +40,11 @@ impl App {
         if !descends_from_pane && peer.in_pane(shell_pid, pane_tty) != PeerInPane::Inside {
             return None;
         }
-        Some(PaneStartedBy::Pane {
-            pane_id: self.public_pane_id(ws_idx, pane_id)?,
+        Some(StarterLink {
+            started_by: PaneStartedBy::Pane {
+                pane_id: self.public_pane_id(ws_idx, pane_id)?,
+            },
+            label: self.state.starter_label(ws_idx, pane_id),
         })
     }
 }

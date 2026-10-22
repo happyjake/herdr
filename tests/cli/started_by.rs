@@ -8,6 +8,7 @@ struct Session {
     server: Option<SpawnedHerdr>,
     agent: InPaneReporter,
     starter: String,
+    path: Option<String>,
 }
 
 impl Session {
@@ -16,21 +17,38 @@ impl Session {
     }
 
     fn with_config(config: &str) -> Self {
-        Self::with_agent_setup(config, |_| {})
+        Self::spawn(config, |_| None)
     }
 
     fn with_agent_setup(config: &str, setup: impl FnOnce(&Path)) -> Self {
-        let base = unique_test_dir();
+        Self::build(config, setup, |_| None)
+    }
+
+    /// A session whose server runs with the PATH `path` makes in its base dir.
+    fn spawn(config: &str, path: impl FnOnce(&Path) -> Option<String>) -> Self {
+        Self::build(config, |_| {}, path)
+    }
+
+    fn build(
+        config: &str,
+        setup: impl FnOnce(&Path),
+        path: impl FnOnce(&Path) -> Option<String>,
+    ) -> Self {
+        // The clock alone can name two parallel sessions alike.
+        static SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = PathBuf::from(format!("{}-{n}", unique_test_dir().display()));
         fs::create_dir_all(&base).unwrap();
         create_committed_repo(&base.join("repo"));
         let socket = base.join("runtime/herdr.sock");
         let agent = InPaneReporter::write(&base, "pi", &socket);
         setup(&base);
+        let path = path(&base);
         let server = spawn_herdr_with_config(
             &base.join("config"),
             &base.join("runtime"),
             &socket,
-            None,
+            path.as_deref().map(Path::new),
             config,
         );
         wait_for_socket(&socket, Duration::from_secs(5));
@@ -70,6 +88,7 @@ impl Session {
             server: Some(server),
             agent,
             starter,
+            path,
         }
     }
 
@@ -680,19 +699,20 @@ impl Session {
 
     /// Starts a stand-in agent in `pane`, so the pane can start panes of its own.
     fn agent_in(&self, pane: &str, name: &str) -> InPaneReporter {
+        self.agent_kind_in(pane, name, "pi")
+    }
+
+    fn agent_kind_in(&self, pane: &str, name: &str, kind: &str) -> InPaneReporter {
         let dir = self.base.join(name);
         fs::create_dir_all(&dir).unwrap();
-        let agent = InPaneReporter::write(&dir, "pi", &self.socket);
-        assert!(
-            run_cli(&self.socket, &["pane", "run", pane, &agent.command()])
-                .status
-                .success()
-        );
+        let agent = InPaneReporter::write(&dir, kind, &self.socket);
+        let run = run_cli(&self.socket, &["pane", "run", pane, &agent.command()]);
+        assert!(run.status.success(), "{run:?}");
         agent.wait_until_started(Duration::from_secs(5));
         assert!(wait_until(
             Duration::from_secs(5),
             Duration::from_millis(50),
-            || self.pane(pane)["agent"] == "pi"
+            || self.pane(pane)["agent"] == kind
         ));
         agent
     }
@@ -703,10 +723,12 @@ impl Session {
 
     fn restart(&mut self) {
         self.stop();
-        self.server = Some(spawn_herdr(
+        self.server = Some(spawn_herdr_with_config(
             &self.base.join("config"),
             &self.base.join("runtime"),
             &self.socket,
+            self.path.as_deref().map(Path::new),
+            "onboarding = false\n",
         ));
         wait_for_socket(&self.socket, Duration::from_secs(5));
     }
@@ -765,10 +787,13 @@ fn saw(events: &[Value], event: &str, pane: &str) -> bool {
     })
 }
 
-fn report_session(agent: &InPaneReporter, pane: &str, base: &Path, source: &str) {
-    let session = base.join(format!("{}-{source}.jsonl", pane.replace(':', "-")));
+/// Reports a pi session as its integration does, sequenced: the server
+/// applies no unsequenced pi session report.
+fn report_session(agent: &InPaneReporter, pane: &str, base: &Path, source: &str, seq: &str) {
+    let name = format!("{}-{source}-{seq}.jsonl", pane.replace(':', "-"));
+    let session = base.join(name);
     fs::write(&session, "").unwrap();
-    agent.ok(&[
+    let args = [
         "pane",
         "report-agent-session",
         pane,
@@ -780,7 +805,10 @@ fn report_session(agent: &InPaneReporter, pane: &str, base: &Path, source: &str)
         session.to_str().unwrap(),
         "--session-start-source",
         source,
-    ]);
+        "--seq",
+        seq,
+    ];
+    agent.ok(&args);
 }
 
 #[test]
@@ -809,12 +837,25 @@ fn started_by_follows_a_starter_moved_to_another_workspace() {
     assert_eq!(handed["started_by"], expected);
 }
 
+impl Session {
+    fn rename(&self, kind: &str, id: &str, label: &str) {
+        assert!(run_cli(&self.socket, &[kind, "rename", id, label])
+            .status
+            .success());
+    }
+}
+
 #[test]
 fn started_by_closed_starter_leaves_a_marker_that_keeps_the_chain() {
     let mut session = Session::new();
+    // A marker names its starter as it was when the link was made: the pane
+    // label, else the tab label. Names given later do not reach it.
+    let starter_tab = session.tab_of(&session.starter);
+    session.rename("tab", &starter_tab, "supervisor");
     let middle = session.create(&["tab", "create"], "root_pane");
     let middle = middle["pane_id"].as_str().unwrap().to_owned();
     let middle_agent = session.agent_in(&middle, "middle");
+    session.rename("pane", &middle, "reviewer");
     let leaf: Value = serde_json::from_str(&middle_agent.ok(&["tab", "create"])).unwrap();
     let leaf = leaf["result"]["root_pane"]["pane_id"]
         .as_str()
@@ -824,19 +865,8 @@ fn started_by_closed_starter_leaves_a_marker_that_keeps_the_chain() {
         session.pane(&leaf)["started_by"],
         json!({"pane_id": middle})
     );
-    // The pane label names a starter; its tab label stands in when it has none.
-    assert!(
-        run_cli(&session.socket, &["pane", "rename", &middle, "reviewer"])
-            .status
-            .success()
-    );
-    let starter_tab = session.tab_of(&session.starter);
-    assert!(run_cli(
-        &session.socket,
-        &["tab", "rename", &starter_tab, "supervisor"]
-    )
-    .status
-    .success());
+    session.rename("pane", &middle, "renamed reviewer");
+    session.rename("tab", &starter_tab, "renamed supervisor");
     let mut events = session.subscribe(&["pane.closed", "tab.closed", "pane.updated"]);
 
     assert!(run_cli(&session.socket, &["pane", "close", &middle])
@@ -868,17 +898,34 @@ fn started_by_closed_starter_leaves_a_marker_that_keeps_the_chain() {
 }
 
 #[test]
-fn started_by_starter_shell_exit_leaves_a_closed_marker() {
-    let session = Session::new();
+fn started_by_label_at_start_survives_restore_and_handoff_before_close() {
+    let mut session = Session::new();
+    let starter_tab = session.tab_of(&session.starter);
+    session.rename("tab", &starter_tab, "supervisor");
     let child = session.create(&["tab", "create"], "root_pane");
     let child = child["pane_id"].as_str().unwrap().to_owned();
+    session.rename("tab", &starter_tab, "renamed supervisor");
+    session.restart();
+    session.live_handoff(&child);
+    assert!(run_cli(&session.socket, &["tab", "close", &starter_tab])
+        .status
+        .success());
+    let closed = session.pane(&child);
+    session.stop();
+    assert_eq!(
+        closed["started_by"],
+        json!({"closed": {"label": "supervisor"}})
+    );
+}
+
+#[test]
+fn started_by_starter_shell_exit_leaves_a_closed_marker() {
+    let session = Session::new();
     let starter_tab = session.tab_of(&session.starter);
-    assert!(run_cli(
-        &session.socket,
-        &["tab", "rename", &starter_tab, "supervisor"]
-    )
-    .status
-    .success());
+    session.rename("tab", &starter_tab, "supervisor");
+    let child = session.create(&["tab", "create"], "root_pane");
+    let child = child["pane_id"].as_str().unwrap().to_owned();
+    session.rename("tab", &starter_tab, "renamed supervisor");
     let mut events = session.subscribe(&["pane.updated"]);
     session.agent.stop();
     assert!(
@@ -903,27 +950,227 @@ fn started_by_first_resume_report_starts_a_new_family() {
     let child = child["pane_id"].as_str().unwrap().to_owned();
     let agent = session.agent_in(&child, "resumed");
     let mut events = session.subscribe(&["pane.updated"]);
-    report_session(&agent, &child, &session.base, "resume");
+    report_session(&agent, &child, &session.base, "resume", "1");
     until_started_by(&mut events, &child, &Value::Null);
     assert_eq!(session.pane(&child)["started_by"], Value::Null);
 }
 
 #[test]
 fn started_by_later_resume_report_keeps_the_link_across_restore() {
-    let mut session = Session::new();
+    // The restored server relaunches the pane's agent to resume its session;
+    // a stand-in on its PATH plays that agent.
+    let mut session = Session::spawn("onboarding = false\n", |base| {
+        Some(format!(
+            "{}:{}",
+            base.join("restored").display(),
+            std::env::var("PATH").unwrap()
+        ))
+    });
     let child = session.create(&["tab", "create"], "root_pane");
     let child = child["pane_id"].as_str().unwrap().to_owned();
     let expected = json!({"pane_id": session.starter});
     let agent = session.agent_in(&child, "fresh");
-    report_session(&agent, &child, &session.base, "startup");
-    report_session(&agent, &child, &session.base, "resume");
+    report_session(&agent, &child, &session.base, "startup", "1");
+    report_session(&agent, &child, &session.base, "resume", "2");
     assert_eq!(session.pane(&child)["started_by"], expected);
 
     // A restored agent resuming its own conversation is not a new family.
+    let restored_dir = session.base.join("restored");
+    fs::create_dir_all(&restored_dir).unwrap();
+    let restored_agent = InPaneReporter::write(&restored_dir, "pi", &session.socket);
     session.restart();
-    let agent = session.agent_in(&child, "restored");
-    report_session(&agent, &child, &session.base, "resume");
+    restored_agent.wait_until_started(Duration::from_secs(10));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || session.pane(&child)["agent"] == "pi"
+    ));
+    report_session(&restored_agent, &child, &session.base, "resume", "3");
     let restored = session.pane(&child);
     session.stop();
     assert_eq!(restored["started_by"], expected);
+}
+
+fn report_claude(agent: &InPaneReporter, pane: &str, command: &str, extra: &[&str]) {
+    let mut args = vec![
+        "pane",
+        command,
+        pane,
+        "--source",
+        "herdr:claude",
+        "--agent",
+        "claude",
+    ];
+    args.extend_from_slice(extra);
+    agent.ok(&args);
+}
+
+#[test]
+fn started_by_stale_resume_report_does_not_decide_the_family() {
+    let session = Session::new();
+    let child = session.create(&["tab", "create"], "root_pane");
+    let child = child["pane_id"].as_str().unwrap().to_owned();
+    let agent = session.agent_kind_in(&child, "stale", "claude");
+    // A state report sets the pane's sequence and session without being a
+    // session report.
+    report_claude(
+        &agent,
+        &child,
+        "report-agent",
+        &[
+            "--state",
+            "working",
+            "--seq",
+            "5",
+            "--agent-session-id",
+            "earlier",
+        ],
+    );
+    // Older than the pane's last report: refused, so it neither clears the
+    // link nor uses up the first-report decision.
+    let resume = |seq: &str| {
+        report_claude(
+            &agent,
+            &child,
+            "report-agent-session",
+            &[
+                "--seq",
+                seq,
+                "--agent-session-id",
+                &format!("resumed-{seq}"),
+                "--session-start-source",
+                "resume",
+            ],
+        )
+    };
+    resume("3");
+    assert_eq!(
+        session.pane(&child)["started_by"],
+        json!({"pane_id": session.starter})
+    );
+    let mut events = session.subscribe(&["pane.updated"]);
+    resume("6");
+    until_started_by(&mut events, &child, &Value::Null);
+    assert_eq!(session.pane(&child)["started_by"], Value::Null);
+}
+
+/// A session whose `git worktree add` waits for `release` to appear, after
+/// leaving `entered` behind.
+fn gated_worktree_session() -> Session {
+    use std::os::unix::fs::PermissionsExt;
+    Session::spawn("onboarding = false\n", |base| {
+        let bin = base.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let real_git = String::from_utf8(
+            Command::new("/bin/sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let script = format!(
+            "#!/bin/sh\ncase \" $* \" in *' worktree add '*)\n  : > {entered}\n  while [ ! -f {release} ]; do sleep 0.05; done ;;\nesac\nexec {git} \"$@\"\n",
+            entered = shell_quote(base.join("entered").to_str().unwrap()),
+            release = shell_quote(base.join("release").to_str().unwrap()),
+            git = shell_quote(real_git.trim()),
+        );
+        fs::write(bin.join("git"), script).unwrap();
+        fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+        Some(format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap()
+        ))
+    })
+}
+
+/// Starts a worktree create from `builder`'s agent, holds it in git while
+/// `between` runs, then returns the created workspace's root pane.
+fn worktree_created_around(
+    session: &Session,
+    builder: &InPaneReporter,
+    between: impl FnOnce(),
+) -> Value {
+    let checkout = session.base.join("slow-checkout");
+    builder.start(&[
+        "worktree",
+        "create",
+        "--branch",
+        "slow",
+        "--path",
+        checkout.to_str().unwrap(),
+    ]);
+    crate::support::wait_for_file(&session.base.join("entered"), Duration::from_secs(10));
+    between();
+    fs::write(session.base.join("release"), "").unwrap();
+    let checkout = checkout.to_str().unwrap().to_owned();
+    let mut found = Value::Null;
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || {
+            let panes = run_cli_json(&session.socket, &["pane", "list"]);
+            found = panes["result"]["panes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|pane| {
+                    pane["cwd"].as_str().is_some_and(|cwd| {
+                        fs::canonicalize(cwd).ok() == fs::canonicalize(&checkout).ok()
+                    })
+                })
+                .cloned()
+                .unwrap_or(Value::Null);
+            !found.is_null()
+        }
+    ));
+    found
+}
+
+fn gated_builder(session: &Session) -> (String, InPaneReporter) {
+    let builder = session.create(&["tab", "create"], "root_pane");
+    let builder = builder["pane_id"].as_str().unwrap().to_owned();
+    let agent = session.agent_in(&builder, "builder");
+    session.rename("pane", &builder, "builder");
+    (builder, agent)
+}
+
+#[test]
+fn started_by_worktree_in_flight_follows_a_moved_starter() {
+    let session = gated_worktree_session();
+    let (builder, agent) = gated_builder(&session);
+    let mut moved_to = String::new();
+    let created = worktree_created_around(&session, &agent, || {
+        let moved = run_cli_json(
+            &session.socket,
+            &["pane", "move", &builder, "--new-workspace"],
+        );
+        moved_to = moved["result"]["move_result"]["pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    });
+    assert_ne!(moved_to, builder);
+    assert_eq!(
+        created["started_by"],
+        json!({"pane_id": moved_to}),
+        "{created}"
+    );
+}
+
+#[test]
+fn started_by_worktree_in_flight_keeps_the_chain_of_a_closed_starter() {
+    let session = gated_worktree_session();
+    let (builder, agent) = gated_builder(&session);
+    let created = worktree_created_around(&session, &agent, || {
+        assert!(run_cli(&session.socket, &["pane", "close", &builder])
+            .status
+            .success());
+    });
+    assert_eq!(
+        created["started_by"],
+        json!({"closed": {"label": "builder", "started_by": {"pane_id": session.starter}}}),
+        "{created}"
+    );
 }

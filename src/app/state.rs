@@ -820,6 +820,10 @@ pub struct AppState {
     pub pending_agent_status_resolutions: Vec<super::actions::PaneStateUpdate>,
     /// Terminals whose started-by link was rewritten, awaiting pane updates.
     pub(crate) pending_started_by_updates: Vec<crate::terminal::TerminalId>,
+    /// Starter links of creates still in flight, by operation id, kept here so
+    /// a starter that moves or closes meanwhile rewrites them too.
+    pub(crate) pending_starter_links:
+        std::collections::HashMap<u64, super::started_by::StarterLink>,
     /// Last reported focus state for the outer terminal hosting herdr.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
     pub outer_terminal_focus: Option<bool>,
@@ -1068,6 +1072,7 @@ impl AppState {
             pending_agent_notifications: std::collections::HashMap::new(),
             pending_agent_status_resolutions: Vec::new(),
             pending_started_by_updates: Vec::new(),
+            pending_starter_links: std::collections::HashMap::new(),
             outer_terminal_focus: None,
             prefix_keys: vec![(KeyCode::Char('b'), KeyModifiers::CONTROL)],
             headless_size: (
