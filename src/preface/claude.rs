@@ -28,6 +28,12 @@ const INTERRUPTED: &str = "[Request interrupted";
 /// What a background task's finishing reads as.
 const TASK_NOTIFICATION: &str = "<task-notification>";
 
+/// What the harness draws at column 0 ahead of a prompt's first row.
+const PROMPT_MARKER: &str = "\u{276f}";
+
+/// The origin the harness gives what the person typed.
+const HUMAN_ORIGIN: &str = "human";
+
 #[derive(Default)]
 pub(crate) struct ClaudeReader {
     session_id: Option<String>,
@@ -61,6 +67,10 @@ impl super::Reader for ClaudeReader {
             turns: self.turns,
         }
     }
+
+    fn prompt_markers(&self) -> &'static [&'static str] {
+        &[PROMPT_MARKER]
+    }
 }
 
 impl ClaudeReader {
@@ -89,6 +99,11 @@ impl ClaudeReader {
             }
             return;
         }
+        // A line that says where it came from is a prompt only when that is
+        // the person; one that says nothing predates the harness saying it.
+        if origin(line).is_some_and(|kind| kind != HUMAN_ORIGIN) {
+            return;
+        }
         if crate::prompt_trail::prompt_text(PromptTrailAgent::Claude, line).is_some() {
             self.start(line, TurnStart::Prompt, Some(prompt_body(raw)));
         }
@@ -96,6 +111,10 @@ impl ClaudeReader {
 
     /// A prompt typed while the agent was working reaches the record as an
     /// attachment to the run rather than a line of its own.
+    ///
+    /// The harness queues its own words the same way — a continuation it
+    /// injects toward a goal, another session's message — so only a queued
+    /// prompt that names the person as its origin is one.
     fn attachment(&mut self, line: &Value) {
         let Some(attachment) = line.get("attachment") else {
             return;
@@ -103,6 +122,7 @@ impl ClaudeReader {
         if attachment.get("type").and_then(Value::as_str) != Some("queued_command")
             || attachment.get("commandMode").and_then(Value::as_str) != Some("prompt")
             || flag(attachment, "isMeta")
+            || origin(attachment) != Some(HUMAN_ORIGIN)
         {
             return;
         }
@@ -170,6 +190,14 @@ impl ClaudeReader {
         self.message_text.clear();
         self.turns.push(Turn::started(id, at, start, prompt));
     }
+}
+
+/// The origin the harness gives a line it queued or recorded.
+fn origin(value: &Value) -> Option<&str> {
+    value
+        .get("origin")
+        .and_then(|origin| origin.get("kind"))
+        .and_then(Value::as_str)
 }
 
 fn flag(value: &Value, key: &str) -> bool {
@@ -451,5 +479,35 @@ mod tests {
         let turns = turns_of(&record);
         assert_eq!(turns[0].end, TurnEnd::Answered);
         assert_eq!(turns[0].answer, None);
+    }
+
+    #[test]
+    fn a_line_the_harness_says_someone_else_wrote_is_no_prompt() {
+        let from = |kind: &str| {
+            line(serde_json::json!({
+                "type": "user", "uuid": format!("u-{kind}"), "timestamp": "2026-03-04T09:00:10Z",
+                "isSidechain": false, "origin": { "kind": kind },
+                "message": { "role": "user", "content": format!("words from {kind}") },
+            }))
+        };
+        let record = [
+            typed("map the piers", "2026-03-04T09:00:00Z"),
+            from("auto-continuation"),
+            from("peer"),
+            from("human"),
+        ]
+        .concat();
+        let prompts: Vec<_> = turns_of(&record)
+            .into_iter()
+            .map(|turn| turn.prompt)
+            .collect();
+        // A line with no origin at all predates the harness writing one.
+        assert_eq!(
+            prompts,
+            vec![
+                Some("map the piers".to_string()),
+                Some("words from human".to_string())
+            ]
+        );
     }
 }

@@ -1745,6 +1745,7 @@ impl App {
             params.format,
             params.lines,
             params.offset_from_bottom,
+            params.span,
         ) {
             Ok(window) => window,
             Err(message) => return encode_error(id, "invalid_request", message),
@@ -2832,6 +2833,7 @@ mod tests {
             format: ReadFormat::Text,
             strip_ansi: true,
             intent: Default::default(),
+            span: None,
             offset_from_bottom,
         }
     }
@@ -4874,6 +4876,7 @@ mod tests {
                 format: crate::api::schema::ReadFormat::Text,
                 strip_ansi: true,
                 intent: crate::api::schema::ReadIntent::Interactive,
+                span: None,
                 offset_from_bottom: None,
             },
         );

@@ -497,6 +497,9 @@ crate::cli::projection::cli_params! {
         #[serde(skip)]
         #[schemars(skip)]
         pub(crate) intent: super::common::ReadIntent => Field::new(super::common::ReadIntent::Interactive),
+        #[serde(skip)]
+        #[schemars(skip)]
+        pub(crate) span: Option<super::common::ReadSpan> => Field::new(None::<super::common::ReadSpan>),
         /// Shift the recent-source window up from the bottom anchor: physical
         /// rows for `recent`, logical lines for `recent_unwrapped`. Inside a
         /// logical line taller than the window, one step degrades to one

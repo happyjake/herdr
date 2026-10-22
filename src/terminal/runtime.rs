@@ -413,6 +413,15 @@ impl TerminalRuntime {
         self.0.recent_read_at_offset(request)
     }
 
+    pub(crate) fn recent_read_span(
+        &self,
+        page_lines: usize,
+        min_lines: usize,
+        max_lines: usize,
+    ) -> Option<crate::pane::RecentReadSpan> {
+        self.0.recent_read_span(page_lines, min_lines, max_lines)
+    }
+
     pub fn snapshot_history(&self) -> Option<String> {
         self.0.snapshot_history()
     }

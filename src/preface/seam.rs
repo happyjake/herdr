@@ -3,42 +3,41 @@
 //! A client pages a pane's history with `recent_unwrapped` offset reads and
 //! holds every line from its oldest page down to the bottom. It names that
 //! oldest line by its offset and its text. The screen is read here the same
-//! way, so the offset means the same line, and the text re-anchors it when
-//! the tail has grown since the client looked.
+//! way, so the offset means the same line — every page from one state of
+//! the terminal, so nothing printed between two pages can shift one — and
+//! the text re-anchors it when the tail has grown since the client looked.
 //!
 //! From the anchor down, the record's prompts are matched against the
-//! screen's rows, newest first, the way the two have to line up: the
-//! newest prompt on screen is one of the record's newest. The oldest prompt
-//! that lines up is the first turn the client holds; every turn older than
-//! it is the preface. A turn the anchor cuts through — its prompt above the
-//! client's oldest line, some of its answer below — is therefore quoted
-//! whole, and a few of its lines show twice.
+//! screen's prompt rows, newest first, the way the two have to line up: the
+//! newest prompt on screen is one of the record's newest. A row counts as a
+//! prompt only when it carries the harness's prompt marker, so an answer or
+//! tool output that repeats a prompt's words is never taken for it. The
+//! oldest prompt that lines up is the first turn the client holds; every
+//! turn older than it is the preface. A turn the anchor cuts through — its
+//! prompt above the client's oldest line, some of its answer below — is
+//! therefore quoted whole, and a few of its lines show twice.
 //!
-//! When the anchor or the prompts cannot be found, there is no preface: a
-//! preface placed by a guess would say the screen begins somewhere it does
-//! not.
+//! When the anchor or the prompts cannot be placed beyond doubt, there is
+//! no preface: a preface placed by a guess would say the screen begins
+//! somewhere it does not, and could leave out a turn without counting it.
 
 use super::{ReadTurns, Turn};
 use crate::api::schema::{Preface, PrefaceReason, PrefaceTurn, TurnStart};
 
-/// Lines one screen page asks for: the most an offset read serves.
+/// Lines one screen page holds: the most an offset read serves.
 pub(crate) const PAGE_LINES: u32 = 1000;
 
 /// Screen lines one preface reads at most.
-const MAX_SCREEN_LINES: usize = 12_000;
+pub(crate) const MAX_SCREEN_LINES: usize = 12_000;
 
 /// How far above its offset the client's oldest line is looked for: the
 /// tail may have grown by this much while the client paged.
-const ANCHOR_ABOVE: usize = 2_000;
+const ANCHOR_ABOVE: usize = 500;
 
 /// How far below it.
-const ANCHOR_BELOW: usize = 200;
+const ANCHOR_BELOW: usize = 50;
 
-/// Times the screen is read again when it moved between two pages.
-const SCREEN_ATTEMPTS: usize = 3;
-
-/// Record prompts that may sit between two that line up with the screen
-/// without showing on it.
+/// Record prompts that may sit between two that line up with the screen.
 const LOOKBACK: usize = 16;
 
 /// A row this long or longer that a prompt's first line begins with is
@@ -52,11 +51,11 @@ pub(crate) const MAX_TURNS: u32 = 200;
 /// turns it keeps.
 pub(crate) const MAX_WAKE_TASK_TURNS: usize = 50;
 
-/// One page of a `recent_unwrapped` offset read.
+/// Recent unwrapped history from the bottom up, read from one state of the
+/// terminal: its lines top first, and whether history remains above them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Page {
+pub(crate) struct Span {
     pub text: String,
-    pub effective_offset: u64,
     pub has_more: bool,
 }
 
@@ -77,24 +76,41 @@ struct Screen {
 }
 
 /// The preface one request asks for.
+///
+/// `prompt_markers` are what the harness draws at column 0 ahead of a
+/// prompt (see [`super::Reader::prompt_markers`]). `span` reads the screen:
+/// asked for more than a number of lines (or the whole screen, up to
+/// [`MAX_SCREEN_LINES`]), it answers one span, or nothing when the screen
+/// cannot be read that way.
 pub(crate) fn preface(
     agent: &str,
     fallback_session_id: &str,
     read: &ReadTurns,
     top: Top<'_>,
     max_turns: u32,
-    page: impl FnMut(u64) -> Option<Page>,
+    prompt_markers: &[&str],
+    span: impl FnOnce(usize) -> Option<Span>,
 ) -> Result<Preface, PrefaceReason> {
     let turns = &read.turns.turns;
-    let want = top.offset.map(|offset| {
+    if prompt_markers.is_empty() {
+        return Err(PrefaceReason::SeamNotFound);
+    }
+    let want = top.offset.map_or(MAX_SCREEN_LINES, |offset| {
         usize::try_from(offset)
             .unwrap_or(usize::MAX)
             .saturating_add(ANCHOR_ABOVE)
+            .min(MAX_SCREEN_LINES)
     });
-    let screen = read_screen(want, page).ok_or(PrefaceReason::SeamNotFound)?;
-    let anchor = anchor(&screen, top).ok_or(PrefaceReason::SeamNotFound)?;
-    let seam = place(turns, screen.rows[..=anchor].iter().map(String::as_str))
+    let screen = span(want)
+        .map(screen_of)
         .ok_or(PrefaceReason::SeamNotFound)?;
+    let anchor = anchor(&screen, top).ok_or(PrefaceReason::SeamNotFound)?;
+    let seam = place(
+        turns,
+        prompt_markers,
+        screen.rows[..=anchor].iter().map(String::as_str),
+    )
+    .ok_or(PrefaceReason::SeamNotFound)?;
     let (kept, omitted) = select(turns, seam, max_turns.min(MAX_TURNS));
     if kept.is_empty() && omitted == 0 {
         return Err(PrefaceReason::NothingAbove);
@@ -125,55 +141,19 @@ fn wire_turn(turn: &Turn) -> PrefaceTurn {
     }
 }
 
-/// Read the screen from the bottom up, far enough to hold `want` lines or
-/// to its top when no line count is known.
-///
-/// Pages overlap by one line, exactly as a client's do. When the line two
-/// pages share differs, the tail moved between them and every offset read
-/// so far is off by the same amount, so the screen is read again from the
-/// bottom rather than stitched across the move.
-fn read_screen(want: Option<usize>, mut page: impl FnMut(u64) -> Option<Page>) -> Option<Screen> {
-    'attempt: for _ in 0..SCREEN_ATTEMPTS {
-        let mut rows: Vec<String> = Vec::new();
-        let mut offset = 0u64;
-        loop {
-            let read = page(offset)?;
-            let lines = page_lines(&read.text);
-            let landed = usize::try_from(read.effective_offset).ok()?;
-            for (from_bottom, line) in lines.iter().rev().enumerate() {
-                let index = landed + from_bottom;
-                let line = row(line);
-                match index.cmp(&rows.len()) {
-                    std::cmp::Ordering::Less if rows[index] != line => continue 'attempt,
-                    std::cmp::Ordering::Less => {}
-                    std::cmp::Ordering::Equal => rows.push(line),
-                    // The server stepped past lines this never saw.
-                    std::cmp::Ordering::Greater => return None,
-                }
-            }
-            if !read.has_more {
-                return Some(Screen { rows, top: true });
-            }
-            if want.is_some_and(|want| rows.len() > want) || rows.len() >= MAX_SCREEN_LINES {
-                return Some(Screen { rows, top: false });
-            }
-            let next = read.effective_offset + lines.len().saturating_sub(1).max(1) as u64;
-            if next <= offset || lines.is_empty() {
-                return None;
-            }
-            offset = next;
-        }
+/// A span's lines, bottom first, split the way a client splits them.
+fn screen_of(span: Span) -> Screen {
+    let text = span.text.strip_suffix('\n').unwrap_or(&span.text);
+    let mut rows: Vec<String> = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split('\n').map(row).collect()
+    };
+    rows.reverse();
+    Screen {
+        rows,
+        top: !span.has_more,
     }
-    None
-}
-
-/// A page's lines, split the way a client splits them.
-fn page_lines(text: &str) -> Vec<&str> {
-    let text = text.strip_suffix('\n').unwrap_or(text);
-    if text.is_empty() {
-        return Vec::new();
-    }
-    text.split('\n').collect()
 }
 
 /// One screen line as the two sides compare it: no styling, no carriage
@@ -184,40 +164,42 @@ fn row(line: &str) -> String {
 
 /// Where in the screen the client's oldest held line is now.
 ///
-/// Its offset is tried first, then the lines around it nearest first, so
-/// an unmoved screen anchors exactly even on a line that repeats. A line
-/// that repeats nearby — a blank one, most often — on a screen that moved
-/// anchors on its nearest copy, which is off by no more than the distance
-/// between the two.
+/// The line is looked for within a margin around its offset, and it must
+/// be there exactly once. A line that repeats nearby — a blank one, most
+/// often — names no one place: taking its nearest copy on a screen that
+/// moved would hand the client turns it already holds, or take from it
+/// turns it does not.
 fn anchor(screen: &Screen, top: Top<'_>) -> Option<usize> {
     let Some(offset) = top.offset else {
         return (screen.top && !screen.rows.is_empty()).then(|| screen.rows.len() - 1);
     };
     let wanted = row(top.line?);
     let offset = usize::try_from(offset).ok()?;
-    let at = |index: usize| screen.rows.get(index).is_some_and(|line| *line == wanted);
-    (0..=ANCHOR_ABOVE.max(ANCHOR_BELOW)).find_map(|distance| {
-        let above = offset.checked_add(distance);
-        let below = offset.checked_sub(distance);
-        if distance <= ANCHOR_ABOVE && above.is_some_and(at) {
-            above
-        } else if distance > 0 && distance <= ANCHOR_BELOW && below.is_some_and(at) {
-            below
-        } else {
-            None
-        }
-    })
+    let low = offset.saturating_sub(ANCHOR_BELOW);
+    let high = offset
+        .saturating_add(ANCHOR_ABOVE)
+        .min(screen.rows.len().checked_sub(1)?);
+    let mut found = (low..=high).filter(|index| screen.rows[*index] == wanted);
+    let only = found.next()?;
+    found.next().is_none().then_some(only)
 }
 
 /// The index of the oldest turn whose prompt the held rows show, when the
-/// record's prompts line up with them at all.
+/// record's prompts line up with them beyond doubt.
 ///
 /// Rows are walked from the bottom up and prompts from the newest back, so
-/// a prompt that repeats is matched where its neighbours say it is. A
-/// record prompt the screen does not show (an image paste, a prompt drawn
-/// some other way) is stepped over within a few prompts of the last one
-/// that lined up; a screen row that matches no prompt is just a row.
-fn place<'a>(turns: &[Turn], held_bottom_first: impl Iterator<Item = &'a str>) -> Option<usize> {
+/// a prompt that repeats is matched where its neighbours say it is. Only a
+/// row carrying a prompt marker can stand for a prompt. A prompt row that
+/// matches no record prompt is a prompt drawn some other way (a paste
+/// shown as a placeholder, say), and each such row may account for one
+/// record prompt that lines up with nothing; a record prompt skipped with
+/// no row to account for it would be a turn left out unseen, so the seam
+/// is refused instead.
+fn place<'a>(
+    turns: &[Turn],
+    markers: &[&str],
+    held_bottom_first: impl Iterator<Item = &'a str>,
+) -> Option<usize> {
     let prompted: Vec<usize> = turns
         .iter()
         .enumerate()
@@ -225,43 +207,45 @@ fn place<'a>(turns: &[Turn], held_bottom_first: impl Iterator<Item = &'a str>) -
         .map(|(index, _)| index)
         .collect();
     let mut remaining = prompted.len();
+    let mut unaccounted = 0usize;
     let mut seam = None;
     for line in held_bottom_first {
         if remaining == 0 {
             break;
         }
-        let line = prompt_row(line);
+        let Some(line) = prompt_row(line, markers) else {
+            continue;
+        };
         if line.is_empty() {
             continue;
         }
-        for back in 0..LOOKBACK.min(remaining) {
-            let candidate = prompted[remaining - 1 - back];
-            if turns[candidate]
+        let matched = (0..LOOKBACK.min(remaining)).find(|back| {
+            turns[prompted[remaining - 1 - back]]
                 .head
                 .as_deref()
                 .is_some_and(|head| shows(&line, head))
-            {
-                seam = Some(candidate);
+        });
+        match matched {
+            Some(back) if back > unaccounted => return None,
+            Some(back) => {
+                seam = Some(prompted[remaining - 1 - back]);
                 remaining -= back + 1;
-                break;
+                unaccounted = 0;
             }
+            None => unaccounted += 1,
         }
     }
     seam
 }
 
-/// A row as a prompt would read in it: one row of text, without the glyph
-/// a harness draws ahead of the person's words.
-fn prompt_row(line: &str) -> String {
-    let line = crate::prompt_trail::clean(line);
-    for glyph in ["❯", "›", ">"] {
-        if let Some(rest) = line.strip_prefix(glyph) {
-            if rest.is_empty() || rest.starts_with(' ') {
-                return rest.trim_start().to_string();
-            }
-        }
-    }
-    line
+/// A row's words as a prompt, when the row is one: it begins at column 0
+/// with one of the harness's prompt markers, followed by a space or
+/// nothing.
+fn prompt_row(line: &str, markers: &[&str]) -> Option<String> {
+    markers.iter().find_map(|marker| {
+        let rest = line.strip_prefix(marker)?;
+        (rest.is_empty() || rest.starts_with(' ')).then(|| crate::prompt_trail::clean(rest))
+    })
 }
 
 /// Whether a row shows a prompt's first line: all of it, or the start of it
@@ -366,6 +350,8 @@ mod tests {
 
     #[test]
     fn a_wrapped_prompt_row_shows_its_prompt_but_a_short_one_must_be_whole() {
+        let markers = ["\u{276f}", ">"];
+        let prompt_row = |line: &str| prompt_row(line, &markers).expect("a prompt row");
         let head = "trace why the ferry timetable importer drops the last sailing of the day";
         assert!(shows(&prompt_row("❯ trace why the ferry timetable"), head));
         assert!(shows(
@@ -380,7 +366,21 @@ mod tests {
         );
         assert!(shows(&prompt_row("❯ yes"), "yes"));
         assert!(!shows(&prompt_row("❯ yes, and more"), "yes"));
-        assert_eq!(prompt_row(">not a glyph"), ">not a glyph");
+    }
+
+    #[test]
+    fn only_a_row_with_the_marker_at_column_zero_is_a_prompt_row() {
+        let markers = ["\u{276f}"];
+        assert_eq!(
+            prompt_row("❯ map  the piers", &markers).as_deref(),
+            Some("map the piers")
+        );
+        assert_eq!(prompt_row("❯ ", &markers).as_deref(), Some(""));
+        // A marker run into a word, an indented one, and none at all.
+        assert_eq!(prompt_row("❯not a marker", &markers), None);
+        assert_eq!(prompt_row("  ❯ map the piers", &markers), None);
+        assert_eq!(prompt_row("map the piers", &markers), None);
+        assert_eq!(prompt_row("⏺ map the piers", &markers), None);
     }
 
     fn turn(index: usize, start: TurnStart) -> Turn {
@@ -446,11 +446,178 @@ mod tests {
             .collect();
         // The screen shows the last two prompts only.
         let held = ["❯ continue", "  output", "❯ continue", "  output", "❯ "];
-        assert_eq!(place(&turns, held.iter().rev().copied()), Some(2));
+        assert_eq!(place(&turns, &MARKERS, held.iter().rev().copied()), Some(2));
         // And all four.
         let held = ["❯ continue", "❯ map the piers", "❯ continue", "❯ continue"];
-        assert_eq!(place(&turns, held.iter().rev().copied()), Some(0));
+        assert_eq!(place(&turns, &MARKERS, held.iter().rev().copied()), Some(0));
         // None of them.
-        assert_eq!(place(&turns, ["❯ something else"].into_iter()), None);
+        assert_eq!(
+            place(&turns, &MARKERS, ["❯ something else"].into_iter()),
+            None
+        );
+    }
+
+    const MARKERS: [&str; 1] = ["\u{276f}"];
+
+    fn prompted(texts: &[&str]) -> ReadTurns {
+        let turns = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let mut turn = Turn::started(
+                    format!("t{index}"),
+                    index as u64,
+                    TurnStart::Prompt,
+                    Some(text.to_string()),
+                );
+                turn.answer(&format!("answer to {text}"));
+                turn
+            })
+            .collect();
+        ReadTurns {
+            revision: "r".into(),
+            turns: std::sync::Arc::new(super::super::RecordTurns {
+                session_id: Some("s".into()),
+                turns,
+            }),
+        }
+    }
+
+    fn preface_of(
+        read: &ReadTurns,
+        rows: &[&str],
+        top: Top<'_>,
+    ) -> Result<Vec<String>, PrefaceReason> {
+        let text = rows.join("\n");
+        preface("claude", "s", read, top, MAX_TURNS, &MARKERS, |_| {
+            Some(Span {
+                text,
+                has_more: false,
+            })
+        })
+        .map(|preface| {
+            preface
+                .turns
+                .into_iter()
+                .filter_map(|turn| turn.prompt)
+                .collect()
+        })
+    }
+
+    /// The client's oldest line repeats near its offset, and the screen has
+    /// grown since: the copy now at the offset is not the client's.
+    #[test]
+    fn an_anchor_line_that_repeats_near_its_offset_places_no_seam() {
+        let read = prompted(&["prompt A", "prompt B", "prompt C"]);
+        let before = [
+            "❯ prompt A",
+            "⏺ answer A",
+            "",
+            "❯ prompt B",
+            "⏺ answer B",
+            "",
+            "❯ prompt C",
+            "⏺ answer C",
+            "❯ ",
+        ];
+        // The client holds from the first blank row, offset 6, so it holds
+        // prompt B and prompt C.
+        assert_eq!(before.len() - 1 - 2, 6);
+        let top = Top {
+            offset: Some(6),
+            line: Some(""),
+        };
+        // Three rows printed above the footer move the second blank row to
+        // offset 6.
+        let mut after = before[..8].to_vec();
+        after.extend(["⏺ more", "⏺ more still", "⏺ and more"]);
+        after.push("❯ ");
+        assert_eq!(after[after.len() - 1 - 6], "");
+        assert_eq!(
+            preface_of(&read, &after, top),
+            Err(PrefaceReason::SeamNotFound)
+        );
+
+        // A line that appears once near its offset still anchors after the
+        // same growth.
+        let top = Top {
+            offset: Some(7),
+            line: Some("⏺ answer A"),
+        };
+        assert_eq!(
+            preface_of(&read, &after, top),
+            Ok(vec!["prompt A".to_string()])
+        );
+    }
+
+    /// An answer that repeats a prompt's words is not the prompt.
+    #[test]
+    fn a_row_without_the_prompt_marker_never_stands_for_a_prompt() {
+        let read = prompted(&["old work", "continue", "continue"]);
+        let held = ["❯ continue", "⏺ Summary", "  continue", "❯ "];
+        let top = Top {
+            offset: None,
+            line: None,
+        };
+        // The client holds only the newest turn; both turns before it are
+        // its preface, none left out.
+        assert_eq!(
+            preface_of(&read, &held, top),
+            Ok(vec!["old work".to_string(), "continue".to_string()])
+        );
+    }
+
+    /// A record prompt that lines up with no row, and no unmatched prompt
+    /// row to account for it, would be a turn left out unseen.
+    #[test]
+    fn a_record_prompt_skipped_with_no_row_to_account_for_it_places_no_seam() {
+        let read = prompted(&["map the piers", "chart the tides", "print the map"]);
+        let top = Top {
+            offset: None,
+            line: None,
+        };
+        // "chart the tides" is not on the screen at all.
+        assert_eq!(
+            preface_of(
+                &read,
+                &["❯ map the piers", "⏺ done", "❯ print the map", "❯ "],
+                top
+            ),
+            Err(PrefaceReason::SeamNotFound)
+        );
+        // Drawn some other way, it still has a prompt row standing for it.
+        assert_eq!(
+            preface_of(
+                &read,
+                &[
+                    "❯ map the piers",
+                    "❯ [Pasted text #1 +4 lines]",
+                    "❯ print the map",
+                    "❯ "
+                ],
+                top
+            ),
+            Err(PrefaceReason::NothingAbove)
+        );
+    }
+
+    #[test]
+    fn a_harness_that_declares_no_prompt_marker_places_no_seam() {
+        let read = prompted(&["map the piers"]);
+        assert_eq!(
+            preface(
+                "pi",
+                "s",
+                &read,
+                Top {
+                    offset: None,
+                    line: None
+                },
+                MAX_TURNS,
+                &[],
+                |_| { panic!("the screen is not read when it cannot be lined up") }
+            ),
+            Err(PrefaceReason::SeamNotFound)
+        );
     }
 }

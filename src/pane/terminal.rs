@@ -82,6 +82,75 @@ pub struct RecentReadWindow {
     pub offset_unsupported: bool,
 }
 
+/// Recent unwrapped history read the way a client pages it — offset 0,
+/// then each page's echoed landing point plus its lines less one overlap —
+/// but every page from one state of the terminal, so the pages meet where
+/// the offsets say they do. `text` is the stitched lines, top first;
+/// `has_more` says history remains above them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecentReadSpan {
+    pub text: String,
+    pub has_more: bool,
+}
+
+/// Stitch offset pages, bottom first, until more than `min_lines` lines
+/// are held, `max_lines` are, or the top is reached.
+///
+/// Within one state of the terminal the line two pages share is the same
+/// line, except that a window whose top cuts a logical line mid-wrap holds
+/// only its tail; the fuller copy from the page above wins. Anything else
+/// means the offsets did not mean what they say, and there is no span.
+fn stitch_recent_pages(
+    page_lines: usize,
+    min_lines: usize,
+    max_lines: usize,
+    mut page: impl FnMut(RecentReadRequest) -> Option<RecentReadWindow>,
+) -> Option<RecentReadSpan> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let window = page(RecentReadRequest {
+            lines: page_lines,
+            offset_from_bottom: offset,
+            unwrapped: true,
+            ansi: false,
+        })?;
+        if window.offset_unsupported {
+            return None;
+        }
+        let text = window.text.strip_suffix('\n').unwrap_or(&window.text);
+        let lines: Vec<&str> = if text.is_empty() {
+            Vec::new()
+        } else {
+            text.split('\n').collect()
+        };
+        for (from_bottom, line) in lines.iter().rev().enumerate() {
+            let index = window.effective_offset + from_bottom;
+            match index.cmp(&rows.len()) {
+                std::cmp::Ordering::Less if rows[index] == *line => {}
+                std::cmp::Ordering::Less if line.ends_with(rows[index].as_str()) => {
+                    rows[index] = (*line).to_string();
+                }
+                std::cmp::Ordering::Less => return None,
+                std::cmp::Ordering::Equal => rows.push((*line).to_string()),
+                std::cmp::Ordering::Greater => return None,
+            }
+        }
+        if !window.has_more || rows.len() > min_lines || rows.len() >= max_lines {
+            rows.reverse();
+            return Some(RecentReadSpan {
+                text: rows.join("\n"),
+                has_more: window.has_more,
+            });
+        }
+        let next = window.effective_offset + lines.len().saturating_sub(1).max(1);
+        if next <= offset || lines.is_empty() {
+            return None;
+        }
+        offset = next;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TerminalTextPoint {
     pub row: u32,
@@ -569,6 +638,16 @@ impl PaneTerminal {
 
     pub fn recent_read_at_offset(&self, request: RecentReadRequest) -> RecentReadWindow {
         self.ghostty.recent_read_at_offset(request)
+    }
+
+    pub(crate) fn recent_read_span(
+        &self,
+        page_lines: usize,
+        min_lines: usize,
+        max_lines: usize,
+    ) -> Option<RecentReadSpan> {
+        self.ghostty
+            .recent_read_span(page_lines, min_lines, max_lines)
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -2365,6 +2444,21 @@ impl GhosttyPaneTerminal {
             .ok()
             .and_then(|core| ghostty_recent_read_at_offset(&core, request).ok())
             .unwrap_or_default()
+    }
+
+    /// Offset pages read under one hold of the core, so nothing the pane
+    /// prints can land between two of them. Once per caller rather than per
+    /// render, and bounded by `max_lines`.
+    pub(crate) fn recent_read_span(
+        &self,
+        page_lines: usize,
+        min_lines: usize,
+        max_lines: usize,
+    ) -> Option<RecentReadSpan> {
+        let core = self.core.lock().ok()?;
+        stitch_recent_pages(page_lines, min_lines, max_lines, |request| {
+            ghostty_recent_read_at_offset(&core, request).ok()
+        })
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -6605,6 +6699,38 @@ mod tests {
                 "unwrapped stepping must cover logical line L{i:02}: {stitched:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_span_holds_every_logical_line_once_however_the_pages_cut_them() {
+        let mut terminal = crate::ghostty::Terminal::new(10, 4, 100_000).unwrap();
+        for i in 0..20 {
+            // Every line soft-wraps into two rows, so 8-row pages cut some
+            // logical lines mid-wrap at their tops.
+            terminal.write(format!("L{i:02}-abcdefgh\r\n").as_bytes());
+        }
+        terminal.write(b"> ");
+        let read = |request| ghostty_recent_read_at_offset_for_terminal(&terminal, request).ok();
+
+        let span = stitch_recent_pages(8, usize::MAX, usize::MAX, read).expect("a span");
+        assert!(!span.has_more);
+        let lines: Vec<&str> = span.text.split('\n').collect();
+        for i in 0..20 {
+            let line = format!("L{i:02}-abcdefgh");
+            assert_eq!(
+                lines.iter().filter(|held| **held == line).count(),
+                1,
+                "{line} held whole, once: {lines:?}"
+            );
+        }
+        assert_eq!(lines.last().map(|line| line.trim_end()), Some(">"));
+
+        // Asked for fewer lines, it stops once it holds more than that,
+        // saying history remains above.
+        let short = stitch_recent_pages(8, 5, usize::MAX, read).expect("a span");
+        assert!(short.has_more);
+        assert!(short.text.split('\n').count() > 5);
+        assert!(span.text.ends_with(&short.text));
     }
 
     #[test]

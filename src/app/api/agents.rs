@@ -360,6 +360,7 @@ impl App {
             params.format,
             params.lines,
             params.offset_from_bottom,
+            None,
         ) {
             Ok(window) => window,
             Err(message) => return encode_error(id, "invalid_request", message),

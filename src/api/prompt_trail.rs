@@ -508,8 +508,8 @@ fn preface_sources(
         pane: Box::new(move || ask_for_pane(&pane_id, &pane_api_tx)),
         home,
         record: Box::new(move |path, agent| {
-            preface_from(path, agent, &params, |offset| {
-                ask_for_page(&read_pane_id, offset, &read_api_tx)
+            preface_from(path, agent, &params, |min_lines| {
+                ask_for_span(&read_pane_id, min_lines, &read_api_tx)
             })
         }),
     }
@@ -520,9 +520,12 @@ fn preface_from(
     path: &std::path::Path,
     agent: PromptTrailAgent,
     params: &PanePrefaceParams,
-    page: impl FnMut(u64) -> Option<crate::preface::seam::Page>,
+    span: impl FnOnce(usize) -> Option<crate::preface::seam::Span>,
 ) -> Result<Preface, PrefaceReason> {
     let read = crate::preface::read(path, agent)?;
+    let markers = crate::preface::reader_for(agent)
+        .map(|reader| reader.prompt_markers())
+        .unwrap_or_default();
     let fallback_session_id = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -536,17 +539,19 @@ fn preface_from(
             line: params.top_line.as_deref(),
         },
         params.max_turns,
-        page,
+        markers,
+        span,
     )
 }
 
-/// Ask the app for one page of the pane's screen, read the way a client
-/// pages it. Anything but a page is no screen to place a seam on.
-fn ask_for_page(
+/// Ask the app for the pane's recent history as one span: the offset pages
+/// a client reads, read by the app from one state of the terminal. Anything
+/// but such a read is no screen to place a seam on.
+fn ask_for_span(
     pane_id: &str,
-    offset: u64,
+    min_lines: usize,
     api_tx: &ApiRequestSender,
-) -> Option<crate::preface::seam::Page> {
+) -> Option<crate::preface::seam::Span> {
     let response = crate::api::server::dispatch_to_app_with_timeout(
         Request {
             id: "internal:preface:read".into(),
@@ -557,7 +562,11 @@ fn ask_for_page(
                 format: ReadFormat::Text,
                 strip_ansi: true,
                 intent: crate::api::schema::ReadIntent::Passive,
-                offset_from_bottom: Some(offset),
+                span: Some(crate::api::schema::ReadSpan {
+                    min_lines,
+                    max_lines: crate::preface::seam::MAX_SCREEN_LINES,
+                }),
+                offset_from_bottom: None,
             }),
         },
         api_tx,
@@ -567,9 +576,8 @@ fn ask_for_page(
         .ok()?
         .result
     {
-        ResponseResult::PaneRead { read } => Some(crate::preface::seam::Page {
+        ResponseResult::PaneRead { read } => Some(crate::preface::seam::Span {
             text: read.text,
-            effective_offset: read.effective_offset?,
             has_more: read.has_more?,
         }),
         _ => None,
@@ -1397,6 +1405,25 @@ mod tests {
             (self.rows.len() - 1 - index) as u64
         }
 
+        /// The newest lines of the screen as one span, from its state now.
+        fn span(&self, span: crate::api::schema::ReadSpan) -> crate::api::schema::PaneReadResult {
+            let total = self.rows.len();
+            let take = total.min(span.max_lines.min(span.min_lines.saturating_add(1)));
+            let top = total - take;
+            crate::api::schema::PaneReadResult {
+                pane_id: "wG4:p1".into(),
+                workspace_id: "wG4".into(),
+                tab_id: "wG4:t1".into(),
+                source: ReadSource::RecentUnwrapped,
+                format: ReadFormat::Text,
+                text: self.rows[top..].join("\n"),
+                revision: 0,
+                truncated: top > 0,
+                effective_offset: Some(0),
+                has_more: Some(top > 0),
+            }
+        }
+
         fn page(&self, offset: u64, lines: u32) -> crate::api::schema::PaneReadResult {
             let total = self.rows.len();
             let landed = usize::try_from(offset)
@@ -1439,14 +1466,25 @@ mod tests {
                     Method::PaneRead(params) => {
                         assert_eq!(params.source, ReadSource::RecentUnwrapped);
                         assert_eq!(params.intent, crate::api::schema::ReadIntent::Passive);
-                        asked.push(format!(
-                            "pane.read@{}",
-                            params.offset_from_bottom.expect("an offset read")
-                        ));
-                        let read = screen.page(
-                            params.offset_from_bottom.unwrap_or(0),
-                            params.lines.unwrap_or(80),
-                        );
+                        let read = match params.span {
+                            // One span is read from one state of the screen,
+                            // as the app reads it under one hold of the
+                            // terminal.
+                            Some(span) => {
+                                asked.push("pane.read:span".to_string());
+                                screen.span(span)
+                            }
+                            None => {
+                                asked.push(format!(
+                                    "pane.read@{}",
+                                    params.offset_from_bottom.expect("an offset read")
+                                ));
+                                screen.page(
+                                    params.offset_from_bottom.unwrap_or(0),
+                                    params.lines.unwrap_or(80),
+                                )
+                            }
+                        };
                         reads += 1;
                         if screen
                             .grow
@@ -1536,7 +1574,7 @@ mod tests {
     fn work_rows(tool: &str) -> Vec<String> {
         vec![
             format!("\u{23fa} {tool}(invented command)"),
-            "  \u{23bf}  invented tool output".into(),
+            format!("  \u{23bf}  invented {tool} output"),
             String::new(),
         ]
     }
@@ -1682,14 +1720,8 @@ mod tests {
         // of turn 4's tool output down, so turn 4's prompt is above what it
         // holds and turn 5's is the oldest prompt it has.
         let rows = screen_of(2..9, 12);
-        let held_from = row_index(&rows, "  \u{23bf}  invented tool output");
-        let held_from = rows
-            .iter()
-            .enumerate()
-            .skip(row_index(&rows, "\u{276f} now chunk the timetable by pier"))
-            .find(|(_, row)| row.contains("invented tool output"))
-            .map(|(index, _)| index)
-            .unwrap_or(held_from);
+        let held_from = row_index(&rows, "  \u{23bf}  invented Edit output");
+        assert!(held_from > row_index(&rows, "\u{276f} now chunk the timetable by pier"));
         let screen = FakeScreen::new(rows.clone());
         let top = (screen.offset_of(held_from), rows[held_from].as_str());
         let (result, asked) = ask_preface(
@@ -1734,8 +1766,8 @@ mod tests {
             .as_deref()
             .is_some_and(|answer| answer.ends_with("https://example.invalid/pull/7")));
         assert!(preface.turns.windows(2).all(|pair| pair[0].at < pair[1].at));
-        // The screen was paged the way a client pages it, from the bottom.
-        assert_eq!(asked, vec!["pane.get", "pane.read@0"]);
+        // The screen was read once, as one span from one state of it.
+        assert_eq!(asked, vec!["pane.get", "pane.read:span"]);
     }
 
     #[test]
@@ -1807,11 +1839,11 @@ mod tests {
     }
 
     #[test]
-    fn preface_reads_a_screen_taller_than_a_page_and_rereads_one_that_moved() {
+    fn preface_reads_a_screen_taller_than_a_page_as_one_span_from_one_state() {
         let fixture = Fixture::new();
         planted_record(&fixture);
         // Turns 0 and 1 above two and a half pages of tool output, and the
-        // client's oldest line inside it, two pages up.
+        // client's oldest line inside it, more than a page up.
         let rows: Vec<String> = (0..2)
             .flat_map(turn_rows)
             .chain((0..2_500).map(|row| format!("  older tool output {row}")))
@@ -1821,8 +1853,9 @@ mod tests {
         let held_from = row_index(&rows, "  older tool output 1200");
         let mut screen = FakeScreen::new(rows.clone());
         let top = (screen.offset_of(held_from), rows[held_from].as_str());
-        // The agent prints between the first page and the second, so the
-        // two no longer meet and the screen is read again.
+        assert!(top.0 > u64::from(crate::preface::seam::PAGE_LINES));
+        // The agent prints right after the first read; a second read would
+        // see a screen that moved.
         screen.grow = Some((1, vec!["  a line printed mid-read".into()]));
         let (result, asked) = ask_preface(
             &fixture,
@@ -1837,14 +1870,67 @@ mod tests {
             Some("/review the harbour schedule parser\nand its tests")
         );
         assert_eq!(
-            asked
-                .iter()
-                .filter(|method| *method == "pane.read@0")
-                .count(),
-            2,
-            "the moved screen is read again from the bottom: {asked:?}"
+            asked,
+            vec!["pane.get", "pane.read:span"],
+            "the screen is read once, from one state of it"
         );
-        assert!(asked.iter().any(|method| method == "pane.read@999"));
+    }
+
+    fn claude_line(value: serde_json::Value) -> String {
+        value.to_string() + "\n"
+    }
+
+    /// A record of typed prompts, each answered.
+    fn answered_record(prompts: &[&str]) -> String {
+        prompts
+            .iter()
+            .enumerate()
+            .map(|(index, prompt)| {
+                let at = format!("2026-03-04T09:{index:02}:00Z");
+                claude_line(serde_json::json!({
+                    "type": "user", "uuid": format!("u{index}"), "timestamp": at,
+                    "sessionId": PREFACE_SESSION, "isSidechain": false,
+                    "origin": { "kind": "human" },
+                    "message": { "role": "user", "content": prompt },
+                })) + &claude_line(serde_json::json!({
+                    "type": "assistant", "timestamp": at, "isSidechain": false,
+                    "message": { "id": format!("m{index}"), "role": "assistant",
+                        "content": [{ "type": "text", "text": format!("answer {index}") }],
+                        "stop_reason": "end_turn" },
+                }))
+            })
+            .collect()
+    }
+
+    /// Pages read across a move can hold one prompt row twice when the line
+    /// two pages share is blank either way. Read as one span, the screen
+    /// holds it once, and the earlier turn that repeats its words stays in
+    /// the preface.
+    #[test]
+    fn preface_never_loses_a_repeated_prompt_to_a_screen_that_moved_mid_read() {
+        let fixture = Fixture::new();
+        fixture.write(
+            &format!(".claude/projects/-invented-harbour/{PREFACE_SESSION}.jsonl"),
+            &answered_record(&["first task", "continue", "continue"]),
+        );
+        // Blank history with only the newest prompt on it, 998 lines up:
+        // two lines printed after a first page would carry it into the
+        // second page too.
+        let mut rows: Vec<String> = vec![String::new(); 2_500];
+        let total = rows.len() + 1;
+        rows[total - 1 - 998] = "\u{276f} continue".into();
+        rows.push("\u{276f} ".into());
+        let mut screen = FakeScreen::new(rows);
+        screen.grow = Some((1, vec![String::new(), String::new()]));
+        let (result, asked) =
+            ask_preface(&fixture, claude_pane(), screen, &preface_params(None, 50));
+        let preface = preface_of(result);
+        assert_eq!(
+            prompts_of(&preface),
+            vec![Some("first task"), Some("continue")]
+        );
+        assert_eq!(preface.omitted, 0);
+        assert_eq!(asked, vec!["pane.get", "pane.read:span"]);
     }
 
     #[test]

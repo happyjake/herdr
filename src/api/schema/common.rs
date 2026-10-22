@@ -98,6 +98,16 @@ pub(crate) const READ_SOURCES: &[crate::cli::projection::Choice<ReadSource>] = &
     crate::cli::projection::Choice::new("detection", ReadSource::Detection),
 ];
 
+/// An in-process read of recent unwrapped history as one span: offset
+/// pages read as a client pages them, all from one state of the terminal,
+/// until more than `min_lines` lines are held, `max_lines` are, or the top
+/// is reached. Never on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadSpan {
+    pub min_lines: usize,
+    pub max_lines: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ReadIntent {
     #[default]

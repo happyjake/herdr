@@ -129,6 +129,16 @@ pub(crate) struct RecordTurns {
 pub(crate) trait Reader {
     fn accept(&mut self, line: &Value);
     fn finish(self: Box<Self>) -> RecordTurns;
+
+    /// What the harness draws at column 0 ahead of the first row of a
+    /// prompt on its screen — the evidence that a screen row is a prompt
+    /// rather than an answer or tool output repeating its words.
+    ///
+    /// A harness that declares none cannot have its screen lined up with
+    /// its record, and its prefaces answer `seam_not_found`.
+    fn prompt_markers(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// The reader for a harness, when this server has one.

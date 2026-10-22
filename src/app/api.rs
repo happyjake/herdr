@@ -96,8 +96,23 @@ fn pane_read_window(
     format: crate::api::schema::ReadFormat,
     lines: Option<u32>,
     offset_from_bottom: Option<u64>,
+    span: Option<crate::api::schema::ReadSpan>,
 ) -> Result<PaneReadWindowParts, &'static str> {
     use crate::api::schema::{ReadFormat, ReadSource};
+
+    if let Some(span) = span {
+        if offset_from_bottom.is_some()
+            || source != ReadSource::RecentUnwrapped
+            || format != ReadFormat::Text
+        {
+            return Err("a span read is a recent_unwrapped text read from the bottom");
+        }
+        let page_lines = lines.unwrap_or(1000).min(1000) as usize;
+        let read = pane
+            .recent_read_span(page_lines, span.min_lines, span.max_lines)
+            .ok_or("this pane's history cannot be read as one span")?;
+        return Ok((read.text, read.has_more, Some(0), Some(read.has_more)));
+    }
 
     if offset_from_bottom.is_some()
         && !matches!(source, ReadSource::Recent | ReadSource::RecentUnwrapped)
