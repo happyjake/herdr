@@ -151,7 +151,8 @@ Claude 和 codex 不受支持。未知窗格返回 `pane_not_found`。
 （与 `recent_unwrapped` 偏移分页的计数方式相同），`top_lines` 是从该行开始、客户端保留的最前若干行（从旧到新，1 至 64 行），服务器要求这一整段在 `top_offset` 上方 500 行、下方 50 行范围内恰好出现一次；
 客户端保留了屏幕顶部时两者均为 null。保留最新的 `max_turns`（最多 200）个提示轮次，
 `omitted` 统计未发送的更早轮次。原因与 prompt trail 共用，另加 `seam_not_found`
-和 `nothing_above`。支持 Claude 窗格，服务器从不记录提示或回答正文。
+和 `nothing_above`。支持 Claude、codex、pi 和 agy 窗格，服务器从不记录提示或回答正文。
+agy 读取与 turn index 相同的对话记录，回合规则相同，`session_id` 为对话 ID。
 支持此方法的服务器在 pong 中声明 `capabilities.preface: true`。
 
 每个回合为 `{id, at, start, prompt, end, answer, answer_id}`。

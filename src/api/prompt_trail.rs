@@ -543,10 +543,15 @@ fn preface_from(
             background: reader.prompt_background(),
         })
         .unwrap_or_default();
-    let fallback_session_id = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default();
+    let fallback_session_id = match agent {
+        PromptTrailAgent::Agy => crate::preface::agy::session_id(path),
+        _ => None,
+    };
+    let fallback_session_id = fallback_session_id.as_deref().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+    });
     crate::preface::seam::preface(
         crate::preface::agent_name(agent),
         fallback_session_id,
@@ -2790,6 +2795,190 @@ mod tests {
                 ("p2", TurnStart::Prompt, TurnEnd::Answered),
             ]
         );
+    }
+
+    /// The agy fixture transcript planted where the conversation id leads,
+    /// beside a truncated copy that must never be what is read.
+    fn planted_agy_transcript(fixture: &Fixture) -> PathBuf {
+        fixture.write(
+            &format!("{AGY_LOGS}/transcript_full.jsonl"),
+            include_str!("../../tests/fixtures/session-record/agy/transcript_full.jsonl"),
+        );
+        fixture.write(
+            &format!("{AGY_LOGS}/transcript.jsonl"),
+            "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\
+             \"status\":\"DONE\",\"created_at\":\"2026-03-04T09:15:00Z\",\
+             \"content\":\"<USER_REQUEST>\\ntruncated copy\\n</USER_REQUEST>\"}\n",
+        )
+    }
+
+    /// The rows the agy fixture's turn at `index` leaves on a screen, drawn
+    /// the way agy draws them: the person's words after `>`, the agent's
+    /// after a bullet.
+    fn agy_turn_rows(index: usize) -> Vec<String> {
+        let said = |line: &str| format!("\u{25cf} {line}");
+        let rule = || "\u{2500}".repeat(40);
+        let rows: Vec<String> = match index {
+            0 => vec![
+                rule(),
+                "> Explain the relay".into(),
+                "  and why it waits".into(),
+                said("Viewed notes.md"),
+                said("The relay waits for the build."),
+                "  It resumes when the build finishes.".into(),
+            ],
+            1 => vec![said("Read build.log"), said("The build passed")],
+            2 => vec![rule(), "> Rename the beacon".into()],
+            3 => vec![
+                rule(),
+                "> Rename the beacon to lighthouse instead".into(),
+                said("Ran make test"),
+                said("Edited beacon.rs"),
+                said("Renamed the beacon to lighthouse."),
+            ],
+            4 => vec![
+                rule(),
+                "> Ship the lighthouse".into(),
+                said("Ran make ship"),
+            ],
+            5 => vec![rule(), "> Try shipping again".into(), said("Ran make ship")],
+            _ => unreachable!(),
+        };
+        rows.into_iter()
+            .chain(std::iter::once(String::new()))
+            .collect()
+    }
+
+    fn agy_screen_of(turns: std::ops::Range<usize>, older_rows: usize) -> Vec<String> {
+        (0..older_rows)
+            .map(|row| format!("  older tool output {row}"))
+            .chain(turns.flat_map(agy_turn_rows))
+            .chain([
+                "\u{2500}".repeat(40),
+                ">".into(),
+                "\u{2500}".repeat(40),
+                "  ? for shortcuts".into(),
+            ])
+            .collect()
+    }
+
+    #[test]
+    fn preface_answers_an_agy_pane_with_the_turns_above_the_seam() {
+        let fixture = Fixture::new();
+        let truncated = planted_agy_transcript(&fixture);
+        // The screen still has turns 2 to 5; the client holds it from a row
+        // of turn 3's work down, so turn 3 is cut by the seam and turn 4's
+        // prompt is the oldest it holds.
+        let rows = agy_screen_of(2..6, 6);
+        let held_from = row_index(&rows, "\u{25cf} Edited beacon.rs");
+        for reported in [None, Some(truncated)] {
+            let screen = FakeScreen::new(rows.clone());
+            let top = (screen.offset_of(held_from), rows[held_from].as_str());
+            let (result, asked) = ask_preface(
+                &fixture,
+                pane(Some(agy_session(reported.clone()))),
+                screen,
+                &PanePrefaceParams {
+                    top_lines: Some(held_run(&rows, held_from)),
+                    ..preface_params(Some(top), 50)
+                },
+            );
+            let preface = preface_of(result);
+            assert_eq!(preface.agent, "agy");
+            assert_eq!(preface.session_id, AGY_CONVERSATION);
+            assert!(!preface.revision.is_empty());
+            assert_eq!(preface.omitted, 0);
+            let turns: Vec<_> = preface
+                .turns
+                .iter()
+                .map(|turn| {
+                    (
+                        turn.id.as_str(),
+                        turn.start,
+                        turn.prompt.as_deref(),
+                        turn.end,
+                        turn.answer.as_deref(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                turns,
+                [
+                    (
+                        "0",
+                        TurnStart::Prompt,
+                        Some("Explain\t the relay\nand why it waits"),
+                        TurnEnd::Answered,
+                        Some("The relay waits for the build.\nIt resumes when the build finishes."),
+                    ),
+                    (
+                        "7",
+                        TurnStart::Task,
+                        None,
+                        TurnEnd::Answered,
+                        Some("```\n\n## The build passed\n\n| step | result |\n| --- | --- |\n| relay | ok |"),
+                    ),
+                    (
+                        "11",
+                        TurnStart::Prompt,
+                        Some("Rename the beacon"),
+                        TurnEnd::Open,
+                        None,
+                    ),
+                    // Cut by the seam and quoted whole.
+                    (
+                        "12",
+                        TurnStart::Prompt,
+                        Some("Rename the beacon to lighthouse instead"),
+                        TurnEnd::Answered,
+                        Some("Renamed the beacon to lighthouse."),
+                    ),
+                ],
+                "reported {reported:?}"
+            );
+            assert_eq!(asked, vec!["pane.get", "pane.read:span"]);
+        }
+    }
+
+    #[test]
+    fn preface_for_an_agy_pane_holding_its_first_prompt_has_nothing_above() {
+        let fixture = Fixture::new();
+        planted_agy_transcript(&fixture);
+        let (result, _) = ask_preface(
+            &fixture,
+            pane(Some(agy_session(None))),
+            FakeScreen::new(agy_screen_of(0..6, 3)),
+            &preface_params(None, 50),
+        );
+        assert_eq!(preface_reason(result), PrefaceReason::NothingAbove);
+
+        // A screen showing none of the transcript's prompts is no place to
+        // put a seam.
+        let rows: Vec<String> = (0..20).map(|row| format!("  unrelated {row}")).collect();
+        let (result, _) = ask_preface(
+            &fixture,
+            pane(Some(agy_session(None))),
+            FakeScreen::new(rows),
+            &preface_params(None, 50),
+        );
+        assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
+
+        // Nor is one whose rows repeat the prompts' words without agy's
+        // prompt marker ahead of them.
+        let rows: Vec<String> = agy_screen_of(0..6, 3)
+            .into_iter()
+            .map(|row| match row.strip_prefix("> ") {
+                Some(words) => format!("\u{25cf} {words}"),
+                None => row,
+            })
+            .collect();
+        let (result, _) = ask_preface(
+            &fixture,
+            pane(Some(agy_session(None))),
+            FakeScreen::new(rows),
+            &preface_params(None, 50),
+        );
+        assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
     }
 
     #[test]

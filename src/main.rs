@@ -13,7 +13,6 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 
 mod agent_resume;
 mod agent_view_eval;
-mod agy_record;
 mod api;
 mod app;
 mod build_info;

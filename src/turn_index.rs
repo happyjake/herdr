@@ -200,7 +200,7 @@ fn parse_agy(
     session_id: String,
     revision: String,
 ) -> Result<TurnIndex, PromptTrailReason> {
-    let record = crate::agy_record::read_turns(reader)?;
+    let record = crate::preface::agy::read_transcript(reader)?;
     let skip = record.turns.len().saturating_sub(MAX_TURNS);
     Ok(TurnIndex {
         agent: "agy".into(),
@@ -216,25 +216,19 @@ fn parse_agy(
                 id: turn.id,
                 at: turn.at,
                 start: turn.start,
-                prompt: turn.prompt_head,
+                prompt: turn
+                    .prompt
+                    .as_deref()
+                    .and_then(|text| text_head(text, false)),
                 end: turn.end,
-                answer: turn.answer_head,
+                answer: turn
+                    .answer
+                    .as_deref()
+                    .and_then(|text| text_head(text, true)),
                 answer_id: turn.answer_id,
             })
             .collect(),
     })
-}
-
-/// An agy transcript is filed as
-/// `brain/<conversation id>/.system_generated/logs/transcript_full.jsonl`.
-fn agy_session_id(path: &std::path::Path) -> Result<String, PromptTrailReason> {
-    path.ancestors()
-        .nth(3)
-        .and_then(std::path::Path::file_name)
-        .and_then(std::ffi::OsStr::to_str)
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned)
-        .ok_or(PromptTrailReason::Unreadable)
 }
 
 fn required_string(value: &Value, field: &str) -> Result<String, PromptTrailReason> {
@@ -338,7 +332,7 @@ fn head(content: &Value, skip_fence: bool) -> Option<String> {
 
 /// A text's first line worth matching on screen: cleaned, cut, and past
 /// blank lines and, when asked, bare code fences.
-pub(crate) fn text_head(text: &str, skip_fence: bool) -> Option<String> {
+fn text_head(text: &str, skip_fence: bool) -> Option<String> {
     text.lines()
         .map(clean)
         .find(|line| !(line.is_empty() || skip_fence && bare_fence(line)))
@@ -524,7 +518,11 @@ impl Cache {
         let reader = std::io::BufReader::new(file);
         let index = match self.format {
             Format::Pi => parse(reader, revision)?,
-            Format::Agy => parse_agy(reader, agy_session_id(path)?, revision)?,
+            Format::Agy => parse_agy(
+                reader,
+                crate::preface::agy::session_id(path).ok_or(PromptTrailReason::Unreadable)?,
+                revision,
+            )?,
         };
         // An append or replacement during the read must not be cached
         // under the old fingerprint. The next request will read it whole.

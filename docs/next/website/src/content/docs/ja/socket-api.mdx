@@ -157,7 +157,9 @@ leaf の親チェーンだけを辿り、古い順で最新 64 ターンまで�
 範囲で連続する行全体がちょうど一度現れることを求めます。画面の先頭を保持している場合は両方 null です。`max_turns`（最大 200）
 件のプロンプトのターンを新しい順に保持し、`omitted` は送られなかった古いターンの
 数です。理由は prompt trail と共通のものに加えて `seam_not_found` と
-`nothing_above` です。Claude ペインに対応し、本文はログに書かれません。
+`nothing_above` です。Claude、codex、pi、agy のペインに対応し、本文はログに書かれません。
+agy では turn index と同じトランスクリプトを同じターン規則で読み、
+`session_id` は会話 ID です。
 対応サーバーは pong で `capabilities.preface: true` を通知します。
 
 ターンは `{id, at, start, prompt, end, answer, answer_id}`。

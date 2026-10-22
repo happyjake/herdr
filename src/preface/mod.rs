@@ -23,6 +23,7 @@
 //! Bodies live only in the answer and in this process's memory. Nothing
 //! here logs a prompt or an answer.
 
+pub(crate) mod agy;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod pi;
@@ -158,7 +159,7 @@ pub(crate) fn reader_for(agent: PromptTrailAgent) -> Option<Box<dyn Reader>> {
         PromptTrailAgent::Claude => Some(Box::new(claude::ClaudeReader::default())),
         PromptTrailAgent::Codex => Some(Box::new(codex::CodexReader::default())),
         PromptTrailAgent::Pi => Some(Box::new(pi::PiReader::default())),
-        PromptTrailAgent::Agy => None,
+        PromptTrailAgent::Agy => Some(Box::new(agy::AgyReader::default())),
     }
 }
 
