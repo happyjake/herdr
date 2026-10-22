@@ -41,15 +41,82 @@ pub(crate) struct Branch<K> {
     pub(crate) entries: Vec<K>,
 }
 
-/// Walk a pi record to its last-recorded branch. `kind_of` sees every entry
-/// after the session header, with its id, and decides what survives of it.
+/// A pi record's entries as they are read, walked to their last-recorded
+/// branch once the record ends.
+pub(crate) struct BranchWalk<K> {
+    entries: HashMap<String, (Option<String>, K)>,
+    session_id: Option<String>,
+    leaf_id: Option<String>,
+}
+
+impl<K> Default for BranchWalk<K> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            session_id: None,
+            leaf_id: None,
+        }
+    }
+}
+
+impl<K> BranchWalk<K> {
+    /// Take one line of the record. `kind_of` sees every entry after the
+    /// session header, with its id, and decides what survives of it.
+    pub(crate) fn accept(
+        &mut self,
+        parsed: &Value,
+        kind_of: impl FnOnce(&Value, &str) -> Result<K, PromptTrailReason>,
+    ) -> Result<(), PromptTrailReason> {
+        if self.session_id.is_none() {
+            if parsed["type"] != "session" {
+                return Err(PromptTrailReason::Unreadable);
+            }
+            self.session_id = Some(required_string(parsed, "id")?);
+            return Ok(());
+        }
+        let id = required_string(parsed, "id")?;
+        let parent = match parsed.get("parentId") {
+            Some(Value::Null) => None,
+            Some(Value::String(parent)) => Some(parent.clone()),
+            _ => return Err(PromptTrailReason::Unreadable),
+        };
+        let kind = kind_of(parsed, &id)?;
+        if self.entries.insert(id.clone(), (parent, kind)).is_some() {
+            return Err(PromptTrailReason::Unreadable);
+        }
+        self.leaf_id = Some(id);
+        Ok(())
+    }
+
+    /// The branch from the root to the last entry read.
+    pub(crate) fn finish(mut self, partial: bool) -> Result<Branch<K>, PromptTrailReason> {
+        let mut branch = Vec::new();
+        let mut next = self.leaf_id.clone();
+        while let Some(id) = next {
+            // Removing each visited entry also rejects cycles.
+            let (parent, kind) = self
+                .entries
+                .remove(&id)
+                .ok_or(PromptTrailReason::Unreadable)?;
+            next = parent;
+            branch.push(kind);
+        }
+        branch.reverse();
+        Ok(Branch {
+            session_id: self.session_id.ok_or(PromptTrailReason::Unreadable)?,
+            leaf_id: self.leaf_id,
+            partial,
+            entries: branch,
+        })
+    }
+}
+
+/// Walk a pi record to its last-recorded branch.
 pub(crate) fn last_branch<K>(
     mut reader: impl BufRead,
     mut kind_of: impl FnMut(&Value, &str) -> Result<K, PromptTrailReason>,
 ) -> Result<Branch<K>, PromptTrailReason> {
-    let mut entries = HashMap::new();
-    let mut session_id = None;
-    let mut leaf_id = None;
+    let mut walk = BranchWalk::default();
     let mut partial = false;
     let mut consumed = 0;
     let mut line = Vec::new();
@@ -77,40 +144,9 @@ pub(crate) fn last_branch<K>(
             }
             Err(_) => return Err(PromptTrailReason::Unreadable),
         };
-        if session_id.is_none() {
-            if parsed["type"] != "session" {
-                return Err(PromptTrailReason::Unreadable);
-            }
-            session_id = Some(required_string(&parsed, "id")?);
-            continue;
-        }
-        let id = required_string(&parsed, "id")?;
-        let parent = match parsed.get("parentId") {
-            Some(Value::Null) => None,
-            Some(Value::String(parent)) => Some(parent.clone()),
-            _ => return Err(PromptTrailReason::Unreadable),
-        };
-        let kind = kind_of(&parsed, &id)?;
-        if entries.insert(id.clone(), (parent, kind)).is_some() {
-            return Err(PromptTrailReason::Unreadable);
-        }
-        leaf_id = Some(id);
+        walk.accept(&parsed, &mut kind_of)?;
     }
-    let mut branch = Vec::new();
-    let mut next = leaf_id.clone();
-    while let Some(id) = next {
-        // Removing each visited entry also rejects cycles.
-        let (parent, kind) = entries.remove(&id).ok_or(PromptTrailReason::Unreadable)?;
-        next = parent;
-        branch.push(kind);
-    }
-    branch.reverse();
-    Ok(Branch {
-        session_id: session_id.ok_or(PromptTrailReason::Unreadable)?,
-        leaf_id,
-        partial,
-        entries: branch,
-    })
+    walk.finish(partial)
 }
 
 pub(crate) fn parse(

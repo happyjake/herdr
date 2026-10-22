@@ -24,6 +24,8 @@
 //! here logs a prompt or an answer.
 
 pub(crate) mod claude;
+pub(crate) mod codex;
+pub(crate) mod pi;
 pub(crate) mod seam;
 
 use std::collections::VecDeque;
@@ -145,7 +147,8 @@ pub(crate) trait Reader {
 pub(crate) fn reader_for(agent: PromptTrailAgent) -> Option<Box<dyn Reader>> {
     match agent {
         PromptTrailAgent::Claude => Some(Box::new(claude::ClaudeReader::default())),
-        PromptTrailAgent::Codex | PromptTrailAgent::Pi => None,
+        PromptTrailAgent::Codex => Some(Box::new(codex::CodexReader::default())),
+        PromptTrailAgent::Pi => Some(Box::new(pi::PiReader::default())),
     }
 }
 
@@ -363,13 +366,14 @@ mod tests {
     }
 
     #[test]
-    fn a_harness_with_no_reader_is_refused_before_its_record_is_walked() {
-        assert_eq!(
-            read_turns(&b"{}\n"[..], PromptTrailAgent::Codex),
-            Err(PromptTrailReason::UnsupportedAgent)
-        );
-        assert!(reader_for(PromptTrailAgent::Pi).is_none());
-        assert!(reader_for(PromptTrailAgent::Claude).is_some());
+    fn every_harness_with_a_trail_has_a_reader() {
+        for agent in [
+            PromptTrailAgent::Claude,
+            PromptTrailAgent::Codex,
+            PromptTrailAgent::Pi,
+        ] {
+            assert!(reader_for(agent).is_some(), "{agent:?}");
+        }
     }
 
     #[test]

@@ -1,16 +1,27 @@
-//! pi records: the last-recorded branch, walked exactly as the turn index
-//! walks it, keeping each turn's whole prompt and whole final answer.
-
-use std::io::BufRead;
+//! pi's record, read into turns.
+//!
+//! The turns are those on the record's last-recorded branch, walked exactly
+//! as the turn index walks it and started and ended by the turn index's own
+//! rules, so a preface and a turn index never disagree about which turns a
+//! pi conversation holds: a person's message starts a turn, and so does a
+//! wake the harness displayed, as an answer-only `wake` turn. A turn's last
+//! assistant message decides how it ended — only a `stop` with no tool call
+//! answers it — and a tool result after it reopens it. Thinking, tool
+//! traffic, hidden messages, error text and compaction summaries are never
+//! quoted.
+//!
+//! A record whose entries do not form a branch the turn index can walk has
+//! no turns here: a preface placed on a guessed branch would quote turns the
+//! conversation does not hold.
 
 use serde_json::Value;
 
-use super::{quoted, RecordStart, RecordTurn};
+use super::{body, RecordTurns, Turn};
 use crate::api::schema::{PromptTrailReason, TurnEnd, TurnStart};
-use crate::turn_index::{assistant_end, last_branch, start_at, turn_start};
+use crate::turn_index::{assistant_end, start_at, turn_start, BranchWalk};
 
 enum Step {
-    Start(RecordTurn),
+    Start(Turn),
     Assistant {
         end: TurnEnd,
         answer: Option<String>,
@@ -19,56 +30,65 @@ enum Step {
     Other,
 }
 
-/// Every turn on the record's last-recorded branch, oldest first.
-///
-/// A turn's last assistant message decides how it ended; a tool result after
-/// it means the agent is still at work, and so does a record whose last line
-/// was cut mid-write.
-pub(crate) fn turns(reader: impl BufRead) -> Result<Vec<RecordTurn>, PromptTrailReason> {
-    let branch = last_branch(reader, step)?;
-    let mut turns: Vec<RecordTurn> = Vec::new();
-    for entry in branch.entries {
-        match entry {
-            Step::Start(turn) => turns.push(turn),
-            Step::Assistant { end, answer } => {
-                if let Some(turn) = turns.last_mut() {
-                    turn.end = end;
-                    turn.answer = answer;
-                }
-            }
-            Step::ToolResult => {
-                if let Some(turn) = turns.last_mut() {
-                    reopen(turn);
-                }
-            }
-            Step::Other => {}
+#[derive(Default)]
+pub(crate) struct PiReader {
+    walk: BranchWalk<Step>,
+    broken: bool,
+}
+
+impl super::Reader for PiReader {
+    fn accept(&mut self, line: &Value) {
+        if !self.broken && self.walk.accept(line, step).is_err() {
+            self.broken = true;
         }
     }
-    if branch.partial {
-        if let Some(turn) = turns.last_mut() {
-            reopen(turn);
+
+    fn finish(self: Box<Self>) -> RecordTurns {
+        if self.broken {
+            return RecordTurns::default();
+        }
+        // A half-written last line never reaches a reader, so the branch
+        // ends at the last whole entry.
+        let Ok(branch) = self.walk.finish(false) else {
+            return RecordTurns::default();
+        };
+        let mut turns: Vec<Turn> = Vec::new();
+        for entry in branch.entries {
+            match entry {
+                Step::Start(turn) => turns.push(turn),
+                Step::Assistant { end, answer } => {
+                    if let Some(turn) = turns.last_mut() {
+                        match end {
+                            TurnEnd::Answered => turn.answer(answer.as_deref().unwrap_or("")),
+                            end => turn.end_without_answer(end),
+                        }
+                    }
+                }
+                Step::ToolResult => {
+                    if let Some(turn) = turns.last_mut() {
+                        turn.end_without_answer(TurnEnd::Open);
+                    }
+                }
+                Step::Other => {}
+            }
+        }
+        RecordTurns {
+            session_id: Some(branch.session_id),
+            turns,
         }
     }
-    Ok(turns)
 }
 
 fn step(value: &Value, id: &str) -> Result<Step, PromptTrailReason> {
     let message = &value["message"];
     if let Some(start) = turn_start(value) {
         let at = start_at(value)?;
-        let turn = match start {
-            TurnStart::Prompt => RecordTurn::new(
-                id.into(),
-                at,
-                RecordStart::Prompt,
-                text(&message["content"])
-                    .map(|text| typed(&text))
-                    .and_then(|text| quoted(&text)),
-            ),
-            // A wake's own text is the harness's reminder, not a prompt.
-            TurnStart::Wake => RecordTurn::new(id.into(), at, RecordStart::Wake, None),
+        // A wake's own text is the harness's reminder, not a prompt.
+        let prompt = match start {
+            TurnStart::Prompt => text(&message["content"]).map(|text| typed(&text)),
+            _ => None,
         };
-        return Ok(Step::Start(turn));
+        return Ok(Step::Start(Turn::started(id.into(), at, start, prompt)));
     }
     if value["type"] != "message" {
         return Ok(Step::Other);
@@ -83,33 +103,27 @@ fn step(value: &Value, id: &str) -> Result<Step, PromptTrailReason> {
     Ok(Step::Assistant {
         end,
         answer: if end == TurnEnd::Answered {
-            text(&message["content"]).and_then(|text| quoted(&text))
+            text(&message["content"])
         } else {
             None
         },
     })
 }
 
-fn reopen(turn: &mut RecordTurn) {
-    turn.end = TurnEnd::Open;
-    turn.answer = None;
-}
-
 /// The text parts of a message, and nothing else of it: never its thinking,
-/// its tool calls or its images.
+/// its tool calls or its images. Nothing when there are no words.
 fn text(content: &Value) -> Option<String> {
-    match content {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(parts) => Some(
-            parts
-                .iter()
-                .filter(|part| part["type"] == "text")
-                .filter_map(|part| part["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        _ => None,
-    }
+    let text = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    (!body(&text).is_empty()).then_some(text)
 }
 
 /// What the person typed into a message. Invoking a skill makes pi write
@@ -155,15 +169,22 @@ fn skill_block(text: &str) -> Option<(&str, Option<&str>)> {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
+    use super::super::read_turns;
     use super::*;
+    use crate::api::schema::PromptTrailAgent;
     use crate::prompt_trail::cut;
 
-    const FIXTURE: &str = include_str!("../../tests/fixtures/session-record/pi.jsonl");
+    fn turns(record: &[u8]) -> Result<Vec<Turn>, PromptTrailReason> {
+        read_turns(record, PromptTrailAgent::Pi).map(|read| read.turns)
+    }
 
-    type Shape = (String, RecordStart, Option<String>, TurnEnd, Option<String>);
+    const FIXTURE: &str = include_str!("fixtures/pi-record.jsonl");
 
-    fn shape(turn: &RecordTurn) -> Shape {
+    type Shape = (String, TurnStart, Option<String>, TurnEnd, Option<String>);
+
+    fn shape(turn: &Turn) -> Shape {
         (
             turn.id.clone(),
             turn.start,
@@ -175,7 +196,7 @@ mod tests {
 
     fn expect(
         id: &str,
-        start: RecordStart,
+        start: TurnStart,
         prompt: Option<&str>,
         end: TurnEnd,
         answer: Option<&str>,
@@ -197,70 +218,70 @@ mod tests {
             vec![
                 expect(
                     "u1",
-                    RecordStart::Prompt,
+                    TurnStart::Prompt,
                     Some("Explain   the relay\n\nin two lines."),
                     TurnEnd::Answered,
                     Some("The relay forwards frames.\nIt keeps one socket."),
                 ),
                 expect(
                     "u2",
-                    RecordStart::Prompt,
+                    TurnStart::Prompt,
                     Some("Check the build."),
                     TurnEnd::Answered,
                     Some("The build passes."),
                 ),
                 expect(
                     "w3",
-                    RecordStart::Wake,
+                    TurnStart::Wake,
                     None,
                     TurnEnd::Answered,
                     Some("Still waiting on the job."),
                 ),
                 expect(
                     "u4",
-                    RecordStart::Prompt,
+                    TurnStart::Prompt,
                     Some("Rewrite the parser."),
                     TurnEnd::Aborted,
                     None,
                 ),
                 expect(
                     "u5",
-                    RecordStart::Prompt,
+                    TurnStart::Prompt,
                     Some("Try again."),
                     TurnEnd::Error,
                     None,
                 ),
                 expect(
                     "u6",
-                    RecordStart::Prompt,
+                    TurnStart::Prompt,
                     Some("Add a test."),
                     TurnEnd::Answered,
                     Some("Test added."),
                 ),
                 expect(
                     "u7",
-                    RecordStart::Prompt,
+                    TurnStart::Prompt,
                     Some("Ship it."),
                     TurnEnd::Answered,
                     Some("Shipped."),
                 ),
                 expect(
                     "u9",
-                    RecordStart::Prompt,
+                    TurnStart::Prompt,
                     Some("/skill:neutral-skill Draw the module map."),
                     TurnEnd::Answered,
                     Some("Map drawn."),
                 ),
                 expect(
                     "u8",
-                    RecordStart::Prompt,
+                    TurnStart::Prompt,
                     Some("Watch the deploy."),
                     TurnEnd::Open,
                     None,
                 ),
             ]
         );
-        assert_eq!(turns[0].prompt_head.as_deref(), Some("Explain the relay"));
+        assert_eq!(turns[0].head.as_deref(), Some("Explain the relay"));
         assert_eq!(turns[0].at, 1_772_614_801);
     }
 
@@ -298,25 +319,47 @@ mod tests {
 
     /// The turn index is what the phone places pi turns by, so the turns
     /// quoted here must be the same turns, ended the same way, at every
-    /// point the record can be caught mid-write.
+    /// whole line the record can be caught at. A half-written last line is
+    /// no line a reader sees: the turns are those of the lines before it.
     #[test]
     fn pi_record_turns_agree_with_the_turn_index_at_every_byte_cut() {
         let header = FIXTURE.find('\n').unwrap() + 1;
-        let mut cuts = vec![FIXTURE.len()];
+        let index_skill_head = Some(
+            r#"<skill name="neutral-skill" location="/skills/neutral-skill/SKILL.md">"#.to_string(),
+        );
+        let mut whole_lines = Vec::new();
         let mut start = 0;
         for line in FIXTURE.split_inclusive('\n') {
-            let end = start + line.len();
-            cuts.extend([start + 1, start + line.len() / 2, end - 1, end]);
-            start = end;
+            start += line.len();
+            if start >= header {
+                whole_lines.push(start);
+            }
         }
-        for cut_at in cuts.into_iter().filter(|cut_at| *cut_at >= header) {
-            let source = &FIXTURE.as_bytes()[..cut_at];
-            let turns = turns(source).unwrap_or_else(|error| panic!("cut {cut_at}: {error:?}"));
-            let index = crate::turn_index::parse(source, "r".into()).unwrap();
-            let index_skill_head = Some(
-                r#"<skill name="neutral-skill" location="/skills/neutral-skill/SKILL.md">"#
-                    .to_string(),
+        let mut previous: Option<Vec<Turn>> = None;
+        let mut line_start = header;
+        for end in whole_lines {
+            // Short of its newline a line is still whole, and is read as
+            // the whole-line cut below is.
+            for cut_at in [line_start + 1, (line_start + end) / 2] {
+                if cut_at <= line_start || cut_at >= end - 1 {
+                    continue;
+                }
+                let turns = turns(&FIXTURE.as_bytes()[..cut_at])
+                    .unwrap_or_else(|error| panic!("cut {cut_at}: {error:?}"));
+                if let Some(previous) = &previous {
+                    assert_eq!(&turns, previous, "cut {cut_at}");
+                }
+            }
+            line_start = end;
+            let source = &FIXTURE.as_bytes()[..end];
+            let whole = turns(source).unwrap_or_else(|error| panic!("cut {end}: {error:?}"));
+            assert_eq!(
+                turns(&FIXTURE.as_bytes()[..end - 1]).as_ref(),
+                Ok(&whole),
+                "cut {}",
+                end - 1
             );
+            let index = crate::turn_index::parse(source, "r".into()).unwrap();
             let indexed: Vec<_> = index
                 .turns
                 .iter()
@@ -324,14 +367,14 @@ mod tests {
                     (
                         turn.id.clone(),
                         turn.at,
-                        turn.start == TurnStart::Wake,
+                        turn.start,
                         turn.end,
                         turn.prompt.clone(),
                         turn.answer.clone(),
                     )
                 })
                 .collect();
-            let read: Vec<_> = turns
+            let read: Vec<_> = whole
                 .iter()
                 .map(|turn| {
                     let head = |text: &Option<String>| {
@@ -353,20 +396,21 @@ mod tests {
                     (
                         turn.id.clone(),
                         turn.at,
-                        turn.start == RecordStart::Wake,
+                        turn.start,
                         turn.end,
                         prompt,
                         head(&turn.answer),
                     )
                 })
                 .collect();
-            assert_eq!(read, indexed, "cut {cut_at}");
-            for turn in &turns {
+            assert_eq!(read, indexed, "cut {end}");
+            for turn in &whole {
                 assert!(
                     turn.end == TurnEnd::Answered || turn.answer.is_none(),
-                    "cut {cut_at}: an unanswered turn carries an answer"
+                    "cut {end}: an unanswered turn carries an answer"
                 );
             }
+            previous = Some(whole);
         }
     }
 
@@ -414,20 +458,18 @@ mod tests {
     }
 
     #[test]
-    fn pi_record_turns_refuse_what_the_turn_index_refuses() {
-        assert_eq!(turns("".as_bytes()), Err(PromptTrailReason::Unreadable));
-        assert_eq!(
-            turns("{\"type\":\"message\",\"id\":\"x\"}\n".as_bytes()),
-            Err(PromptTrailReason::Unreadable)
-        );
+    fn a_pi_record_the_turn_index_refuses_has_no_turns() {
         let undated = FIXTURE.replacen(
             "\"timestamp\":\"2026-03-04T09:00:01.000Z\"",
             "\"timestamp\":\"later\"",
             1,
         );
-        assert_eq!(
-            turns(undated.as_bytes()),
-            Err(PromptTrailReason::Unreadable)
-        );
+        let no_header = FIXTURE.split_once('\n').unwrap().1.to_string();
+        let orphaned = FIXTURE.replacen("\"parentId\":\"a7\"", "\"parentId\":\"nowhere\"", 1);
+        for record in [undated, no_header, orphaned] {
+            assert!(crate::turn_index::parse(record.as_bytes(), "r".into()).is_err());
+            assert_eq!(turns(record.as_bytes()), Ok(Vec::new()));
+        }
+        assert_eq!(turns(b""), Ok(Vec::new()));
     }
 }

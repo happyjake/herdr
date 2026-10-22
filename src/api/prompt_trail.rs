@@ -2041,6 +2041,263 @@ mod tests {
         assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
     }
 
+    const CODEX_THREAD: &str = "00000000-0000-7000-8000-000000000000";
+
+    fn codex_turn_id(n: u32) -> String {
+        format!("00000000-0000-7000-8000-00000000000{n}")
+    }
+
+    /// A codex pane whose rollout is filed where codex files it.
+    fn codex_preface_pane(fixture: &Fixture) -> PaneInfo {
+        fixture.write(
+            &format!(".codex/sessions/2026/03/04/rollout-2026-03-04T09-00-00-{CODEX_THREAD}.jsonl"),
+            include_str!("../preface/fixtures/codex-record.jsonl"),
+        );
+        pane(Some(session(
+            "codex",
+            AgentSessionRefKind::Id,
+            CODEX_THREAD,
+        )))
+    }
+
+    /// The rows codex leaves for the fixture rollout's turns from the one
+    /// that asked for the private helpers on: its prompt glyph, its
+    /// bulleted messages, and its input box.
+    fn codex_screen() -> Vec<String> {
+        (0..6)
+            .map(|row| format!("  older tool output {row}"))
+            .chain(
+                [
+                    "\u{203a} Only rename the private ones.",
+                    "",
+                    "\u{2022} Ran invented command",
+                    "  \u{2514} invented tool output",
+                    "",
+                    "\u{2022} Renamed the private helpers.",
+                    "",
+                    "\u{2022} Goal step finished.",
+                    "",
+                    "\u{203a} Continue with the tests.",
+                    "",
+                    "\u{2022} Tests added.",
+                    "",
+                    "\u{203a} Run the full check.",
+                    "",
+                    "\u{2022} Running it now.",
+                    "",
+                    "\u{203a} ",
+                    "  invented model \u{b7} 100% context left",
+                ]
+                .map(String::from),
+            )
+            .collect()
+    }
+
+    #[test]
+    fn preface_quotes_a_codex_panes_turns_above_the_oldest_held_prompt() {
+        let fixture = Fixture::new();
+        let rows = codex_screen();
+
+        // Held from the older tool output down: the oldest prompt held is
+        // the one asking for the private helpers, and every turn before it
+        // is the preface.
+        let held_from = row_index(&rows, "  older tool output 3");
+        let screen = FakeScreen::new(rows.clone());
+        let top = (screen.offset_of(held_from), rows[held_from].as_str());
+        let (result, asked) = ask_preface(
+            &fixture,
+            codex_preface_pane(&fixture),
+            screen,
+            &preface_params(Some(top), 50),
+        );
+        let preface = preface_of(result);
+        assert_eq!(preface.agent, "codex");
+        assert_eq!(preface.session_id, CODEX_THREAD);
+        assert_eq!(preface.omitted, 0);
+        assert_eq!(
+            preface
+                .turns
+                .iter()
+                .map(|turn| (turn.id.clone(), turn.end))
+                .collect::<Vec<_>>(),
+            vec![
+                (codex_turn_id(1), TurnEnd::Answered),
+                (codex_turn_id(2), TurnEnd::Answered),
+                (codex_turn_id(3), TurnEnd::Aborted),
+            ]
+        );
+        assert_eq!(
+            prompts_of(&preface),
+            vec![
+                Some("Summarize   the layout module\n\nand list its public functions."),
+                Some("Compare these:\n[image]\nwhich one is wider?"),
+                Some("Rename every helper."),
+            ]
+        );
+        assert_eq!(
+            preface.turns[1].answer.as_deref(),
+            Some("The first one is wider.")
+        );
+        assert!(asked
+            .iter()
+            .all(|method| method == "pane.get" || method.starts_with("pane.read@")));
+        assert_eq!(asked[0], "pane.get");
+
+        // Held from inside that turn's answer: its prompt is above what is
+        // held, so it is quoted whole, and so is the goal turn after it.
+        let held_from = row_index(&rows, "\u{2022} Renamed the private helpers.");
+        let screen = FakeScreen::new(rows.clone());
+        let top = (screen.offset_of(held_from), rows[held_from].as_str());
+        let (result, _) = ask_preface(
+            &fixture,
+            codex_preface_pane(&fixture),
+            screen,
+            &preface_params(Some(top), 50),
+        );
+        let preface = preface_of(result);
+        assert_eq!(
+            preface
+                .turns
+                .iter()
+                .map(|turn| (turn.id.clone(), turn.start))
+                .collect::<Vec<_>>(),
+            vec![
+                (codex_turn_id(1), TurnStart::Prompt),
+                (codex_turn_id(2), TurnStart::Prompt),
+                (codex_turn_id(3), TurnStart::Prompt),
+                (codex_turn_id(4), TurnStart::Prompt),
+                (codex_turn_id(6), TurnStart::Task),
+            ]
+        );
+        assert_eq!(
+            preface.turns[4].answer.as_deref(),
+            Some("Goal step finished.")
+        );
+    }
+
+    /// A pi pane whose session file is the one it reports.
+    fn pi_preface_pane(fixture: &Fixture) -> PaneInfo {
+        let path = fixture.write(
+            ".pi/agent/sessions/--invented--/2026-03-04T09-00-00-000Z_session-1.jsonl",
+            include_str!("../preface/fixtures/pi-record.jsonl"),
+        );
+        pane(Some(session(
+            "pi",
+            AgentSessionRefKind::Path,
+            path.to_str().expect("a path"),
+        )))
+    }
+
+    /// The rows pi leaves for the fixture record's turns from the one that
+    /// added a test on: the person's words as they wrote them, the agent's
+    /// answers under them, a skill invocation drawn as pi collapses it, and
+    /// its editor and footer.
+    fn pi_screen() -> Vec<String> {
+        (0..6)
+            .map(|row| format!(" older tool output {row}"))
+            .chain(
+                [
+                    " Add a test.",
+                    "",
+                    " Test added.",
+                    "",
+                    " Ship it.",
+                    "",
+                    " Shipped.",
+                    "",
+                    " [skill] neutral-skill",
+                    " Draw the module map.",
+                    "",
+                    " Map drawn.",
+                    "",
+                    " Watch the deploy.",
+                    "",
+                    " $ true",
+                    "",
+                    "\u{2500}".repeat(40).as_str(),
+                    "",
+                    "\u{2500}".repeat(40).as_str(),
+                    " ~/invented (main)",
+                ]
+                .map(String::from),
+            )
+            .collect()
+    }
+
+    #[test]
+    fn preface_quotes_a_pi_panes_turns_above_the_oldest_held_prompt() {
+        let fixture = Fixture::new();
+        let rows = pi_screen();
+        let held_from = row_index(&rows, " older tool output 2");
+        let screen = FakeScreen::new(rows.clone());
+        let top = (screen.offset_of(held_from), rows[held_from].as_str());
+        let (result, asked) = ask_preface(
+            &fixture,
+            pi_preface_pane(&fixture),
+            screen,
+            &preface_params(Some(top), 50),
+        );
+        let preface = preface_of(result);
+        assert_eq!(preface.agent, "pi");
+        assert_eq!(preface.session_id, "session-1");
+        assert_eq!(preface.omitted, 0);
+        assert_eq!(
+            preface
+                .turns
+                .iter()
+                .map(|turn| (turn.id.as_str(), turn.start, turn.end))
+                .collect::<Vec<_>>(),
+            vec![
+                ("u1", TurnStart::Prompt, TurnEnd::Answered),
+                ("u2", TurnStart::Prompt, TurnEnd::Answered),
+                ("w3", TurnStart::Wake, TurnEnd::Answered),
+                ("u4", TurnStart::Prompt, TurnEnd::Aborted),
+                ("u5", TurnStart::Prompt, TurnEnd::Error),
+            ]
+        );
+        assert_eq!(
+            prompts_of(&preface),
+            vec![
+                Some("Explain   the relay\n\nin two lines."),
+                Some("Check the build."),
+                None,
+                Some("Rewrite the parser."),
+                Some("Try again."),
+            ]
+        );
+        assert_eq!(
+            preface.turns[2].answer.as_deref(),
+            Some("Still waiting on the job.")
+        );
+        assert_eq!(asked[0], "pane.get");
+
+        // Held from below the shipped turn's prompt: the oldest prompt held
+        // is now the deploy, so the skill turn above it is quoted too, as
+        // its invocation and request rather than the skill's body.
+        let held_from = row_index(&rows, " Shipped.");
+        let screen = FakeScreen::new(rows.clone());
+        let top = (screen.offset_of(held_from), rows[held_from].as_str());
+        let (result, _) = ask_preface(
+            &fixture,
+            pi_preface_pane(&fixture),
+            screen,
+            &preface_params(Some(top), 50),
+        );
+        let preface = preface_of(result);
+        assert_eq!(
+            preface
+                .turns
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["u1", "u2", "w3", "u4", "u5", "u6", "u7", "u9"]
+        );
+        assert_eq!(
+            preface.turns[7].prompt.as_deref(),
+            Some("/skill:neutral-skill Draw the module map.")
+        );
+    }
+
     #[test]
     fn preface_reasons_reuse_the_prompt_trails_refusals() {
         let fixture = Fixture::new();
@@ -2052,35 +2309,37 @@ mod tests {
             ),
             PrefaceReason::NoSession
         );
-        // Harnesses this server has no preface reader for, until it does.
-        for (agent, kind, value) in [
-            ("codex", AgentSessionRefKind::Id, "0199f3c2b7d84a1e9c05"),
-            ("pi", AgentSessionRefKind::Path, "/invented/pi.jsonl"),
-            ("droid", AgentSessionRefKind::Id, "droid-session"),
-        ] {
-            let (result, asked) = ask_preface(
-                &fixture,
-                pane(Some(session(agent, kind, value))),
-                screen(),
-                &preface_params(None, 50),
-            );
-            assert_eq!(
-                preface_reason(result),
-                PrefaceReason::UnsupportedAgent,
-                "{agent}"
-            );
-            assert_eq!(
-                asked,
-                vec!["pane.get"],
-                "the screen is never read for {agent}"
-            );
-        }
+        // A harness this server has no preface reader for.
+        let (result, asked) = ask_preface(
+            &fixture,
+            pane(Some(session(
+                "droid",
+                AgentSessionRefKind::Id,
+                "droid-session",
+            ))),
+            screen(),
+            &preface_params(None, 50),
+        );
+        assert_eq!(preface_reason(result), PrefaceReason::UnsupportedAgent);
+        assert_eq!(asked, vec!["pane.get"], "the screen is never read");
         assert_eq!(
             preface_reason(
                 ask_preface(&fixture, claude_pane(), screen(), &preface_params(None, 50)).0
             ),
             PrefaceReason::NoRecord
         );
+        for (agent, kind, value) in [
+            ("codex", AgentSessionRefKind::Id, "0199f3c2b7d84a1e9c05"),
+            ("pi", AgentSessionRefKind::Path, "/invented/pi.jsonl"),
+        ] {
+            let (result, _) = ask_preface(
+                &fixture,
+                pane(Some(session(agent, kind, value))),
+                screen(),
+                &preface_params(None, 50),
+            );
+            assert_eq!(preface_reason(result), PrefaceReason::NoRecord, "{agent}");
+        }
         fixture.write(
             &format!(".claude/projects/-invented-harbour/{PREFACE_SESSION}.jsonl"),
             "not a record\n",

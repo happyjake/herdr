@@ -3840,10 +3840,10 @@ fn preface_places_the_seam_between_a_real_screen_and_a_reported_record() {
     let reported = ws.request(
         &serde_json::json!({"id":"pf_report_shell", "method":"pane.report_agent_session", "params":{
             "pane_id": shell_id,
-            "source": "herdr:codex",
-            "agent": "codex",
+            "source": "herdr:droid",
+            "agent": "droid",
             "seq": 1,
-            "agent_session_id": "0199f3c2b7d84a1e9c05",
+            "agent_session_id": "droid-session",
         }})
         .to_string(),
     );

@@ -393,7 +393,8 @@ turns have no prompt), and `end` one of `answered`, `aborted`, `error` or
 `no_record`, `unreadable`), plus `seam_not_found` when the client's oldest
 line or any record prompt below it cannot be found on the screen, and
 `nothing_above` when the screen already reaches the record's first turn.
-Claude panes are supported; other harnesses answer `unsupported_agent`. The
+Claude, codex and pi panes are supported; other harnesses answer
+`unsupported_agent`. The
 server never logs a prompt or an answer. A supporting server advertises
 `capabilities.preface: true` in its pong.
 
