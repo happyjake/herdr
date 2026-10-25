@@ -939,6 +939,8 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 fn spawn_basic_detection_task(
     pane_id: PaneId,
     child_pid: Arc<AtomicU32>,
+    reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
+    last_observed_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     terminal: Arc<PaneTerminal>,
     content_seq: Arc<AtomicU64>,
     detection_content_seq: Arc<AtomicU64>,
@@ -977,10 +979,13 @@ fn spawn_basic_detection_task(
         let mut last_codex_prompt_ready = false;
         let mut last_self_reported_shell_check = None;
         let mut agent_job = AgentJobTracker::default();
+        let mut cwd_settle_recheck = false;
 
         loop {
             let sleep_duration = if pending_idle.active() {
                 AGENT_PENDING_IDLE_RECHECK
+            } else if cwd_settle_recheck {
+                CWD_SETTLE_RECHECK
             } else {
                 std::time::Duration::from_millis(300)
             };
@@ -1010,6 +1015,7 @@ fn spawn_basic_detection_task(
                     agent_startup_grace_until = None;
                     pending_idle.clear();
                     agent_job = AgentJobTracker::default();
+                    cwd_settle_recheck = false;
                 }
             }
 
@@ -1038,6 +1044,15 @@ fn spawn_basic_detection_task(
             let foreground_pgid = (pid > 0)
                 .then(|| crate::detect::foreground_process_group_id(pid))
                 .flatten();
+            observe_sampled_pane_cwd(
+                pane_id,
+                pid,
+                foreground_pgid,
+                &reported_cwd,
+                &last_observed_cwd,
+                &mut cwd_settle_recheck,
+                &state_events,
+            );
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
             let should_check_process = pid > 0 && {
@@ -2269,6 +2284,62 @@ fn publish_terminal_bells(pane_id: PaneId, count: u16, events: &mpsc::Sender<App
     }
 }
 
+const CWD_SETTLE_RECHECK: std::time::Duration = std::time::Duration::from_millis(75);
+
+fn resolve_pane_cwd(
+    reported_cwd: &Mutex<Option<std::path::PathBuf>>,
+    pid: u32,
+    foreground_pgid: impl FnOnce() -> Option<u32>,
+) -> Option<std::path::PathBuf> {
+    if let Some(cwd) = reported_cwd
+        .lock()
+        .ok()
+        .and_then(|reported_cwd| reported_cwd.clone())
+    {
+        return Some(cwd);
+    }
+    crate::platform::pane_shell_cwd(pid, foreground_pgid())
+}
+
+fn observe_sampled_pane_cwd(
+    pane_id: PaneId,
+    pid: u32,
+    foreground_pgid: Option<u32>,
+    reported_cwd: &Mutex<Option<std::path::PathBuf>>,
+    last_observed_cwd: &Mutex<Option<std::path::PathBuf>>,
+    settle_recheck_pending: &mut bool,
+    events: &mpsc::Sender<AppEvent>,
+) {
+    if pid == 0 {
+        *settle_recheck_pending = false;
+        return;
+    }
+    let Some(cwd) = resolve_pane_cwd(reported_cwd, pid, || foreground_pgid) else {
+        *settle_recheck_pending = false;
+        return;
+    };
+    let changed = match last_observed_cwd.lock() {
+        Ok(mut observed) => {
+            let changed = observed.as_ref().is_some_and(|prev| prev != &cwd);
+            if observed.as_ref() != Some(&cwd) {
+                *observed = Some(cwd.clone());
+            }
+            changed
+        }
+        Err(_) => false,
+    };
+    *settle_recheck_pending = changed;
+    if changed {
+        if let Err(err) = events.try_send(AppEvent::TerminalCwdReported { pane_id, cwd }) {
+            warn!(
+                pane = pane_id.raw(),
+                err = %err,
+                "failed to send sampled terminal cwd report"
+            );
+        }
+    }
+}
+
 fn publish_reported_cwd(
     pane_id: PaneId,
     cwd: std::path::PathBuf,
@@ -2733,9 +2804,16 @@ impl PaneRuntime {
 
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
+        let initial_pid = child_pid.load(Ordering::Acquire);
+        let initial_observed_cwd = (initial_pid > 0)
+            .then(|| resolve_pane_cwd(&reported_cwd, initial_pid, || None))
+            .flatten();
+        let last_observed_cwd = Arc::new(Mutex::new(initial_observed_cwd));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
+            reported_cwd.clone(),
+            last_observed_cwd,
             terminal.clone(),
             content_seq.clone(),
             detection_content_seq.clone(),
@@ -2929,6 +3007,11 @@ impl PaneRuntime {
         };
 
         // --- Detection task ---
+        let initial_pid = child_pid.load(Ordering::Acquire);
+        let initial_observed_cwd = (initial_pid > 0)
+            .then(|| resolve_pane_cwd(&reported_cwd, initial_pid, || None))
+            .flatten();
+        let last_observed_cwd = Arc::new(Mutex::new(initial_observed_cwd));
         let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
             == AgentDetection::Enabled
         {
@@ -2940,6 +3023,8 @@ impl PaneRuntime {
             const TICK_PENDING_RELEASE: Duration = Duration::from_millis(50);
 
             let child_pid = child_pid.clone();
+            let reported_cwd = reported_cwd.clone();
+            let last_observed_cwd = last_observed_cwd.clone();
             let terminal = terminal.clone();
             let state_events = events.clone();
             let text_content_seq = content_seq.clone();
@@ -2979,6 +3064,7 @@ impl PaneRuntime {
                 let mut last_codex_prompt_ready = false;
                 let mut last_self_reported_shell_check = None;
                 let mut agent_job = AgentJobTracker::default();
+                let mut cwd_settle_recheck = false;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2991,6 +3077,8 @@ impl PaneRuntime {
                         TICK_PENDING_RELEASE
                     } else if pending_idle.active() {
                         AGENT_PENDING_IDLE_RECHECK
+                    } else if cwd_settle_recheck {
+                        CWD_SETTLE_RECHECK
                     } else if agent_presence.current_agent().is_none() {
                         TICK_UNIDENTIFIED
                     } else {
@@ -3022,6 +3110,7 @@ impl PaneRuntime {
                             agent_startup_grace_until = None;
                             pending_idle.clear();
                             agent_job = AgentJobTracker::default();
+                            cwd_settle_recheck = false;
                         }
                     }
 
@@ -3083,6 +3172,17 @@ impl PaneRuntime {
                         let retry =
                             last_content_seq.is_some() && last_content_seq != Some(content_seq);
                         last_observation = (now, (!retry).then_some(content_seq));
+                    }
+                    if foreground_observation_due {
+                        observe_sampled_pane_cwd(
+                            pane_id,
+                            pid,
+                            foreground_pgid,
+                            &reported_cwd,
+                            &last_observed_cwd,
+                            &mut cwd_settle_recheck,
+                            &state_events,
+                        );
                     }
                     let process_group_changed =
                         foreground_group_changed(foreground_pgid, last_foreground_pgid);
@@ -3934,24 +4034,19 @@ impl PaneRuntime {
     /// Get the current working directory of the pane's shell — the child
     /// itself, or the innermost nested shell when the user is driving one.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
-        if let Some(cwd) = self
-            .reported_cwd
-            .lock()
-            .ok()
-            .and_then(|reported_cwd| reported_cwd.clone())
-        {
-            return Some(cwd);
-        }
-
         let pid = self.child_pid.load(Ordering::Relaxed);
-        #[cfg(unix)]
-        let foreground = self
-            .io
-            .foreground_process_group_id()
-            .or_else(|| crate::platform::foreground_process_group_id(pid));
-        #[cfg(not(unix))]
-        let foreground = None;
-        crate::platform::pane_shell_cwd(pid, foreground)
+        resolve_pane_cwd(&self.reported_cwd, pid, || {
+            #[cfg(unix)]
+            {
+                self.io
+                    .foreground_process_group_id()
+                    .or_else(|| crate::platform::foreground_process_group_id(pid))
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        })
     }
 
     pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
@@ -4110,6 +4205,8 @@ impl PaneRuntime {
         let (handle, reset, release) = spawn_basic_detection_task(
             self.pane_id,
             self.child_pid.clone(),
+            self.reported_cwd.clone(),
+            Arc::new(Mutex::new(None)),
             self.terminal.clone(),
             self.content_seq.clone(),
             self.detection_content_seq.clone(),

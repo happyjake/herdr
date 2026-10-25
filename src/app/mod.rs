@@ -197,10 +197,14 @@ pub struct App {
     /// Live advertised endpoint shared with both API listeners. Config
     /// reload replaces or clears it for every subsequent pong.
     pub(crate) advertised_endpoint: Option<crate::api::SharedAdvertisedEndpoint>,
+    pub(crate) pending_pane_cwd_updates: HashMap<crate::layout::PaneId, Instant>,
+    pub(crate) last_emitted_pane_cwds: HashMap<crate::layout::PaneId, std::path::PathBuf>,
+    pub(crate) last_emitted_workspace_labels: HashMap<String, String>,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
 pub(crate) const APP_EVENT_DRAIN_LIMIT: usize = 64;
+pub(crate) const PANE_CWD_EVENT_DEBOUNCE: Duration = Duration::from_millis(150);
 
 fn auto_updates_enabled(background_updates: bool) -> bool {
     background_updates && !cfg!(debug_assertions)
@@ -715,12 +719,16 @@ impl App {
             server_name: None,
             server_reach: None,
             advertised_endpoint: None,
+            pending_pane_cwd_updates: HashMap::new(),
+            last_emitted_pane_cwds: HashMap::new(),
+            last_emitted_workspace_labels: HashMap::new(),
         };
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
         app.refresh_restored_workspace_git_metadata();
         app.initialize_logbook();
         app.sync_flag_deadline();
+        app.seed_emitted_pane_and_workspace_facts();
         Ok(app)
     }
 
@@ -790,6 +798,7 @@ impl App {
         app.policy = AppPolicy::HANDOFF_REPLACEMENT;
         app.initialize_logbook();
         app.sync_flag_deadline();
+        app.seed_emitted_pane_and_workspace_facts();
         Ok(app)
     }
 
@@ -818,6 +827,7 @@ impl App {
                     self.pane_exit_checkpoint_pending = true;
                     self.finish_checkpointed_pane_exit();
                 }
+                self.seed_emitted_pane_and_workspace_facts();
                 true
             }
             Err(err) => {

@@ -403,6 +403,7 @@ impl Workspace {
         };
         let mut public_pane_numbers = HashMap::new();
         public_pane_numbers.insert(tab.root_pane, 1);
+        let initial_cwd = terminal.cwd.clone();
         let (cached_git_space, cached_auto_label, cached_git_status_key) =
             discover_workspace_git_identity(&initial_cwd);
         Ok((

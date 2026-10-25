@@ -177,9 +177,18 @@ impl App {
         } else {
             self.last_git_remote_status_refresh = Instant::now();
         }
+        for ws in &self.state.workspaces {
+            let ws_id = ws.id.clone();
+            self.last_emitted_workspace_labels
+                .entry(ws_id)
+                .or_insert_with(|| {
+                    ws.display_name_from(&self.state.terminals, &self.terminal_runtimes)
+                });
+        }
         let changed = self
             .state
             .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+        self.emit_due_workspace_label_updates();
         if changed {
             self.render_dirty.request_generic();
             self.render_notify.notify_one();
@@ -454,7 +463,33 @@ impl App {
             } else {
                 None
             };
-        let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        let terminal_cwd_reported = if let AppEvent::TerminalCwdReported { pane_id, .. } = &ev {
+            let found = self
+                .find_pane(*pane_id)
+                .map(|(ws_idx, pane)| (ws_idx, pane.attached_terminal_id.clone()));
+            let prev = if let Some((ws_idx, terminal_id)) = found {
+                let ws_id = self.state.workspaces[ws_idx].id.clone();
+                let ws_label = self.state.workspaces[ws_idx]
+                    .display_name_from_terminals(&self.state.terminals);
+                self.last_emitted_workspace_labels
+                    .entry(ws_id)
+                    .or_insert(ws_label);
+                if let Some(terminal) = self.state.terminals.get(&terminal_id) {
+                    let prev_cwd = terminal.cwd.clone();
+                    self.last_emitted_pane_cwds
+                        .entry(*pane_id)
+                        .or_insert_with(|| prev_cwd.clone());
+                    Some((terminal_id, prev_cwd))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Some((*pane_id, prev))
+        } else {
+            None
+        };
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
         if update_ready.is_some() {
@@ -480,8 +515,20 @@ impl App {
             }
         }
         self.sync_full_lifecycle_authority_detection_pauses();
-        if terminal_cwd_reported {
-            self.request_git_identity_refresh(Instant::now());
+        if let Some((pane_id, prev_terminal)) = terminal_cwd_reported {
+            let now = Instant::now();
+            if let Some((terminal_id, prev_cwd)) = prev_terminal {
+                if self
+                    .state
+                    .terminals
+                    .get(&terminal_id)
+                    .is_some_and(|terminal| terminal.cwd != prev_cwd)
+                {
+                    self.pending_pane_cwd_updates
+                        .insert(pane_id, now + super::PANE_CWD_EVENT_DEBOUNCE);
+                }
+            }
+            self.request_git_identity_refresh(now);
             self.render_dirty.request_generic();
             self.render_notify.notify_one();
         }
@@ -962,6 +1009,22 @@ impl App {
     }
 
     pub(super) fn emit_event(&mut self, event: crate::api::schema::EventEnvelope) {
+        match &event.data {
+            crate::api::schema::EventData::WorkspaceCreated { workspace }
+            | crate::api::schema::EventData::WorkspaceUpdated { workspace } => {
+                self.last_emitted_workspace_labels
+                    .insert(workspace.workspace_id.clone(), workspace.label.clone());
+            }
+            crate::api::schema::EventData::PaneCreated { pane } => {
+                if let (Some((_, pane_id)), Some(cwd)) =
+                    (self.parse_pane_id(&pane.pane_id), pane.cwd.as_deref())
+                {
+                    self.last_emitted_pane_cwds
+                        .insert(pane_id, std::path::PathBuf::from(cwd));
+                }
+            }
+            _ => {}
+        }
         self.run_plugin_event_hooks(&event);
         self.event_hub.push(event);
     }

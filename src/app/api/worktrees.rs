@@ -117,20 +117,30 @@ impl App {
                 Err(err) => return encode_error(id, "worktree_open_failed", err.to_string()),
             }
         };
-        self.mark_worktree_membership(
+        let renamed = if let Some(label) = params.label {
+            let previous_label = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .map(|ws| ws.display_name_from(&self.state.terminals, &self.terminal_runtimes));
+            if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+                ws.set_custom_name(label.clone());
+                crate::logging::workspace_renamed(&ws.id);
+            }
+            (previous_label.as_deref() != Some(label.as_str())).then_some(label)
+        } else {
+            None
+        };
+        let membership_changed = self.mark_worktree_membership(
             &source,
             ws_idx,
             entry.path.clone(),
             canonical_path != crate::worktree::canonical_or_original(&source.source_repo_root),
             !created_workspace,
         );
-        if let Some(label) = params.label {
-            let workspace_id = self.public_workspace_id(ws_idx);
-            if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
-                ws.set_custom_name(label.clone());
-                crate::logging::workspace_renamed(&ws.id);
-            }
+        if let Some(label) = renamed {
             if !created_workspace {
+                let workspace_id = self.public_workspace_id(ws_idx);
                 self.emit_event(EventEnvelope {
                     event: EventKind::WorkspaceRenamed,
                     data: EventData::WorkspaceRenamed {
@@ -138,6 +148,9 @@ impl App {
                         label,
                     },
                 });
+                if !membership_changed {
+                    self.emit_workspace_updated(ws_idx);
+                }
             }
         }
         self.state.mark_session_dirty();
@@ -358,9 +371,9 @@ impl App {
         target_path: PathBuf,
         target_is_linked_worktree: bool,
         emit_update: bool,
-    ) {
+    ) -> bool {
         let membership = worktree_membership(source, target_path, target_is_linked_worktree);
-        self.set_worktree_membership(target_ws_idx, membership, emit_update);
+        self.set_worktree_membership(target_ws_idx, membership, emit_update)
     }
 
     pub(crate) fn set_worktree_membership(
@@ -368,7 +381,7 @@ impl App {
         ws_idx: usize,
         membership: crate::workspace::WorktreeSpaceMembership,
         emit_update: bool,
-    ) {
+    ) -> bool {
         let changed = if let Some(workspace) = self.state.workspaces.get_mut(ws_idx) {
             if workspace.worktree_space.as_ref() == Some(&membership) {
                 false
@@ -385,6 +398,7 @@ impl App {
                 self.emit_workspace_updated(ws_idx);
             }
         }
+        changed
     }
 
     fn worktree_source_info(&self, source: &WorktreeSource) -> WorktreeSourceInfo {
@@ -518,7 +532,7 @@ impl App {
         });
     }
 
-    pub(super) fn emit_workspace_updated(&mut self, ws_idx: usize) {
+    pub(crate) fn emit_workspace_updated(&mut self, ws_idx: usize) {
         self.emit_event(EventEnvelope {
             event: EventKind::WorkspaceUpdated,
             data: EventData::WorkspaceUpdated {

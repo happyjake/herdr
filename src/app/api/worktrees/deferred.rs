@@ -479,17 +479,28 @@ impl App {
                 }
             };
 
-        self.mark_worktree_membership(
+        let label_changed = if let Some(label) = api.label {
+            let previous_label = self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .map(|ws| ws.display_name_from(&self.state.terminals, &self.terminal_runtimes));
+            if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+                ws.set_custom_name(label.clone());
+            }
+            previous_label.as_deref() != Some(label.as_str())
+        } else {
+            false
+        };
+        let membership_changed = self.mark_worktree_membership(
             &source,
             ws_idx,
             result.path.clone(),
             true,
             !created_workspace,
         );
-        if let Some(label) = api.label {
-            if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
-                ws.set_custom_name(label);
-            }
+        if !created_workspace && label_changed && !membership_changed {
+            self.emit_workspace_updated(ws_idx);
         }
         self.state.mark_session_dirty();
         if created_workspace {

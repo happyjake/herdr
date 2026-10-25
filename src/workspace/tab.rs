@@ -168,6 +168,7 @@ impl Tab {
             )?
         };
 
+        let initial_cwd = runtime.cwd().unwrap_or(initial_cwd);
         let terminal_id = TerminalId::alloc();
         let terminal = match argv {
             Some(argv) => {
@@ -398,6 +399,7 @@ impl Tab {
                 return Err(err);
             }
         };
+        let actual_cwd = runtime.cwd().unwrap_or(actual_cwd);
         let terminal_id = TerminalId::alloc();
         let terminal = match launch_argv {
             Some(argv) => {

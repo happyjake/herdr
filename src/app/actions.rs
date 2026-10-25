@@ -1996,7 +1996,7 @@ impl AppState {
             AppEvent::TerminalBell { .. } => Vec::new(),
             AppEvent::ClipboardWrite { .. } => Vec::new(),
             AppEvent::TerminalCwdReported { pane_id, cwd } => {
-                if !cwd.is_absolute() || !cwd.is_dir() {
+                if !cwd.is_absolute() {
                     return Vec::new();
                 }
                 let Some(terminal_id) = self.workspaces.iter().find_map(|ws| {
