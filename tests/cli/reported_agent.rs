@@ -146,6 +146,77 @@ fn reported_agent_on_a_plain_shell_survives_live_handoff() {
 }
 
 #[test]
+fn reported_agent_with_resume_argv_survives_two_live_handoffs() {
+    let base = unique_test_dir();
+    let socket = base.join("runtime/herdr.sock");
+    let server = spawn_herdr(&base.join("config"), &base.join("runtime"), &socket);
+    let mut session = Session {
+        base,
+        socket,
+        server: Some(server),
+    };
+    wait_for_socket(&session.socket, Duration::from_secs(10));
+    let created = run_cli_json(
+        &session.socket,
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            session.base.to_str().unwrap(),
+        ],
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    assert!(created["result"]["root_pane"]["agent"].is_null());
+    let reported = send_request(
+        &session.socket,
+        &serde_json::json!({
+            "id": "report-with-resume",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": pane_id,
+                "source": "custom:test",
+                "agent": "pi",
+                "state": "working",
+                "resume_argv": ["sh", "-c", "exit 0"],
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(reported["result"]["type"], "ok", "{reported}");
+
+    for handoff_count in 0..=2 {
+        if handoff_count > 0 {
+            perform_live_handoff(&mut session, pane_id);
+        }
+        // The saved status can mask missing authority for 15 seconds after
+        // restore. Observe beyond that window after the second handoff.
+        let observe_until = Instant::now()
+            + if handoff_count == 2 {
+                Duration::from_secs(16)
+            } else {
+                Duration::ZERO
+            };
+        loop {
+            let pane =
+                run_cli_json(&session.socket, &["pane", "get", pane_id])["result"]["pane"].clone();
+            assert_eq!(pane["agent"], "pi", "handoff {handoff_count}: {pane}");
+            assert_eq!(
+                pane["agent_status"], "working",
+                "handoff {handoff_count}: {pane}"
+            );
+            assert!(
+                pane["ended_agent"].is_null(),
+                "handoff {handoff_count}: {pane}"
+            );
+            if Instant::now() >= observe_until {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+#[test]
 fn reported_agent_explain_authority_and_repeated_handoff_survive_live_handoff() {
     let base = unique_test_dir();
     let socket = base.join("runtime/herdr.sock");

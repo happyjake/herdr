@@ -195,6 +195,8 @@ pub struct TerminalState {
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
+    /// Actual process evidence, unlike identity and launch state seeded by restore.
+    observed_agent_process: Option<(Agent, Instant)>,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -256,6 +258,7 @@ impl TerminalState {
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
+            observed_agent_process: None,
             recent_agent_process_exit: None,
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
@@ -298,6 +301,16 @@ impl TerminalState {
         agent: Agent,
         now: Instant,
     ) -> TerminalStateMutation {
+        if !self.detected_state_observed_before_release_suppression(Some(agent), now)
+            && self
+                .recent_agent_process_exit
+                .is_none_or(|exit| exit.observed_at < now)
+            && self
+                .observed_agent_process
+                .is_none_or(|(_, observed_at)| observed_at <= now)
+        {
+            self.observed_agent_process = Some((agent, now));
+        }
         let starts_acquisition = !self
             .should_ignore_detected_state_under_full_lifecycle_hook(Some(agent), false)
             && !self.detected_state_observed_before_release_suppression(Some(agent), now);
@@ -324,10 +337,8 @@ impl TerminalState {
             .hook_authority
             .as_ref()
             .filter(|authority| self.hook_authority_is_effective(authority))?;
-        let report_only = authority.source.starts_with("custom:")
-            && self.detected_agent.is_none()
-            && self.managed_agent.is_none()
-            && !self.agent_process_acquisition_pending;
+        let report_only =
+            authority.source.starts_with("custom:") && self.observed_agent_process.is_none();
         // Custom process-backed reports must be rebuilt by process detection;
         // the handoff snapshot does not carry their process-liveness association.
         if !self.live_full_lifecycle_hook_authority() && !report_only {
@@ -557,6 +568,14 @@ impl TerminalState {
         self.fallback_visible_blocker = visible_blocker && fallback_state == AgentState::Blocked;
         self.fallback_observed_at = Some(now);
         if process_exited {
+            if self
+                .observed_agent_process
+                .is_some_and(|(observed_agent, observed_at)| {
+                    Some(observed_agent) == agent && observed_at <= now
+                })
+            {
+                self.observed_agent_process = None;
+            }
             if let Some(agent) = agent {
                 self.recent_agent_process_exit = Some(RecentAgentProcessExit {
                     agent,
@@ -2013,6 +2032,12 @@ impl TerminalState {
         self.hook_authority = None;
         self.set_reported_resume(None);
         self.detected_agent = None;
+        if self
+            .observed_agent_process
+            .is_some_and(|(_, detected_at)| detected_at <= observed_at)
+        {
+            self.observed_agent_process = None;
+        }
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
         self.fallback_observed_at = None;
@@ -2598,6 +2623,7 @@ impl TerminalState {
         self.last_agent_completion_seq = None;
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
+        self.observed_agent_process = None;
         self.recent_agent_process_exit = None;
         self.agent_process_acquisition_pending = false;
         self.pending_agent_resume_plan = None;
@@ -6854,6 +6880,8 @@ mod tests {
     #[cfg(unix)]
     fn handoff_agent_state_drops_custom_authority_with_managed_agent() {
         let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        terminal.set_detected_state(None, AgentState::Unknown);
         terminal.restore_managed_agent("agent".into(), Agent::Pi);
         terminal.set_hook_authority(
             "custom:test".into(),
@@ -6866,6 +6894,92 @@ mod tests {
         assert!(!terminal.agent_process_acquisition_pending);
         assert_eq!(terminal.effective_agent_label(), Some("pi"));
         assert!(terminal.handoff_agent_state().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_agent_state_carries_custom_authority_with_unobserved_launch_and_restore_state() {
+        let mut terminal = test_terminal();
+        terminal.set_hook_authority(
+            "custom:test".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        terminal.begin_managed_agent(
+            "agent".into(),
+            Agent::Pi,
+            Instant::now(),
+            Duration::ZERO,
+            Duration::from_secs(10),
+        );
+        terminal.restore_managed_agent("agent".into(), Agent::Pi);
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Unknown);
+        assert_eq!(terminal.detected_agent, Some(Agent::Pi));
+        assert!(terminal.managed_agent.is_some());
+        assert!(terminal.agent_process_acquisition_pending);
+        assert_eq!(terminal.state, AgentState::Working);
+
+        for _ in 0..2 {
+            let snapshot = terminal
+                .handoff_agent_state()
+                .expect("report-only authority");
+            let mut restored = test_terminal();
+            restored.restore_managed_agent("agent".into(), Agent::Pi);
+            restored.set_detected_state(Some(Agent::Pi), AgentState::Unknown);
+            restored.restore_handoff_agent_state(snapshot);
+            assert_eq!(restored.effective_agent_label(), Some("pi"));
+            assert_eq!(restored.state, AgentState::Working);
+            assert!(restored.ended_agent.is_none());
+            terminal = restored;
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_agent_state_process_evidence_clears_only_after_a_current_exit() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Pi, now + Duration::from_secs(2));
+        terminal.set_hook_authority(
+            "custom:test".into(),
+            "reporter".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        for (exit_after, should_export) in [(1, false), (3, true)] {
+            terminal.set_detected_state_with_screen_signals_at(
+                Some(Agent::Pi),
+                AgentState::Unknown,
+                false,
+                false,
+                false,
+                true,
+                now + Duration::from_secs(exit_after),
+            );
+            assert_eq!(terminal.effective_agent_label(), Some("reporter"));
+            assert_eq!(terminal.handoff_agent_state().is_some(), should_export);
+        }
+        terminal.set_detected_agent_process_at(Agent::Pi, now);
+        assert!(terminal.handoff_agent_state().is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_agent_state_allows_report_only_authority_after_shell_respawn() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        terminal.clear_agent_runtime_identity_after_respawn();
+        terminal.set_hook_authority(
+            "custom:test".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        assert!(terminal.handoff_agent_state().is_some());
     }
 
     #[test]
