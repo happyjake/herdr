@@ -81,9 +81,8 @@ impl App {
                 .iter()
                 .any(|ws| ws.pane_state(*pane_id).is_some())
         });
-        self.last_emitted_workspace_labels.retain(|ws_id, _| {
-            self.state.workspaces.iter().any(|ws| &ws.id == ws_id)
-        });
+        self.last_emitted_workspace_labels
+            .retain(|ws_id, _| self.state.workspaces.iter().any(|ws| &ws.id == ws_id));
     }
 
     pub(crate) fn next_pane_cwd_update_deadline(&self) -> Option<Instant> {

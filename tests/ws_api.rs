@@ -3450,7 +3450,10 @@ fn subscribed_client_receives_coalesced_pane_cwd_and_workspace_label_updates_wit
     let sub_ack = sub.request(
         r#"{"id":"req_sub","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.updated"},{"type":"workspace.updated"}]}}"#,
     );
-    assert_eq!(sub_ack["result"]["type"], "subscription_started", "{sub_ack}");
+    assert_eq!(
+        sub_ack["result"]["type"], "subscription_started",
+        "{sub_ack}"
+    );
 
     // 1. No-op `cd .` and foreground-only non-shell cwd churn must not emit.
     let _ = control.request(&format!(

@@ -1270,11 +1270,9 @@ mod tests {
             cwd: PathBuf::from("/tmp/alpha"),
         });
         assert!(app.pending_pane_cwd_updates.is_empty());
-        assert!(
-            !app.flush_due_pane_cwd_updates(
-                std::time::Instant::now() + crate::app::PANE_CWD_EVENT_DEBOUNCE
-            )
-        );
+        assert!(!app.flush_due_pane_cwd_updates(
+            std::time::Instant::now() + crate::app::PANE_CWD_EVENT_DEBOUNCE
+        ));
         assert!(event_hub.events_after(0).is_empty());
 
         // Burst of two cwd changes within the debounce window coalesces into one
@@ -1335,21 +1333,19 @@ mod tests {
         app.seed_emitted_pane_and_workspace_facts();
         let workspace_id = app.public_workspace_id(0);
 
-        app.handle_internal_event_with_render_impact(
-            crate::events::AppEvent::GitStatusRefreshed {
-                results: vec![crate::workspace::WorkspaceGitStatus {
-                    workspace_id: workspace_id.clone(),
-                    resolved_identity_cwd: PathBuf::from("/tmp/repo/subdir"),
-                    status_cache_key: PathBuf::from("/tmp/repo"),
-                    demand: crate::workspace::GitStatusRefreshDemand::ALL,
-                    auto_label: "repo".into(),
-                    branch: Some("main".into()),
-                    ahead_behind: None,
-                    space: None,
-                }],
-                cache_updates: Vec::new(),
-            },
-        );
+        app.handle_internal_event_with_render_impact(crate::events::AppEvent::GitStatusRefreshed {
+            results: vec![crate::workspace::WorkspaceGitStatus {
+                workspace_id: workspace_id.clone(),
+                resolved_identity_cwd: PathBuf::from("/tmp/repo/subdir"),
+                status_cache_key: PathBuf::from("/tmp/repo"),
+                demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                auto_label: "repo".into(),
+                branch: Some("main".into()),
+                ahead_behind: None,
+                space: None,
+            }],
+            cache_updates: Vec::new(),
+        });
 
         let events = event_hub.events_after(0);
         assert_eq!(events.len(), 1, "{events:?}");
