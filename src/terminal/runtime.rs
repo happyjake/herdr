@@ -596,6 +596,10 @@ impl TerminalRuntime {
         self.0.cwd()
     }
 
+    pub(crate) fn record_published_cwd(&self, cwd: Option<&std::path::Path>) {
+        self.0.record_published_cwd(cwd);
+    }
+
     pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
         self.0.cwd_for_persistence()
     }
@@ -647,6 +651,11 @@ impl TerminalRuntime {
         &self,
     ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
         self.0.test_hold_core()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn test_sample_cwd(&self, now: std::time::Instant, events: &mpsc::Sender<AppEvent>) {
+        self.0.test_sample_cwd(now, events);
     }
 
     #[cfg(unix)]

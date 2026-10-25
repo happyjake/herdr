@@ -1530,6 +1530,7 @@ pub struct PaneRuntime {
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
+    cwd_observation: Arc<Mutex<CwdObservation>>,
     persistence_cwd: Mutex<Option<std::path::PathBuf>>,
     cwd_process_exited: Arc<AtomicBool>,
     child_wait_completed: Option<Arc<AtomicBool>>,
@@ -2286,6 +2287,8 @@ const CWD_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 
 #[derive(Default)]
 struct CwdObservation {
+    // Coalesce forwarded observations only until the App publishes another fact.
+    // Every publication overwrites this value, including cwd sampled by a title update.
     last_delivered: Option<std::path::PathBuf>,
     last_sample_at: Option<std::time::Instant>,
     pending: Option<std::path::PathBuf>,
@@ -2865,7 +2868,7 @@ impl PaneRuntime {
             pane_id,
             child_pid.clone(),
             reported_cwd.clone(),
-            last_observed_cwd,
+            last_observed_cwd.clone(),
             terminal.clone(),
             content_seq.clone(),
             detection_content_seq.clone(),
@@ -2881,6 +2884,7 @@ impl PaneRuntime {
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
+            cwd_observation: last_observed_cwd,
             persistence_cwd: Mutex::new(None),
             cwd_process_exited,
             child_wait_completed: None,
@@ -3517,6 +3521,7 @@ impl PaneRuntime {
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
+            cwd_observation: last_observed_cwd,
             persistence_cwd: Mutex::new(None),
             cwd_process_exited: child_wait_completed.clone(),
             child_wait_completed: Some(child_wait_completed),
@@ -4086,6 +4091,17 @@ impl PaneRuntime {
         resolve_runtime_pane_cwd(&self.reported_cwd, pid, &self.io)
     }
 
+    /// Synchronize suppression with the App publication ledger without another
+    /// process probe or any extra work on a detection tick.
+    pub(crate) fn record_published_cwd(&self, cwd: Option<&std::path::Path>) {
+        if let Ok(mut observation) = self.cwd_observation.lock() {
+            observation.last_delivered = cwd.map(std::path::Path::to_path_buf);
+            if observation.pending.as_deref() == cwd {
+                observation.pending = None;
+            }
+        }
+    }
+
     pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
         let pid = self.child_pid.load(Ordering::Acquire);
         let exited = self.cwd_process_exited.load(Ordering::Acquire);
@@ -4234,6 +4250,20 @@ impl PaneRuntime {
     }
 
     #[cfg(unix)]
+    pub(crate) fn test_sample_cwd(&self, now: std::time::Instant, events: &mpsc::Sender<AppEvent>) {
+        let pid = self.child_pid.load(Ordering::Acquire);
+        observe_sampled_pane_cwd(
+            self.pane_id,
+            pid,
+            crate::platform::foreground_process_group_id(pid),
+            &self.reported_cwd,
+            &self.cwd_observation,
+            now,
+            events,
+        );
+    }
+
+    #[cfg(unix)]
     pub(crate) fn test_start_basic_detection(&mut self) -> mpsc::Receiver<AppEvent> {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
@@ -4243,7 +4273,7 @@ impl PaneRuntime {
             self.pane_id,
             self.child_pid.clone(),
             self.reported_cwd.clone(),
-            Arc::new(Mutex::new(CwdObservation::seeded(self.cwd()))),
+            self.cwd_observation.clone(),
             self.terminal.clone(),
             self.content_seq.clone(),
             self.detection_content_seq.clone(),
@@ -4388,6 +4418,7 @@ impl PaneRuntime {
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
+                cwd_observation: Arc::new(Mutex::new(CwdObservation::default())),
                 persistence_cwd: Mutex::new(None),
                 cwd_process_exited: Arc::new(AtomicBool::new(false)),
                 child_wait_completed: None,
@@ -5947,6 +5978,7 @@ mod tests {
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
+            cwd_observation: Arc::new(Mutex::new(CwdObservation::default())),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
@@ -5988,6 +6020,7 @@ mod tests {
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
+            cwd_observation: Arc::new(Mutex::new(CwdObservation::default())),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             content_seq: Arc::new(AtomicU64::new(0)),
