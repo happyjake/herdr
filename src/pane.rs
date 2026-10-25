@@ -940,7 +940,7 @@ fn spawn_basic_detection_task(
     pane_id: PaneId,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
-    last_observed_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
+    last_observed_cwd: Arc<Mutex<CwdObservation>>,
     terminal: Arc<PaneTerminal>,
     content_seq: Arc<AtomicU64>,
     detection_content_seq: Arc<AtomicU64>,
@@ -979,13 +979,10 @@ fn spawn_basic_detection_task(
         let mut last_codex_prompt_ready = false;
         let mut last_self_reported_shell_check = None;
         let mut agent_job = AgentJobTracker::default();
-        let mut cwd_settle_recheck = false;
 
         loop {
             let sleep_duration = if pending_idle.active() {
                 AGENT_PENDING_IDLE_RECHECK
-            } else if cwd_settle_recheck {
-                CWD_SETTLE_RECHECK
             } else {
                 std::time::Duration::from_millis(300)
             };
@@ -1015,7 +1012,6 @@ fn spawn_basic_detection_task(
                     agent_startup_grace_until = None;
                     pending_idle.clear();
                     agent_job = AgentJobTracker::default();
-                    cwd_settle_recheck = false;
                 }
             }
 
@@ -1050,7 +1046,7 @@ fn spawn_basic_detection_task(
                 foreground_pgid,
                 &reported_cwd,
                 &last_observed_cwd,
-                &mut cwd_settle_recheck,
+                now,
                 &state_events,
             );
             let process_group_changed =
@@ -2284,7 +2280,35 @@ fn publish_terminal_bells(pane_id: PaneId, count: u16, events: &mpsc::Sender<App
     }
 }
 
-const CWD_SETTLE_RECHECK: std::time::Duration = std::time::Duration::from_millis(75);
+// Process inspection is capped independently of detection ticks and visibility:
+// at most one shell ancestry walk per second per pane (1 / 15 for 1 / 15 panes).
+const CWD_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Default)]
+struct CwdObservation {
+    last_delivered: Option<std::path::PathBuf>,
+    last_sample_at: Option<std::time::Instant>,
+    pending: Option<std::path::PathBuf>,
+}
+
+impl CwdObservation {
+    fn seeded(cwd: Option<std::path::PathBuf>) -> Self {
+        Self {
+            last_delivered: cwd,
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CWD_WALKS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_cwd_walk_count() -> usize {
+    CWD_WALKS.with(|count| count.replace(0))
+}
 
 fn resolve_pane_cwd(
     reported_cwd: &Mutex<Option<std::path::PathBuf>>,
@@ -2298,6 +2322,8 @@ fn resolve_pane_cwd(
     {
         return Some(cwd);
     }
+    #[cfg(test)]
+    CWD_WALKS.with(|count| count.set(count.get() + 1));
     crate::platform::pane_shell_cwd(pid, foreground_pgid())
 }
 
@@ -2306,38 +2332,64 @@ fn observe_sampled_pane_cwd(
     pid: u32,
     foreground_pgid: Option<u32>,
     reported_cwd: &Mutex<Option<std::path::PathBuf>>,
-    last_observed_cwd: &Mutex<Option<std::path::PathBuf>>,
-    settle_recheck_pending: &mut bool,
+    observation: &Mutex<CwdObservation>,
+    now: std::time::Instant,
     events: &mpsc::Sender<AppEvent>,
 ) {
     if pid == 0 {
-        *settle_recheck_pending = false;
         return;
     }
-    let Some(cwd) = resolve_pane_cwd(reported_cwd, pid, || foreground_pgid) else {
-        *settle_recheck_pending = false;
+    let Ok(mut observation) = observation.lock() else {
         return;
     };
-    let changed = match last_observed_cwd.lock() {
-        Ok(mut observed) => {
-            let changed = observed.as_ref().is_some_and(|prev| prev != &cwd);
-            if observed.as_ref() != Some(&cwd) {
-                *observed = Some(cwd.clone());
+    let reported = reported_cwd.lock().ok().and_then(|cwd| cwd.clone());
+    let sample = if reported.is_some() {
+        reported
+    } else if observation
+        .last_sample_at
+        .is_none_or(|last| now.duration_since(last) >= CWD_SAMPLE_INTERVAL)
+    {
+        observation.last_sample_at = Some(now);
+        resolve_pane_cwd(reported_cwd, pid, || foreground_pgid)
+    } else {
+        None
+    };
+    if let Some(cwd) = sample {
+        observation.pending = (observation.last_delivered.as_ref() != Some(&cwd)).then_some(cwd);
+    }
+    if let Some(cwd) = observation.pending.clone() {
+        match events.try_send(AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: cwd.clone(),
+        }) {
+            Ok(()) => {
+                observation.last_delivered = Some(cwd);
+                observation.pending = None;
             }
-            changed
-        }
-        Err(_) => false,
-    };
-    *settle_recheck_pending = changed;
-    if changed {
-        if let Err(err) = events.try_send(AppEvent::TerminalCwdReported { pane_id, cwd }) {
-            warn!(
-                pane = pane_id.raw(),
-                err = %err,
-                "failed to send sampled terminal cwd report"
-            );
+            Err(err) => {
+                warn!(pane = pane_id.raw(), err = %err, "failed to send sampled terminal cwd report");
+            }
         }
     }
+}
+
+fn resolve_runtime_pane_cwd(
+    reported_cwd: &Mutex<Option<std::path::PathBuf>>,
+    pid: u32,
+    io: &PaneRuntimeIo,
+) -> Option<std::path::PathBuf> {
+    resolve_pane_cwd(reported_cwd, pid, || {
+        #[cfg(unix)]
+        {
+            io.foreground_process_group_id()
+                .or_else(|| crate::platform::foreground_process_group_id(pid))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = io;
+            None
+        }
+    })
 }
 
 fn publish_reported_cwd(
@@ -2806,9 +2858,9 @@ impl PaneRuntime {
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
         let initial_pid = child_pid.load(Ordering::Acquire);
         let initial_observed_cwd = (initial_pid > 0)
-            .then(|| resolve_pane_cwd(&reported_cwd, initial_pid, || None))
+            .then(|| resolve_runtime_pane_cwd(&reported_cwd, initial_pid, &io))
             .flatten();
-        let last_observed_cwd = Arc::new(Mutex::new(initial_observed_cwd));
+        let last_observed_cwd = Arc::new(Mutex::new(CwdObservation::seeded(initial_observed_cwd)));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
@@ -3009,9 +3061,9 @@ impl PaneRuntime {
         // --- Detection task ---
         let initial_pid = child_pid.load(Ordering::Acquire);
         let initial_observed_cwd = (initial_pid > 0)
-            .then(|| resolve_pane_cwd(&reported_cwd, initial_pid, || None))
+            .then(|| resolve_runtime_pane_cwd(&reported_cwd, initial_pid, &io))
             .flatten();
-        let last_observed_cwd = Arc::new(Mutex::new(initial_observed_cwd));
+        let last_observed_cwd = Arc::new(Mutex::new(CwdObservation::seeded(initial_observed_cwd)));
         let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
             == AgentDetection::Enabled
         {
@@ -3064,7 +3116,6 @@ impl PaneRuntime {
                 let mut last_codex_prompt_ready = false;
                 let mut last_self_reported_shell_check = None;
                 let mut agent_job = AgentJobTracker::default();
-                let mut cwd_settle_recheck = false;
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -3077,8 +3128,6 @@ impl PaneRuntime {
                         TICK_PENDING_RELEASE
                     } else if pending_idle.active() {
                         AGENT_PENDING_IDLE_RECHECK
-                    } else if cwd_settle_recheck {
-                        CWD_SETTLE_RECHECK
                     } else if agent_presence.current_agent().is_none() {
                         TICK_UNIDENTIFIED
                     } else {
@@ -3110,8 +3159,7 @@ impl PaneRuntime {
                             agent_startup_grace_until = None;
                             pending_idle.clear();
                             agent_job = AgentJobTracker::default();
-                            cwd_settle_recheck = false;
-                        }
+                                }
                     }
 
                     let now = Instant::now();
@@ -3180,7 +3228,7 @@ impl PaneRuntime {
                             foreground_pgid,
                             &reported_cwd,
                             &last_observed_cwd,
-                            &mut cwd_settle_recheck,
+                            now,
                             &state_events,
                         );
                     }
@@ -4035,18 +4083,7 @@ impl PaneRuntime {
     /// itself, or the innermost nested shell when the user is driving one.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         let pid = self.child_pid.load(Ordering::Relaxed);
-        resolve_pane_cwd(&self.reported_cwd, pid, || {
-            #[cfg(unix)]
-            {
-                self.io
-                    .foreground_process_group_id()
-                    .or_else(|| crate::platform::foreground_process_group_id(pid))
-            }
-            #[cfg(not(unix))]
-            {
-                None
-            }
-        })
+        resolve_runtime_pane_cwd(&self.reported_cwd, pid, &self.io)
     }
 
     pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
@@ -4206,7 +4243,7 @@ impl PaneRuntime {
             self.pane_id,
             self.child_pid.clone(),
             self.reported_cwd.clone(),
-            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(CwdObservation::seeded(self.cwd()))),
             self.terminal.clone(),
             self.content_seq.clone(),
             self.detection_content_seq.clone(),
@@ -4375,6 +4412,172 @@ impl PaneRuntime {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn pane_cwd_sampling_does_not_walk_on_every_tick() {
+        for panes in [1, 15] {
+            CWD_WALKS.with(|count| count.set(0));
+            let (events, _rx) = mpsc::channel(64);
+            for pane in 0..panes {
+                let observed = Mutex::new(CwdObservation::default());
+                let reported = Mutex::new(None);
+                let now = std::time::Instant::now();
+                for _ in 0..30 {
+                    observe_sampled_pane_cwd(
+                        PaneId::from_raw(pane),
+                        std::process::id(),
+                        None,
+                        &reported,
+                        &observed,
+                        now,
+                        &events,
+                    );
+                }
+            }
+            assert_eq!(
+                CWD_WALKS.with(Cell::get),
+                panes as usize,
+                "stable ticks must not inspect the process tree"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_cwd_sampling_counts_one_walk_per_second_for_populated_panes() {
+        let start = std::time::Instant::now();
+        for panes in [1, 15] {
+            take_cwd_walk_count();
+            let (events, _rx) = mpsc::channel(64);
+            for pane in 0..panes {
+                let observed = Mutex::new(CwdObservation::default());
+                let reported = Mutex::new(None);
+                for tick in 0..100 {
+                    observe_sampled_pane_cwd(
+                        PaneId::from_raw(pane),
+                        std::process::id(),
+                        None,
+                        &reported,
+                        &observed,
+                        start + std::time::Duration::from_millis(tick * 100),
+                        &events,
+                    );
+                }
+            }
+            let walks = take_cwd_walk_count();
+            assert_eq!(walks, panes as usize * 10);
+            eprintln!("{panes} panes, 100 ticks over 10 seconds: {walks} cwd walks");
+        }
+    }
+
+    #[test]
+    fn pane_cwd_retries_sample_after_full_event_channel() {
+        let (events, mut rx) = mpsc::channel(1);
+        let pane_id = PaneId::from_raw(1);
+        let observed = Mutex::new(CwdObservation::seeded(Some(std::path::PathBuf::from(
+            "/tmp/alpha",
+        ))));
+        let reported = Mutex::new(Some(std::path::PathBuf::from("/tmp/beta")));
+        let now = std::time::Instant::now();
+        events
+            .try_send(AppEvent::TerminalCwdReported {
+                pane_id,
+                cwd: "/tmp/occupied".into(),
+            })
+            .unwrap();
+        observe_sampled_pane_cwd(pane_id, 1, None, &reported, &observed, now, &events);
+        rx.try_recv().unwrap();
+        observe_sampled_pane_cwd(pane_id, 1, None, &reported, &observed, now, &events);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::TerminalCwdReported { cwd, .. }) if cwd == std::path::Path::new("/tmp/beta"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_cwd_handoff_observes_nested_shell_return_before_first_tick() {
+        let base = std::env::temp_dir().join(format!("herdr-cwd-handoff-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let alpha = base.canonicalize().unwrap();
+        let beta = alpha.join("beta");
+        std::fs::create_dir(&beta).unwrap();
+        let (events, _rx) = mpsc::channel(64);
+        let runtime = PaneRuntime::spawn_argv_command(
+            PaneId::from_raw(42),
+            24,
+            80,
+            alpha.clone(),
+            &["/bin/sh".into(), "-i".into()],
+            &PaneLaunchEnv::default(),
+            AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"/bin/sh -i\n"))
+            .unwrap();
+        runtime
+            .try_send_bytes(Bytes::from_static(b"cd beta\n"))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while runtime.cwd().as_ref() != Some(&beta) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("nested shell must reach beta");
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(2))
+            .unwrap();
+        let import = crate::handoff_runtime::ImportedHandoffRuntime {
+            master_fd: runtime.duplicate_handoff_fd().unwrap(),
+            state: runtime.handoff_runtime_state(42),
+        };
+        runtime.preserve_for_handoff();
+        let (events, mut rx) = mpsc::channel(64);
+        let mut imported = PaneRuntime::from_handoff_fd(
+            import,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        imported.assume_handoff_ownership();
+        imported.set_handoff_reader_paused(false);
+        assert_eq!(imported.cwd(), Some(beta));
+        imported
+            .try_send_bytes(Bytes::from_static(b"cd ..\n"))
+            .unwrap();
+        // Keep this current-thread executor from polling the detector until the shell is back.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while imported.cwd().as_ref() != Some(&alpha) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(imported.cwd(), Some(alpha.clone()));
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, AppEvent::TerminalCwdReported { cwd, .. } if cwd == alpha) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        imported.shutdown();
+        std::fs::remove_dir_all(base).unwrap();
+        assert!(
+            delivered,
+            "nested shell return must correct the published cwd"
+        );
+    }
 
     #[tokio::test]
     async fn unidentified_text_cache_tracks_runtime_mutations_not_viewport_scroll() {

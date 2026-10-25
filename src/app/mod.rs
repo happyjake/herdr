@@ -17,6 +17,7 @@ pub(crate) mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod creation;
 mod custom_commands;
+mod fact_updates;
 mod flags;
 mod git_refresh;
 mod ids;
@@ -197,13 +198,21 @@ pub struct App {
     /// Live advertised endpoint shared with both API listeners. Config
     /// reload replaces or clears it for every subsequent pong.
     pub(crate) advertised_endpoint: Option<crate::api::SharedAdvertisedEndpoint>,
-    pub(crate) pending_pane_cwd_updates: HashMap<crate::layout::PaneId, Instant>,
+    pub(crate) pending_pane_cwd_updates: HashMap<crate::layout::PaneId, PendingCwdUpdate>,
+    pub(crate) dirty_workspace_labels: HashMap<String, Instant>,
     pub(crate) last_emitted_pane_cwds: HashMap<crate::layout::PaneId, std::path::PathBuf>,
     pub(crate) last_emitted_workspace_labels: HashMap<String, String>,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
 pub(crate) const APP_EVENT_DRAIN_LIMIT: usize = 64;
+#[derive(Clone, Copy)]
+pub(crate) struct PendingCwdUpdate {
+    first_seen: Instant,
+    deadline: Instant,
+}
+
+pub(crate) const PANE_CWD_EVENT_MAX_DELAY: Duration = Duration::from_secs(1);
 pub(crate) const PANE_CWD_EVENT_DEBOUNCE: Duration = Duration::from_millis(150);
 
 fn auto_updates_enabled(background_updates: bool) -> bool {
@@ -720,6 +729,7 @@ impl App {
             server_reach: None,
             advertised_endpoint: None,
             pending_pane_cwd_updates: HashMap::new(),
+            dirty_workspace_labels: HashMap::new(),
             last_emitted_pane_cwds: HashMap::new(),
             last_emitted_workspace_labels: HashMap::new(),
         };

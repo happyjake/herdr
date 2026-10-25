@@ -1306,6 +1306,278 @@ mod tests {
         ));
     }
 
+    fn cwd_event_app() -> (App, crate::layout::PaneId, crate::api::EventHub) {
+        let hub = crate::api::EventHub::default();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            rx,
+            hub.clone(),
+        );
+        let mut ws = Workspace::test_new("alpha");
+        ws.custom_name = None;
+        ws.identity_cwd = PathBuf::from("/tmp/alpha");
+        ws.cached_identity_cwd = ws.identity_cwd.clone();
+        ws.cached_auto_label = "alpha".into();
+        let pane = ws.tabs[0].root_pane;
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let terminal = app.state.workspaces[0].tabs[0]
+            .terminal_id(pane)
+            .unwrap()
+            .clone();
+        app.state.terminals.get_mut(&terminal).unwrap().cwd = PathBuf::from("/tmp/alpha");
+        app.seed_emitted_pane_and_workspace_facts();
+        (app, pane, hub)
+    }
+
+    fn report_cwd(app: &mut App, pane_id: crate::layout::PaneId, cwd: &str) {
+        app.handle_internal_event(crate::events::AppEvent::TerminalCwdReported {
+            pane_id,
+            cwd: cwd.into(),
+        });
+    }
+
+    #[test]
+    fn pane_cwd_corrects_an_intervening_presentation_publication() {
+        let (mut app, pane, hub) = cwd_event_app();
+        report_cwd(&mut app, pane, "/tmp/beta");
+        app.emit_pane_updated(0, pane);
+        report_cwd(&mut app, pane, "/tmp/alpha");
+        app.flush_due_pane_cwd_updates(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        let cwds: Vec<_> = hub
+            .events_after(0)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                EventData::PaneUpdated { pane } => pane.cwd,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cwds, ["/tmp/beta", "/tmp/alpha"]);
+    }
+
+    #[test]
+    fn pane_cwd_compares_reports_to_publication_after_restore() {
+        let (mut app, pane, hub) = cwd_event_app();
+        // The snapshot has sampled the live shell while restored terminal state is older.
+        app.last_emitted_pane_cwds
+            .insert(pane, PathBuf::from("/tmp/beta"));
+        report_cwd(&mut app, pane, "/tmp/alpha");
+        app.flush_due_pane_cwd_updates(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        assert!(hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| matches!(&event.data,
+            EventData::PaneUpdated { pane } if pane.cwd.as_deref() == Some("/tmp/alpha"))));
+    }
+
+    #[test]
+    fn pane_cwd_continuous_reports_have_a_publication_ceiling() {
+        let (mut app, pane, _) = cwd_event_app();
+        let start = std::time::Instant::now();
+        for index in 0..12 {
+            report_cwd(&mut app, pane, &format!("/tmp/dir-{index}"));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let deadline = app.next_pane_cwd_update_deadline().unwrap();
+        assert!(
+            deadline <= start + std::time::Duration::from_millis(1050),
+            "{deadline:?}"
+        );
+        assert!(app.flush_due_pane_cwd_updates(deadline));
+    }
+
+    #[test]
+    fn workspace_label_reconciles_only_dirty_workspaces() {
+        let (mut app, pane, hub) = cwd_event_app();
+        let mut unrelated = Workspace::test_new("unrelated");
+        unrelated.custom_name = None;
+        app.state.workspaces.push(unrelated);
+        app.state.ensure_test_terminals();
+        app.seed_emitted_pane_and_workspace_facts();
+        let other_id = app.public_workspace_id(1);
+        let other = &app.state.workspaces[1].tabs[0];
+        let terminal = other.terminal_id(other.root_pane).unwrap().clone();
+        app.state.terminals.get_mut(&terminal).unwrap().cwd = "/tmp/unobserved".into();
+        report_cwd(&mut app, pane, "/tmp/beta");
+        app.flush_due_pane_cwd_updates(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        assert!(!hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| matches!(&event.data,
+            EventData::WorkspaceUpdated { workspace } if workspace.workspace_id == other_id)));
+        assert!(hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| matches!(&event.data,
+            EventData::WorkspaceUpdated { workspace } if workspace.label == "beta")));
+    }
+
+    #[test]
+    fn workspace_label_first_tab_reorder_wakes_headless_reconciliation() {
+        let (mut app, _, hub) = cwd_event_app();
+        app.state.workspaces[0].test_add_tab(None);
+        let second_pane = app.state.workspaces[0].tabs[1].root_pane;
+        app.state.ensure_test_terminals();
+        let terminal = app.state.workspaces[0].tabs[1]
+            .terminal_id(second_pane)
+            .unwrap()
+            .clone();
+        app.state.terminals.get_mut(&terminal).unwrap().cwd = "/tmp/beta".into();
+        app.seed_emitted_pane_and_workspace_facts();
+        let tab_id = app.public_tab_id(0, 1).unwrap();
+        app.handle_tab_move(
+            "move".into(),
+            crate::api::schema::TabMoveParams {
+                tab_id,
+                insert_index: 0,
+            },
+        );
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, second_pane);
+        let deadline = app.next_headless_loop_deadline_with_git_refresh(
+            std::time::Instant::now(),
+            false,
+            false,
+        );
+        assert!(
+            deadline.is_some(),
+            "headless loop must wake without git refresh"
+        );
+        app.flush_due_pane_cwd_updates(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        assert!(hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| matches!(&event.data,
+            EventData::WorkspaceUpdated { workspace } if workspace.label == "beta")));
+    }
+
+    #[test]
+    fn workspace_label_root_close_and_exit_reconcile_without_cwd_reports() {
+        for exit in [false, true] {
+            let (mut app, root, hub) = cwd_event_app();
+            let survivor =
+                app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+            app.state.ensure_test_terminals();
+            let terminal = app.state.workspaces[0].tabs[0]
+                .terminal_id(survivor)
+                .unwrap()
+                .clone();
+            app.state.terminals.get_mut(&terminal).unwrap().cwd = "/tmp/beta".into();
+            app.seed_emitted_pane_and_workspace_facts();
+            if exit {
+                app.handle_internal_event(crate::events::AppEvent::PaneDied {
+                    pane_id: root,
+                    exit_reason: crate::platform::ChildExitReason::Exited,
+                });
+            } else {
+                let pane_id = app.public_pane_id(0, root).unwrap();
+                app.close_pane("close".into(), &crate::api::schema::PaneTarget { pane_id })
+                    .unwrap();
+            }
+            assert_eq!(app.state.workspaces[0].tabs[0].root_pane, survivor);
+            assert!(app.pending_pane_cwd_updates.is_empty());
+            assert!(app
+                .next_headless_loop_deadline_with_git_refresh(
+                    std::time::Instant::now(),
+                    false,
+                    false
+                )
+                .is_some());
+            app.flush_due_pane_cwd_updates(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            assert!(hub
+                .events_after(0)
+                .iter()
+                .any(|(_, event)| matches!(&event.data,
+                EventData::WorkspaceUpdated { workspace } if workspace.label == "beta")));
+            app.state.assert_invariants_for_test();
+        }
+    }
+
+    #[test]
+    fn workspace_label_first_tab_close_and_exit_reconcile_without_cwd_reports() {
+        for exit in [false, true] {
+            let (mut app, root, hub) = cwd_event_app();
+            app.state.workspaces[0].test_add_tab(None);
+            let second = app.state.workspaces[0].tabs[1].root_pane;
+            app.state.ensure_test_terminals();
+            let terminal = app.state.workspaces[0].tabs[1]
+                .terminal_id(second)
+                .unwrap()
+                .clone();
+            app.state.terminals.get_mut(&terminal).unwrap().cwd = "/tmp/beta".into();
+            app.seed_emitted_pane_and_workspace_facts();
+            if exit {
+                app.handle_internal_event(crate::events::AppEvent::PaneDied {
+                    pane_id: root,
+                    exit_reason: crate::platform::ChildExitReason::Exited,
+                });
+            } else {
+                let tab_id = app.public_tab_id(0, 0).unwrap();
+                let response =
+                    app.handle_tab_close("close".into(), crate::api::schema::TabTarget { tab_id });
+                let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+            }
+            assert_eq!(app.state.workspaces[0].tabs[0].root_pane, second);
+            app.flush_due_pane_cwd_updates(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            assert!(hub
+                .events_after(0)
+                .iter()
+                .any(|(_, event)| matches!(&event.data,
+                EventData::WorkspaceUpdated { workspace } if workspace.label == "beta")));
+            app.state.assert_invariants_for_test();
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_label_reconciliation_performs_no_cwd_walks() {
+        for workspaces in [1, 15] {
+            let (mut app, _, hub) = cwd_event_app();
+            for _ in 1..workspaces {
+                let mut ws = Workspace::test_new("other");
+                ws.custom_name = None;
+                app.state.workspaces.push(ws);
+            }
+            app.state.ensure_test_terminals();
+            for ws in &app.state.workspaces {
+                let tab = &ws.tabs[0];
+                let terminal_id = tab.terminal_id(tab.root_pane).unwrap().clone();
+                let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+                app.terminal_runtimes.insert(terminal_id, runtime);
+            }
+            app.seed_emitted_pane_and_workspace_facts();
+            let root = &app.state.workspaces[0].tabs[0];
+            let terminal = root.terminal_id(root.root_pane).unwrap().clone();
+            app.state.terminals.get_mut(&terminal).unwrap().cwd = "/tmp/beta".into();
+            let id = app.public_workspace_id(0);
+            app.mark_workspace_label_dirty(&id, std::time::Instant::now());
+            // The real projection must exercise the counter before trusting its zero.
+            app.workspace_info(0);
+            assert!(crate::pane::take_cwd_walk_count() > 0);
+            app.emit_due_workspace_label_updates(std::time::Instant::now());
+            assert_eq!(crate::pane::take_cwd_walk_count(), 0);
+            let events = hub.events_after(0);
+            assert_eq!(events.len(), 1);
+            assert!(
+                matches!(&events[0].1.data, EventData::WorkspaceUpdated { workspace } if workspace.label == "beta")
+            );
+        }
+    }
+
     #[test]
     fn git_status_refresh_emits_workspace_updated_when_auto_label_changes() {
         let event_hub = crate::api::EventHub::default();

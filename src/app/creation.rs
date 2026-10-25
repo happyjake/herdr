@@ -434,12 +434,23 @@ impl App {
         index: usize,
         projection: AgentStatusProjection,
     ) -> crate::api::schema::WorkspaceInfo {
+        let label = self.state.workspaces[index]
+            .display_name_from(&self.state.terminals, &self.terminal_runtimes);
+        self.workspace_info_with_label(index, projection, label)
+    }
+
+    pub(super) fn workspace_info_with_label(
+        &self,
+        index: usize,
+        projection: AgentStatusProjection,
+        label: String,
+    ) -> crate::api::schema::WorkspaceInfo {
         let ws = &self.state.workspaces[index];
         let agent_status = ws.agent_status_from(&self.state.terminals, projection);
         crate::api::schema::WorkspaceInfo {
             workspace_id: self.public_workspace_id(index),
             number: index + 1,
-            label: ws.display_name_from(&self.state.terminals, &self.terminal_runtimes),
+            label,
             focused: self.state.active == Some(index),
             pane_count: ws.public_pane_numbers.len(),
             tab_count: ws.tabs.len(),
