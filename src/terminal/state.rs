@@ -320,10 +320,10 @@ impl TerminalState {
 
     #[cfg(unix)]
     pub(crate) fn handoff_agent_state(&self) -> Option<HandoffAgentState> {
-        if !self.live_full_lifecycle_hook_authority() {
-            return None;
-        }
-        let authority = self.hook_authority.as_ref()?;
+        let authority = self
+            .hook_authority
+            .as_ref()
+            .filter(|authority| self.hook_authority_is_effective(authority))?;
         Some(HandoffAgentState {
             authority: authority.clone(),
             sequence: self.hook_report_sequences.get(&authority.source).copied(),
@@ -337,7 +337,17 @@ impl TerminalState {
             self.hook_report_sequences
                 .insert(snapshot.authority.source.clone(), sequence);
         }
-        self.detected_agent = crate::detect::parse_agent_label(&snapshot.authority.agent_label);
+        if crate::detect::full_lifecycle_hook_authority(
+            &snapshot.authority.source,
+            &snapshot.authority.agent_label,
+        ) {
+            self.detected_agent = crate::detect::parse_agent_label(&snapshot.authority.agent_label);
+        }
+        self.reconcile_agent_name_owner(
+            &snapshot.authority.agent_label,
+            snapshot.authority.session_ref.as_ref(),
+        );
+        self.ended_agent = None;
         self.state = snapshot.authority.state;
         self.hook_authority = Some(snapshot.authority);
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
@@ -6780,5 +6790,79 @@ mod tests {
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_agent_state_carries_custom_report_authority_without_fabricating_detected_agent() {
+        let mut before = test_terminal();
+        before.set_hook_authority(
+            "custom:test".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(7),
+        );
+        assert!(before.detected_agent.is_none());
+        assert_eq!(before.effective_agent_label(), Some("pi"));
+        assert_eq!(before.effective_known_agent(), Some(Agent::Pi));
+
+        let snapshot = before
+            .handoff_agent_state()
+            .expect("custom report authority should be carried across handoff");
+        assert_eq!(snapshot.authority.source, "custom:test");
+        assert_eq!(snapshot.authority.agent_label, "pi");
+        assert_eq!(snapshot.authority.state, AgentState::Working);
+        assert_eq!(snapshot.sequence, Some(7));
+
+        let mut after = test_terminal();
+        after.ended_agent = Some("pi".into());
+        after.restore_handoff_agent_state(snapshot);
+        assert!(
+            after.detected_agent.is_none(),
+            "custom report restore must not invent process detection"
+        );
+        assert!(after.ended_agent.is_none());
+        assert_eq!(after.effective_agent_label(), Some("pi"));
+        assert_eq!(after.effective_known_agent(), Some(Agent::Pi));
+        assert_eq!(after.state, AgentState::Working);
+
+        assert!(
+            after
+                .set_hook_authority(
+                    "custom:test".into(),
+                    "pi".into(),
+                    AgentState::Idle,
+                    None,
+                    Some(7),
+                )
+                .is_none(),
+            "stale sequence from the carried source must be rejected after handoff"
+        );
+        assert!(
+            after
+                .clear_hook_authority(Some("custom:other"), None)
+                .is_none(),
+            "foreign source must not clear the carried authority"
+        );
+        assert!(
+            after
+                .set_hook_authority(
+                    "custom:test".into(),
+                    "pi".into(),
+                    AgentState::Idle,
+                    None,
+                    Some(8),
+                )
+                .is_some(),
+            "fresh sequence from the carried source must update the pane"
+        );
+        assert_eq!(after.state, AgentState::Idle);
+
+        assert!(after
+            .clear_hook_authority(Some("custom:test"), Some(9))
+            .is_some());
+        assert!(after.effective_agent_label().is_none());
+        assert_eq!(after.state, AgentState::Unknown);
     }
 }

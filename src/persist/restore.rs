@@ -817,6 +817,10 @@ fn restore_tab(
                 #[cfg(unix)]
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
+                    runtime.set_full_lifecycle_authority_active(
+                        terminal.full_lifecycle_hook_authority_active(),
+                    );
+                    runtime.set_self_reported_agent_active(terminal.self_reported_agent_active());
                 }
                 panes.insert(*id, restored_pane_state(&terminal, was_imported));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -3850,6 +3854,83 @@ mod tests {
                 "hook state {hook_state:?}: the claim survives to its deadline"
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_preserves_custom_reported_agent_on_plain_shell() {
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let (events, _events_rx) = mpsc::channel(32);
+        let (workspaces, mut terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let terminal = terminals.values_mut().next().unwrap();
+        terminal.set_hook_authority(
+            "custom:test".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(3),
+        );
+        assert!(terminal.detected_agent.is_none());
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(terminal.state, AgentState::Working);
+
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+        let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
+        let runtime = runtimes.values().next().unwrap();
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(2))
+            .unwrap();
+        let mut state = runtime.handoff_runtime_state(pane_id.raw());
+        state.agent_state = terminals.values().next().unwrap().handoff_agent_state();
+        let state = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let mut imports = HashMap::from([(
+            pane_id.raw(),
+            crate::handoff_runtime::ImportedHandoffRuntime {
+                master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                state,
+            },
+        )]);
+        let (restored_workspaces, mut restored_terminals, restored_runtimes) = restore_handoff(
+            &snapshot,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &mut imports,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        drop(restored_runtimes);
+        drop(runtimes);
+
+        let pane = only_pane(&restored_workspaces);
+        assert_eq!(
+            pane.agent_status(),
+            crate::api::schema::AgentStatus::Working
+        );
+        let terminal = restored_terminals.values_mut().next().unwrap();
+        assert!(terminal.detected_agent.is_none());
+        assert!(terminal.ended_agent.is_none());
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert_eq!(
+            terminal.effective_known_agent(),
+            Some(crate::detect::Agent::Pi)
+        );
+        assert_eq!(terminal.state, AgentState::Working);
     }
 
     #[tokio::test]
