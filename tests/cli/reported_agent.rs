@@ -24,14 +24,17 @@ fn shell_quote(value: &str) -> String {
 fn run_in_pane_herdr(session: &Session, pane_id: &str, name: &str, args: &[&str]) -> String {
     let out_path = session.base.join(format!("{name}.out"));
     let status_path = session.base.join(format!("{name}.status"));
+    let status_tmp_path = session.base.join(format!("{name}.status.tmp"));
     let _ = fs::remove_file(&out_path);
     let _ = fs::remove_file(&status_path);
     let mut quoted_args = vec![shell_quote(env!("CARGO_BIN_EXE_herdr"))];
     quoted_args.extend(args.iter().map(|arg| shell_quote(arg)));
     let command = format!(
-        "{} > {} 2>&1; printf '%s\\n' \"$?\" > {}",
+        "{} > {} 2>&1; printf '%s\\n' \"$?\" > {} && mv {} {}",
         quoted_args.join(" "),
         shell_quote(out_path.to_str().unwrap()),
+        shell_quote(status_tmp_path.to_str().unwrap()),
+        shell_quote(status_tmp_path.to_str().unwrap()),
         shell_quote(status_path.to_str().unwrap()),
     );
     let run = run_cli(&session.socket, &["pane", "run", pane_id, &command]);

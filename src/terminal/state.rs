@@ -324,6 +324,15 @@ impl TerminalState {
             .hook_authority
             .as_ref()
             .filter(|authority| self.hook_authority_is_effective(authority))?;
+        let report_only = authority.source.starts_with("custom:")
+            && self.detected_agent.is_none()
+            && self.managed_agent.is_none()
+            && !self.agent_process_acquisition_pending;
+        // Custom process-backed reports must be rebuilt by process detection;
+        // the handoff snapshot does not carry their process-liveness association.
+        if !self.live_full_lifecycle_hook_authority() && !report_only {
+            return None;
+        }
         Some(HandoffAgentState {
             authority: authority.clone(),
             sequence: self.hook_report_sequences.get(&authority.source).copied(),
@@ -6790,6 +6799,73 @@ mod tests {
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_agent_state_drops_custom_authority_backed_by_detected_process() {
+        let mut before = test_terminal();
+        before.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        before.set_hook_authority(
+            "custom:test".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(7),
+        );
+        assert_eq!(before.detected_agent, Some(Agent::Pi));
+        assert_eq!(before.effective_agent_label(), Some("pi"));
+        assert_eq!(before.state, AgentState::Working);
+        assert!(before.current_session_identity_for_persistence().is_none());
+        assert!(before.reported_resume().is_none());
+
+        let snapshot = before.handoff_agent_state();
+        // The agent exits after capture, leaving only the shell at import.
+        let mut after = test_terminal();
+        if let Some(snapshot) = snapshot.clone() {
+            after.restore_handoff_agent_state(snapshot);
+        }
+        after.set_detected_state(None, AgentState::Unknown);
+        assert!(after.effective_agent_label().is_none());
+        assert_eq!(after.state, AgentState::Unknown);
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_agent_state_drops_custom_authority_with_pending_process_acquisition() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_agent_process_at(Agent::Pi, Instant::now());
+        terminal.set_detected_state(None, AgentState::Unknown);
+        terminal.set_hook_authority(
+            "custom:test".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            Some(1),
+        );
+        assert!(terminal.detected_agent.is_none());
+        assert!(terminal.agent_process_acquisition_pending);
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert!(terminal.handoff_agent_state().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_agent_state_drops_custom_authority_with_managed_agent() {
+        let mut terminal = test_terminal();
+        terminal.restore_managed_agent("agent".into(), Agent::Pi);
+        terminal.set_hook_authority(
+            "custom:test".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(1),
+        );
+        assert!(terminal.detected_agent.is_none());
+        assert!(!terminal.agent_process_acquisition_pending);
+        assert_eq!(terminal.effective_agent_label(), Some("pi"));
+        assert!(terminal.handoff_agent_state().is_none());
     }
 
     #[test]
