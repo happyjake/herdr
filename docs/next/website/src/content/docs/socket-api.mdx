@@ -1150,13 +1150,16 @@ an older server without this capability.
 
 The CLI supplies `HERDR_PANE_ID` as the hidden `caller_pane_id` request field on
 `tab.create`, `pane.split`, `workspace.create`, and `worktree.create`. The server
-records it only when the local socket peer is positively verified inside that
-pane by its controlling terminal or process ancestry, and the pane currently
-runs an agent. The split target and destination workspace do not determine the
-starter. Missing, unverifiable, or outside callers still create the requested
-pane, with `started_by: null`. The TUI client-shell lane, plugin panes, WebSocket
-clients, remote-machine CLI calls, SSH forwards, and plain-shell callers create
-roots. Peer identity is server-owned and cannot be supplied in JSON.
+records it when the local socket peer is positively verified inside that pane by
+its controlling terminal or process ancestry; if the claimed pane does not match
+the peer, the server derives the caller pane from the peer's controlling
+terminal or process ancestry instead. In either case, the pane is recorded only
+when it currently runs an agent. The split target and destination workspace do
+not determine the starter. Missing, unverifiable, or outside callers still
+create the requested pane, with `started_by: null`. The TUI client-shell lane,
+plugin panes, WebSocket clients, remote-machine CLI calls, SSH forwards, and
+plain-shell callers create roots. Peer identity is server-owned and cannot be
+supplied in JSON.
 
 The link uses the public pane ID and is stored on the terminal. It is captured
 with the session and restored across cold restarts and live handoffs, including

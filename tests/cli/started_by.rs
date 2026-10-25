@@ -289,12 +289,89 @@ fn started_by_refuses_forged_environment_from_outside() {
 }
 
 #[test]
+fn started_by_derives_caller_pane_when_claimed_pane_is_stale() {
+    let session = Session::new();
+    let created = run_cli_json(&session.socket, &["tab", "create"]);
+    let caller = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(caller, session.starter);
+
+    let dir = session.base.join("stale-claim-agent");
+    fs::create_dir_all(&dir).unwrap();
+    let agent = InPaneReporter::write(&dir, "pi", &session.socket);
+    let script = dir.join("pi");
+    let body = fs::read_to_string(&script).unwrap();
+    let direct = "/bin/sh \"$inbox/$n.cmd\"";
+    assert!(body.contains(direct));
+    fs::write(
+        &script,
+        body.replace(
+            direct,
+            &format!(
+                "HERDR_PANE_ID=\"$(cat {})\" {direct}",
+                shell_quote(dir.join("claimed-pane").to_str().unwrap()),
+            ),
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("claimed-pane"), &session.starter).unwrap();
+    assert!(
+        run_cli(&session.socket, &["pane", "run", &caller, &agent.command()])
+            .status
+            .success()
+    );
+    agent.wait_until_started(Duration::from_secs(5));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || session.pane(&caller)["agent"] == "pi"
+    ));
+
+    let checkout = session.base.join("stale-claim-checkout");
+    for (key, args) in create_lanes(&caller, "w1", checkout.to_str().unwrap()) {
+        let response: Value = serde_json::from_str(&agent.ok(&args)).unwrap();
+        assert_eq!(
+            response["result"][key]["started_by"],
+            json!({"pane_id": caller}),
+            "{response}"
+        );
+    }
+
+    fs::write(dir.join("claimed-pane"), "w99:p9").unwrap();
+    let closed_claim: Value = serde_json::from_str(&agent.ok(&["tab", "create"])).unwrap();
+    assert_eq!(
+        closed_claim["result"]["root_pane"]["started_by"],
+        json!({"pane_id": caller}),
+        "{closed_claim}"
+    );
+}
+
+#[test]
 fn started_by_plain_shell_caller_has_no_starter() {
     let session = Session::new();
     session.create(&["tab", "create"], "root_pane");
     let plain = InPaneReporter::write(&session.base, "plain-shell", &session.socket);
+    let script = session.base.join("plain-shell");
+    let body = fs::read_to_string(&script).unwrap();
+    let direct = "/bin/sh \"$inbox/$n.cmd\"";
+    assert!(body.contains(direct));
+    let claimed_file = session.base.join("plain-claimed-pane");
+    fs::write(
+        &script,
+        body.replace(
+            direct,
+            &format!(
+                "HERDR_PANE_ID=\"$(cat {})\" {direct}",
+                shell_quote(claimed_file.to_str().unwrap()),
+            ),
+        ),
+    )
+    .unwrap();
     let created = run_cli_json(&session.socket, &["tab", "create"]);
     let caller = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    fs::write(&claimed_file, caller).unwrap();
     assert!(
         run_cli(&session.socket, &["pane", "run", caller, &plain.command()])
             .status
@@ -311,6 +388,16 @@ fn started_by_plain_shell_caller_has_no_starter() {
             "{response}"
         );
     }
+
+    // Even when the plain shell's environment claims a live agent pane, the
+    // derived caller pane is still a plain shell and records no starter.
+    fs::write(&claimed_file, &session.starter).unwrap();
+    let stale_response: Value = serde_json::from_str(&plain.ok(&["tab", "create"])).unwrap();
+    assert_eq!(
+        stale_response["result"]["root_pane"].get("started_by"),
+        Some(&Value::Null),
+        "{stale_response}"
+    );
 }
 
 #[test]
