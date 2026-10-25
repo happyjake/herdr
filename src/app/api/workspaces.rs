@@ -1174,4 +1174,189 @@ mod tests {
         assert_eq!(workspaces[0].workspace_id, moved_id);
         assert!(event_hub.events_after(0).is_empty());
     }
+
+    #[test]
+    fn api_workspace_rename_emits_workspace_updated_and_skips_noop() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.ensure_test_terminals();
+        let workspace_id = app.public_workspace_id(0);
+
+        let response = app.handle_workspace_rename(
+            "req_rename".into(),
+            WorkspaceRenameParams {
+                workspace_id: workspace_id.clone(),
+                label: "renamed".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorkspaceInfo { workspace } = success.result else {
+            panic!("expected workspace info");
+        };
+        assert_eq!(workspace.label, "renamed");
+
+        let events = event_hub.events_after(0);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0].1.data,
+            EventData::WorkspaceRenamed {
+                workspace_id: id,
+                label,
+            } if id == &workspace_id && label == "renamed"
+        ));
+        assert!(matches!(
+            &events[1].1.data,
+            EventData::WorkspaceUpdated { workspace }
+                if workspace.workspace_id == workspace_id && workspace.label == "renamed"
+        ));
+
+        let last_seq = events.last().unwrap().0;
+        let noop_response = app.handle_workspace_rename(
+            "req_noop".into(),
+            WorkspaceRenameParams {
+                workspace_id,
+                label: "renamed".into(),
+            },
+        );
+        let noop_success: SuccessResponse = serde_json::from_str(&noop_response).unwrap();
+        assert!(matches!(
+            noop_success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        assert!(event_hub.events_after(last_seq).is_empty());
+    }
+
+    #[test]
+    fn debounced_pane_cwd_updates_coalesce_burst_and_emit_workspace_updated_on_default_label_drift()
+    {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let mut ws = Workspace::test_new("alpha");
+        ws.custom_name = None;
+        ws.identity_cwd = PathBuf::from("/tmp/alpha");
+        ws.cached_identity_cwd = PathBuf::from("/tmp/alpha");
+        ws.cached_auto_label = "alpha".into();
+        let root_pane = ws.tabs[0].root_pane;
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0].tabs[0]
+            .terminal_id(root_pane)
+            .unwrap()
+            .clone();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = PathBuf::from("/tmp/alpha");
+        app.seed_emitted_pane_and_workspace_facts();
+
+        let workspace_id = app.public_workspace_id(0);
+        let public_pane_id = app.public_pane_id(0, root_pane).unwrap();
+
+        // Same cwd reports nothing.
+        app.handle_internal_event(crate::events::AppEvent::TerminalCwdReported {
+            pane_id: root_pane,
+            cwd: PathBuf::from("/tmp/alpha"),
+        });
+        assert!(app.pending_pane_cwd_updates.is_empty());
+        assert!(
+            !app.flush_due_pane_cwd_updates(
+                std::time::Instant::now() + crate::app::PANE_CWD_EVENT_DEBOUNCE
+            )
+        );
+        assert!(event_hub.events_after(0).is_empty());
+
+        // Burst of two cwd changes within the debounce window coalesces into one
+        // pane.updated and one workspace.updated for the final directory.
+        app.handle_internal_event(crate::events::AppEvent::TerminalCwdReported {
+            pane_id: root_pane,
+            cwd: PathBuf::from("/tmp/beta"),
+        });
+        app.handle_internal_event(crate::events::AppEvent::TerminalCwdReported {
+            pane_id: root_pane,
+            cwd: PathBuf::from("/tmp/gamma"),
+        });
+        assert!(event_hub.events_after(0).is_empty());
+
+        let due = app
+            .next_pane_cwd_update_deadline()
+            .expect("pending pane cwd update deadline");
+        assert!(app.flush_due_pane_cwd_updates(due));
+
+        let events = event_hub.events_after(0);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(
+            &events[0].1.data,
+            EventData::PaneUpdated { pane }
+                if pane.pane_id == public_pane_id && pane.cwd.as_deref() == Some("/tmp/gamma")
+        ));
+        assert!(matches!(
+            &events[1].1.data,
+            EventData::WorkspaceUpdated { workspace }
+                if workspace.workspace_id == workspace_id && workspace.label == "gamma"
+        ));
+    }
+
+    #[test]
+    fn git_status_refresh_emits_workspace_updated_when_auto_label_changes() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let mut ws = Workspace::test_new("subdir");
+        ws.custom_name = None;
+        ws.identity_cwd = PathBuf::from("/tmp/repo/subdir");
+        ws.cached_identity_cwd = PathBuf::from("/tmp/repo/subdir");
+        ws.cached_auto_label = "subdir".into();
+        let root_pane = ws.tabs[0].root_pane;
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0].tabs[0]
+            .terminal_id(root_pane)
+            .unwrap()
+            .clone();
+        app.state.terminals.get_mut(&terminal_id).unwrap().cwd = PathBuf::from("/tmp/repo/subdir");
+        app.seed_emitted_pane_and_workspace_facts();
+        let workspace_id = app.public_workspace_id(0);
+
+        app.handle_internal_event_with_render_impact(
+            crate::events::AppEvent::GitStatusRefreshed {
+                results: vec![crate::workspace::WorkspaceGitStatus {
+                    workspace_id: workspace_id.clone(),
+                    resolved_identity_cwd: PathBuf::from("/tmp/repo/subdir"),
+                    status_cache_key: PathBuf::from("/tmp/repo"),
+                    demand: crate::workspace::GitStatusRefreshDemand::ALL,
+                    auto_label: "repo".into(),
+                    branch: Some("main".into()),
+                    ahead_behind: None,
+                    space: None,
+                }],
+                cache_updates: Vec::new(),
+            },
+        );
+
+        let events = event_hub.events_after(0);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            &events[0].1.data,
+            EventData::WorkspaceUpdated { workspace }
+                if workspace.workspace_id == workspace_id && workspace.label == "repo"
+        ));
+    }
 }

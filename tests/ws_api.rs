@@ -411,6 +411,30 @@ impl WsClient {
         serde_json::from_str(&self.read_raw(timeout)).unwrap()
     }
 
+    fn try_read_json(&mut self, timeout: Duration) -> Option<serde_json::Value> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.websocket.read() {
+                Ok(Message::Text(text)) => {
+                    return Some(serde_json::from_str(text.as_str()).unwrap());
+                }
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                Ok(other) => panic!("unexpected websocket message: {other:?}"),
+                Err(tungstenite::Error::Io(err))
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                }
+                Err(err) => panic!("failed to read websocket message: {err}"),
+            }
+        }
+    }
+
     fn request(&mut self, json: &str) -> serde_json::Value {
         self.send(json);
         self.read_json(Duration::from_secs(5))
@@ -3354,6 +3378,206 @@ fn revoke_all_leaves_every_logged_out_browser_able_to_learn_it() {
             "credential_revoked",
             "browser {index} of {} could not learn it was logged out: {refused}",
             tokens.len()
+        );
+    }
+
+    cleanup_spawned_herdr(server.child, server.base);
+}
+
+#[test]
+fn subscribed_client_receives_coalesced_pane_cwd_and_workspace_label_updates_with_replay() {
+    let _lock = test_lock();
+    let server = start_ws_test_server();
+
+    let dir_init = server.base.join("dir_init");
+    let dir_burst_1 = server.base.join("dir_burst_1");
+    let dir_burst_2 = server.base.join("dir_burst_2");
+    let dir_nested = server.base.join("dir_nested");
+    let dir_fg_only = server.base.join("dir_fg_only");
+    for dir in [
+        &dir_init,
+        &dir_burst_1,
+        &dir_burst_2,
+        &dir_nested,
+        &dir_fg_only,
+    ] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let dir_init = fs::canonicalize(&dir_init).unwrap();
+    let dir_burst_1 = fs::canonicalize(&dir_burst_1).unwrap();
+    let dir_burst_2 = fs::canonicalize(&dir_burst_2).unwrap();
+    let dir_nested = fs::canonicalize(&dir_nested).unwrap();
+    let dir_fg_only = fs::canonicalize(&dir_fg_only).unwrap();
+
+    let mut control = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let created = control.request(&format!(
+        r#"{{"id":"req_create_ws","method":"workspace.create","params":{{"cwd":{}}}}}"#,
+        serde_json::to_string(&dir_init.display().to_string()).unwrap()
+    ));
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(created["result"]["workspace"]["label"], "dir_init");
+
+    // Wait for initial shell prompt to settle before subscribing.
+    let settle_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = control.request(&format!(
+            r#"{{"id":"req_prompt_probe","method":"pane.send_input","params":{{"pane_id":"{pane_id}","text":"echo SHELL_READY\n"}}}}"#
+        ));
+        let read = control.request(&format!(
+            r#"{{"id":"req_read_probe","method":"pane.read","params":{{"pane_id":"{pane_id}","source":"recent"}}}}"#
+        ));
+        if read["result"]["read"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("SHELL_READY"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < settle_deadline,
+            "shell did not become ready"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut sub = WsClient::connect(server.ws_addr, TEST_TOKEN);
+    let sub_ack = sub.request(
+        r#"{"id":"req_sub","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.updated"},{"type":"workspace.updated"}]}}"#,
+    );
+    assert_eq!(sub_ack["result"]["type"], "subscription_started", "{sub_ack}");
+
+    // 1. No-op `cd .` and foreground-only non-shell cwd churn must not emit.
+    let _ = control.request(&format!(
+        r#"{{"id":"req_noop_cd","method":"pane.send_input","params":{{"pane_id":"{pane_id}","text":"cd . && env -C {} /bin/sleep 0.2 && echo NOOP_DONE\n"}}}}"#,
+        dir_fg_only.display()
+    ));
+    let noop_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let read = control.request(&format!(
+            r#"{{"id":"req_read_noop","method":"pane.read","params":{{"pane_id":"{pane_id}","source":"recent"}}}}"#
+        ));
+        if read["result"]["read"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("NOOP_DONE"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < noop_deadline,
+            "noop command did not finish"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    while let Some(ev) = sub.try_read_json(Duration::from_millis(300)) {
+        let matches_target = ev["data"]["pane"]["pane_id"].as_str() == Some(pane_id.as_str())
+            || ev["data"]["workspace"]["workspace_id"].as_str() == Some(workspace_id.as_str());
+        assert!(
+            !matches_target,
+            "unexpected update event on noop/foreground-only churn: {ev}"
+        );
+    }
+
+    // 2. A rapid `cd` burst coalesces into a single pane_updated for the final cwd
+    //    and emits workspace_updated for the default cwd-following workspace label.
+    let _ = control.request(&format!(
+        r#"{{"id":"req_cd_burst","method":"pane.send_input","params":{{"pane_id":"{pane_id}","text":"cd {} && cd {}\n"}}}}"#,
+        dir_burst_1.display(),
+        dir_burst_2.display()
+    ));
+
+    let mut saw_pane_burst_2 = false;
+    let mut saw_ws_burst_2 = false;
+    let burst_deadline = Instant::now() + Duration::from_secs(5);
+    while !(saw_pane_burst_2 && saw_ws_burst_2) {
+        assert!(
+            Instant::now() < burst_deadline,
+            "timed out waiting for burst pane_updated and workspace_updated"
+        );
+        let ev = sub.read_json(Duration::from_secs(5));
+        if ev["event"] == "pane_updated"
+            && ev["data"]["pane"]["pane_id"].as_str() == Some(pane_id.as_str())
+        {
+            assert_eq!(
+                ev["data"]["pane"]["cwd"].as_str(),
+                Some(dir_burst_2.to_str().unwrap()),
+                "intermediate burst cwd should be coalesced: {ev}"
+            );
+            saw_pane_burst_2 = true;
+        } else if ev["event"] == "workspace_updated"
+            && ev["data"]["workspace"]["workspace_id"].as_str() == Some(workspace_id.as_str())
+        {
+            assert_eq!(
+                ev["data"]["workspace"]["label"].as_str(),
+                Some("dir_burst_2"),
+                "workspace label should follow final burst cwd: {ev}"
+            );
+            saw_ws_burst_2 = true;
+        }
+    }
+
+    // 3. A `cd` inside a nested shell is sampled via pane_shell_cwd and emits both
+    //    pane_updated and workspace_updated.
+    let _ = control.request(&format!(
+        r#"{{"id":"req_nested_sh","method":"pane.send_input","params":{{"pane_id":"{pane_id}","text":"/bin/sh\n"}}}}"#
+    ));
+    thread::sleep(Duration::from_millis(150));
+    let _ = control.request(&format!(
+        r#"{{"id":"req_nested_cd","method":"pane.send_input","params":{{"pane_id":"{pane_id}","text":"cd {}\n"}}}}"#,
+        dir_nested.display()
+    ));
+
+    let nested_pane_ev = wait_for_event_matching(
+        &mut |timeout| sub.read_json(timeout),
+        "pane_updated",
+        Duration::from_secs(5),
+        |ev| {
+            ev["data"]["pane"]["pane_id"].as_str() == Some(pane_id.as_str())
+                && ev["data"]["pane"]["cwd"].as_str() == Some(dir_nested.to_str().unwrap())
+        },
+    );
+    assert!(nested_pane_ev["data"]["pane"]["foreground_cwd"].is_string());
+
+    let _nested_ws_ev = wait_for_event_matching(
+        &mut |timeout| sub.read_json(timeout),
+        "workspace_updated",
+        Duration::from_secs(5),
+        |ev| {
+            ev["data"]["workspace"]["workspace_id"].as_str() == Some(workspace_id.as_str())
+                && ev["data"]["workspace"]["label"].as_str() == Some("dir_nested")
+        },
+    );
+
+    // 4. Explicit workspace.rename emits workspace_updated; renaming to the same
+    //    label emits nothing.
+    let renamed = control.request(&format!(
+        r#"{{"id":"req_rename_ws","method":"workspace.rename","params":{{"workspace_id":"{workspace_id}","label":"custom_space"}}}}"#
+    ));
+    assert_eq!(renamed["result"]["workspace"]["label"], "custom_space");
+
+    let _rename_ev = wait_for_event_matching(
+        &mut |timeout| sub.read_json(timeout),
+        "workspace_updated",
+        Duration::from_secs(5),
+        |ev| {
+            ev["data"]["workspace"]["workspace_id"].as_str() == Some(workspace_id.as_str())
+                && ev["data"]["workspace"]["label"].as_str() == Some("custom_space")
+        },
+    );
+
+    let _ = control.request(&format!(
+        r#"{{"id":"req_rename_ws_noop","method":"workspace.rename","params":{{"workspace_id":"{workspace_id}","label":"custom_space"}}}}"#
+    ));
+    while let Some(ev) = sub.try_read_json(Duration::from_millis(250)) {
+        assert_ne!(
+            ev["data"]["workspace"]["workspace_id"].as_str(),
+            Some(workspace_id.as_str()),
+            "noop rename should not emit workspace_updated: {ev}"
         );
     }
 
