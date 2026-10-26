@@ -55,15 +55,11 @@ struct CodexFile {
 }
 
 fn read_settings(home: Option<&Path>, env: impl Fn(&str) -> Option<OsString>) -> ResponseResult {
-    let pi_dir = config_dir(home, env("PI_CODING_AGENT_DIR"), ".pi/agent").and_then(|path| {
-        match path.strip_prefix("~") {
-            Ok(rest) => home.map(|home| home.join(rest)),
-            Err(_) => Some(path),
-        }
-    });
+    let pi_dir = pi_config_dir(home, env("PI_CODING_AGENT_DIR"));
     let claude_dir = config_dir(home, env("CLAUDE_CONFIG_DIR"), ".claude");
     let codex_dir = config_dir(home, env("CODEX_HOME"), ".codex");
-    let pi = read_json::<PiFile>(pi_dir.map(|dir| dir.join("settings.json")).as_deref());
+    let pi = pi_dir
+        .and_then(|dir| read_json::<PiFile>(dir.map(|dir| dir.join("settings.json")).as_deref()));
     let (pi, models) = match pi {
         Ok(file) => {
             let model = match (file.default_provider, file.default_model) {
@@ -103,6 +99,67 @@ fn read_settings(home: Option<&Path>, env: impl Fn(&str) -> Option<OsString>) ->
         claude: settings(claude),
         codex: settings(codex),
     }
+}
+
+fn pi_config_dir(
+    home: Option<&Path>,
+    override_dir: Option<OsString>,
+) -> Result<Option<PathBuf>, AgentSettingsReason> {
+    let Some(path) = config_dir(home, override_dir, ".pi/agent") else {
+        return Ok(None);
+    };
+    // Pi calls normalizePath with its default options: shell-drive syntax on
+    // Windows, tilde expansion, then lowercase file:// URLs. No trimming or @ removal.
+    let path = crate::platform::normalize_pi_settings_shell_path(&path);
+    if let Ok(rest) = path.strip_prefix("~") {
+        return Ok(home.map(|home| {
+            // Node's path.join normalizes dot segments before filesystem access.
+            let mut result = PathBuf::new();
+            for component in home.join(rest).components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        result.pop();
+                    }
+                    _ => result.push(component.as_os_str()),
+                }
+            }
+            result
+        }));
+    }
+    let Some(input) = path.to_str().filter(|input| input.starts_with("file://")) else {
+        return Ok(Some(path));
+    };
+    let url = url::Url::parse(input).map_err(|_| AgentSettingsReason::Unreadable)?;
+    let bytes = url.path().as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'%' {
+            let hex = |offset| {
+                bytes
+                    .get(offset)
+                    .and_then(|byte| char::from(*byte).to_digit(16))
+            };
+            let high = hex(index + 1).ok_or(AgentSettingsReason::Unreadable)?;
+            let low = hex(index + 2).ok_or(AgentSettingsReason::Unreadable)?;
+            let byte = (high * 16 + low) as u8;
+            // Node's fileURLToPath rejects encoded separators before decoding.
+            if byte == b'/' || byte == std::path::MAIN_SEPARATOR as u8 {
+                return Err(AgentSettingsReason::Unreadable);
+            }
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).map_err(|_| AgentSettingsReason::Unreadable)?;
+    crate::platform::pi_settings_file_url_path(url.host_str(), decoded)
+        .map(Some)
+        .ok_or(AgentSettingsReason::Unreadable)
 }
 
 fn config_dir(
@@ -321,6 +378,113 @@ mod tests {
             serde_json::to_value(read_settings(Some(&fixture.home), |_| Some("".into()))).unwrap();
         for agent in ["pi", "claude", "codex"] {
             assert_eq!(empty_overrides[agent]["default"]["model"], "ignored");
+        }
+    }
+
+    #[test]
+    fn agent_settings_reads_pi_file_url_overrides_with_percent_encoding() {
+        let fixture = Fixture::new();
+        fixture.write(".pi/agent/settings.json", r#"{"defaultModel":"ignored"}"#);
+        for directory in ["pi-config", "pi config", "pi%config"] {
+            fixture.write(
+                &format!("{directory}/settings.json"),
+                r#"{"defaultModel":"chosen"}"#,
+            );
+            let path = fixture
+                .home
+                .join(directory)
+                .to_str()
+                .unwrap()
+                .replace('\\', "/");
+            let path = path.replace('%', "%25").replace(' ', "%20");
+            let slash = if path.starts_with('/') { "" } else { "/" };
+            for authority in ["", "localhost", "LOCALHOST"] {
+                let url = format!("file://{authority}{slash}{path}");
+                for url in [url.clone(), format!("{url}?ignored#fragment")] {
+                    let result = serde_json::to_value(read_settings(Some(&fixture.home), |key| {
+                        (key == "PI_CODING_AGENT_DIR").then(|| url.clone().into())
+                    }))
+                    .unwrap();
+                    assert_eq!(
+                        result["pi"],
+                        serde_json::json!({
+                            "default":{"model":"chosen", "effort":null}, "reason":null, "models":[]
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_settings_matches_pi_directory_normalization_forms() {
+        let fixture = Fixture::new();
+        fixture.write("settings.json", r#"{"defaultModel":"chosen"}"#);
+        fixture.write("pi-config/settings.json", r#"{"defaultModel":"chosen"}"#);
+        let path = fixture.home.to_str().unwrap().replace('\\', "/");
+        let slash = if path.starts_with('/') { "" } else { "/" };
+        let url = format!("file://{slash}{path}/missing/%2e%2e/pi-config");
+        let read = |directory: &str| {
+            serde_json::to_value(read_settings(Some(&fixture.home), |key| {
+                (key == "PI_CODING_AGENT_DIR").then(|| directory.into())
+            }))
+            .unwrap()
+        };
+        let mut directories = vec![
+            "~".to_string(),
+            "~//pi-config".into(),
+            "~/missing/../pi-config".into(),
+            url.clone(),
+        ];
+        if cfg!(windows) {
+            let drive = &path[..1];
+            let rest = &path[2..];
+            for prefix in ["", "mnt/", "cygdrive/", "MNT/", "CYGDRIVE/"] {
+                directories.push(format!("/{prefix}{drive}{rest}/pi-config"));
+            }
+        }
+        for directory in directories {
+            assert_eq!(read(&directory)["pi"]["default"]["model"], "chosen");
+        }
+        for directory in [
+            url.replacen("file://", "FILE://", 1),
+            url.replacen("file://", "file:", 1),
+            format!(" {url}"),
+            format!("@{url}"),
+            "~user/pi-config".into(),
+        ] {
+            assert_eq!(read(&directory)["pi"]["reason"], "no_settings");
+        }
+    }
+
+    #[test]
+    fn agent_settings_rejects_invalid_pi_file_urls_without_losing_other_agents() {
+        let fixture = Fixture::new();
+        fixture.write(".claude/settings.json", r#"{"model":"kept"}"#);
+        fixture.write(".codex/config.toml", "model = 'kept'\n");
+        for directory in [
+            "file:///config%2fprivate",
+            "file:///config%2Fprivate",
+            "file:///config%",
+            "file:///config%zz",
+            "file:///config%FF",
+            "file:///config%C0%AF",
+            "file://user:secret@localhost/config",
+            "file://localhost:80/config",
+        ] {
+            let result = serde_json::to_value(read_settings(Some(&fixture.home), |key| {
+                (key == "PI_CODING_AGENT_DIR").then(|| directory.into())
+            }))
+            .unwrap();
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "type":"server_agent_settings",
+                    "pi":{"default":null, "reason":"unreadable", "models":[]},
+                    "claude":{"default":{"model":"kept", "effort":null}, "reason":null},
+                    "codex":{"default":{"model":"kept", "effort":null}, "reason":null}
+                })
+            );
         }
     }
 

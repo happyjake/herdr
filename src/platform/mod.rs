@@ -320,6 +320,20 @@ pub(crate) fn normalize_cwd_for_launch(path: &std::path::Path) -> std::path::Pat
 }
 
 #[cfg(not(windows))]
+pub(crate) fn normalize_pi_settings_shell_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn pi_settings_file_url_path(
+    host: Option<&str>,
+    path: String,
+) -> Option<std::path::PathBuf> {
+    // The WHATWG parser has already normalized localhost to an empty host.
+    host.is_none().then(|| std::path::PathBuf::from(path))
+}
+
+#[cfg(not(windows))]
 fn normalize_cwd_for_launch_platform(path: &std::path::Path) -> std::path::PathBuf {
     path.to_path_buf()
 }

@@ -658,6 +658,55 @@ pub(crate) fn prepare_paste_text_for_pty_platform(text: String) -> String {
     text.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
+pub(crate) fn normalize_pi_settings_shell_path(path: &std::path::Path) -> PathBuf {
+    let Some(input) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if !input.starts_with('/') || input.starts_with("//") || input.contains('\\') {
+        return path.to_path_buf();
+    }
+    let lower = input.to_ascii_lowercase();
+    let offset = if lower.starts_with("/mnt/") {
+        5
+    } else if lower.starts_with("/cygdrive/") {
+        10
+    } else {
+        1
+    };
+    let rest = &input[offset..];
+    let Some(drive) = rest
+        .as_bytes()
+        .first()
+        .filter(|drive| drive.is_ascii_alphabetic())
+    else {
+        return path.to_path_buf();
+    };
+    if rest.len() > 1 && !rest[1..].starts_with('/')
+        || rest.contains(['\n', '\r', '\u{2028}', '\u{2029}'])
+    {
+        return path.to_path_buf();
+    }
+    let suffix = rest.get(2..).unwrap_or_default().replace('/', "\\");
+    PathBuf::from(format!(
+        "{}:\\{suffix}",
+        char::from(*drive).to_ascii_uppercase()
+    ))
+}
+
+pub(crate) fn pi_settings_file_url_path(host: Option<&str>, path: String) -> Option<PathBuf> {
+    let path = path.replace('/', "\\");
+    if let Some(host) = host {
+        let unicode = url::quirks::domain_to_unicode(host);
+        let host = if unicode.is_empty() { host } else { &unicode };
+        return Some(PathBuf::from(format!("\\\\{host}{path}")));
+    }
+    let bytes = path.as_bytes();
+    if !bytes.get(1)?.is_ascii_alphabetic() || bytes.get(2) != Some(&b':') {
+        return None;
+    }
+    Some(PathBuf::from(&path[1..]))
+}
+
 pub(crate) fn normalize_cwd_for_launch_platform(path: &std::path::Path) -> PathBuf {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::{Component, Prefix};
