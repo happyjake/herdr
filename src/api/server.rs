@@ -969,6 +969,7 @@ fn handle_request(
         Method::ServerSearchSessions(params) => {
             crate::api::search_sessions::handle_search(request.id, &params, api_tx)
         }
+        Method::ServerAgentSettings(_) => crate::api::agent_settings::handle_settings(request.id),
         // A trail opens a session record, walks it and parses it. Served
         // here for the same reason, with the app asked only for the pane's
         // own identity and the session it reports.
@@ -1960,6 +1961,7 @@ mod tests {
                 agent_report_cancelled: false,
                 agent_prompt_expectations: false,
                 turn_index: false,
+                agent_settings: false,
             }),
             None,
             None,

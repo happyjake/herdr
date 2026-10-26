@@ -649,6 +649,155 @@ fn test_ws_idle_close_after() -> Duration {
 }
 
 #[test]
+fn agent_settings_websocket_reads_fixture_home_without_leaking_secrets_to_tracing() {
+    let _lock = test_lock();
+    let base = std::env::temp_dir().join(format!("has-{}", std::process::id()));
+    let home = base.join("home");
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("api.sock");
+    let pi_dir = home.join("pi-config");
+    let claude_dir = home.join(".claude");
+    let codex_dir = home.join("codex-config");
+    for dir in [&pi_dir, &claude_dir, &codex_dir] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(
+        pi_dir.join("settings.json"),
+        r#"{
+        "defaultProvider":"provider", "defaultModel":"model", "defaultThinkingLevel":"xhigh",
+        "enabledModels":["provider/second", "provider/first"],
+        "apiKey":"pi-private-token", "env":{"TOKEN":"pi-env-token"}
+    }"#,
+    )
+    .unwrap();
+    fs::write(
+        claude_dir.join("settings.json"),
+        r#"{
+        "model":"sonnet", "effortLevel":"high", "env":{"TOKEN":"claude-private-token"}
+    }"#,
+    )
+    .unwrap();
+    fs::write(
+        codex_dir.join("config.toml"),
+        "model = 'model'\nmodel_reasoning_effort = 'high'\n[env]\nTOKEN = 'codex-private-token'\n",
+    )
+    .unwrap();
+    let port = pick_free_port();
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut child = spawn_herdr_with_config_and_env(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        &websocket_section(port),
+        &[
+            ("HOME", home.to_str().unwrap()),
+            ("PI_CODING_AGENT_DIR", "~/pi-config"),
+            ("CLAUDE_CONFIG_DIR", claude_dir.to_str().unwrap()),
+            ("CODEX_HOME", codex_dir.to_str().unwrap()),
+            ("HERDR_LOG", "herdr=trace"),
+        ],
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(10));
+    wait_for_ws_listener(addr, Duration::from_secs(10));
+    let mut ws = WsClient::connect(addr, TEST_TOKEN);
+    let pong = ws.request(r#"{"id":"settings_ping","method":"ping","params":{}}"#);
+    assert_eq!(pong["result"]["capabilities"]["agent_settings"], true);
+    let request = r#"{"id":"settings_present","method":"server.agent_settings","params":{}}"#;
+    let response = ws.request(request);
+    assert_eq!(
+        response,
+        serde_json::json!({"id":"settings_present", "result":{
+            "type":"server_agent_settings",
+            "pi":{"default":{"model":"provider/model", "effort":"xhigh"}, "reason":null, "models":["provider/second", "provider/first"]},
+            "claude":{"default":{"model":"sonnet", "effort":"high"}, "reason":null},
+            "codex":{"default":{"model":"model", "effort":"high"}, "reason":null}
+        }})
+    );
+    assert_eq!(unix_request(&socket_path, request), response);
+
+    // Read again after changes, including parser errors whose diagnostics
+    // would contain planted secrets if they escaped into logs or responses.
+    for (agent, path, malformed) in [
+        (
+            "pi",
+            pi_dir.join("settings.json"),
+            r#"{"apiKey":"pi-malformed-secret""#,
+        ),
+        (
+            "claude",
+            claude_dir.join("settings.json"),
+            r#"{"env":{"TOKEN":"claude-malformed-secret"}"#,
+        ),
+        (
+            "codex",
+            codex_dir.join("config.toml"),
+            "token = ['codex-malformed-secret'",
+        ),
+    ] {
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, malformed).unwrap();
+        let request = serde_json::json!({"id":format!("settings_bad_{agent}"), "method":"server.agent_settings", "params":{}});
+        let bad = ws.request(&request.to_string());
+        let mut expected = response["result"].clone();
+        expected[agent]["default"] = serde_json::Value::Null;
+        expected[agent]["reason"] = "unreadable".into();
+        if agent == "pi" {
+            expected[agent]["models"] = serde_json::json!([]);
+        }
+        assert_eq!(
+            bad,
+            serde_json::json!({"id":format!("settings_bad_{agent}"), "result":expected})
+        );
+        fs::remove_file(&path).unwrap();
+        let missing = ws.request(&request.to_string());
+        expected[agent]["reason"] = "no_settings".into();
+        assert_eq!(missing["result"], expected);
+        fs::write(path, original).unwrap();
+    }
+    let final_request = r#"{"id":"settings_final","method":"server.agent_settings","params":{}}"#;
+    assert_eq!(ws.request(final_request)["result"], response["result"]);
+    let log_path = server_log_path(&config_home);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let log = loop {
+        let log = fs::read_to_string(&log_path).unwrap();
+        if log
+            .lines()
+            .any(|line| line.contains("api.request.complete") && line.contains("settings_final"))
+        {
+            break log;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "API completion tracing must be active"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(log
+        .lines()
+        .any(|line| line.contains("api.request.start") && line.contains("server.agent_settings")));
+    for secret in [
+        "apiKey",
+        "TOKEN",
+        "pi-private-token",
+        "pi-env-token",
+        "claude-private-token",
+        "codex-private-token",
+        "pi-malformed-secret",
+        "claude-malformed-secret",
+        "codex-malformed-secret",
+    ] {
+        assert!(
+            !log.contains(secret),
+            "settings secret appeared in API tracing"
+        );
+    }
+    drop(ws);
+    support::stop_spawned_herdr(child.child.as_mut());
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
 fn ping_response_is_identical_over_unix_socket_and_websocket() {
     let _lock = test_lock();
     let server = start_named_session_ws_test_server(TEST_SESSION_NAME);

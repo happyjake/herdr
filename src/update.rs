@@ -3062,6 +3062,7 @@ mod tests {
                 agent_report_cancelled: false,
                 agent_prompt_expectations: false,
                 turn_index: false,
+                agent_settings: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3144,6 +3145,7 @@ mod tests {
                     agent_report_cancelled: false,
                     agent_prompt_expectations: false,
                     turn_index: false,
+                    agent_settings: false,
                 }),
             },
         };
@@ -3410,6 +3412,7 @@ mod tests {
                     agent_report_cancelled: false,
                     agent_prompt_expectations: false,
                     turn_index: false,
+                    agent_settings: false,
                 }),
             },
         };

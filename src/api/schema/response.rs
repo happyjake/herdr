@@ -18,7 +18,7 @@ use super::plugins::{
     PluginPaneInfo,
 };
 use super::search_sessions::SessionHit;
-use super::server::{PlaceInfo, ServerCapabilities};
+use super::server::{AgentSettings, PiAgentSettings, PlaceInfo, ServerCapabilities};
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
@@ -92,6 +92,11 @@ pub enum ResponseResult {
         /// Ranked directories that exist, best first, at most the request's
         /// `limit`. Empty when nothing in this server's memory matched.
         places: Vec<PlaceInfo>,
+    },
+    ServerAgentSettings {
+        pi: PiAgentSettings,
+        claude: AgentSettings,
+        codex: AgentSettings,
     },
     ServerSearchSessions {
         sessions: Vec<SessionHit>,

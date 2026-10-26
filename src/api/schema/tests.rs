@@ -1595,6 +1595,7 @@ fn success_response_round_trips() {
                 agent_report_cancelled: false,
                 agent_prompt_expectations: true,
                 turn_index: true,
+                agent_settings: true,
             }),
             name: Some("test-server".into()),
             reach: Some("test-server".into()),
@@ -2415,4 +2416,64 @@ fn turn_index_capability_is_advertised_and_defaults_to_absent() {
     assert!(crate::api::server_capabilities().turn_index);
     let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
     assert!(!old.turn_index);
+}
+
+#[test]
+fn agent_settings_request_and_response_round_trip() {
+    let request = serde_json::json!({"id":"req", "method":"server.agent_settings", "params":{}});
+    let decoded: Request = serde_json::from_value(request.clone()).unwrap();
+    assert!(matches!(decoded.method, Method::ServerAgentSettings(_)));
+    assert!(!crate::api::request_changes_ui(&decoded));
+    assert!(!crate::server::client_commands::supports_client_shell_method(&decoded.method));
+    assert!(
+        !crate::server::client_commands::supports_client_shell_method_name("server.agent_settings")
+    );
+    assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+    for reason in ["no_settings", "unreadable"] {
+        let response = serde_json::json!({"id":"req", "result": {
+            "type":"server_agent_settings",
+            "pi":{"default":{"model":"provider/model", "effort":"high"}, "reason":null, "models":["provider/second", "provider/first"]},
+            "claude":{"default":{"model":null, "effort":null}, "reason":null},
+            "codex":{"default":null, "reason":reason}
+        }});
+        let decoded: SuccessResponse = serde_json::from_value(response.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), response);
+    }
+}
+
+#[test]
+fn agent_settings_capability_is_advertised_and_defaults_to_absent() {
+    let current = serde_json::to_value(crate::api::server_capabilities()).unwrap();
+    assert_eq!(current["agent_settings"], true);
+    let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+    assert_eq!(serde_json::to_value(old).unwrap()["agent_settings"], false);
+}
+
+#[test]
+fn agent_settings_schema_requires_nullable_keys() {
+    let schema = protocol_schema_document();
+    let definitions = &schema["schemas"]["success_response"]["$defs"];
+    for (name, keys) in [
+        ("AgentDefault", ["model", "effort"]),
+        ("AgentSettings", ["default", "reason"]),
+        ("PiAgentSettings", ["default", "reason"]),
+    ] {
+        for key in keys {
+            let definition = &definitions[name];
+            assert!(
+                definition["required"]
+                    .as_array()
+                    .is_some_and(|keys| keys.contains(&serde_json::json!(key))),
+                "schema made {name}.{key} optional"
+            );
+            let property = &definition["properties"][key];
+            let nullable = property["type"]
+                .as_array()
+                .is_some_and(|types| types.contains(&serde_json::json!("null")))
+                || property["anyOf"]
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|entry| entry["type"] == "null"));
+            assert!(nullable, "schema forbids null for {name}.{key}");
+        }
+    }
 }

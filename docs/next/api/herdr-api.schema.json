@@ -7242,6 +7242,22 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "server.agent_settings",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -7588,6 +7604,28 @@
     },
     "success_response": {
       "$defs": {
+        "AgentDefault": {
+          "description": "User-level defaults only; absent fields remain explicit nulls.",
+          "properties": {
+            "effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "model",
+            "effort"
+          ],
+          "type": "object"
+        },
         "AgentInfo": {
           "properties": {
             "agent": {
@@ -7818,6 +7856,43 @@
           "enum": [
             "id",
             "path"
+          ],
+          "type": "string"
+        },
+        "AgentSettings": {
+          "description": "Exactly one of `default` and `reason` is non-null.",
+          "properties": {
+            "default": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentDefault"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentSettingsReason"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "default",
+            "reason"
+          ],
+          "type": "object"
+        },
+        "AgentSettingsReason": {
+          "enum": [
+            "no_settings",
+            "unreadable"
           ],
           "type": "string"
         },
@@ -10018,6 +10093,44 @@
           ],
           "type": "object"
         },
+        "PiAgentSettings": {
+          "description": "Exactly one of `default` and `reason` is non-null.",
+          "properties": {
+            "default": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentDefault"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "models": {
+              "description": "Enabled models in file order; empty when unset or unreadable.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentSettingsReason"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "default",
+            "reason",
+            "models"
+          ],
+          "type": "object"
+        },
         "PlaceInfo": {
           "properties": {
             "path": {
@@ -10844,6 +10957,30 @@
               "required": [
                 "type",
                 "places"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "claude": {
+                  "$ref": "#/schemas/success_response/$defs/AgentSettings"
+                },
+                "codex": {
+                  "$ref": "#/schemas/success_response/$defs/AgentSettings"
+                },
+                "pi": {
+                  "$ref": "#/schemas/success_response/$defs/PiAgentSettings"
+                },
+                "type": {
+                  "const": "server_agent_settings",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pi",
+                "claude",
+                "codex"
               ],
               "type": "object"
             },
@@ -12338,6 +12475,11 @@
             "agent_report_cancelled": {
               "default": false,
               "description": "Whether `pane.report_agent` honors `cancelled`: an idle report for a\nrun the user cancelled, which settles without a completion. Additive:\nabsent (false) in pongs of servers that predate it, which ignore the\nfield and read the report as a finished run, so an integration sends\n`cancelled` only to a server that declares this.",
+              "type": "boolean"
+            },
+            "agent_settings": {
+              "default": false,
+              "description": "Supports `server.agent_settings` for user-level agent defaults.",
               "type": "boolean"
             },
             "credential_registry": {

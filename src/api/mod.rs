@@ -1,4 +1,5 @@
 mod advertised_endpoint;
+mod agent_settings;
 mod attachment;
 pub mod client;
 pub(crate) mod credentials;
@@ -65,6 +66,7 @@ pub fn server_capabilities() -> crate::api::schema::ServerCapabilities {
         agent_report_cancelled: true,
         agent_prompt_expectations: true,
         turn_index: true,
+        agent_settings: true,
     }
 }
 
@@ -135,6 +137,7 @@ mod tests {
         assert!(capabilities.agent_report_cancelled);
         assert!(capabilities.agent_prompt_expectations);
         assert!(capabilities.turn_index);
+        assert!(capabilities.agent_settings);
     }
 
     const PANE_SHELL: u32 = 500;

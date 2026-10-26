@@ -432,6 +432,7 @@ mod tests {
                 agent_report_cancelled: false,
                 agent_prompt_expectations: false,
                 turn_index: false,
+                agent_settings: false,
             }),
         }
     }

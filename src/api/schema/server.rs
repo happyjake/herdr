@@ -107,6 +107,56 @@ pub struct PlaceInfo {
     pub source: PlaceSource,
 }
 
+/// User-level defaults only; absent fields remain explicit nulls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentDefault {
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(schema_with = "nullable_schema::<String>")]
+    pub model: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(schema_with = "nullable_schema::<String>")]
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSettingsReason {
+    NoSettings,
+    Unreadable,
+}
+
+/// Exactly one of `default` and `reason` is non-null.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentSettings {
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(schema_with = "nullable_schema::<AgentDefault>")]
+    pub default: Option<AgentDefault>,
+    #[serde(deserialize_with = "required_nullable")]
+    #[schemars(schema_with = "nullable_schema::<AgentSettingsReason>")]
+    pub reason: Option<AgentSettingsReason>,
+}
+
+// Keep null in the schema without Option's implicit key optionality.
+fn nullable_schema<T: schemars::JsonSchema>(
+    generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    <Option<T> as schemars::JsonSchema>::json_schema(generator)
+}
+
+fn required_nullable<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    Option::<T>::deserialize(deserializer)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PiAgentSettings {
+    #[serde(flatten)]
+    pub settings: AgentSettings,
+    /// Enabled models in file order; empty when unset or unreadable.
+    pub models: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AttachmentCreateParams {
     /// Attachment bytes encoded as standard base64 (RFC 4648, padding
@@ -227,4 +277,7 @@ pub struct ServerCapabilities {
     /// Supports `pane.turn_index` for pi session records.
     #[serde(default)]
     pub turn_index: bool,
+    /// Supports `server.agent_settings` for user-level agent defaults.
+    #[serde(default)]
+    pub agent_settings: bool,
 }
