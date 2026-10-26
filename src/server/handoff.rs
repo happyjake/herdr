@@ -46,7 +46,7 @@ pub(crate) const MAX_MANIFEST_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const COMMIT_TIMEOUT: Duration = READY_TIMEOUT;
 
 /// Manifest extension advertising that the exporter can carry each pane's
-/// replay as a per-pane frame after the descriptor transfer instead of
+/// replay as a per-pane frame before the descriptor transfer instead of
 /// inline under the legacy budgets. The manifest keeps its legacy shape —
 /// version, inline replay, and all — so an importer that predates frames
 /// ignores the unknown field, answers with a plain `validated`, and gets a
@@ -67,6 +67,10 @@ const VALIDATED_REPLAY_FRAMES: &str = "validated replay-frames";
 /// computes is clamped to this value, so a legitimate frame never exceeds it.
 #[cfg(unix)]
 pub(crate) const MAX_REPLAY_FRAME_BYTES: usize = 64 * 1024 * 1024;
+/// Aggregate payload/storage ceiling while both servers and their terminals
+/// are alive. Enforced independently of the per-frame wire sanity limit.
+#[cfg(unix)]
+pub(crate) const MAX_REPLAY_FRAMES_TOTAL: usize = 32 * 1024 * 1024;
 /// Replay frame wire format: magic, pane index (its position in
 /// `manifest.panes`), payload length, payload. The index lets the importer
 /// catch a desync that a small garbage length would otherwise hide.
@@ -83,20 +87,67 @@ const REPLAY_FRAME_HEADER_BYTES: usize = 8 + 4 + 8;
 pub(crate) enum ReplayTransport {
     /// Replay rides inline in the manifest under the legacy budgets.
     InlineLegacy,
-    /// Replay follows the descriptor transfer as one frame per pane.
+    /// Replay precedes the descriptor transfer as one frame per pane.
     ReplayFrames,
 }
 
-/// The per-pane replay budget for a frame export. Rendered ANSI runs larger
-/// than the raw scrollback text the terminal's byte cap counts (style
-/// sequences per run), so the budget gives that rendering headroom, never
-/// drops below the legacy per-pane floor, and never exceeds what the
-/// importer accepts.
+/// Cap actual rendered bytes, not an estimate based on terminal storage.
 #[cfg(unix)]
-pub(crate) fn replay_frame_budget(scrollback_limit_bytes: usize) -> usize {
-    scrollback_limit_bytes
-        .saturating_mul(4)
-        .clamp(MAX_REPLAY_BYTES_PER_PANE, MAX_REPLAY_FRAME_BYTES)
+pub(crate) fn replay_frame_budget(rendered_bytes: usize) -> usize {
+    rendered_bytes
+        .min(MAX_REPLAY_FRAME_BYTES)
+        .min(MAX_REPLAY_FRAMES_TOTAL)
+}
+
+/// Water-fill the aggregate budget: satisfy small histories first, then
+/// share the remainder among larger ones. Return budgets in manifest order.
+#[cfg(unix)]
+pub(crate) fn replay_frame_budgets(rendered_bytes: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rendered_bytes.len()).collect();
+    order.sort_by_key(|index| (rendered_bytes[*index], *index));
+    let mut budgets = vec![0; rendered_bytes.len()];
+    let mut remaining = MAX_REPLAY_FRAMES_TOTAL;
+    for (position, index) in order.into_iter().enumerate() {
+        let share = remaining / (rendered_bytes.len() - position);
+        budgets[index] = replay_frame_budget(rendered_bytes[index]).min(share);
+        remaining -= budgets[index];
+    }
+    budgets
+}
+
+/// Keep a suffix of complete rendered rows. The terminal formatter resets
+/// styles before newlines, so a row boundary is also an ANSI boundary.
+/// Preserve alternate-screen entry even when no content row fits. A nonempty
+/// reset-only frame distinguishes an intentional cut from a missing frame.
+#[cfg(unix)]
+pub(crate) fn budget_replay_frame(history: String, budget: usize) -> io::Result<(String, usize)> {
+    if history.len() <= budget {
+        return Ok((history, 0));
+    }
+    let alternate_prefix = "\x1b[?1049h\x1b[H";
+    let (prefix, preserved_bytes) = if history.starts_with(alternate_prefix) {
+        (alternate_prefix, alternate_prefix.len())
+    } else {
+        ("\x1b[0m", 0)
+    };
+    if budget < prefix.len() {
+        return Err(io::Error::other(
+            "handoff replay budget cannot retain terminal mode",
+        ));
+    }
+    let earliest = history.len() - (budget - prefix.len());
+    let start = if earliest > 0 && history.as_bytes()[earliest - 1] == b'\n' {
+        earliest
+    } else {
+        history.as_bytes()[earliest..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(history.len(), |offset| earliest + offset + 1)
+    };
+    Ok((
+        format!("{prefix}{}", &history[start..]),
+        start - preserved_bytes,
+    ))
 }
 
 /// The importer replays every frame through its terminal parsers before it
@@ -300,7 +351,7 @@ pub(crate) fn wait_restored(stream: &mut UnixStream, timeout: Duration) -> io::R
     Ok(())
 }
 
-/// One pane's replay as a frame after the descriptor transfer. An empty or
+/// One pane's replay as a frame before the descriptor transfer. An empty or
 /// absent history travels as a zero-length payload.
 #[cfg(unix)]
 pub(crate) fn send_replay_frame(
@@ -326,6 +377,17 @@ fn recv_replay_frames(
     panes: &mut [crate::handoff_runtime::HandoffRuntimeState],
 ) -> io::Result<()> {
     let mut stream = stream;
+    let mut received_bytes = 0usize;
+    let mut retained_bytes: usize = panes
+        .iter()
+        .map(|pane| pane.initial_history_ansi.as_ref().map_or(0, String::len))
+        .sum();
+    if retained_bytes > MAX_REPLAY_FRAMES_TOTAL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "handoff aggregate replay exceeds limit",
+        ));
+    }
     for (index, pane) in panes.iter_mut().enumerate() {
         let mut header = [0u8; REPLAY_FRAME_HEADER_BYTES];
         stream.read_exact(&mut header)?;
@@ -357,19 +419,35 @@ fn recv_replay_frames(
                 format!("handoff replay frame {index} announced {length} bytes"),
             ));
         }
-        let mut payload = vec![0u8; length as usize];
-        stream.read_exact(&mut payload)?;
-        // A bigger budget never legitimately renders less than the inline
-        // legacy replay the manifest already carried, so an empty frame means
-        // the exporter lost the pane mid-handoff: keep the inline replay
-        // rather than clear it.
-        if payload.is_empty() {
+        // Check the untrusted u64 before converting or allocating. Include
+        // still-retained inline fallbacks in the storage bound as well.
+        let inline_bytes = pane.initial_history_ansi.as_ref().map_or(0, String::len);
+        let retained_without_pane = retained_bytes - inline_bytes;
+        if length > (MAX_REPLAY_FRAMES_TOTAL - received_bytes) as u64
+            || (length != 0 && length > (MAX_REPLAY_FRAMES_TOTAL - retained_without_pane) as u64)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handoff aggregate replay exceeds limit",
+            ));
+        }
+        received_bytes += length as usize;
+        if length == 0 {
+            // Missing replay retains the legacy fallback, counted above.
             continue;
         }
+        pane.initial_history_ansi = None;
+        retained_bytes = retained_without_pane + length as usize;
+        let mut payload = vec![0u8; length as usize];
+        stream.read_exact(&mut payload)?;
         let history = String::from_utf8(payload)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         pane.initial_history_ansi = Some(history);
     }
+    info!(
+        replay_bytes = received_bytes,
+        retained_bytes, "live handoff replay received"
+    );
     Ok(())
 }
 
@@ -419,6 +497,7 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     let manifest_line = read_line_unbuffered(&mut stream)?;
     let mut manifest: HandoffManifest =
         serde_json::from_str(&manifest_line).map_err(io::Error::other)?;
+    drop(manifest_line);
     if manifest.version != HANDOFF_VERSION {
         return Err(io::Error::other(format!(
             "unsupported handoff version {}",
@@ -1328,16 +1407,113 @@ mod tests {
     fn replay_frame_budget_clamps_to_the_wire_cap() {
         assert_eq!(
             replay_frame_budget(crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES),
-            crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES * 4
+            crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES
         );
-        assert_eq!(replay_frame_budget(1), MAX_REPLAY_BYTES_PER_PANE);
-        assert_eq!(replay_frame_budget(usize::MAX), MAX_REPLAY_FRAME_BYTES);
+        assert_eq!(replay_frame_budget(1), 1);
+        assert_eq!(replay_frame_budget(usize::MAX), 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn handoff_rejects_aggregate_replay_before_reading_the_excess_payload() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let writer = std::thread::spawn(move || {
+            send_replay_frame(&mut sender, 0, Some(&"x".repeat(16 * 1024 * 1024))).unwrap();
+            let mut header = [0u8; REPLAY_FRAME_HEADER_BYTES];
+            header[..8].copy_from_slice(&REPLAY_FRAME_MAGIC);
+            header[8..12].copy_from_slice(&1u32.to_le_bytes());
+            header[12..20].copy_from_slice(&(16 * 1024 * 1024 + 1u64).to_le_bytes());
+            sender.write_all(&header).unwrap();
+            // No excess payload follows: the length must be refused first.
+        });
+        let mut panes = vec![manifest_pane(1, false, None), manifest_pane(2, false, None)];
+        let error =
+            recv_replay_frames(&receiver, &mut panes).expect_err("aggregate must be bounded");
+        writer.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("aggregate"), "{error}");
     }
 
     #[test]
     fn replay_restored_timeout_grows_with_the_replay_size() {
         assert_eq!(replay_restored_timeout(0), READY_TIMEOUT);
         assert!(replay_restored_timeout(256 * 1024 * 1024) > READY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn handoff_styled_history_keeps_complete_newest_rows_within_budget() {
+        let styles = [
+            "\x1b[38;2;111;122;133m\x1b[48;2;144;155;166m\x1b[58;2;177;188;199m\x1b[4:3m",
+            "\x1b[38;2;211;222;233m\x1b[48;2;244;155;166m\x1b[58;2;177;188;199m\x1b[4:2m",
+        ];
+        let mut input = String::new();
+        for row in 1..=6_000 {
+            let text = format!("ROW-{row:05}-{}", "x".repeat(110));
+            for (column, character) in text.chars().enumerate() {
+                input.push_str(styles[column % 2]);
+                input.push(character);
+            }
+            if row != 6_000 {
+                input.push_str("\r\n");
+            }
+        }
+        let runtime = crate::pane::PaneRuntime::test_with_scrollback_bytes(
+            120,
+            24,
+            10_000_000,
+            input.as_bytes(),
+        );
+        drop(input);
+        let full = runtime.handoff_history_ansi(usize::MAX).unwrap();
+        assert!(
+            full.len() > 40_000_000,
+            "fixture must exceed the former ANSI estimate: {}",
+            full.len()
+        );
+        let budget = replay_frame_budgets(&[full.len()])[0];
+        let (frame, dropped) = budget_replay_frame(full.clone(), budget).unwrap();
+        assert!(frame.len() <= 32 * 1024 * 1024);
+        assert!(dropped > 0);
+        assert_eq!(frame.len() + dropped, full.len() + "\x1b[0m".len());
+        assert!(
+            full.as_bytes()[dropped - 1] == b'\n',
+            "cut must follow a complete row"
+        );
+        assert_eq!(frame.strip_prefix("\x1b[0m").unwrap(), &full[dropped..]);
+        assert_eq!(
+            budget_replay_frame(full, budget).unwrap().0,
+            frame,
+            "cut must be deterministic"
+        );
+
+        let restored = crate::pane::PaneRuntime::test_with_scrollback_bytes(
+            120,
+            24,
+            10_000_000,
+            frame.as_bytes(),
+        );
+        let text = restored.recent_unwrapped_text_snapshot(usize::MAX).text;
+        let rows: Vec<_> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let first = rows.first().unwrap()[4..9].parse::<usize>().unwrap();
+        assert!(first > 1);
+        assert_eq!(rows.len(), 6_000 - first + 1);
+        for (offset, row) in rows.iter().enumerate() {
+            assert_eq!(
+                *row,
+                format!("ROW-{:05}-{}", first + offset, "x".repeat(110))
+            );
+        }
+        assert_eq!(
+            restored.recent_unwrapped_ansi(1),
+            runtime.recent_unwrapped_ansi(1),
+            "newest row must retain its ANSI styles"
+        );
+        eprintln!("styled handoff measurement: retained_bytes={} dropped_bytes={dropped} first_row={first} rows={}", frame.len(), rows.len());
     }
 
     /// The importer side, played by receive() against a scripted exporter:

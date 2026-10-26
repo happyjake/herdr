@@ -182,28 +182,48 @@ impl HeadlessServer {
             crate::server::handoff::ReplayTransport::ReplayFrames => {
                 // The manifest already carried a legacy-budget replay inline;
                 // the importer that acknowledged frames replaces it with each
-                // pane's full scrollback. Pane readers stay paused for the
+                // pane's budgeted scrollback. Pane readers stay paused for the
                 // whole handoff, so rendering frame by frame here cannot
                 // capture content past the snapshot. One pane's frame is
                 // materialized at a time instead of every pane's at once, and
                 // frames go before the descriptors so no plain bytes follow a
                 // descriptor batch on the stream (see receive).
-                let frame_budget = crate::server::handoff::replay_frame_budget(
-                    self.app.state.pane_scrollback_limit_bytes,
-                );
+                // Count actual ANSI bytes one pane at a time. The second pass
+                // renders the same paused terminals; no all-pane payload copy
+                // or terminal-storage-to-ANSI expansion estimate is needed.
+                let history_sizes: Vec<usize> = handoff_entries
+                    .iter()
+                    .map(|(terminal_id, _)| {
+                        self.app
+                            .terminal_runtimes
+                            .get(terminal_id)
+                            .and_then(|runtime| runtime.handoff_history_ansi(usize::MAX))
+                            .map_or(0, |history| history.len())
+                    })
+                    .collect();
+                let frame_budgets = crate::server::handoff::replay_frame_budgets(&history_sizes);
                 let send_frames = (|| {
                     let mut replay_bytes = 0usize;
+                    let mut panes_cut = 0usize;
+                    let mut bytes_dropped = 0usize;
                     for (index, (terminal_id, _)) in handoff_entries.iter().enumerate() {
                         let history = self
                             .app
                             .terminal_runtimes
                             .get(terminal_id)
-                            .and_then(|runtime| runtime.handoff_history_ansi(frame_budget));
-                        replay_bytes += history.as_deref().map_or(0, str::len);
+                            .and_then(|runtime| runtime.handoff_history_ansi(usize::MAX))
+                            .unwrap_or_default();
+                        let (history, dropped) = crate::server::handoff::budget_replay_frame(
+                            history,
+                            frame_budgets[index],
+                        )?;
+                        replay_bytes += history.len();
+                        panes_cut += usize::from(dropped != 0);
+                        bytes_dropped += dropped;
                         crate::server::handoff::send_replay_frame(
                             &mut stream,
                             index as u32,
-                            history.as_deref(),
+                            Some(&history),
                         )?;
                     }
                     crate::server::handoff::send_fds(&stream, &fds)?;
@@ -211,12 +231,14 @@ impl HeadlessServer {
                         &mut stream,
                         crate::server::handoff::replay_restored_timeout(replay_bytes),
                     )?;
-                    Ok::<usize, io::Error>(replay_bytes)
+                    Ok::<_, io::Error>((replay_bytes, panes_cut, bytes_dropped))
                 })();
-                send_frames.map(|replay_bytes| {
+                send_frames.map(|(replay_bytes, panes_cut, bytes_dropped)| {
                     info!(
                         panes = handoff_entries.len(),
                         replay_bytes,
+                        panes_cut,
+                        bytes_dropped,
                         transport = "frames",
                         "live handoff replay exported"
                     );

@@ -3368,9 +3368,13 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     ));
     let child_pid = wait_for_pid_marker(&marker, Duration::from_secs(5));
 
+    let mut handoff_params = serde_json::json!({});
+    if failure_point == "aggregate_replay" {
+        handoff_params["import_exe"] = serde_json::json!(oversized_replay_importer(&base));
+    }
     let failed = request(
         &api_socket,
-        serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":{}}),
+        serde_json::json!({"id":"test:handoff-fail","method":"server.live_handoff","params":handoff_params}),
     );
     assert!(
         failed.get("error").is_some(),
@@ -3379,6 +3383,13 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(5));
     assert_eq!(unsafe { libc::kill(child_pid as libc::pid_t, 0) }, 0);
+    if failure_point == "aggregate_replay" {
+        let verdict = fs::read_to_string(base.join("aggregate-refused")).unwrap();
+        assert!(
+            verdict.contains("handoff aggregate replay exceeds limit"),
+            "real importer must reject the budget, not EOF: {verdict}"
+        );
+    }
 
     assert_ok(request(
         &api_socket,
@@ -3405,6 +3416,70 @@ fn live_handoff_import_failure_rolls_back_old_server_at(failure_point: &str) {
 #[test]
 fn live_handoff_after_restored_failure_rolls_back_old_server() {
     live_handoff_import_failure_rolls_back_old_server_at("after_restored");
+}
+
+#[test]
+fn live_handoff_over_aggregate_replay_keeps_old_server_and_pane_running() {
+    live_handoff_import_failure_rolls_back_old_server_at("aggregate_replay");
+}
+
+/// Interpose at the socket boundary, corrupting one length prefix while the
+/// real replacement binary runs its normal receiver. No descriptors reach it.
+fn oversized_replay_importer(base: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = base.join("oversized-importer.py");
+    fs::write(&script, format!(r#"#!/usr/bin/env python3
+import pathlib
+import socket
+import struct
+import subprocess
+import sys
+
+def line(sock):
+    result = bytearray()
+    while not result.endswith(b"\n"):
+        chunk = sock.recv(1)
+        assert chunk, "unexpected EOF"
+        result += chunk
+    return bytes(result)
+
+source = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+source.settimeout(10)
+source.connect(sys.argv[3])
+token = sys.argv[4]
+source.sendall(token.encode() + b"\n")
+manifest = line(source)
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.settimeout(10)
+listener.bind({relay:?})
+listener.listen(1)
+child = subprocess.Popen([{binary:?}, "server", "--handoff-import", {relay:?}, token], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    replacement, _ = listener.accept()
+    replacement.settimeout(10)
+    assert line(replacement) == token.encode() + b"\n"
+    replacement.sendall(manifest)
+    ack = line(replacement)
+    assert ack == b"validated replay-frames\n"
+    source.sendall(ack)
+    replacement.sendall(struct.pack("<8sIQ", b"HRD-RPL1", 0, 32 * 1024 * 1024 + 1))
+    replacement.shutdown(socket.SHUT_WR)
+    _, error = child.communicate(timeout=10)
+    assert child.returncode != 0
+    assert b"handoff aggregate replay exceeds limit" in error, error
+    pathlib.Path({verdict:?}).write_bytes(error)
+finally:
+    if child.poll() is None:
+        child.kill()
+        child.wait()
+    source.close()
+"#,
+        relay = base.join("replay-relay.sock").display().to_string(),
+        binary = env!("CARGO_BIN_EXE_herdr"),
+        verdict = base.join("aggregate-refused").display().to_string(),
+    )).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
 }
 
 fn websocket_config(port: u16, token: &str) -> String {
@@ -3659,8 +3734,18 @@ fn pane_fill_row(tag: &str, row: usize) -> String {
 /// pane at this pane count), and report what it moved.
 #[test]
 fn live_handoff_carries_full_scrollback_across_many_panes() {
-    const PANES: usize = 60;
-    const ROWS: usize = 2_500;
+    measure_many_pane_handoff(60, 2_500, 0);
+}
+
+#[test]
+fn live_handoff_shares_aggregate_budget_and_keeps_small_panes_whole() {
+    measure_many_pane_handoff(90, 6_000, 10);
+}
+
+fn measure_many_pane_handoff(panes_count: usize, rows: usize, small_panes: usize) {
+    let row_counts: Vec<usize> = (0..panes_count)
+        .map(|index| if index < small_panes { 100 } else { rows })
+        .collect();
 
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -3690,7 +3775,7 @@ fn live_handoff_carries_full_scrollback_across_many_panes() {
         .as_str()
         .unwrap()
         .to_string();
-    for index in 1..PANES {
+    for index in 1..panes_count {
         assert_ok(request(
             &api_socket,
             serde_json::json!({
@@ -3700,7 +3785,7 @@ fn live_handoff_carries_full_scrollback_across_many_panes() {
             }),
         ));
     }
-    wait_for_server_ptmx_fd_count(server_pid, PANES, Duration::from_secs(60));
+    wait_for_server_ptmx_fd_count(server_pid, panes_count, Duration::from_secs(60));
 
     let panes = request(
         &api_socket,
@@ -3712,7 +3797,7 @@ fn live_handoff_carries_full_scrollback_across_many_panes() {
         .iter()
         .map(|pane| pane["pane_id"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(pane_ids.len(), PANES);
+    assert_eq!(pane_ids.len(), panes_count);
 
     for (index, pane_id) in pane_ids.iter().enumerate() {
         let tag = format!("{index:02}");
@@ -3728,14 +3813,14 @@ fn live_handoff_carries_full_scrollback_across_many_panes() {
                         fill.display(),
                         tag,
                         base.join(format!("fill-done-{tag}")).display(),
-                        ROWS
+                        row_counts[index]
                     ),
                     "keys": ["Enter"]
                 }
             }),
         ));
     }
-    for index in 0..PANES {
+    for index in 0..panes_count {
         support::wait_for_file(
             &base.join(format!("fill-done-{index:02}")),
             Duration::from_secs(60),
@@ -3747,10 +3832,55 @@ fn live_handoff_carries_full_scrollback_across_many_panes() {
         wait_for_output(
             &api_socket,
             pane_id,
-            &pane_fill_row(&format!("{index:02}"), ROWS),
+            &pane_fill_row(&format!("{index:02}"), row_counts[index]),
         );
     }
 
+    let (memory_stop, memory_receiver) = std::sync::mpsc::channel::<()>();
+    let log_paths = [
+        config_home.join("herdr-dev/herdr-server.log"),
+        config_home.join("herdr/herdr-server.log"),
+    ];
+    let memory_sampler = thread::spawn(move || {
+        let mut importer_pid = None;
+        let mut peak_rss_bytes = 0u64;
+        while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            memory_receiver.recv_timeout(Duration::from_millis(20))
+        {
+            if importer_pid.is_none() {
+                importer_pid = log_paths
+                    .iter()
+                    .filter_map(|path| fs::read_to_string(path).ok())
+                    .flat_map(|text| {
+                        text.lines()
+                            .filter(|line| line.contains("spawned handoff import server"))
+                            .filter_map(|line| {
+                                line.split_whitespace().find_map(|field| {
+                                    field
+                                        .strip_prefix("pid=")
+                                        .and_then(|pid| pid.parse::<u32>().ok())
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .next();
+            }
+            if let Some(pid) = importer_pid {
+                if let Ok(output) = std::process::Command::new("ps")
+                    .args(["-o", "rss=", "-p", &pid.to_string()])
+                    .output()
+                {
+                    if let Ok(kib) = String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse::<u64>()
+                    {
+                        peak_rss_bytes = peak_rss_bytes.max(kib * 1024);
+                    }
+                }
+            }
+        }
+        peak_rss_bytes
+    });
     let started = Instant::now();
     assert_ok(request(
         &api_socket,
@@ -3759,19 +3889,34 @@ fn live_handoff_carries_full_scrollback_across_many_panes() {
     let handoff_elapsed = started.elapsed();
     drop(spawned);
     wait_for_api(&api_socket, Duration::from_secs(30));
+    drop(memory_stop);
+    let peak_importer_rss_bytes = memory_sampler.join().unwrap();
 
     for (index, pane_id) in pane_ids.iter().enumerate() {
         let tag = format!("{index:02}");
         // pane.read caps a window at 1,000 rows, so page: a far offset clamps
         // to the oldest window, the zero-offset read anchors at the newest.
-        let oldest =
-            wait_for_read_offset_contains(&api_socket, pane_id, 1_000_000, &pane_fill_row(&tag, 1));
+        let oldest = if small_panes == 0 || index < small_panes {
+            wait_for_read_offset_contains(&api_socket, pane_id, 1_000_000, &pane_fill_row(&tag, 1))
+        } else {
+            let oldest = wait_for_read_offset_contains(
+                &api_socket,
+                pane_id,
+                1_000_000,
+                &format!("FH-{tag}-ROW-"),
+            );
+            assert!(
+                !oldest.contains(&pane_fill_row(&tag, 1)),
+                "large pane {tag} should drop oldest rows"
+            );
+            oldest
+        };
         let newest = wait_for_read_source_contains(
             &api_socket,
             pane_id,
             "recent_unwrapped",
             1000,
-            &pane_fill_row(&tag, ROWS),
+            &pane_fill_row(&tag, row_counts[index]),
         );
         assert!(
             !oldest.is_empty() && !newest.is_empty(),
@@ -3780,6 +3925,7 @@ fn live_handoff_carries_full_scrollback_across_many_panes() {
     }
 
     let mut replay_report = String::new();
+    let mut received_report = String::new();
     for log in [
         config_home.join("herdr-dev/herdr-server.log"),
         config_home.join("herdr/herdr-server.log"),
@@ -3790,9 +3936,15 @@ fn live_handoff_carries_full_scrollback_across_many_panes() {
         if let Some(line) = text
             .lines()
             .rev()
-            .find(|line| line.contains("handoff replay"))
+            .find(|line| line.contains("live handoff replay exported"))
         {
             replay_report = line.to_string();
+            received_report = text
+                .lines()
+                .rev()
+                .find(|line| line.contains("live handoff replay received"))
+                .unwrap_or_default()
+                .to_string();
             break;
         }
     }
@@ -3800,8 +3952,38 @@ fn live_handoff_carries_full_scrollback_across_many_panes() {
         !replay_report.is_empty(),
         "the exporting server should log the replay it carried"
     );
+    let field = |line: &str, name: &str| -> usize {
+        line.split_whitespace()
+            .find_map(|part| {
+                part.strip_prefix(&format!("{name}="))
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or_else(|| panic!("missing {name}: {line}"))
+    };
+    assert!(
+        field(&replay_report, "replay_bytes") <= 32 * 1024 * 1024,
+        "{replay_report}"
+    );
+    assert!(
+        field(&received_report, "replay_bytes") <= 32 * 1024 * 1024,
+        "{received_report}"
+    );
+    if small_panes > 0 {
+        assert_eq!(
+            field(&replay_report, "panes_cut"),
+            panes_count - small_panes
+        );
+        assert!(field(&replay_report, "bytes_dropped") > 0);
+        assert!(
+            field(&received_report, "replay_bytes") > 31 * 1024 * 1024,
+            "water filling should use the available budget: {received_report}"
+        );
+    } else {
+        assert_eq!(field(&replay_report, "panes_cut"), 0);
+        assert_eq!(field(&replay_report, "bytes_dropped"), 0);
+    }
     eprintln!(
-        "handoff measurement: panes={PANES} rows_per_pane={ROWS} elapsed={handoff_elapsed:?} report={replay_report}"
+        "handoff measurement: panes={panes_count} rows_per_pane={rows} elapsed={handoff_elapsed:?} small_panes={small_panes} peak_importer_rss_bytes={peak_importer_rss_bytes} report={replay_report} received={received_report}"
     );
 
     let _ = request(
@@ -3917,10 +4099,13 @@ try:
     committed = read_line_capped(sock, 4096)
     if committed != b"committed\n":
         fail(f"expected the commit line right after the descriptors, got {{committed[:64]!r}}")
-    sock.sendall(b"owned\n")
-
-    with open(VERDICT, "w") as handle:
+    with open(VERDICT + ".tmp", "w") as handle:
         json.dump({{"ok": True, "line_bytes": len(raw_line), "pane_bytes": pane_bytes}}, handle)
+        handle.flush()
+    # Publish a complete verdict before the exporter can finish the API call.
+    import os
+    os.replace(VERDICT + ".tmp", VERDICT)
+    sock.sendall(b"owned\n")
 except SystemExit:
     raise
 except Exception as error:
