@@ -257,6 +257,10 @@ pub(crate) fn accept_and_validate_on(
 
     stream.set_read_timeout(Some(READY_TIMEOUT))?;
     let validated = read_line_unbuffered(&mut stream)?;
+    // Replay frames require the importer's explicit acknowledgment. Every legacy
+    // importer replies with plain validated and therefore keeps the legacy
+    // replay limits, preserving rollback safety. Version fields validate the
+    // target only; they do not select the replay transport.
     let transport = match validated.trim_end() {
         "validated" => ReplayTransport::InlineLegacy,
         VALIDATED_REPLAY_FRAMES => {
