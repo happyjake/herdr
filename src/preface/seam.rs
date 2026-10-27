@@ -917,10 +917,10 @@ mod tests {
         );
     }
 
-    /// One lost prompt echo, or one prompt drawn some other way, still
-    /// places the seam when the surrounding prompts line up unambiguously.
+    /// A lost echo with the prompts around it lining up places the seam; a
+    /// prompt drawn some other way still has a row standing for it.
     #[test]
-    fn a_record_prompt_skipped_with_no_row_to_account_for_it_places_no_seam() {
+    fn a_record_prompt_whose_echo_was_lost_is_stepped_over() {
         let read = prompted(&["map the piers", "chart the tides", "print the map"]);
         let top = Top {
             offset: None,
