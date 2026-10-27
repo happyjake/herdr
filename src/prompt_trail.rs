@@ -493,10 +493,16 @@ fn find_pasted_content_close<'a>(text: &'a str, id: &str) -> Option<(&'a str, &'
         let (line, line_end) = split_next_line(&text[offset..]);
         let trimmed = line.strip_suffix('\r').unwrap_or(line);
         if trimmed == close {
-            return Some((&text[..offset], &text[offset + line_end..]));
-        }
-        if pasted_content_open_id(trimmed).is_some() {
-            return None;
+            let after_close = &text[offset + line_end..];
+            let inside = if after_close.is_empty() {
+                text[..offset]
+                    .strip_suffix("\r\n")
+                    .or_else(|| text[..offset].strip_suffix('\n'))
+                    .unwrap_or(&text[..offset])
+            } else {
+                &text[..offset]
+            };
+            return Some((inside, after_close));
         }
         offset += line_end;
     }
@@ -1244,6 +1250,34 @@ pub(crate) mod tests {
                 "{raw:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_outer_claude_paste_wrapper_keeps_inner_paste_tag_lines_verbatim() {
+        let raw = "<pasted_content id=\"a1\">\nouter\n<pasted_content id=\"b2\">\ninner\n</pasted_content id=\"b2\">\n</pasted_content id=\"a1\">";
+        assert_eq!(
+            strip_pasted_content_tags(raw),
+            "outer\n<pasted_content id=\"b2\">\ninner\n</pasted_content id=\"b2\">"
+        );
+        let line = claude_user(raw, "2026-03-04T09:00:00Z");
+        assert_eq!(
+            prompt_text(PromptTrailAgent::Claude, &line).as_deref(),
+            Some("outer <pasted_content id=\"b2\"> inner </pasted_content id=\"b2\">")
+        );
+    }
+
+    #[test]
+    fn two_separate_top_level_claude_paste_blocks_are_both_unwrapped() {
+        let raw = "<pasted_content id=\"a1\">\nfirst block\n</pasted_content id=\"a1\">\nbetween\n<pasted_content id=\"b2\">\nsecond block\n</pasted_content id=\"b2\">";
+        assert_eq!(
+            strip_pasted_content_tags(raw),
+            "first block\nbetween\nsecond block"
+        );
+        let line = claude_user(raw, "2026-03-04T09:00:00Z");
+        assert_eq!(
+            prompt_text(PromptTrailAgent::Claude, &line).as_deref(),
+            Some("first block between second block")
+        );
     }
 
     #[test]

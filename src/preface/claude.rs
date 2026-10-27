@@ -83,7 +83,7 @@ impl ClaudeReader {
             .get("message")
             .and_then(|message| message.get("content"));
         let raw = content.map(raw_text).unwrap_or_default();
-        let raw = raw.trim_start();
+        let trimmed = raw.trim_start();
 
         if flag(line, "isMeta") {
             // A scheduled task firing speaks in the harness's voice, but it
@@ -93,11 +93,11 @@ impl ClaudeReader {
             }
             return;
         }
-        if raw.starts_with(TASK_NOTIFICATION) {
+        if trimmed.starts_with(TASK_NOTIFICATION) {
             self.start(line, TurnStart::Task, None);
             return;
         }
-        if raw.starts_with(INTERRUPTED) && !flag(line, "isCompactSummary") {
+        if trimmed.starts_with(INTERRUPTED) && !flag(line, "isCompactSummary") {
             if let Some(turn) = self.turns.last_mut() {
                 turn.end_without_answer(TurnEnd::Aborted);
             }
@@ -109,7 +109,7 @@ impl ClaudeReader {
             return;
         }
         if crate::prompt_trail::prompt_text(PromptTrailAgent::Claude, line).is_some() {
-            self.start(line, TurnStart::Prompt, Some(prompt_body(raw)));
+            self.start(line, TurnStart::Prompt, Some(prompt_body(&raw)));
         }
     }
 
@@ -554,6 +554,48 @@ mod tests {
         assert_eq!(
             turns[0].head.as_deref(),
             Some("keep the south jetty beacon lit")
+        );
+    }
+
+    #[test]
+    fn an_indented_claude_paste_tag_line_reads_the_same_on_user_attachment_and_trail_paths() {
+        let indented = "  <pasted_content id=\"a1\">\nfirst line\n</pasted_content id=\"a1\">";
+        let user_line = serde_json::json!({
+            "type": "user",
+            "uuid": "u-1",
+            "timestamp": "2026-03-04T09:00:00Z",
+            "isSidechain": false,
+            "message": { "role": "user", "content": indented },
+        });
+        let queued_line = serde_json::json!({
+            "type": "attachment",
+            "uuid": "u-2",
+            "timestamp": "2026-03-04T09:00:10Z",
+            "isSidechain": false,
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": "prompt",
+                "origin": { "kind": "human" },
+                "prompt": indented,
+            },
+        });
+        let trail = crate::prompt_trail::prompt_text(PromptTrailAgent::Claude, &user_line);
+        let user_turn = &turns_of(&line(user_line))[0];
+        let queued_turn = &turns_of(&line(queued_line))[0];
+
+        assert_eq!(
+            trail.as_deref(),
+            Some("<pasted_content id=\"a1\"> first line </pasted_content id=\"a1\">")
+        );
+        assert_eq!(
+            user_turn.prompt.as_deref(),
+            Some("<pasted_content id=\"a1\">\nfirst line\n</pasted_content id=\"a1\">")
+        );
+        assert_eq!(user_turn.prompt, queued_turn.prompt);
+        assert_eq!(user_turn.head, queued_turn.head);
+        assert_eq!(
+            user_turn.prompt.as_deref().map(crate::prompt_trail::clean),
+            trail
         );
     }
 }
