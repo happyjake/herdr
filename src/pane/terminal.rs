@@ -80,6 +80,9 @@ pub struct RecentReadWindow {
     pub effective_offset: usize,
     pub has_more: bool,
     pub offset_unsupported: bool,
+    /// Internal paging evidence: the first logical line begins mid-wrap.
+    /// This is not part of the pane.read wire response.
+    pub(crate) top_is_wrap_tail: bool,
 }
 
 /// Recent unwrapped history read the way a client pages it — offset 0,
@@ -120,6 +123,7 @@ fn stitch_recent_pages(
     };
     let mut rows: Vec<String> = Vec::new();
     let mut offset = 0usize;
+    let mut held_top_is_wrap_tail = false;
     loop {
         let window = page(RecentReadRequest {
             lines: page_lines,
@@ -150,7 +154,7 @@ fn stitch_recent_pages(
                     let (held, seen) = (visible(&rows[index]), visible(line));
                     if seen == held
                         || (index + 1 == rows.len()
-                            && !held.is_empty()
+                            && held_top_is_wrap_tail
                             && seen.ends_with(held.as_str()))
                     {
                         rows[index] = (*line).to_string();
@@ -161,6 +165,9 @@ fn stitch_recent_pages(
                 std::cmp::Ordering::Equal => rows.push((*line).to_string()),
                 std::cmp::Ordering::Greater => return None,
             }
+        }
+        if window.effective_offset + lines.len() == rows.len() {
+            held_top_is_wrap_tail = window.top_is_wrap_tail;
         }
         if !window.has_more || rows.len() > min_lines || rows.len() >= max_lines {
             rows.reverse();
@@ -3354,13 +3361,18 @@ fn ghostty_recent_read_at_offset_for_terminal(
             (true, false) => ghostty_recent_text_unwrapped_for_terminal(terminal, lines)?,
             (_, true) => ghostty_recent_ansi_for_terminal(terminal, lines, unwrapped)?,
         };
-        let has_more =
-            ghostty_recent_read_range(terminal, lines)?.is_some_and(|(start, _, _)| start > 0);
+        let range = ghostty_recent_read_range(terminal, lines)?;
+        let has_more = range.is_some_and(|(start, _, _)| start > 0);
+        let top_is_wrap_tail = match range {
+            Some((start, _, _)) if unwrapped => terminal.row_wrap_continuation(start as u32)?,
+            _ => false,
+        };
         return Ok(RecentReadWindow {
             text,
             effective_offset: 0,
             has_more,
             offset_unsupported: false,
+            top_is_wrap_tail,
         });
     }
     let Some((_, end, _)) = ghostty_recent_read_range(terminal, lines)? else {
@@ -3406,6 +3418,7 @@ fn ghostty_recent_read_at_offset_for_terminal(
         effective_offset,
         has_more: start > 0,
         offset_unsupported: false,
+        top_is_wrap_tail: unwrapped && terminal.row_wrap_continuation(start as u32)?,
     })
 }
 
@@ -6984,6 +6997,30 @@ mod tests {
     }
 
     #[test]
+    fn a_span_preserves_an_empty_wrap_cut_tail() {
+        let mut terminal = crate::ghostty::Terminal::new(8, 3, 100_000).unwrap();
+        terminal.write(b"abcdefgh \r\nnewer\r\nbottom");
+        for ansi in [false, true] {
+            let zero = offset_window(&terminal, 3, 0, true, ansi);
+            if !ansi {
+                assert_eq!(zero.text, "\nnewer\nbottom");
+            }
+            let clamped = offset_window(&terminal, 3, 2, true, ansi);
+            assert_eq!(clamped.effective_offset, 1);
+            let span = stitch_recent_pages(3, usize::MAX, usize::MAX, ansi, |request| {
+                ghostty_recent_read_at_offset_for_terminal(&terminal, request).ok()
+            })
+            .expect("the blank row is a verified wrap tail");
+            let whole = offset_window(&terminal, 100, 0, true, ansi);
+            assert_eq!(
+                strip_ansi(&span.text),
+                strip_ansi(&whole.text).replace('\r', "")
+            );
+            assert!(!span.has_more);
+        }
+    }
+
+    #[test]
     fn a_span_rejects_a_shifted_middle_page_even_when_the_overlap_is_blank() {
         for ansi in [false, true] {
             let span = stitch_recent_pages(3, usize::MAX, usize::MAX, ansi, |request| {
@@ -6993,6 +7030,7 @@ mod tests {
                         effective_offset: 0,
                         has_more: true,
                         offset_unsupported: false,
+                        top_is_wrap_tail: false,
                     },
                     2 => RecentReadWindow {
                         // The actual page is "oldest\nolder\n": its bottom
@@ -7001,13 +7039,41 @@ mod tests {
                         effective_offset: 2,
                         has_more: true,
                         offset_unsupported: false,
+                        top_is_wrap_tail: false,
                     },
                     _ => RecentReadWindow {
                         text: "oldest\nolder".into(),
                         effective_offset: 2,
                         has_more: false,
                         offset_unsupported: false,
+                        top_is_wrap_tail: false,
                     },
+                })
+            });
+            assert_eq!(span, None, "ansi {ansi}");
+        }
+    }
+
+    #[test]
+    fn a_span_requires_wrap_evidence_for_a_suffix_overlap() {
+        for ansi in [false, true] {
+            let span = stitch_recent_pages(3, usize::MAX, usize::MAX, ansi, |request| {
+                Some(if request.offset_from_bottom == 0 {
+                    RecentReadWindow {
+                        text: "tail\nnewer\nbottom".into(),
+                        effective_offset: 0,
+                        has_more: true,
+                        top_is_wrap_tail: false,
+                        ..RecentReadWindow::default()
+                    }
+                } else {
+                    RecentReadWindow {
+                        text: "older\nwhole-tail".into(),
+                        effective_offset: 2,
+                        has_more: false,
+                        top_is_wrap_tail: false,
+                        ..RecentReadWindow::default()
+                    }
                 })
             });
             assert_eq!(span, None, "ansi {ansi}");
@@ -7032,6 +7098,7 @@ mod tests {
                             effective_offset: 0,
                             has_more: true,
                             offset_unsupported: false,
+                            top_is_wrap_tail: true,
                         }
                     } else {
                         RecentReadWindow {
@@ -7039,6 +7106,7 @@ mod tests {
                             effective_offset: if expected.is_some() { 2 } else { 1 },
                             has_more: false,
                             offset_unsupported: false,
+                            top_is_wrap_tail: false,
                         }
                     })
                 });
@@ -7068,12 +7136,14 @@ mod tests {
                         effective_offset: 0,
                         has_more: true,
                         offset_unsupported: false,
+                        top_is_wrap_tail: true,
                     },
                     2 => RecentReadWindow {
                         text: format!("L-1\r\n{above}"),
                         effective_offset: 2,
                         has_more: false,
                         offset_unsupported: false,
+                        top_is_wrap_tail: false,
                     },
                     other => panic!("no page at {other}"),
                 })
