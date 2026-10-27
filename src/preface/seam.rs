@@ -11,11 +11,16 @@
 //! screen's prompt rows, newest first, the way the two have to line up: the
 //! newest prompt on screen is one of the record's newest. A row counts as a
 //! prompt only when it carries the harness's prompt marker, so an answer or
-//! tool output that repeats a prompt's words is never taken for it. The
-//! oldest prompt that lines up is the first turn the client holds; every
-//! turn older than it is the preface. A turn the anchor cuts through — its
-//! prompt above the client's oldest line, some of its answer below — is
-//! therefore quoted whole, and a few of its lines show twice.
+//! tool output that repeats a prompt's words is never taken for it. An
+//! unmatched prompt row may stand for one record prompt drawn another way,
+//! and a match may also step over one record prompt whose screen echo was
+//! overwritten (at most two across a seam) when the matching row shows only
+//! one remaining record prompt and no skipped prompt's words appear on any
+//! held non-editor row. The oldest prompt that lines up is the first turn
+//! the client holds; every turn older than it is the preface. A turn the
+//! anchor cuts through — its prompt above the client's oldest line, some of
+//! its answer below — is therefore quoted whole, and a few of its lines
+//! show twice.
 //!
 //! With an anchor but no sent prompts or prompt words held, older record
 //! turns precede the screen. The newest prompted turn is still withheld:
@@ -43,6 +48,10 @@ const ANCHOR_BELOW: usize = 50;
 
 /// Record prompts that may sit between two that line up with the screen.
 const LOOKBACK: usize = 16;
+
+/// Record prompts with no row on screen that one seam may step over in all,
+/// at most one at a single match.
+const MAX_LOST_PROMPTS: usize = 2;
 
 /// A row this long or longer that a prompt's first line begins with is
 /// that line wrapped.
@@ -131,33 +140,25 @@ pub(crate) fn preface(
         .map(|span| screen_of(span, evidence))
         .ok_or(PrefaceReason::SeamNotFound)?;
     let anchor = anchor(&screen, top).ok_or(PrefaceReason::SeamNotFound)?;
-    let held = &screen.rows[..=anchor];
-    let prompts = held
+    let held: Vec<(&str, Option<String>)> = screen.rows[..=anchor]
         .iter()
         .enumerate()
+        .filter(|(index, _)| !screen.editor.contains(index))
         .map(|(index, row)| {
-            if screen.editor.contains(&index) {
-                return None;
-            }
-            match evidence.background {
+            let prompt = match evidence.background {
                 Some(_) => screen.prompts[index].then(|| crate::prompt_trail::clean(row)),
                 None => prompt_row(row, evidence.markers),
-            }
+            };
+            (row.as_str(), prompt)
         })
-        .collect::<Vec<_>>();
-    let seam = if prompts
+        .collect();
+    let seam = if held
         .iter()
-        .any(|prompt| prompt.as_ref().is_some_and(|words| !words.is_empty()))
+        .any(|(_, prompt)| prompt.as_ref().is_some_and(|words| !words.is_empty()))
     {
-        place_prompts(turns, prompts.into_iter())
+        place_prompts(turns, &held)
     } else {
-        place_without_prompts(
-            turns,
-            held.iter()
-                .enumerate()
-                .filter(|(index, _)| !screen.editor.contains(index))
-                .map(|(_, row)| row.as_str()),
-        )
+        place_without_prompts(turns, held.iter().map(|(row, _)| *row))
     }
     .ok_or(PrefaceReason::SeamNotFound)?;
     let (kept, omitted) = select(turns, seam, max_turns.min(MAX_TURNS));
@@ -424,19 +425,13 @@ fn anchor(screen: &Screen, top: Top<'_>) -> Option<usize> {
 /// the harness's evidence are ambiguous, so they still refuse the seam.
 fn place_without_prompts<'a>(turns: &[Turn], held: impl Iterator<Item = &'a str>) -> Option<usize> {
     for line in held {
-        let cleaned = crate::prompt_trail::clean(line);
-        let words = cleaned
-            .chars()
-            .next()
-            .filter(|glyph| !glyph.is_alphanumeric())
-            .and_then(|glyph| cleaned[glyph.len_utf8()..].strip_prefix(' '))
-            .unwrap_or(&cleaned);
-        if turns
-            .iter()
-            .filter(|turn| turn.start == TurnStart::Prompt)
-            .filter_map(|turn| turn.head.as_deref())
-            .any(|head| shows(&cleaned, head) || shows(words, head))
-        {
+        if row_shows(
+            line,
+            turns
+                .iter()
+                .filter(|turn| turn.start == TurnStart::Prompt)
+                .filter_map(|turn| turn.head.as_deref()),
+        ) {
             return None;
         }
     }
@@ -445,35 +440,49 @@ fn place_without_prompts<'a>(turns: &[Turn], held: impl Iterator<Item = &'a str>
         .rposition(|turn| turn.start == TurnStart::Prompt)
 }
 
-/// The index of the oldest turn whose prompt the held rows show, when the
-/// record's prompts line up with them beyond doubt.
-///
-/// Rows are walked from the bottom up and prompts from the newest back, so
-/// a prompt that repeats is matched where its neighbours say it is. Only a
-/// row carrying a prompt marker can stand for a prompt. A prompt row that
-/// matches no record prompt is a prompt drawn some other way (a paste
-/// shown as a placeholder, say), and each such row may account for one
-/// record prompt that lines up with nothing; a record prompt skipped with
-/// no row to account for it would be a turn left out unseen, so the seam
-/// is refused instead.
+/// Whether a held row shows any of `heads`, as it stands or after a
+/// leading non-alphanumeric glyph and space.
+fn row_shows<'a>(line: &str, mut heads: impl Iterator<Item = &'a str>) -> bool {
+    let cleaned = crate::prompt_trail::clean(line);
+    let words = cleaned
+        .chars()
+        .next()
+        .filter(|glyph| !glyph.is_alphanumeric())
+        .and_then(|glyph| cleaned[glyph.len_utf8()..].strip_prefix(' '))
+        .unwrap_or(&cleaned);
+    heads.any(|head| shows(&cleaned, head) || shows(words, head))
+}
+
 #[cfg(test)]
 fn place<'a>(
     turns: &[Turn],
     markers: &[&str],
     held_bottom_first: impl Iterator<Item = &'a str>,
 ) -> Option<usize> {
-    place_prompts(
-        turns,
-        held_bottom_first.map(|line| prompt_row(line, markers)),
-    )
+    let held: Vec<(&str, Option<String>)> = held_bottom_first
+        .map(|line| (line, prompt_row(line, markers)))
+        .collect();
+    place_prompts(turns, &held)
 }
 
-/// Over rows already judged: each held row, bottom first, is its
-/// words as a prompt when it is a prompt row and nothing otherwise.
-fn place_prompts(
-    turns: &[Turn],
-    held_bottom_first: impl Iterator<Item = Option<String>>,
-) -> Option<usize> {
+/// The index of the oldest turn whose prompt the held rows show, when the
+/// record's prompts line up with them beyond doubt.
+///
+/// Each held non-editor row, bottom first, carries its raw line and its
+/// words as a prompt when it is a prompt row. Prompts are walked from the
+/// newest back within [`LOOKBACK`], so a prompt that repeats is matched
+/// where its neighbours say it is. A prompt row that matches no record
+/// prompt is a prompt drawn some other way (a paste shown as a
+/// placeholder, say), and each such row may account for one record prompt
+/// that lines up with nothing (`lost = back - unaccounted <= 0`).
+///
+/// One record prompt beyond `unaccounted` (`lost == 1`) may also be stepped
+/// over when its screen echo was overwritten, up to [`MAX_LOST_PROMPTS`]
+/// across the seam, provided the matching row [`shows`] only one remaining
+/// record prompt and no skipped prompt's head appears on any held
+/// non-editor row. A match that would leave two or more prompts
+/// unaccounted (`lost >= 2`) refuses the seam.
+fn place_prompts(turns: &[Turn], held_bottom_first: &[(&str, Option<String>)]) -> Option<usize> {
     let prompted: Vec<usize> = turns
         .iter()
         .enumerate()
@@ -482,12 +491,13 @@ fn place_prompts(
         .collect();
     let mut remaining = prompted.len();
     let mut unaccounted = 0usize;
+    let mut skips = 0usize;
     let mut seam = None;
-    for line in held_bottom_first {
+    for (_, line) in held_bottom_first {
         if remaining == 0 {
             break;
         }
-        let Some(line) = line else {
+        let Some(line) = line.as_deref() else {
             continue;
         };
         if line.is_empty() {
@@ -497,17 +507,52 @@ fn place_prompts(
             turns[prompted[remaining - 1 - back]]
                 .head
                 .as_deref()
-                .is_some_and(|head| shows(&line, head))
+                .is_some_and(|head| shows(line, head))
         });
         match matched {
-            Some(back) if back > unaccounted => return None,
+            Some(back) if back <= unaccounted => {
+                seam = Some(prompted[remaining - 1 - back]);
+                remaining -= back + 1;
+                unaccounted = 0;
+            }
             Some(back) => {
+                let lost = back - unaccounted;
+                if lost > 1 || skips >= MAX_LOST_PROMPTS {
+                    return None;
+                }
+                let matches = prompted[..remaining]
+                    .iter()
+                    .filter(|&&index| {
+                        turns[index]
+                            .head
+                            .as_deref()
+                            .is_some_and(|head| shows(line, head))
+                    })
+                    .count();
+                if matches != 1 {
+                    return None;
+                }
+                let skipped = &prompted[remaining - back..remaining];
+                if held_bottom_first.iter().any(|(row, _)| {
+                    row_shows(
+                        row,
+                        skipped
+                            .iter()
+                            .filter_map(|&index| turns[index].head.as_deref()),
+                    )
+                }) {
+                    return None;
+                }
+                skips += 1;
                 seam = Some(prompted[remaining - 1 - back]);
                 remaining -= back + 1;
                 unaccounted = 0;
             }
             None => unaccounted += 1,
         }
+    }
+    if seam.is_some() && skips > 0 {
+        tracing::debug!(skips, "preface seam skipped lost prompt echo");
     }
     seam
 }
@@ -872,8 +917,8 @@ mod tests {
         );
     }
 
-    /// A record prompt that lines up with no row, and no unmatched prompt
-    /// row to account for it, would be a turn left out unseen.
+    /// One lost prompt echo, or one prompt drawn some other way, still
+    /// places the seam when the surrounding prompts line up unambiguously.
     #[test]
     fn a_record_prompt_skipped_with_no_row_to_account_for_it_places_no_seam() {
         let read = prompted(&["map the piers", "chart the tides", "print the map"]);
@@ -881,16 +926,17 @@ mod tests {
             offset: None,
             lines: None,
         };
-        // "chart the tides" is not on the screen at all.
+        // "chart the tides" is not on the screen at all: one lost echo is
+        // stepped over.
         assert_eq!(
             preface_of(
                 &read,
                 &["❯ map the piers", "⏺ done", "❯ print the map", "❯ "],
                 top
             ),
-            Err(PrefaceReason::SeamNotFound)
+            Err(PrefaceReason::NothingAbove)
         );
-        // Drawn some other way, it still has a prompt row standing for it.
+        // Drawn some other way, it has a prompt row standing for it.
         assert_eq!(
             preface_of(
                 &read,
@@ -904,6 +950,218 @@ mod tests {
             ),
             Err(PrefaceReason::NothingAbove)
         );
+    }
+
+    #[test]
+    fn one_lost_prompt_echo_still_places_the_seam() {
+        let read = prompted(&["prompt A", "prompt B", "prompt C", "prompt D", "prompt E"]);
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+        let rows = [
+            "❯ prompt B",
+            "⏺ answer B",
+            "❯ prompt C",
+            "⏺ answer C",
+            "❯ prompt E",
+            "⏺ answer E",
+            "❯ ",
+        ];
+        let got = preface(
+            "claude",
+            "s",
+            &read,
+            top,
+            MAX_TURNS,
+            PromptEvidence {
+                markers: &MARKERS,
+                background: None,
+                editor_box: true,
+            },
+            |_| {
+                Some(Span {
+                    text: rows.join("\n"),
+                    has_more: false,
+                })
+            },
+        )
+        .expect("a preface");
+        assert_eq!(got.omitted, 0);
+        let prompts: Vec<_> = got
+            .turns
+            .into_iter()
+            .filter_map(|turn| turn.prompt)
+            .collect();
+        assert_eq!(prompts, vec!["prompt A".to_string()]);
+        assert!(!prompts.iter().any(|prompt| prompt == "prompt D"));
+    }
+
+    #[test]
+    fn one_lost_prompt_echo_and_an_unmatched_prompt_row_combine() {
+        let read = prompted(&["prompt Z", "prompt A", "prompt P", "prompt B", "prompt C"]);
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+        assert_eq!(
+            preface_of(
+                &read,
+                &["❯ prompt A", "❯ [Pasted text]", "❯ prompt C", "❯ ",],
+                top
+            ),
+            Ok(vec!["prompt Z".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_repeated_prompt_cannot_skip_a_lost_echo_but_places_without_skipping() {
+        let read = prompted(&[
+            "prompt A", "yes", "prompt B", "yes", "prompt C", "yes", "prompt D", "prompt E",
+        ]);
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+        assert_eq!(
+            preface_of(&read, &["❯ yes", "❯ prompt E", "❯ "], top),
+            Err(PrefaceReason::SeamNotFound)
+        );
+        assert_eq!(
+            preface_of(&read, &["❯ yes", "❯ prompt D", "❯ prompt E", "❯ "], top),
+            Ok(vec![
+                "prompt A".to_string(),
+                "yes".to_string(),
+                "prompt B".to_string(),
+                "yes".to_string(),
+                "prompt C".to_string(),
+            ])
+        );
+        // A repeat older than LOOKBACK still disqualifies a skip.
+        let mut long_prompts = vec!["prompt A".to_string(), "yes".to_string()];
+        long_prompts.extend((0..LOOKBACK + 2).map(|index| format!("distinct {index}")));
+        long_prompts.extend(["yes", "prompt D", "prompt E"].map(str::to_string));
+        let long_refs: Vec<&str> = long_prompts.iter().map(String::as_str).collect();
+        let long_read = prompted(&long_refs);
+        assert_eq!(
+            preface_of(&long_read, &["❯ yes", "❯ prompt E", "❯ "], top),
+            Err(PrefaceReason::SeamNotFound)
+        );
+    }
+
+    #[test]
+    fn a_skipping_prompt_row_whose_wrapped_prefix_matches_two_heads_places_no_seam() {
+        let read = prompted(&[
+            "prompt A",
+            "deploy it when the app lands and tell me",
+            "prompt B",
+            "deploy it when the app lands",
+            "prompt D",
+            "prompt E",
+        ]);
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+        assert_eq!(
+            preface_of(
+                &read,
+                &["❯ deploy it when the app lands", "❯ prompt E", "❯ ",],
+                top
+            ),
+            Err(PrefaceReason::SeamNotFound)
+        );
+    }
+
+    #[test]
+    fn a_lost_prompt_echo_at_the_bottom_above_an_editor_box_still_places_the_seam() {
+        let read = prompted(&["prompt A", "prompt B", "prompt C"]);
+        let rule = "─".repeat(40);
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+        assert_eq!(
+            preface_of(
+                &read,
+                &[
+                    "❯ prompt B",
+                    "⏺ Starting build",
+                    &rule,
+                    "❯ ",
+                    &rule,
+                    "  ? for shortcuts",
+                ],
+                top
+            ),
+            Ok(vec!["prompt A".to_string()])
+        );
+    }
+
+    #[test]
+    fn two_adjacent_lost_prompt_echoes_place_no_seam() {
+        let read = prompted(&["prompt A", "prompt B", "prompt C", "prompt D", "prompt E"]);
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+        assert_eq!(
+            preface_of(&read, &["❯ prompt B", "❯ prompt E", "❯ "], top),
+            Err(PrefaceReason::SeamNotFound)
+        );
+    }
+
+    #[test]
+    fn at_most_two_single_lost_prompt_echoes_are_allowed_per_seam() {
+        let read = prompted(&[
+            "prompt A", "prompt B", "prompt C", "prompt D", "prompt E", "prompt F", "prompt G",
+            "prompt H",
+        ]);
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+        // Two separate single losses (C and E lost) place the seam at B.
+        assert_eq!(
+            preface_of(
+                &read,
+                &[
+                    "❯ prompt B",
+                    "❯ prompt D",
+                    "❯ prompt F",
+                    "❯ prompt G",
+                    "❯ prompt H",
+                    "❯ ",
+                ],
+                top
+            ),
+            Ok(vec!["prompt A".to_string()])
+        );
+        // Three separate single losses (C, E, and G lost) refuse the seam.
+        assert_eq!(
+            preface_of(
+                &read,
+                &["❯ prompt B", "❯ prompt D", "❯ prompt F", "❯ prompt H", "❯ ",],
+                top
+            ),
+            Err(PrefaceReason::SeamNotFound)
+        );
+    }
+
+    #[test]
+    fn a_lost_prompt_whose_words_appear_on_an_unmarked_row_places_no_seam() {
+        let read = prompted(&["prompt A", "prompt B", "prompt C", "prompt D"]);
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+        for unmarked in ["prompt C", "  prompt C", "⏺ prompt C"] {
+            assert_eq!(
+                preface_of(&read, &["❯ prompt B", unmarked, "❯ prompt D", "❯ "], top),
+                Err(PrefaceReason::SeamNotFound),
+                "{unmarked}"
+            );
+        }
     }
 
     #[test]
