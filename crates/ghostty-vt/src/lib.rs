@@ -1631,6 +1631,61 @@ impl Terminal {
         )
     }
 
+    /// Read complete screen rows without dropping blank logical lines.
+    /// The formatter trims trailing blank rows even with trimming disabled,
+    /// so each logical line is selected separately and joined explicitly.
+    pub fn read_text_screen_untrimmed(&self, start: u32, end: u32) -> Result<String, Error> {
+        self.read_screen_rows_untrimmed(start, end, FormatterFormat::Plain, true)
+    }
+
+    /// Like `read_text_screen_untrimmed`, retaining terminal styling.
+    pub fn read_ansi_screen_untrimmed(
+        &self,
+        start: u32,
+        end: u32,
+        unwrap: bool,
+    ) -> Result<String, Error> {
+        self.read_screen_rows_untrimmed(start, end, FormatterFormat::Vt, unwrap)
+    }
+
+    fn read_screen_rows_untrimmed(
+        &self,
+        start: u32,
+        end: u32,
+        format: FormatterFormat,
+        unwrap: bool,
+    ) -> Result<String, Error> {
+        let cols = self.cols()?;
+        let mut text = String::new();
+        let mut first = start;
+        while first <= end {
+            let mut last = first;
+            while unwrap && last < end && self.row_wrap_continuation(last + 1)? {
+                last += 1;
+            }
+            if first != start {
+                text.push_str(if format == FormatterFormat::Vt {
+                    "\r\n"
+                } else {
+                    "\n"
+                });
+            }
+            text.push_str(&self.read_formatted_selection(
+                ghostty_screen_point(0, first),
+                ghostty_screen_point(cols.saturating_sub(1), last),
+                false,
+                format,
+                unwrap,
+                false,
+            )?);
+            if last == end {
+                break;
+            }
+            first = last + 1;
+        }
+        Ok(text)
+    }
+
     fn read_formatted_selection(
         &self,
         start: ffi::GhosttyPoint,

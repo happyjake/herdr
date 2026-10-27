@@ -133,7 +133,7 @@ fn stitch_recent_pages(
         let text = window.text.strip_suffix('\n').unwrap_or(&window.text);
         // A styled page ends its lines with a carriage return as well, all
         // but its last; a line is the same line either way.
-        let lines: Vec<&str> = if text.is_empty() {
+        let lines: Vec<&str> = if window.text.is_empty() {
             Vec::new()
         } else if ansi {
             text.split('\n')
@@ -148,7 +148,11 @@ fn stitch_recent_pages(
                 std::cmp::Ordering::Less if rows[index] == *line => {}
                 std::cmp::Ordering::Less => {
                     let (held, seen) = (visible(&rows[index]), visible(line));
-                    if seen.ends_with(held.as_str()) {
+                    if seen == held
+                        || (index + 1 == rows.len()
+                            && !held.is_empty()
+                            && seen.ends_with(held.as_str()))
+                    {
                         rows[index] = (*line).to_string();
                     } else {
                         return None;
@@ -3359,7 +3363,7 @@ fn ghostty_recent_read_at_offset_for_terminal(
             offset_unsupported: false,
         });
     }
-    let Some((_, end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
+    let Some((_, end, _)) = ghostty_recent_read_range(terminal, lines)? else {
         return Ok(RecentReadWindow::default());
     };
     // A nonzero offset is an explicit history read, so the window may land
@@ -3376,19 +3380,15 @@ fn ghostty_recent_read_at_offset_for_terminal(
         let start = page_end.saturating_add(1).saturating_sub(lines);
         (start, page_end, effective)
     };
-    let text = if ansi {
-        terminal.read_ansi_screen(
-            (0, start as u32),
-            (cols.saturating_sub(1), page_end as u32),
-            false,
-            unwrapped,
-        )?
+    let mut text = if ansi {
+        terminal.read_ansi_screen_untrimmed(start as u32, page_end as u32, unwrapped)?
     } else if unwrapped {
-        terminal.read_text_screen(
-            (0, start as u32),
-            (cols.saturating_sub(1), page_end as u32),
-            false,
-        )?
+        terminal
+            .read_text_screen_untrimmed(start as u32, page_end as u32)?
+            .split('\n')
+            .map(|line| line.trim_end_matches(' '))
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
         let mut rows = Vec::with_capacity(page_end.saturating_sub(start).saturating_add(1));
         for y in start..=page_end {
@@ -3396,6 +3396,11 @@ fn ghostty_recent_read_at_offset_for_terminal(
         }
         lines_to_text(rows)
     };
+    // A final newline is the read protocol's optional terminator. When the
+    // last logical row is blank, keep its separator as well as a terminator.
+    if (ansi || unwrapped) && (text.is_empty() || text.ends_with('\n')) {
+        text.push_str(if ansi { "\r\n" } else { "\n" });
+    }
     Ok(RecentReadWindow {
         text,
         effective_offset,
@@ -6534,6 +6539,190 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual offset-page timing"]
+    fn offset_page_read_cost() {
+        let mut terminal = crate::ghostty::Terminal::new(80, 24, 4_000_000).unwrap();
+        for i in 0..3200 {
+            terminal
+                .write(format!("\x1b[32mrow {i:04} coloured\x1b[0m default text\r\n").as_bytes());
+        }
+        terminal.write(b"bottom");
+        for ansi in [false, true] {
+            for _ in 0..3 {
+                std::hint::black_box(offset_window(&terminal, 1000, 1200, true, ansi));
+            }
+            let mut samples = Vec::new();
+            for _ in 0..12 {
+                let start = Instant::now();
+                for _ in 0..10 {
+                    std::hint::black_box(offset_window(&terminal, 1000, 1200, true, ansi));
+                }
+                samples.push(start.elapsed().as_micros() / 10);
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "1000-row offset page, ansi={ansi}: median {} us, range {}..{} us",
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn offset_pages_preserve_blank_rows_and_match_the_full_plain_read() {
+        assert_offset_pages_match_full_read(false);
+    }
+
+    #[test]
+    fn offset_pages_preserve_blank_rows_and_match_the_full_ansi_read() {
+        assert_offset_pages_match_full_read(true);
+    }
+
+    fn assert_offset_pages_match_full_read(ansi: bool) {
+        let mut terminal = crate::ghostty::Terminal::new(20, 5, 100_000).unwrap();
+        let rows: Vec<String> = (0..60)
+            .map(|i| match i % 6 {
+                0..=2 => String::new(),
+                3 => format!("wrapped-{i:02}-abcdefghijklmnop"),
+                _ => format!("line-{i:02}   "),
+            })
+            .chain(std::iter::once("bottom".to_string()))
+            .collect();
+        for row in &rows[..rows.len() - 1] {
+            terminal.write(format!("\x1b[32m{row}\x1b[0m\r\n").as_bytes());
+        }
+        terminal.write(b"bottom");
+
+        let full = offset_window(&terminal, 1000, 0, true, ansi);
+        let oracle: Vec<_> = full
+            .text
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r'))
+            .collect();
+        assert_eq!(oracle.len(), rows.len());
+        // Align each window's top to a logical-line boundary. Existing
+        // wrap-cut tests cover windows that begin with a partial line.
+        for bottom in 5..rows.len() - 1 {
+            let first = bottom - 5;
+            let physical_rows: usize = rows[first..=bottom]
+                .iter()
+                .map(|row| row.len().max(1).div_ceil(20))
+                .sum();
+            let offset = rows.len() - 1 - bottom;
+            let page = offset_window(&terminal, physical_rows, offset, true, ansi);
+            assert_eq!(page.effective_offset, offset);
+            let page_rows: Vec<_> = page
+                .text
+                .strip_suffix('\n')
+                .unwrap_or(&page.text)
+                .split('\n')
+                .map(|line| line.trim_end_matches('\r'))
+                .collect();
+            assert_eq!(
+                page_rows.len(),
+                6,
+                "offset {offset}, ansi {ansi}: {:?}",
+                page.text
+            );
+            for (k, line) in page_rows.iter().rev().enumerate() {
+                assert_eq!(
+                    *line,
+                    oracle[oracle.len() - 1 - page.effective_offset - k],
+                    "offset {offset}, from bottom {k}, ansi {ansi}"
+                );
+            }
+        }
+        // Overshooting returns the same complete top window, including
+        // its leading blank run and trailing blank row.
+        let page = offset_window(&terminal, 8, 999, true, ansi);
+        assert!(!page.has_more);
+        let page_rows: Vec<_> = page
+            .text
+            .strip_suffix('\n')
+            .unwrap_or(&page.text)
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r'))
+            .collect();
+        assert_eq!(page_rows.len(), 7);
+        for (k, line) in page_rows.iter().rev().enumerate() {
+            assert_eq!(*line, oracle[oracle.len() - 1 - page.effective_offset - k]);
+        }
+    }
+
+    #[test]
+    fn offset_ansi_pages_preserve_cell_styles_across_line_and_page_joins() {
+        fn rendered(text: &str) -> Vec<Vec<(String, crate::ghostty::CellStyle)>> {
+            let mut terminal = crate::ghostty::Terminal::new(20, 20, 100_000).unwrap();
+            terminal.write(text.as_bytes());
+            let mut state = crate::ghostty::RenderState::new().unwrap();
+            state.update(&mut terminal).unwrap();
+            let mut iterator = crate::ghostty::RowIterator::new().unwrap();
+            let mut rows = state.populate_row_iterator(&mut iterator).unwrap();
+            let mut storage = crate::ghostty::RowCells::new().unwrap();
+            let mut rendered = Vec::new();
+            while rows.next() {
+                let mut cells = rows.populate_cells(&mut storage).unwrap();
+                let mut row = Vec::new();
+                while cells.next() {
+                    row.push((cells.grapheme_text().unwrap(), cells.style().unwrap()));
+                }
+                rendered.push(row);
+            }
+            rendered
+        }
+
+        let mut terminal = crate::ghostty::Terminal::new(20, 4, 100_000).unwrap();
+        for i in 0..14 {
+            if i > 0 {
+                terminal.write(b"\r\n");
+            }
+            if i % 2 == 1 {
+                terminal.write(format!("\x1b[1;31;48;2;20;30;40mstyled {i}\x1b[0m").as_bytes());
+            } else {
+                terminal.write(format!("default {i}").as_bytes());
+            }
+        }
+        let full = offset_window(&terminal, 1000, 0, true, true);
+        let oracle = rendered(&full.text);
+        assert_ne!(oracle[4][0].1, oracle[5][0].1, "the fixture changes style");
+        let pages: Vec<_> = [8, 4, 0]
+            .map(|offset| offset_window(&terminal, 4, offset, true, true))
+            .into();
+        // Each page ends styled; the next starts with default cells. Feed the
+        // joined stream through a real terminal so SGR state carries across
+        // both kinds of join, just as it does in a client renderer.
+        let joined = pages
+            .iter()
+            .map(|page| page.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        for (y, row) in rendered(&joined)[..12].iter().enumerate() {
+            for (x, cell) in row.iter().enumerate() {
+                assert_eq!(*cell, oracle[y + 2][x], "row {y}, cell {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn offset_pages_keep_entirely_blank_windows() {
+        let mut terminal = crate::ghostty::Terminal::new(20, 4, 100_000).unwrap();
+        terminal.write(b"above\r\n\r\n\r\n\r\nbottom");
+        for ansi in [false, true] {
+            for lines in 1..=3 {
+                let page = offset_window(&terminal, lines, 1, true, ansi);
+                assert_eq!(page.effective_offset, 1);
+                assert_eq!(page.text, if ansi { "\r\n" } else { "\n" }.repeat(lines));
+            }
+            let span = stitch_recent_pages(3, usize::MAX, usize::MAX, ansi, |request| {
+                ghostty_recent_read_at_offset_for_terminal(&terminal, request).ok()
+            })
+            .expect("blank rows still meet exactly");
+            assert_eq!(strip_ansi(&span.text), "above\n\n\n\nbottom");
+        }
+    }
+
+    #[test]
     fn offset_read_zero_matches_legacy_recent_reads() {
         let terminal = terminal_with_numbered_scrollback();
 
@@ -6792,6 +6981,74 @@ mod tests {
         assert!(short.has_more);
         assert!(short.text.split('\n').count() > 5);
         assert!(span.text.ends_with(&short.text));
+    }
+
+    #[test]
+    fn a_span_rejects_a_shifted_middle_page_even_when_the_overlap_is_blank() {
+        for ansi in [false, true] {
+            let span = stitch_recent_pages(3, usize::MAX, usize::MAX, ansi, |request| {
+                Some(match request.offset_from_bottom {
+                    0 => RecentReadWindow {
+                        text: "\nnewer\nbottom".into(),
+                        effective_offset: 0,
+                        has_more: true,
+                        offset_unsupported: false,
+                    },
+                    2 => RecentReadWindow {
+                        // The actual page is "oldest\nolder\n": its bottom
+                        // blank was dropped without correcting its offset.
+                        text: "oldest\nolder".into(),
+                        effective_offset: 2,
+                        has_more: true,
+                        offset_unsupported: false,
+                    },
+                    _ => RecentReadWindow {
+                        text: "oldest\nolder".into(),
+                        effective_offset: 2,
+                        has_more: false,
+                        offset_unsupported: false,
+                    },
+                })
+            });
+            assert_eq!(span, None, "ansi {ansi}");
+        }
+    }
+
+    #[test]
+    fn a_span_only_accepts_a_wrap_tail_at_the_held_windows_top() {
+        for ansi in [false, true] {
+            for (held, above, expected) in [
+                (
+                    "tail\nnewer\nbottom",
+                    "older\nwhole-tail",
+                    Some("older\nwhole-tail\nnewer\nbottom"),
+                ),
+                ("top\ntail\nbottom", "older\ntop\nwhole-tail", None),
+            ] {
+                let span = stitch_recent_pages(3, usize::MAX, usize::MAX, ansi, |request| {
+                    Some(if request.offset_from_bottom == 0 {
+                        RecentReadWindow {
+                            text: held.into(),
+                            effective_offset: 0,
+                            has_more: true,
+                            offset_unsupported: false,
+                        }
+                    } else {
+                        RecentReadWindow {
+                            text: above.into(),
+                            effective_offset: if expected.is_some() { 2 } else { 1 },
+                            has_more: false,
+                            offset_unsupported: false,
+                        }
+                    })
+                });
+                assert_eq!(
+                    span.as_ref().map(|span| span.text.as_str()),
+                    expected,
+                    "ansi {ansi}"
+                );
+            }
+        }
     }
 
     #[test]
