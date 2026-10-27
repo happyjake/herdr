@@ -86,7 +86,7 @@ pub struct RecentReadWindow {
 }
 
 /// Recent unwrapped history read the way a client pages it — offset 0,
-/// then each page's echoed landing point plus its lines less one overlap —
+/// then each page's echoed landing point plus its lines less two overlaps —
 /// but every page from one state of the terminal, so the pages meet where
 /// the offsets say they do. `text` is the stitched lines, top first;
 /// `has_more` says history remains above them.
@@ -101,8 +101,9 @@ pub struct RecentReadSpan {
 ///
 /// Within one state of the terminal the line two pages share is the same
 /// line, except that a window whose top cuts a logical line mid-wrap holds
-/// only its tail; the fuller copy from the page above wins. Anything else
-/// means the offsets did not mean what they say, and there is no span.
+/// only its tail; the fuller copy from the page above wins only after the
+/// overlapping line below it matched exactly. Anything else means the
+/// offsets did not mean what they say, and there is no span.
 ///
 /// With `ansi` the pages carry styling, and two copies of a line are
 /// compared by their text alone: a tail cut mid-wrap opens with the style
@@ -146,23 +147,31 @@ fn stitch_recent_pages(
         } else {
             text.split('\n').collect()
         };
+        let mut matched_below = false;
         for (from_bottom, line) in lines.iter().rev().enumerate() {
             let index = window.effective_offset + from_bottom;
             match index.cmp(&rows.len()) {
-                std::cmp::Ordering::Less if rows[index] == *line => {}
+                std::cmp::Ordering::Less if rows[index] == *line => {
+                    matched_below = true;
+                }
                 std::cmp::Ordering::Less => {
                     let (held, seen) = (visible(&rows[index]), visible(line));
                     if seen == held
                         || (index + 1 == rows.len()
                             && held_top_is_wrap_tail
+                            && matched_below
                             && seen.ends_with(held.as_str()))
                     {
+                        matched_below = seen == held;
                         rows[index] = (*line).to_string();
                     } else {
                         return None;
                     }
                 }
-                std::cmp::Ordering::Equal => rows.push((*line).to_string()),
+                std::cmp::Ordering::Equal => {
+                    rows.push((*line).to_string());
+                    matched_below = false;
+                }
                 std::cmp::Ordering::Greater => return None,
             }
         }
@@ -176,7 +185,7 @@ fn stitch_recent_pages(
                 has_more: window.has_more,
             });
         }
-        let next = window.effective_offset + lines.len().saturating_sub(1).max(1);
+        let next = window.effective_offset + lines.len().saturating_sub(2).max(1);
         if next <= offset || lines.is_empty() {
             return None;
         }
@@ -3375,9 +3384,36 @@ fn ghostty_recent_read_at_offset_for_terminal(
             top_is_wrap_tail,
         });
     }
-    let Some((_, end, _)) = ghostty_recent_read_range(terminal, lines)? else {
+    let Some((_, mut end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
         return Ok(RecentReadWindow::default());
     };
+    // Zero-offset formatting drops blank rows after its last returned line.
+    // Use that same line as offset zero, even when the cursor is below it.
+    // Ask the matching formatter so ANSI spaces and plain-text trimming
+    // retain exactly the same meaning as in the zero-offset read.
+    loop {
+        let empty = match (unwrapped, ansi) {
+            (_, true) => terminal
+                .read_ansi_screen(
+                    (0, end as u32),
+                    (cols.saturating_sub(1), end as u32),
+                    false,
+                    unwrapped,
+                )?
+                .is_empty(),
+            (true, false) => terminal
+                .read_text_screen((0, end as u32), (cols.saturating_sub(1), end as u32), false)?
+                .is_empty(),
+            (false, false) => ghostty_screen_row(terminal, end as u32)?.trim().is_empty(),
+        };
+        if !empty {
+            break;
+        }
+        let Some(previous) = end.checked_sub(1) else {
+            return Ok(RecentReadWindow::default());
+        };
+        end = previous;
+    }
     // A nonzero offset is an explicit history read, so the window may land
     // on any scrollback row; the zero-offset floor guard that keeps small
     // reads on the visible screen does not apply. The window also keeps
@@ -6607,24 +6643,56 @@ mod tests {
         }
         terminal.write(b"bottom");
 
-        let full = offset_window(&terminal, 1000, 0, true, ansi);
-        let oracle: Vec<_> = full
-            .text
-            .split('\n')
-            .map(|line| line.trim_end_matches('\r'))
-            .collect();
-        assert_eq!(oracle.len(), rows.len());
-        // Align each window's top to a logical-line boundary. Existing
-        // wrap-cut tests cover windows that begin with a partial line.
-        for bottom in 5..rows.len() - 1 {
-            let first = bottom - 5;
-            let physical_rows: usize = rows[first..=bottom]
-                .iter()
-                .map(|row| row.len().max(1).div_ceil(20))
-                .sum();
-            let offset = rows.len() - 1 - bottom;
-            let page = offset_window(&terminal, physical_rows, offset, true, ansi);
-            assert_eq!(page.effective_offset, offset);
+        for trailing_blank_rows in [0, 1, 3] {
+            if trailing_blank_rows > 0 {
+                terminal.write(b"\r\n");
+                if trailing_blank_rows == 3 {
+                    terminal.write(b"\r\n");
+                }
+            }
+            let full = offset_window(&terminal, 1000, 0, true, ansi);
+            let oracle: Vec<_> = full
+                .text
+                .split('\n')
+                .map(|line| line.trim_end_matches('\r'))
+                .collect();
+            assert_eq!(oracle.len(), rows.len());
+            // Align each window's top to a logical-line boundary. Existing
+            // wrap-cut tests cover windows that begin with a partial line.
+            for bottom in 5..rows.len() - 1 {
+                let first = bottom - 5;
+                let physical_rows: usize = rows[first..=bottom]
+                    .iter()
+                    .map(|row| row.len().max(1).div_ceil(20))
+                    .sum();
+                let offset = rows.len() - 1 - bottom;
+                let page = offset_window(&terminal, physical_rows, offset, true, ansi);
+                assert_eq!(page.effective_offset, offset);
+                let page_rows: Vec<_> = page
+                    .text
+                    .strip_suffix('\n')
+                    .unwrap_or(&page.text)
+                    .split('\n')
+                    .map(|line| line.trim_end_matches('\r'))
+                    .collect();
+                assert_eq!(
+                    page_rows.len(),
+                    6,
+                    "offset {offset}, ansi {ansi}: {:?}",
+                    page.text
+                );
+                for (k, line) in page_rows.iter().rev().enumerate() {
+                    assert_eq!(
+                        *line,
+                        oracle[oracle.len() - 1 - page.effective_offset - k],
+                        "offset {offset}, from bottom {k}, ansi {ansi}"
+                    );
+                }
+            }
+            // Overshooting returns the same complete top window, including
+            // its leading blank run and trailing blank row.
+            let page = offset_window(&terminal, 8, 999, true, ansi);
+            assert!(!page.has_more);
             let page_rows: Vec<_> = page
                 .text
                 .strip_suffix('\n')
@@ -6632,34 +6700,10 @@ mod tests {
                 .split('\n')
                 .map(|line| line.trim_end_matches('\r'))
                 .collect();
-            assert_eq!(
-                page_rows.len(),
-                6,
-                "offset {offset}, ansi {ansi}: {:?}",
-                page.text
-            );
+            assert_eq!(page_rows.len(), 7);
             for (k, line) in page_rows.iter().rev().enumerate() {
-                assert_eq!(
-                    *line,
-                    oracle[oracle.len() - 1 - page.effective_offset - k],
-                    "offset {offset}, from bottom {k}, ansi {ansi}"
-                );
+                assert_eq!(*line, oracle[oracle.len() - 1 - page.effective_offset - k]);
             }
-        }
-        // Overshooting returns the same complete top window, including
-        // its leading blank run and trailing blank row.
-        let page = offset_window(&terminal, 8, 999, true, ansi);
-        assert!(!page.has_more);
-        let page_rows: Vec<_> = page
-            .text
-            .strip_suffix('\n')
-            .unwrap_or(&page.text)
-            .split('\n')
-            .map(|line| line.trim_end_matches('\r'))
-            .collect();
-        assert_eq!(page_rows.len(), 7);
-        for (k, line) in page_rows.iter().rev().enumerate() {
-            assert_eq!(*line, oracle[oracle.len() - 1 - page.effective_offset - k]);
         }
     }
 
@@ -6996,6 +7040,147 @@ mod tests {
         assert!(span.text.ends_with(&short.text));
     }
 
+    fn terminal_with_a_wrap_tail_and_blank_cursor(wrap_tail: bool) -> crate::ghostty::Terminal {
+        let mut terminal = crate::ghostty::Terminal::new(80, 4, 100_000).unwrap();
+        terminal.write(b"old1\r\nold2\r\n");
+        terminal.write("x".repeat(80).as_bytes());
+        if wrap_tail {
+            terminal.write(b" ");
+        }
+        terminal.write(b"\r\nnewer\r\nbottom\r\n");
+        terminal
+    }
+
+    #[test]
+    fn offset_pages_below_a_wrap_tail_match_the_zero_offset_oracle() {
+        for wrap_tail in [false, true] {
+            let terminal = terminal_with_a_wrap_tail_and_blank_cursor(wrap_tail);
+            for ansi in [false, true] {
+                let full = offset_window(&terminal, 100, 0, true, ansi);
+                let oracle: Vec<_> = full
+                    .text
+                    .split('\n')
+                    .map(|line| line.trim_end_matches('\r'))
+                    .collect();
+                for offset in 1..=8 {
+                    let page = offset_window(&terminal, 4, offset, true, ansi);
+                    let lines: Vec<_> = page
+                        .text
+                        .strip_suffix('\n')
+                        .unwrap_or(&page.text)
+                        .split('\n')
+                        .map(|line| line.trim_end_matches('\r'))
+                        .collect();
+                    for (k, line) in lines.iter().rev().enumerate() {
+                        assert_eq!(
+                            *line,
+                            oracle[oracle.len() - 1 - page.effective_offset - k],
+                            "offset {offset}, row {k}, ansi {ansi}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_span_with_a_blank_cursor_after_a_wrap_tail_stitches_each_line_once() {
+        for wrap_tail in [true, false] {
+            let terminal = terminal_with_a_wrap_tail_and_blank_cursor(wrap_tail);
+            for ansi in [false, true] {
+                let full = offset_window(&terminal, 100, 0, true, ansi);
+                let span = stitch_recent_pages(4, usize::MAX, usize::MAX, ansi, |request| {
+                    ghostty_recent_read_at_offset_for_terminal(&terminal, request).ok()
+                })
+                .expect("aligned offset pages stitch");
+                assert_eq!(
+                    strip_ansi(&span.text),
+                    strip_ansi(&full.text).replace('\r', "")
+                );
+                assert!(!span.has_more);
+            }
+        }
+    }
+
+    #[test]
+    fn a_span_rejects_pages_indexed_from_a_dropped_cursor_row() {
+        let wrapped = "x".repeat(80);
+        // Captured from the synthetic terminal before offset reads skipped
+        // the cursor's blank row. Page zero is trimmed; other pages count it.
+        let span = stitch_recent_pages(4, usize::MAX, usize::MAX, false, |request| {
+            Some(match request.offset_from_bottom {
+                0 => RecentReadWindow {
+                    text: "\nnewer\nbottom".into(),
+                    effective_offset: 0,
+                    has_more: true,
+                    top_is_wrap_tail: true,
+                    ..RecentReadWindow::default()
+                },
+                1 => RecentReadWindow {
+                    text: format!("{wrapped}\nnewer\nbottom"),
+                    effective_offset: 1,
+                    has_more: true,
+                    ..RecentReadWindow::default()
+                },
+                2 => RecentReadWindow {
+                    text: format!("old2\n{wrapped}\nnewer"),
+                    effective_offset: 2,
+                    has_more: true,
+                    ..RecentReadWindow::default()
+                },
+                _ => RecentReadWindow {
+                    text: format!("old1\nold2\n{wrapped}"),
+                    effective_offset: 3,
+                    has_more: false,
+                    ..RecentReadWindow::default()
+                },
+            })
+        });
+        assert_eq!(span, None);
+    }
+
+    #[test]
+    fn a_span_requires_an_exact_line_below_a_wrap_tail_merge() {
+        for tail in ["", "tail"] {
+            let span = stitch_recent_pages(2, usize::MAX, usize::MAX, false, |request| {
+                Some(if request.offset_from_bottom == 0 {
+                    RecentReadWindow {
+                        text: format!("{tail}\nbottom"),
+                        effective_offset: 0,
+                        has_more: true,
+                        top_is_wrap_tail: true,
+                        ..RecentReadWindow::default()
+                    }
+                } else {
+                    RecentReadWindow {
+                        text: "older\nwhole-tail".into(),
+                        effective_offset: 1,
+                        has_more: false,
+                        ..RecentReadWindow::default()
+                    }
+                })
+            });
+            assert_eq!(span, None, "tail {tail:?}");
+        }
+    }
+
+    #[test]
+    fn tiny_span_pages_keep_advancing_without_wrap_tail_merges() {
+        let terminal = terminal_with_numbered_scrollback();
+        for page_lines in [1, 2] {
+            let mut calls = 0;
+            let span = stitch_recent_pages(page_lines, usize::MAX, usize::MAX, false, |request| {
+                calls += 1;
+                assert!(calls <= 40, "tiny pages must make progress");
+                ghostty_recent_read_at_offset_for_terminal(&terminal, request).ok()
+            })
+            .expect("complete lines need no tail replacement");
+            let whole = offset_window(&terminal, 1000, 0, true, false);
+            assert_eq!(span.text, whole.text);
+            assert!(!span.has_more);
+        }
+    }
+
     #[test]
     fn a_span_preserves_an_empty_wrap_cut_tail() {
         let mut terminal = crate::ghostty::Terminal::new(8, 3, 100_000).unwrap();
@@ -7026,24 +7211,24 @@ mod tests {
             let span = stitch_recent_pages(3, usize::MAX, usize::MAX, ansi, |request| {
                 Some(match request.offset_from_bottom {
                     0 => RecentReadWindow {
-                        text: "\nnewer\nbottom".into(),
+                        text: "older\n\nbottom".into(),
                         effective_offset: 0,
                         has_more: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
                     },
-                    2 => RecentReadWindow {
+                    1 => RecentReadWindow {
                         // The actual page is "oldest\nolder\n": its bottom
                         // blank was dropped without correcting its offset.
                         text: "oldest\nolder".into(),
-                        effective_offset: 2,
+                        effective_offset: 1,
                         has_more: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
                     },
                     _ => RecentReadWindow {
                         text: "oldest\nolder".into(),
-                        effective_offset: 2,
+                        effective_offset: 1,
                         has_more: false,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
@@ -7068,8 +7253,8 @@ mod tests {
                     }
                 } else {
                     RecentReadWindow {
-                        text: "older\nwhole-tail".into(),
-                        effective_offset: 2,
+                        text: "older\nwhole-tail\nnewer".into(),
+                        effective_offset: 1,
                         has_more: false,
                         top_is_wrap_tail: false,
                         ..RecentReadWindow::default()
@@ -7086,7 +7271,7 @@ mod tests {
             for (held, above, expected) in [
                 (
                     "tail\nnewer\nbottom",
-                    "older\nwhole-tail",
+                    "older\nwhole-tail\nnewer",
                     Some("older\nwhole-tail\nnewer\nbottom"),
                 ),
                 ("top\ntail\nbottom", "older\ntop\nwhole-tail", None),
@@ -7103,7 +7288,7 @@ mod tests {
                     } else {
                         RecentReadWindow {
                             text: above.into(),
-                            effective_offset: if expected.is_some() { 2 } else { 1 },
+                            effective_offset: 1,
                             has_more: false,
                             offset_unsupported: false,
                             top_is_wrap_tail: false,
@@ -7138,9 +7323,9 @@ mod tests {
                         offset_unsupported: false,
                         top_is_wrap_tail: true,
                     },
-                    2 => RecentReadWindow {
-                        text: format!("L-1\r\n{above}"),
-                        effective_offset: 2,
+                    1 => RecentReadWindow {
+                        text: format!("L-1\r\n{above}\r\nL1"),
+                        effective_offset: 1,
                         has_more: false,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
