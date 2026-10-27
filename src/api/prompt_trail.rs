@@ -2358,7 +2358,9 @@ mod tests {
         );
         assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
 
-        // The line is there, but none of the record's prompts are below it.
+        // The anchor is placed, and the held rows show neither prompts nor
+        // prompt words. The record's older turns are above the held screen;
+        // omit the newest prompted turn, which may own the visible answer.
         let rows: Vec<String> = (0..30)
             .map(|row| format!("  unrelated output {row}"))
             .collect();
@@ -2370,7 +2372,22 @@ mod tests {
             screen,
             &preface_params(Some(top), 50),
         );
-        assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
+        let preface = preface_of(result);
+        let prompted: Vec<_> = preface
+            .turns
+            .iter()
+            .filter(|turn| turn.start == TurnStart::Prompt)
+            .map(|turn| turn.id.clone())
+            .collect();
+        assert_eq!(
+            prompted,
+            [1, 20, 25, 35, 39, 57].map(|id| format!("00000000-0000-4000-8000-{id:012}"))
+        );
+        assert_eq!(
+            preface.turns.len(),
+            8,
+            "wake and task turns still ride along"
+        );
     }
 
     const CODEX_THREAD: &str = "00000000-0000-7000-8000-000000000000";
@@ -3015,8 +3032,8 @@ mod tests {
         );
         assert_eq!(preface_reason(result), PrefaceReason::NothingAbove);
 
-        // A screen showing none of the transcript's prompts is no place to
-        // put a seam.
+        // Unrelated rows show neither sent prompts nor their words. Every
+        // older turn can be prefaced; the newest may own the visible answer.
         let rows: Vec<String> = (0..20).map(|row| format!("  unrelated {row}")).collect();
         let (result, _) = ask_preface(
             &fixture,
@@ -3024,10 +3041,18 @@ mod tests {
             FakeScreen::new(rows),
             &preface_params(None, 50),
         );
-        assert_eq!(preface_reason(result), PrefaceReason::SeamNotFound);
+        assert_eq!(
+            turn_summary(&preface_of(result)),
+            vec![
+                ("0", TurnStart::Prompt, TurnEnd::Answered),
+                ("7", TurnStart::Task, TurnEnd::Answered),
+                ("11", TurnStart::Prompt, TurnEnd::Open),
+                ("12", TurnStart::Prompt, TurnEnd::Answered),
+                ("20", TurnStart::Prompt, TurnEnd::Error),
+            ]
+        );
 
-        // Nor is one whose rows repeat the prompts' words without agy's
-        // prompt marker ahead of them.
+        // Rows repeating prompt words without the marker remain ambiguous.
         let rows: Vec<String> = agy_screen_of(0..6, 3)
             .into_iter()
             .map(|row| match row.strip_prefix("> ") {

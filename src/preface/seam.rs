@@ -17,9 +17,13 @@
 //! prompt above the client's oldest line, some of its answer below — is
 //! therefore quoted whole, and a few of its lines show twice.
 //!
-//! When the anchor or the prompts cannot be placed beyond doubt, there is
-//! no preface: a preface placed by a guess would say the screen begins
-//! somewhere it does not, and could leave out a turn without counting it.
+//! With an anchor but no sent prompts or prompt words held, older record
+//! turns precede the screen. The newest prompted turn is still withheld:
+//! its answer may be visible or still running. The bottom input editor is
+//! excluded from both prompt evidence and the search for prompt words.
+//!
+//! When the anchor or prompt evidence is ambiguous, there is no preface:
+//! guessing could leave out a turn without counting it.
 
 use super::{ReadTurns, Turn};
 use crate::api::schema::{Preface, PrefaceReason, PrefaceTurn, TurnStart};
@@ -90,6 +94,9 @@ struct Screen {
     /// Whether `rows[i]` is a prompt row by its background; empty unless
     /// the harness sets a prompt apart by one.
     prompts: Vec<bool>,
+    /// Input editor rows, bottom first, excluded from both prompt evidence
+    /// and the fallback's search for ambiguous prompt words.
+    editor: std::ops::Range<usize>,
 }
 
 /// The preface one request asks for.
@@ -123,14 +130,29 @@ pub(crate) fn preface(
         .ok_or(PrefaceReason::SeamNotFound)?;
     let anchor = anchor(&screen, top).ok_or(PrefaceReason::SeamNotFound)?;
     let held = &screen.rows[..=anchor];
-    let seam = match evidence.background {
-        Some(_) => place_prompts(
+    let prompts = held
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if screen.editor.contains(&index) {
+                return None;
+            }
+            match evidence.background {
+                Some(_) => screen.prompts[index].then(|| crate::prompt_trail::clean(row)),
+                None => prompt_row(row, evidence.markers),
+            }
+        })
+        .collect::<Vec<_>>();
+    let seam = if prompts.iter().any(Option::is_some) {
+        place_prompts(turns, prompts.into_iter())
+    } else {
+        place_without_prompts(
             turns,
             held.iter()
-                .zip(&screen.prompts)
-                .map(|(row, prompt)| prompt.then(|| crate::prompt_trail::clean(row))),
-        ),
-        None => place(turns, evidence.markers, held.iter().map(String::as_str)),
+                .enumerate()
+                .filter(|(index, _)| !screen.editor.contains(index))
+                .map(|(_, row)| row.as_str()),
+        )
     }
     .ok_or(PrefaceReason::SeamNotFound)?;
     let (kept, omitted) = select(turns, seam, max_turns.min(MAX_TURNS));
@@ -178,11 +200,43 @@ fn screen_of(span: Span, background: Option<[u8; 3]>) -> Screen {
     prompts.reverse();
     let mut rows: Vec<String> = lines.into_iter().map(row).collect();
     rows.reverse();
+    let editor = bottom_input_box(&rows).unwrap_or(0..0);
     Screen {
         rows,
         top: !span.has_more,
         prompts,
+        editor,
     }
+}
+
+/// The bottom-most pair of full-row rules bounds the editor only when
+/// the suffix consists of footer controls. Rules in output above that box
+/// must never hide sent prompts. The rules must have equal widths; editor
+/// lines themselves may exceed that width after soft wraps are joined.
+fn bottom_input_box(rows: &[String]) -> Option<std::ops::Range<usize>> {
+    let rule = |row: &str| !row.is_empty() && row.chars().all(|c| c == '─');
+    let bottom = rows.iter().position(|row| rule(row))?;
+    if !rows[..bottom].iter().all(|row| footer_row(row)) {
+        return None;
+    }
+    let top = (bottom + 1..rows.len()).find(|&index| rule(&rows[index]))?;
+    if top == bottom + 1 || rows[top] != rows[bottom] {
+        return None;
+    }
+    Some(bottom + 1..top)
+}
+
+/// Recognised footer controls keep an arbitrary output rule pair from
+/// being interpreted as the live editor. Unknown suffix text is ambiguous.
+fn footer_row(row: &str) -> bool {
+    let row = row.trim();
+    row.is_empty()
+        || row.starts_with("? for shortcuts")
+        || row.starts_with("⏵⏵ ")
+        || row.starts_with("⏸ ")
+        || row.starts_with("shift+tab ")
+        || row.starts_with("ctrl+")
+        || row.starts_with("esc to ")
 }
 
 /// Which of a screen's styled lines, top first, are prompt rows by their
@@ -365,6 +419,32 @@ fn anchor(screen: &Screen, top: Top<'_>) -> Option<usize> {
     found.next().is_none().then_some(only)
 }
 
+/// With no sent prompts held, the newest prompted turn may account for the
+/// visible answer. Keep that turn out of the preface. Prompt words without
+/// the harness's evidence are ambiguous, so they still refuse the seam.
+fn place_without_prompts<'a>(turns: &[Turn], held: impl Iterator<Item = &'a str>) -> Option<usize> {
+    for line in held {
+        let cleaned = crate::prompt_trail::clean(line);
+        let words = cleaned
+            .chars()
+            .next()
+            .filter(|glyph| !glyph.is_alphanumeric())
+            .and_then(|glyph| cleaned[glyph.len_utf8()..].strip_prefix(' '))
+            .unwrap_or(&cleaned);
+        if turns
+            .iter()
+            .filter(|turn| turn.start == TurnStart::Prompt)
+            .filter_map(|turn| turn.head.as_deref())
+            .any(|head| shows(words, head))
+        {
+            return None;
+        }
+    }
+    turns
+        .iter()
+        .rposition(|turn| turn.start == TurnStart::Prompt)
+}
+
 /// The index of the oldest turn whose prompt the held rows show, when the
 /// record's prompts line up with them beyond doubt.
 ///
@@ -376,6 +456,7 @@ fn anchor(screen: &Screen, top: Top<'_>) -> Option<usize> {
 /// record prompt that lines up with nothing; a record prompt skipped with
 /// no row to account for it would be a turn left out unseen, so the seam
 /// is refused instead.
+#[cfg(test)]
 fn place<'a>(
     turns: &[Turn],
     markers: &[&str],
@@ -387,7 +468,7 @@ fn place<'a>(
     )
 }
 
-/// [`place`] over rows already judged: each held row, bottom first, is its
+/// Over rows already judged: each held row, bottom first, is its
 /// words as a prompt when it is a prompt row and nothing otherwise.
 fn place_prompts(
     turns: &[Turn],
@@ -822,6 +903,172 @@ mod tests {
             ),
             Err(PrefaceReason::NothingAbove)
         );
+    }
+
+    #[test]
+    fn a_placed_screen_without_prompt_rows_prefaces_all_but_the_newest_prompt() {
+        let read = prompted(&["prompt one", "prompt two", "prompt three"]);
+        let held = run(&["an unrelated answer"]);
+        let top = Top {
+            offset: Some(1),
+            lines: Some(&held),
+        };
+        assert_eq!(
+            preface_of(&read, &["an unrelated answer", "more output"], top),
+            Ok(vec!["prompt one".into(), "prompt two".into()])
+        );
+        // Only the rows the client holds decide the seam.
+        assert_eq!(
+            preface_of(
+                &read,
+                &["prompt one", "an unrelated answer", "more output"],
+                top
+            ),
+            Ok(vec!["prompt one".into(), "prompt two".into()])
+        );
+        assert_eq!(
+            preface_of(&read, &["a different answer", "more output"], top),
+            Err(PrefaceReason::SeamNotFound),
+            "the anchor must still be placed"
+        );
+        assert_eq!(
+            preface_of(&prompted(&[]), &["an unrelated answer", "more output"], top),
+            Err(PrefaceReason::SeamNotFound),
+            "the record needs a prompted turn"
+        );
+    }
+
+    #[test]
+    fn prompt_words_without_prompt_evidence_still_refuse_the_seam() {
+        let read = prompted(&[
+            "prompt one",
+            "a sufficiently long prompt whose wrapped head is still recognisable",
+            "prompt three",
+        ]);
+        for row in [
+            "prompt one",
+            "  prompt   one",
+            "  ⏺ prompt one",
+            "  > prompt one",
+            "  ⏺ a sufficiently long prompt whose",
+        ] {
+            assert_eq!(
+                preface_of(
+                    &read,
+                    &[row, "an unrelated answer"],
+                    Top {
+                        offset: None,
+                        lines: None
+                    }
+                ),
+                Err(PrefaceReason::SeamNotFound),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn drafts_in_the_bottom_input_box_are_not_marker_prompts() {
+        assert_editor_drafts_are_not_prompts(None);
+    }
+
+    #[test]
+    fn drafts_in_the_bottom_input_box_are_not_background_prompts() {
+        assert_editor_drafts_are_not_prompts(Some([20, 30, 40]));
+    }
+
+    fn assert_editor_drafts_are_not_prompts(background: Option<[u8; 3]>) {
+        let read = prompted(&["prompt one", "prompt two", "prompt three"]);
+        let rule = "─".repeat(40);
+        for draft in [
+            "an unsent draft",
+            "prompt one",
+            "an unsent draft whose soft wraps form a logical line longer than the input box",
+        ] {
+            let editor = match background {
+                Some(_) => format!("\x1b[48;2;20;30;40m❯ {draft}\x1b[0m"),
+                None => format!("❯ {draft}"),
+            };
+            let rows = [
+                "unrelated answer",
+                &rule,
+                &editor,
+                &rule,
+                "  ? for shortcuts",
+            ];
+            let anchor_lines = run(&[&editor]);
+            for top in [
+                Top {
+                    offset: None,
+                    lines: None,
+                },
+                Top {
+                    offset: Some(2),
+                    lines: Some(&anchor_lines),
+                },
+            ] {
+                let result = preface(
+                    "claude",
+                    "s",
+                    &read,
+                    top,
+                    MAX_TURNS,
+                    PromptEvidence {
+                        markers: &MARKERS,
+                        background,
+                    },
+                    |_| {
+                        Some(Span {
+                            text: rows.join("\n"),
+                            has_more: false,
+                        })
+                    },
+                )
+                .map(|preface| {
+                    preface
+                        .turns
+                        .into_iter()
+                        .filter_map(|turn| turn.prompt)
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(
+                    result,
+                    Ok(vec!["prompt one".into(), "prompt two".into()]),
+                    "background {background:?}, draft {draft}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sent_prompt_rows_outside_the_bottom_input_box_still_refuse_an_unknown_prompt() {
+        let read = prompted(&["prompt one", "prompt two", "prompt three"]);
+        let rule = "─".repeat(40);
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+        for rows in [
+            vec!["❯ an unknown sent prompt", "an answer"],
+            vec![
+                &rule,
+                "❯ an unknown sent prompt",
+                &rule,
+                "an answer",
+                &rule,
+                "❯ an unsent draft",
+                &rule,
+                "  ? for shortcuts",
+            ],
+            vec![&rule, "❯ an unknown sent prompt", &rule, "output continues"],
+            vec![&rule, "❯ an unknown sent prompt", "──", "  ? for shortcuts"],
+        ] {
+            assert_eq!(
+                preface_of(&read, &rows, top),
+                Err(PrefaceReason::SeamNotFound),
+                "{rows:?}"
+            );
+        }
     }
 
     #[test]
