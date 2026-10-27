@@ -169,15 +169,17 @@ impl HeadlessServer {
                     .sum();
                 let send_result =
                     crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds);
-                if send_result.is_ok() {
+                if let Ok(fd_stats) = &send_result {
                     info!(
                         panes = handoff_entries.len(),
                         replay_bytes = inline_replay_bytes,
+                        fd_retries = fd_stats.retries,
+                        fd_waited_ms = fd_stats.waited.as_millis() as u64,
                         transport = "inline-legacy",
                         "live handoff replay exported"
                     );
                 }
-                send_result
+                send_result.map(|_| ())
             }
             crate::server::handoff::ReplayTransport::ReplayFrames => {
                 // The manifest already carried a legacy-budget replay inline;
@@ -226,19 +228,23 @@ impl HeadlessServer {
                             Some(&history),
                         )?;
                     }
-                    crate::server::handoff::send_fds(&stream, &fds)?;
+                    let deadline = std::time::Instant::now()
+                        + crate::server::handoff::replay_restored_timeout(replay_bytes);
+                    let fd_stats = crate::server::handoff::send_fds(&stream, &fds, deadline)?;
                     crate::server::handoff::wait_restored(
                         &mut stream,
-                        crate::server::handoff::replay_restored_timeout(replay_bytes),
+                        deadline.saturating_duration_since(std::time::Instant::now()),
                     )?;
-                    Ok::<_, io::Error>((replay_bytes, panes_cut, bytes_dropped))
+                    Ok::<_, io::Error>((replay_bytes, panes_cut, bytes_dropped, fd_stats))
                 })();
-                send_frames.map(|(replay_bytes, panes_cut, bytes_dropped)| {
+                send_frames.map(|(replay_bytes, panes_cut, bytes_dropped, fd_stats)| {
                     info!(
                         panes = handoff_entries.len(),
                         replay_bytes,
                         panes_cut,
                         bytes_dropped,
+                        fd_retries = fd_stats.retries,
+                        fd_waited_ms = fd_stats.waited.as_millis() as u64,
                         transport = "frames",
                         "live handoff replay exported"
                     );

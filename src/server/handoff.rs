@@ -333,15 +333,36 @@ pub(crate) fn accept_and_validate_on(
 }
 
 #[cfg(unix)]
-pub(crate) fn send_fds_and_wait_restored(stream: &mut UnixStream, fds: &[RawFd]) -> io::Result<()> {
-    send_fds(stream, fds)?;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FdSendStats {
+    pub retries: usize,
+    pub waited: Duration,
+}
 
-    wait_restored(stream, READY_TIMEOUT)
+#[cfg(unix)]
+const FD_SEND_INITIAL_BACKOFF: Duration = Duration::from_millis(1);
+#[cfg(unix)]
+const FD_SEND_MAX_BACKOFF: Duration = Duration::from_millis(50);
+#[cfg(unix)]
+const FD_SEND_MIN_WRITE_TIMEOUT: Duration = Duration::from_millis(1);
+
+#[cfg(unix)]
+pub(crate) fn send_fds_and_wait_restored(
+    stream: &mut UnixStream,
+    fds: &[RawFd],
+) -> io::Result<FdSendStats> {
+    let deadline = std::time::Instant::now() + READY_TIMEOUT;
+    let stats = send_fds(stream, fds, deadline)?;
+    wait_restored(
+        stream,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    )?;
+    Ok(stats)
 }
 
 #[cfg(unix)]
 pub(crate) fn wait_restored(stream: &mut UnixStream, timeout: Duration) -> io::Result<()> {
-    stream.set_read_timeout(Some(timeout))?;
+    stream.set_read_timeout(Some(timeout.max(FD_SEND_MIN_WRITE_TIMEOUT)))?;
     let restored = read_line_unbuffered(&mut *stream)?;
     if restored.trim_end() != "restored" {
         return Err(io::Error::other(
@@ -703,15 +724,31 @@ fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
 }
 
 #[cfg(unix)]
-pub(crate) fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
-    for batch in fds.chunks(FDS_PER_MESSAGE) {
-        send_fd_batch(stream, batch)?;
+pub(crate) fn send_fds(
+    stream: &UnixStream,
+    fds: &[RawFd],
+    deadline: std::time::Instant,
+) -> io::Result<FdSendStats> {
+    let batches: Vec<&[RawFd]> = fds.chunks(FDS_PER_MESSAGE).collect();
+    let batch_count = batches.len();
+    let mut stats = FdSendStats::default();
+    for (index, batch) in batches.into_iter().enumerate() {
+        let batch_stats = send_fd_batch(stream, batch, index + 1, batch_count, deadline)?;
+        stats.retries += batch_stats.retries;
+        stats.waited += batch_stats.waited;
     }
-    Ok(())
+    if stats.retries > 0 {
+        info!(
+            retries = stats.retries,
+            waited_ms = stats.waited.as_millis() as u64,
+            "handoff fd transfer succeeded after retries"
+        );
+    }
+    Ok(stats)
 }
 
 #[cfg(unix)]
-fn send_fd_batch(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
+fn send_fd_batch_once(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
     if fds.is_empty() {
         return Ok(());
     }
@@ -742,6 +779,110 @@ fn send_fd_batch(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn is_retryable_fd_send_errno(errno: i32) -> bool {
+    errno == libc::EMSGSIZE
+        || errno == libc::ENOBUFS
+        || errno == libc::EAGAIN
+        || errno == libc::EWOULDBLOCK
+}
+
+#[cfg(unix)]
+fn fd_send_errno_name(errno: i32) -> &'static str {
+    if errno == libc::EMSGSIZE {
+        "EMSGSIZE"
+    } else if errno == libc::ENOBUFS {
+        "ENOBUFS"
+    } else if errno == libc::EAGAIN {
+        "EAGAIN"
+    } else if errno == libc::EWOULDBLOCK {
+        "EWOULDBLOCK"
+    } else if errno == libc::EINTR {
+        "EINTR"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+#[cfg(unix)]
+fn send_fd_batch(
+    stream: &UnixStream,
+    fds: &[RawFd],
+    batch_num: usize,
+    batch_count: usize,
+    deadline: std::time::Instant,
+) -> io::Result<FdSendStats> {
+    if fds.is_empty() {
+        return Ok(FdSendStats::default());
+    }
+    let previous_write_timeout = stream.write_timeout()?;
+    let started_at = std::time::Instant::now();
+    let deadline_budget = deadline.saturating_duration_since(started_at);
+    let mut backoff = FD_SEND_INITIAL_BACKOFF;
+    let mut retries = 0usize;
+
+    let result = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Err(err) = stream.set_write_timeout(Some(remaining.max(FD_SEND_MIN_WRITE_TIMEOUT))) {
+            break Err(err);
+        }
+
+        match send_fd_batch_once(stream, fds) {
+            Ok(()) => {
+                let waited = if retries > 0 {
+                    started_at.elapsed()
+                } else {
+                    Duration::ZERO
+                };
+                break Ok(FdSendStats { retries, waited });
+            }
+            Err(err) => {
+                let Some(errno) = err.raw_os_error() else {
+                    break Err(err);
+                };
+                if errno == libc::EINTR {
+                    continue;
+                }
+                if !is_retryable_fd_send_errno(errno) {
+                    break Err(err);
+                }
+
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    let errno_name = fd_send_errno_name(errno);
+                    break Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "handoff fd send timed out on batch {batch_num}/{batch_count} after {:?} (deadline {:?}, retries {retries}, last errno {errno_name}/{errno}): {err}",
+                            started_at.elapsed(),
+                            deadline_budget,
+                        ),
+                    ));
+                }
+
+                if retries == 0 {
+                    warn!(
+                        batch = batch_num,
+                        batches = batch_count,
+                        fds = fds.len(),
+                        errno,
+                        "handoff fd batch send stalled; retrying"
+                    );
+                }
+                retries += 1;
+                let sleep_for = backoff.min(deadline.saturating_duration_since(now));
+                std::thread::sleep(sleep_for);
+                backoff = (backoff * 2).min(FD_SEND_MAX_BACKOFF);
+            }
+        }
+    };
+
+    let restore_result = stream.set_write_timeout(previous_write_timeout);
+    let stats = result?;
+    restore_result?;
+    Ok(stats)
 }
 
 #[cfg(unix)]
@@ -1561,5 +1702,167 @@ mod tests {
     fn an_importer_answers_a_manifest_with_replay_frames_with_the_frames_ack() {
         let (ack, _) = receive_against_exporter("frames", &[EXTENSION_REPLAY_FRAMES]);
         assert_eq!(ack, VALIDATED_REPLAY_FRAMES);
+    }
+
+    /// Fill the stream's send/peer buffer by switching the sender nonblocking,
+    /// writing until `WouldBlock`, then restoring blocking mode.
+    fn fill_stream_buffer(sender: &mut UnixStream) -> usize {
+        sender.set_nonblocking(true).expect("set nonblocking");
+        let chunk = [b'x'; 1024];
+        let mut written = 0usize;
+        loop {
+            match sender.write(&chunk) {
+                Ok(0) => break,
+                Ok(count) => written += count,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => panic!("unexpected write error while filling socket buffer: {err}"),
+            }
+        }
+        loop {
+            match sender.write(&[b'x']) {
+                Ok(0) => break,
+                Ok(count) => written += count,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    panic!("unexpected 1-byte write error while filling socket buffer: {err}")
+                }
+            }
+        }
+        sender.set_nonblocking(false).expect("restore blocking");
+        assert!(
+            written > 0,
+            "socket buffer should accept bytes before WouldBlock"
+        );
+        written
+    }
+
+    fn open_dev_null_fds(count: usize) -> Vec<RawFd> {
+        let dev_null = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let mut fds = Vec::with_capacity(count);
+        for _ in 0..count {
+            let fd = unsafe { libc::dup(dev_null.as_raw_fd()) };
+            assert!(
+                fd >= 0,
+                "dup /dev/null failed: {}",
+                io::Error::last_os_error()
+            );
+            fds.push(fd);
+        }
+        fds
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn filled_socket_pair_rejects_one_raw_fd_batch_with_emsgsize() {
+        let (mut sender, _receiver) = UnixStream::pair().expect("socket pair");
+        fill_stream_buffer(&mut sender);
+        let fds = open_dev_null_fds(FDS_PER_MESSAGE);
+        let result = send_fd_batch_once(&sender, &fds);
+        close_raw_fds(&fds);
+
+        let err = result.expect_err("raw sendmsg of 64 fds on a filled macOS pair must fail");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EMSGSIZE),
+            "expected EMSGSIZE on filled macOS socket pair, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn send_fds_stalls_on_full_peer_buffer_then_succeeds_once_drained() {
+        let (mut sender, mut receiver) = UnixStream::pair().expect("socket pair");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set receiver read timeout");
+        let previous_write_timeout = Some(Duration::from_secs(17));
+        sender
+            .set_write_timeout(previous_write_timeout)
+            .expect("set initial sender write timeout");
+        let filled_bytes = fill_stream_buffer(&mut sender);
+        let sender_fds = open_dev_null_fds(FDS_PER_MESSAGE);
+
+        let sender_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let result = send_fds(&sender, &sender_fds, deadline);
+            let restored_timeout = sender.write_timeout().expect("query sender write timeout");
+            close_raw_fds(&sender_fds);
+            (result, restored_timeout)
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        let mut drained = vec![0u8; filled_bytes];
+        receiver
+            .read_exact(&mut drained)
+            .expect("drain unread replay bytes");
+        let recv_result = recv_fds(&receiver, FDS_PER_MESSAGE);
+
+        let (send_result, restored_timeout) = sender_thread.join().expect("sender thread");
+        let stats = send_result.expect("send_fds should succeed once importer drains");
+        let received_fds = recv_result.expect("receive 64 fds after draining");
+        assert_eq!(received_fds.len(), FDS_PER_MESSAGE);
+        close_raw_fds(&received_fds);
+        assert_eq!(
+            restored_timeout, previous_write_timeout,
+            "send_fds must restore previous write timeout"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            stats.retries >= 1,
+            "expected at least one retry on macOS while buffer was full, got {stats:?}"
+        );
+        #[cfg(not(target_os = "macos"))]
+        let _ = stats;
+    }
+
+    #[test]
+    fn send_fds_returns_deadline_error_when_peer_never_drains() {
+        let (mut sender, _receiver) = UnixStream::pair().expect("socket pair");
+        let previous_write_timeout = Some(Duration::from_secs(19));
+        sender
+            .set_write_timeout(previous_write_timeout)
+            .expect("set initial sender write timeout");
+        fill_stream_buffer(&mut sender);
+        let fds = open_dev_null_fds(FDS_PER_MESSAGE);
+
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        let err = send_fds(&sender, &fds, deadline)
+            .expect_err("send_fds must fail when peer never drains before deadline");
+        let elapsed = started.elapsed();
+        let restored_timeout = sender.write_timeout().expect("query sender write timeout");
+        close_raw_fds(&fds);
+
+        assert_eq!(
+            restored_timeout, previous_write_timeout,
+            "send_fds must restore previous write timeout after deadline error"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed <= Duration::from_millis(1200),
+            "expected deadline failure within [200ms, 1.2s], got {elapsed:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("batch 1/1"),
+            "deadline error should name batch 1/1: {message}"
+        );
+        assert!(
+            message.contains("deadline"),
+            "deadline error should name deadline: {message}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            message.contains("EMSGSIZE") || message.contains("40"),
+            "deadline error on macOS should name EMSGSIZE/40: {message}"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(
+            message.contains("EAGAIN")
+                || message.contains("EWOULDBLOCK")
+                || message.contains("EMSGSIZE")
+                || message.contains("ENOBUFS"),
+            "deadline error should name the retryable errno: {message}"
+        );
     }
 }
