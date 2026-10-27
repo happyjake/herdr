@@ -541,6 +541,7 @@ fn preface_from(
         .map(|reader| crate::preface::seam::PromptEvidence {
             markers: reader.prompt_markers(),
             background: reader.prompt_background(),
+            editor_box: reader.editor_box(),
         })
         .unwrap_or_default();
     let fallback_session_id = match agent {
@@ -1715,6 +1716,68 @@ mod tests {
         assert_eq!(permits().available_permits(), 1);
         release.send(()).unwrap();
         completion.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    /// Inspect a real record against captured plain recent_unwrapped text.
+    /// PREFACE_AGENT selects claude, codex, pi, or agy; PREFACE_RECORD and
+    /// PREFACE_SCREEN name the files. Optional PREFACE_TOP_OFFSET and
+    /// PREFACE_TOP_LINES must be supplied together; the latter accepts a
+    /// JSON string array or one anchor line per text-file line.
+    /// Run this ignored test with output capture disabled. Its only output
+    /// is a reason code or turn counts, never record or screen contents.
+    #[test]
+    #[ignore = "reads a record and captured screen named by the environment"]
+    fn preface_captured_screen_outcome() {
+        let outcome = (|| {
+            let agent = match std::env::var("PREFACE_AGENT").as_deref() {
+                Ok("claude") => PromptTrailAgent::Claude,
+                Ok("codex") => PromptTrailAgent::Codex,
+                Ok("pi") => PromptTrailAgent::Pi,
+                Ok("agy") => PromptTrailAgent::Agy,
+                _ => return Err(PrefaceReason::UnsupportedAgent),
+            };
+            let record = std::env::var_os("PREFACE_RECORD").ok_or(PrefaceReason::Unreadable)?;
+            let screen = std::env::var_os("PREFACE_SCREEN").ok_or(PrefaceReason::Unreadable)?;
+            let text = std::fs::read_to_string(PathBuf::from(screen))
+                .map_err(|_| PrefaceReason::Unreadable)?;
+            let top_offset = std::env::var_os("PREFACE_TOP_OFFSET")
+                .map(|offset| {
+                    offset
+                        .to_str()
+                        .and_then(|offset| offset.parse::<u64>().ok())
+                        .ok_or(PrefaceReason::SeamNotFound)
+                })
+                .transpose()?;
+            let top_lines = std::env::var_os("PREFACE_TOP_LINES")
+                .map(|path| {
+                    let text = std::fs::read_to_string(PathBuf::from(path))
+                        .map_err(|_| PrefaceReason::Unreadable)?;
+                    Ok::<_, PrefaceReason>(
+                        serde_json::from_str::<Vec<String>>(&text)
+                            .unwrap_or_else(|_| text.lines().map(str::to_string).collect()),
+                    )
+                })
+                .transpose()?;
+            if top_offset.is_some() != top_lines.is_some() {
+                return Err(PrefaceReason::SeamNotFound);
+            }
+            let params = PanePrefaceParams {
+                pane_id: "capture".into(),
+                top_offset,
+                top_lines,
+                max_turns: crate::preface::seam::MAX_TURNS,
+            };
+            preface_from(&PathBuf::from(record), agent, &params, |_, _| {
+                Some(crate::preface::seam::Span {
+                    text,
+                    has_more: false,
+                })
+            })
+        })();
+        match outcome {
+            Ok(preface) => println!("turns={} omitted={}", preface.turns.len(), preface.omitted),
+            Err(reason) => println!("{}", prefacereason_code(reason)),
+        }
     }
 
     // ---- pane.preface ----

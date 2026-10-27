@@ -71,6 +71,10 @@ impl super::Reader for ClaudeReader {
     fn prompt_markers(&self) -> &'static [&'static str] {
         &[PROMPT_MARKER]
     }
+
+    fn editor_box(&self) -> bool {
+        true
+    }
 }
 
 impl ClaudeReader {

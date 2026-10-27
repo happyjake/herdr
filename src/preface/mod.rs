@@ -143,6 +143,13 @@ pub(crate) trait Reader {
         &[]
     }
 
+    /// Whether the harness draws its live editor between horizontal rules,
+    /// followed by a bounded status area. Other harnesses must not treat
+    /// output between rules as unsent input.
+    fn editor_box(&self) -> bool {
+        false
+    }
+
     /// The background colour, as RGB, a harness lays under every visible
     /// cell of a prompt on its screen, for a harness that sets a prompt
     /// apart by colour rather than by a marker. A screen is then read with

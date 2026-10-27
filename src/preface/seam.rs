@@ -82,6 +82,8 @@ pub(crate) struct PromptEvidence<'a> {
     /// [`super::Reader::prompt_background`]); when set, the screen is read
     /// with its styling and the background is the evidence.
     pub background: Option<[u8; 3]>,
+    /// Whether this harness declares a ruled input editor.
+    pub editor_box: bool,
 }
 
 /// A screen as far up as it was read: `rows[i]` is the line `i` lines up
@@ -126,7 +128,7 @@ pub(crate) fn preface(
             .min(MAX_SCREEN_LINES)
     });
     let screen = span(want)
-        .map(|span| screen_of(span, evidence.background))
+        .map(|span| screen_of(span, evidence))
         .ok_or(PrefaceReason::SeamNotFound)?;
     let anchor = anchor(&screen, top).ok_or(PrefaceReason::SeamNotFound)?;
     let held = &screen.rows[..=anchor];
@@ -143,7 +145,10 @@ pub(crate) fn preface(
             }
         })
         .collect::<Vec<_>>();
-    let seam = if prompts.iter().any(Option::is_some) {
+    let seam = if prompts
+        .iter()
+        .any(|prompt| prompt.as_ref().is_some_and(|words| !words.is_empty()))
+    {
         place_prompts(turns, prompts.into_iter())
     } else {
         place_without_prompts(
@@ -187,20 +192,24 @@ fn wire_turn(turn: &Turn) -> PrefaceTurn {
 
 /// A span's lines, bottom first, split the way a client splits them; with
 /// a prompt background, which of them are prompt rows by it.
-fn screen_of(span: Span, background: Option<[u8; 3]>) -> Screen {
+fn screen_of(span: Span, evidence: PromptEvidence<'_>) -> Screen {
     let text = span.text.strip_suffix('\n').unwrap_or(&span.text);
     let lines: Vec<&str> = if text.is_empty() {
         Vec::new()
     } else {
         text.split('\n').collect()
     };
-    let mut prompts = background.map_or_else(Vec::new, |background| {
+    let mut prompts = evidence.background.map_or_else(Vec::new, |background| {
         prompt_rows_by_background(&lines, background)
     });
     prompts.reverse();
     let mut rows: Vec<String> = lines.into_iter().map(row).collect();
     rows.reverse();
-    let editor = bottom_input_box(&rows).unwrap_or(0..0);
+    let editor = evidence
+        .editor_box
+        .then(|| bottom_input_box(&rows, evidence.markers))
+        .flatten()
+        .unwrap_or(0..0);
     Screen {
         rows,
         top: !span.has_more,
@@ -209,14 +218,18 @@ fn screen_of(span: Span, background: Option<[u8; 3]>) -> Screen {
     }
 }
 
-/// The bottom-most pair of full-row rules bounds the editor only when
-/// the suffix consists of footer controls. Rules in output above that box
-/// must never hide sent prompts. The rules must have equal widths; editor
-/// lines themselves may exceed that width after soft wraps are joined.
-fn bottom_input_box(rows: &[String]) -> Option<std::ops::Range<usize>> {
+/// A declared editor is the bottom-most pair of identical rule rows, at
+/// least 20 columns wide, with one to six status rows below it. Status text
+/// is configurable; only rule rows and prompt markers disqualify it.
+fn bottom_input_box(rows: &[String], markers: &[&str]) -> Option<std::ops::Range<usize>> {
     let rule = |row: &str| !row.is_empty() && row.chars().all(|c| c == '─');
     let bottom = rows.iter().position(|row| rule(row))?;
-    if !rows[..bottom].iter().all(|row| footer_row(row)) {
+    if !(1..=6).contains(&bottom)
+        || rows[bottom].chars().count() < 20
+        || rows[..bottom]
+            .iter()
+            .any(|row| prompt_row(row, markers).is_some())
+    {
         return None;
     }
     let top = (bottom + 1..rows.len()).find(|&index| rule(&rows[index]))?;
@@ -224,19 +237,6 @@ fn bottom_input_box(rows: &[String]) -> Option<std::ops::Range<usize>> {
         return None;
     }
     Some(bottom + 1..top)
-}
-
-/// Recognised footer controls keep an arbitrary output rule pair from
-/// being interpreted as the live editor. Unknown suffix text is ambiguous.
-fn footer_row(row: &str) -> bool {
-    let row = row.trim();
-    row.is_empty()
-        || row.starts_with("? for shortcuts")
-        || row.starts_with("⏵⏵ ")
-        || row.starts_with("⏸ ")
-        || row.starts_with("shift+tab ")
-        || row.starts_with("ctrl+")
-        || row.starts_with("esc to ")
 }
 
 /// Which of a screen's styled lines, top first, are prompt rows by their
@@ -435,7 +435,7 @@ fn place_without_prompts<'a>(turns: &[Turn], held: impl Iterator<Item = &'a str>
             .iter()
             .filter(|turn| turn.start == TurnStart::Prompt)
             .filter_map(|turn| turn.head.as_deref())
-            .any(|head| shows(words, head))
+            .any(|head| shows(&cleaned, head) || shows(words, head))
         {
             return None;
         }
@@ -736,6 +736,7 @@ mod tests {
             PromptEvidence {
                 markers: &MARKERS,
                 background: None,
+                editor_box: true,
             },
             |_| {
                 Some(Span {
@@ -938,6 +939,172 @@ mod tests {
         );
     }
 
+    fn preface_for_agent(
+        agent: crate::api::schema::PromptTrailAgent,
+        read: &ReadTurns,
+        rows: &[&str],
+    ) -> Result<Vec<String>, PrefaceReason> {
+        let reader = super::super::reader_for(agent).expect("a reader");
+        preface(
+            super::super::agent_name(agent),
+            "s",
+            read,
+            Top {
+                offset: None,
+                lines: None,
+            },
+            MAX_TURNS,
+            PromptEvidence {
+                markers: reader.prompt_markers(),
+                background: reader.prompt_background(),
+                editor_box: reader.editor_box(),
+            },
+            |_| {
+                Some(Span {
+                    text: rows.join("\n"),
+                    has_more: false,
+                })
+            },
+        )
+        .map(|preface| {
+            preface
+                .turns
+                .into_iter()
+                .filter_map(|turn| turn.prompt)
+                .collect()
+        })
+    }
+
+    #[test]
+    fn literal_prompt_heads_keep_their_leading_glyph_without_background_evidence() {
+        let read = prompted(&["- audit parser", "- watch deployment"]);
+        assert_eq!(
+            preface_for_agent(
+                crate::api::schema::PromptTrailAgent::Pi,
+                &read,
+                &["- audit parser", "an answer", "- watch deployment"],
+            ),
+            Err(PrefaceReason::SeamNotFound)
+        );
+    }
+
+    #[test]
+    fn empty_marker_rows_do_not_block_a_resumed_screens_preface() {
+        let read = prompted(&["prompt one", "prompt two", "prompt three"]);
+        for (agent, editor) in [
+            (crate::api::schema::PromptTrailAgent::Codex, "› "),
+            (crate::api::schema::PromptTrailAgent::Claude, "❯ "),
+        ] {
+            assert_eq!(
+                preface_for_agent(agent, &read, &["unrelated output", editor]),
+                Ok(vec!["prompt one".into(), "prompt two".into()]),
+                "{agent:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn claude_custom_status_lines_allow_an_empty_editor() {
+        assert_claude_custom_status_editor("");
+    }
+
+    #[test]
+    fn claude_custom_status_lines_allow_an_unsent_draft() {
+        assert_claude_custom_status_editor("an unsent draft");
+    }
+
+    fn assert_claude_custom_status_editor(draft: &str) {
+        let read = prompted(&["prompt one", "prompt two", "prompt three"]);
+        let rule = "─".repeat(40);
+        let editor = format!("❯ {draft}");
+        assert_eq!(
+            preface_for_agent(
+                crate::api::schema::PromptTrailAgent::Claude,
+                &read,
+                &[
+                    "unrelated output",
+                    &rule,
+                    &editor,
+                    &rule,
+                    "  workspace · main · 0% · model · $1.00",
+                    "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+                ],
+            ),
+            Ok(vec!["prompt one".into(), "prompt two".into()]),
+        );
+    }
+
+    #[test]
+    fn other_harnesses_never_hide_prompt_text_between_rule_pairs() {
+        let read = prompted(&["prompt one", "prompt two"]);
+        for agent in [
+            crate::api::schema::PromptTrailAgent::Codex,
+            crate::api::schema::PromptTrailAgent::Pi,
+            crate::api::schema::PromptTrailAgent::Agy,
+        ] {
+            for (width, footer) in [(10, false), (40, true)] {
+                let rule = "─".repeat(width);
+                let mut rows = vec![rule.as_str(), "❯ prompt one", rule.as_str()];
+                if footer {
+                    rows.push("  ? for shortcuts");
+                }
+                assert_eq!(
+                    preface_for_agent(agent, &read, &rows),
+                    Err(PrefaceReason::SeamNotFound),
+                    "{agent:?}, width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_does_not_hide_an_editor_with_seven_rows_below_it() {
+        let read = prompted(&["prompt one", "prompt two", "prompt three"]);
+        let rule = "─".repeat(40);
+        let mut rows = vec![
+            "unrelated output",
+            rule.as_str(),
+            "❯ an unsent draft",
+            rule.as_str(),
+        ];
+        rows.extend(std::iter::repeat_n("  ? for shortcuts", 7));
+        assert_eq!(
+            preface_for_agent(crate::api::schema::PromptTrailAgent::Claude, &read, &rows),
+            Err(PrefaceReason::SeamNotFound)
+        );
+    }
+
+    #[test]
+    fn declared_editor_boxes_require_width_and_footer_evidence() {
+        let read = prompted(&["prompt one", "prompt two", "prompt three"]);
+        for (width, footer, excluded) in [
+            (20, vec!["custom status"], true),
+            (20, vec!["custom status"; 6], true),
+            (20, vec![], false),
+            (19, vec!["custom status"], false),
+            (40, vec!["❯ "], false),
+        ] {
+            let rule = "─".repeat(width);
+            let mut rows = vec![
+                "unrelated output",
+                rule.as_str(),
+                "❯ unsent draft",
+                rule.as_str(),
+            ];
+            rows.extend(footer);
+            let expected = if excluded {
+                Ok(vec!["prompt one".into(), "prompt two".into()])
+            } else {
+                Err(PrefaceReason::SeamNotFound)
+            };
+            assert_eq!(
+                preface_for_agent(crate::api::schema::PromptTrailAgent::Claude, &read, &rows),
+                expected,
+                "width {width}, rows {rows:?}",
+            );
+        }
+    }
+
     #[test]
     fn prompt_words_without_prompt_evidence_still_refuse_the_seam() {
         let read = prompted(&[
@@ -1016,6 +1183,7 @@ mod tests {
                     PromptEvidence {
                         markers: &MARKERS,
                         background,
+                        editor_box: true,
                     },
                     |_| {
                         Some(Span {
@@ -1060,7 +1228,6 @@ mod tests {
                 &rule,
                 "  ? for shortcuts",
             ],
-            vec![&rule, "❯ an unknown sent prompt", &rule, "output continues"],
             vec![&rule, "❯ an unknown sent prompt", "──", "  ? for shortcuts"],
         ] {
             assert_eq!(
@@ -1069,6 +1236,15 @@ mod tests {
                 "{rows:?}"
             );
         }
+        // A declared editor may have arbitrary user-configured status text.
+        assert_eq!(
+            preface_of(
+                &read,
+                &[&rule, "❯ an unknown sent prompt", &rule, "output continues"],
+                top
+            ),
+            Ok(vec!["prompt one".into(), "prompt two".into()])
+        );
     }
 
     #[test]
