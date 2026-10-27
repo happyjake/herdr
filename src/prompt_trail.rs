@@ -329,6 +329,7 @@ fn claude_prompt(line: &Value) -> Option<String> {
         }
         _ => return None,
     };
+    let text = strip_pasted_content_tags(&text);
     let text = clean(&text);
 
     if text.starts_with("<command-message>") || text.starts_with("<command-name>") {
@@ -444,6 +445,62 @@ pub(crate) fn tag_contents<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let start = text.find(&format!("<{tag}>"))? + tag.len() + 2;
     let end = text[start..].find(&format!("</{tag}>"))? + start;
     Some(&text[start..end])
+}
+
+const PASTED_CONTENT_OPEN: &str = "<pasted_content id=\"";
+const PASTED_CONTENT_OPEN_END: &str = "\">";
+
+/// Remove each well-formed `<pasted_content id="…">` wrapper line pair,
+/// keeping what was pasted between them and whatever was typed around them.
+pub(crate) fn strip_pasted_content_tags(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (line, line_end) = split_next_line(rest);
+        let trimmed = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(id) = pasted_content_open_id(trimmed) {
+            let after_open = &rest[line_end..];
+            if let Some((inside, after_close)) = find_pasted_content_close(after_open, id) {
+                stripped.push_str(inside);
+                rest = after_close;
+                continue;
+            }
+        }
+        stripped.push_str(&rest[..line_end]);
+        rest = &rest[line_end..];
+    }
+    stripped
+}
+
+fn split_next_line(text: &str) -> (&str, usize) {
+    match text.find('\n') {
+        Some(index) => (&text[..index], index + 1),
+        None => (text, text.len()),
+    }
+}
+
+fn pasted_content_open_id(line: &str) -> Option<&str> {
+    let id = line
+        .strip_prefix(PASTED_CONTENT_OPEN)?
+        .strip_suffix(PASTED_CONTENT_OPEN_END)?;
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit())).then_some(id)
+}
+
+fn find_pasted_content_close<'a>(text: &'a str, id: &str) -> Option<(&'a str, &'a str)> {
+    let close = format!("</pasted_content id=\"{id}\">");
+    let mut offset = 0;
+    while offset < text.len() {
+        let (line, line_end) = split_next_line(&text[offset..]);
+        let trimmed = line.strip_suffix('\r').unwrap_or(line);
+        if trimmed == close {
+            return Some((&text[..offset], &text[offset + line_end..]));
+        }
+        if pasted_content_open_id(trimmed).is_some() {
+            return None;
+        }
+        offset += line_end;
+    }
+    None
 }
 
 /// How an attached image is written into a user turn.
@@ -1144,6 +1201,49 @@ pub(crate) mod tests {
             texts(&trail.recent),
             vec!["/inspect the parser", "/inspect the cache"]
         );
+    }
+
+    #[test]
+    fn a_claude_paste_block_reads_as_the_pasted_text_without_its_wrapper() {
+        let line = claude_user(
+            "<pasted_content id=\"ec3c\">\nfirst line of the paste\nsecond line of the paste\n</pasted_content id=\"ec3c\">",
+            "2026-03-04T09:00:00Z",
+        );
+        assert_eq!(
+            prompt_text(PromptTrailAgent::Claude, &line).as_deref(),
+            Some("first line of the paste second line of the paste")
+        );
+    }
+
+    #[test]
+    fn a_claude_paste_block_keeps_typed_text_before_and_after_it() {
+        let raw = "check the harbor log\n<pasted_content id=\"a1b2\">\nline one\nline two\n</pasted_content id=\"a1b2\">\n[Image #2]";
+        assert_eq!(
+            strip_pasted_content_tags(raw),
+            "check the harbor log\nline one\nline two\n[Image #2]"
+        );
+        let line = claude_user(raw, "2026-03-04T09:00:00Z");
+        assert_eq!(
+            prompt_text(PromptTrailAgent::Claude, &line).as_deref(),
+            Some("check the harbor log line one line two [Image #2]")
+        );
+    }
+
+    #[test]
+    fn an_unpaired_or_inline_claude_paste_tag_is_left_untouched() {
+        for raw in [
+            "<pasted_content id=\"ec3c\">\nfirst line\n</pasted_content id=\"ffff\">",
+            "<pasted_content id=\"ec3c\">\nfirst line with no closing tag",
+            "words before <pasted_content id=\"ec3c\">\nfirst line\n</pasted_content id=\"ec3c\">",
+        ] {
+            assert_eq!(strip_pasted_content_tags(raw), raw, "{raw:?}");
+            let line = claude_user(raw, "2026-03-04T09:00:00Z");
+            assert_eq!(
+                prompt_text(PromptTrailAgent::Claude, &line).as_deref(),
+                Some(clean(raw).as_str()),
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]

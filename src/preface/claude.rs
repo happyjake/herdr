@@ -142,7 +142,7 @@ impl ClaudeReader {
             return;
         }
         let raw = raw_text(prompt);
-        self.start(line, TurnStart::Prompt, Some(prompt_body(raw.trim_start())));
+        self.start(line, TurnStart::Prompt, Some(prompt_body(&raw)));
     }
 
     fn assistant(&mut self, line: &Value) {
@@ -222,9 +222,11 @@ fn raw_text(content: &Value) -> String {
     }
 }
 
-/// A prompt the trail counted, as the person wrote it: a slash command read
-/// back as it was typed, everything else whole.
+/// A prompt the trail counted, as the person wrote it: paste wrapper tags
+/// removed, a slash command read back as it was typed, everything else whole.
 fn prompt_body(raw: &str) -> String {
+    let stripped = crate::prompt_trail::strip_pasted_content_tags(raw);
+    let raw = stripped.trim_start();
     if raw.starts_with("<command-message>") || raw.starts_with("<command-name>") {
         let name = crate::prompt_trail::tag_contents(raw, "command-name")
             .unwrap_or_default()
@@ -512,6 +514,46 @@ mod tests {
                 Some("map the piers".to_string()),
                 Some("words from human".to_string())
             ]
+        );
+    }
+
+    #[test]
+    fn a_pasted_claude_prompt_reads_as_its_text_and_its_first_line_is_its_head() {
+        let turns = turns_of(&typed(
+            "\n<pasted_content id=\"ec3c\">\nchart the north breakwater\nand mark the shoals\n</pasted_content id=\"ec3c\">",
+            "2026-03-04T09:00:00Z",
+        ));
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].prompt.as_deref(),
+            Some("chart the north breakwater\nand mark the shoals")
+        );
+        assert_eq!(turns[0].head.as_deref(), Some("chart the north breakwater"));
+    }
+
+    #[test]
+    fn a_queued_claude_paste_prompt_reads_as_its_text_and_its_first_line_is_its_head() {
+        let queued = line(serde_json::json!({
+            "type": "attachment",
+            "uuid": "u-queued",
+            "timestamp": "2026-03-04T09:00:10Z",
+            "isSidechain": false,
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": "prompt",
+                "origin": { "kind": "human" },
+                "prompt": "<pasted_content id=\"b4a1\">\nkeep the south jetty beacon lit\nuntil dawn\n</pasted_content id=\"b4a1\">",
+            },
+        }));
+        let turns = turns_of(&queued);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].prompt.as_deref(),
+            Some("keep the south jetty beacon lit\nuntil dawn")
+        );
+        assert_eq!(
+            turns[0].head.as_deref(),
+            Some("keep the south jetty beacon lit")
         );
     }
 }

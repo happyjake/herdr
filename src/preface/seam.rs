@@ -1524,4 +1524,52 @@ mod tests {
             Err(PrefaceReason::SeamNotFound)
         );
     }
+
+    #[test]
+    fn a_claude_pasted_prompt_matches_its_first_line_on_screen_at_lookback_zero() {
+        let line = |text: &str, at: &str| {
+            serde_json::json!({
+                "type": "user",
+                "uuid": at,
+                "timestamp": at,
+                "isSidechain": false,
+                "message": { "role": "user", "content": text },
+            })
+            .to_string()
+                + "\n"
+        };
+        let record = [
+            line("chart the north pier", "2026-03-04T09:00:00Z"),
+            line(
+                "<pasted_content id=\"ec3c\">\nrebuild the tide table parser\nand verify the bounds\n</pasted_content id=\"ec3c\">",
+                "2026-03-04T09:01:00Z",
+            ),
+        ]
+        .concat();
+        let turns = super::super::read_turns(
+            record.as_bytes(),
+            crate::api::schema::PromptTrailAgent::Claude,
+        )
+        .expect("a readable record");
+        let read = ReadTurns {
+            revision: "r".into(),
+            turns: std::sync::Arc::new(turns),
+        };
+        // The screen shows only the newest prompt (the paste's first line),
+        // with no unaccounted prompt row below it — so it must match at
+        // lookback 0, placing the seam at turn 1 and quoting turn 0.
+        assert_eq!(
+            preface_for_agent(
+                crate::api::schema::PromptTrailAgent::Claude,
+                &read,
+                &[
+                    "❯ rebuild the tide table parser",
+                    "  and verify the bounds",
+                    "⏺ Working on the parser.",
+                    "❯ ",
+                ],
+            ),
+            Ok(vec!["chart the north pier".to_string()])
+        );
+    }
 }
