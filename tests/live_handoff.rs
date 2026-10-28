@@ -32,6 +32,20 @@ struct RequestError {
     message: String,
 }
 
+/// Also stop an imported replacement if an assertion unwinds past its creator.
+struct StopTestServerOnDrop(PathBuf);
+
+impl Drop for StopTestServerOnDrop {
+    fn drop(&mut self) {
+        let _ = try_request(
+            &self.0,
+            serde_json::json!({
+                "id": "cleanup", "method": "server.stop", "params": {}
+            }),
+        );
+    }
+}
+
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
@@ -2948,6 +2962,7 @@ fn live_handoff_keeps_a_screen_detected_unseen_completion_done() {
         &[("PATH", path.as_str())],
     );
     wait_for_socket(&api_socket, Duration::from_secs(10));
+    let _stop_import_on_failure = StopTestServerOnDrop(api_socket.clone());
     register_runtime_dir(&runtime_dir);
     let created = request(
         &api_socket,
@@ -3013,6 +3028,9 @@ fn live_handoff_keeps_a_screen_detected_unseen_completion_done() {
         );
         thread::sleep(Duration::from_millis(50));
     };
+    let completion_seq = pane_status("completed").2["result"]["pane"]["completion_seq"]
+        .as_u64()
+        .expect("the screen-detected completion has a sequence");
     // Dates are whole seconds; let one pass so a date taken at the handoff
     // cannot equal the completion's by coincidence.
     thread::sleep(Duration::from_millis(1_100));
@@ -3038,6 +3056,10 @@ fn live_handoff_keeps_a_screen_detected_unseen_completion_done() {
             changed_at,
             Some(done_since),
             "handoff re-dated the captured completion: {response}"
+        );
+        assert_eq!(
+            response["result"]["pane"]["completion_seq"], completion_seq,
+            "reacquiring the same idle must retain its completion"
         );
         samples += 1;
         if Instant::now() >= deadline {

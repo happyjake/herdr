@@ -413,6 +413,11 @@ UI 上下文变化时,该投影会重新求值。它控制展开和折叠的侧�
 有效 status 值为 `idle`、`working`、`blocked`、`done` 和 `unknown`;`done`
 表示 idle 且尚未查看。
 
+当前 idle 表示工作完成时，`completion_seq` 为数字，否则为 null。支持此功能的服务器之间实时交接会保留这个值
+及状态变更顺序；新的状态变更使用高于已分配最大值的编号，包括已关闭窗格的编号。
+交接后重新识别同一智能体不算新的完成。冷重启会重置这些编号；它们不是持久标识，
+客户端不应跨任意重连比较它们。
+
 排序字段包括 `workspace_order`、`tab_order`、`pane_order`、`attention`、
 `status`、`agent`、`seen`、`state_change_seq` 或 `{"token":"name"}`。排序是
 稳定的,按声明顺序求值,并接受 `asc` 或 `desc`。缺失值排在存在值之后。省略

@@ -93,6 +93,7 @@ impl HeadlessServer {
                 handoff_runtime.agent_state = terminal.handoff_agent_state();
                 handoff_runtime.last_agent_state_change_seq = terminal.last_agent_state_change_seq;
                 handoff_runtime.last_agent_completion_seq = terminal.last_agent_completion_seq;
+                handoff_runtime.sequence_baseline = Some(terminal.handoff_sequence_baseline());
             }
             handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi(replay_budget);
             handoff_entries.push((terminal_id.clone(), handoff_runtime));

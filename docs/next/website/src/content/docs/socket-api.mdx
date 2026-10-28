@@ -864,6 +864,13 @@ such as `status` being `blocked`, still match agents on any connected machine.
 Effective status values are `idle`, `working`, `blocked`, `done`, and `unknown`;
 `done` means idle and not yet seen.
 
+`completion_seq` is a number when the current idle completed work, and null
+otherwise. Live handoff between supporting servers preserves this value and the agent state-change order;
+new transitions allocate numbers above the carried high-water mark, including
+numbers from closed panes. Reacquiring the same agent after handoff is not a
+new completion. A cold restart resets these numbers; they are not durable
+identifiers and should not be compared across arbitrary reconnects.
+
 Sort fields are `workspace_order`, `tab_order`, `pane_order`, `attention`,
 `status`, `agent`, `seen`, `state_change_seq`, or `{"token":"name"}`. Sorts are
 stable, evaluated in order, and accept `asc` or `desc`. Missing values stay

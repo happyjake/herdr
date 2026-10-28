@@ -666,6 +666,7 @@ fn restore_tab(
             (
                 imported.state.last_agent_state_change_seq,
                 imported.state.last_agent_completion_seq,
+                imported.state.sequence_baseline.clone(),
             )
         });
         let pending_native_agent_restore = if was_imported {
@@ -830,8 +831,8 @@ fn restore_tab(
                     runtime.set_self_reported_agent_active(terminal.self_reported_agent_active());
                 }
                 #[cfg(unix)]
-                if let Some((state_change_seq, completion_seq)) = handoff_sequences {
-                    terminal.restore_handoff_sequences(state_change_seq, completion_seq);
+                if let Some((state_change_seq, completion_seq, baseline)) = handoff_sequences {
+                    terminal.restore_handoff_sequences(state_change_seq, completion_seq, baseline);
                 }
                 panes.insert(*id, restored_pane_state(&terminal, was_imported));
                 terminal_runtimes.insert(terminal_id, runtime);

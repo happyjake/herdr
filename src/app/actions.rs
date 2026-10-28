@@ -630,17 +630,25 @@ impl AppState {
         pane_id: PaneId,
         now_unix: u64,
     ) -> Option<PaneStateUpdate> {
-        let terminals = &self.terminals;
+        let terminals = &mut self.terminals;
         for (ws_idx, ws) in self.workspaces.iter_mut().enumerate() {
             for tab in &mut ws.tabs {
                 let Some(pane) = tab.panes.get_mut(&pane_id) else {
                     continue;
                 };
-                let terminal = terminals.get(&pane.attached_terminal_id)?;
+                let terminal = terminals.get_mut(&pane.attached_terminal_id)?;
+                let sequence_resolution = terminal.resolve_handoff_sequence_baseline();
+                if sequence_resolution.is_some_and(|previous| previous != terminal.state) {
+                    self.next_agent_state_change_seq += 1;
+                    terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
+                }
                 let previous_reported_status = pane.agent_status();
                 let had_window = pane.agent_status_resolution_due_at().is_some();
                 let status = pane_agent_status(terminal.state, pane.seen);
-                if !pane.resolve_agent_status_at(status, now_unix) && !had_window {
+                if !pane.resolve_agent_status_at(status, now_unix)
+                    && !had_window
+                    && sequence_resolution.is_none()
+                {
                     return None;
                 }
                 return Some(PaneStateUpdate::status_resolution(
@@ -2106,6 +2114,7 @@ impl AppState {
             unchanged_change,
             suppress_acquisition_completion,
             completion_reset,
+            preserve_handoff_sequences,
         ) = {
             let terminal = self.terminals.get_mut(&terminal_id)?;
             let previous_agent_name = terminal.agent_name.clone();
@@ -2117,17 +2126,23 @@ impl AppState {
             if terminal.reported_resume_revision() != resume_revision {
                 self.session_dirty = true;
             }
-            let mutation = mutation?;
-            let completion_reset = mutation.session_ref_changed
-                || mutation
-                    .effective_state_change
-                    .as_ref()
-                    .is_some_and(|change| change.previous_agent_label != change.agent_label);
+            let mut mutation = mutation?;
+            let handoff_reading =
+                terminal.reconcile_handoff_sequence_reading(&mut mutation, reading);
+            let preserve_handoff_sequences =
+                handoff_reading == crate::terminal::state::HandoffSequenceReading::Preserve;
+            let completion_reset = !preserve_handoff_sequences
+                && (mutation.session_ref_changed
+                    || mutation
+                        .effective_state_change
+                        .as_ref()
+                        .is_some_and(|change| change.previous_agent_label != change.agent_label));
             if completion_reset {
                 terminal.last_agent_completion_seq = None;
             }
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
-            let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();
+            let suppress_acquisition_completion = terminal.finish_agent_process_acquisition()
+                && handoff_reading != crate::terminal::state::HandoffSequenceReading::Transition;
             let agent_name_changed = terminal.agent_name != previous_agent_name;
             let unchanged_change = (mutation.agent_released
                 || agent_name_changed
@@ -2140,6 +2155,7 @@ impl AppState {
                 unchanged_change,
                 suppress_acquisition_completion,
                 completion_reset,
+                preserve_handoff_sequences,
             )
         };
         if completion_reset {
@@ -2174,9 +2190,10 @@ impl AppState {
             }
             return None;
         };
-        let suppress_completion = force_suppress_completion
+        let suppress_completion = preserve_handoff_sequences
+            || force_suppress_completion
             || (change.state == AgentState::Idle && suppress_acquisition_completion);
-        if change.previous_state != change.state {
+        if change.previous_state != change.state && !preserve_handoff_sequences {
             self.next_agent_state_change_seq += 1;
             if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
                 terminal.last_agent_state_change_seq = Some(self.next_agent_state_change_seq);
@@ -3645,7 +3662,7 @@ mod tests {
             let pane_id = app.workspaces[0].tabs[0].root_pane;
             let terminal_id = app.workspaces[0].terminal_id(pane_id).unwrap().clone();
             let terminal = app.terminals.get_mut(&terminal_id).unwrap();
-            terminal.restore_handoff_sequences(Some(state_seq), Some(completion_seq));
+            terminal.restore_handoff_sequences(Some(state_seq), Some(completion_seq), None);
             app.restore_agent_sequence_high_water_mark(carried);
             assert_eq!(app.next_agent_state_change_seq, floor);
             app.handle_app_event(AppEvent::StateChanged {
@@ -3664,6 +3681,334 @@ mod tests {
             );
             assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
         }
+    }
+
+    #[cfg(unix)]
+    fn handoff_sequence_probe(
+        before: AgentState,
+        completed: bool,
+    ) -> (AppState, PaneId, crate::terminal::TerminalId) {
+        let mut app = app_with_workspaces(&["active"]);
+        let (pane_id, terminal_id) = first_pane_terminal(&app);
+        let mut old = crate::terminal::TerminalState::new(
+            terminal_id.clone(),
+            app.terminals[&terminal_id].cwd.clone(),
+        );
+        old.set_detected_state(Some(Agent::Pi), before);
+        let baseline =
+            serde_json::from_value(serde_json::to_value(old.handoff_sequence_baseline()).unwrap())
+                .unwrap();
+        app.terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .restore_handoff_sequences(Some(41), completed.then_some(41), Some(baseline));
+        app.restore_agent_sequence_high_water_mark(73);
+        let now = crate::pane::unix_now_secs();
+        let pane = app.workspaces[0].pane_state_mut(pane_id).unwrap();
+        *pane = crate::pane::PaneState::restored_from(
+            terminal_id.clone(),
+            crate::pane::AgentStatusClaim {
+                status: pane_agent_status(before, !completed),
+                changed_at: 1000,
+                resolve_by: None,
+                saw_other_status: false,
+                reported_through: None,
+                captured_pair_reported: true,
+            },
+            now,
+        );
+        pane.seen = !completed;
+        (app, pane_id, terminal_id)
+    }
+
+    #[cfg(unix)]
+    fn sequence_reading(
+        app: &mut AppState,
+        pane_id: PaneId,
+        agent: Option<Agent>,
+        state: AgentState,
+        reading: crate::events::StatusReading,
+    ) {
+        app.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent,
+            state,
+            visible_blocker: false,
+            visible_working: state == AgentState::Working,
+            process_exited: false,
+            observed_at: Instant::now(),
+            reading,
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_reacquisition_preserves_numbers_and_nulls_until_real_work() {
+        use crate::events::StatusReading::{Provisional, Verdict};
+        for completed in [false, true] {
+            let (mut app, pane_id, terminal_id) =
+                handoff_sequence_probe(AgentState::Idle, completed);
+            app.handle_app_event(AppEvent::AgentProcessDetected {
+                pane_id,
+                agent: Agent::Pi,
+                observed_at: Instant::now(),
+                reading: Provisional,
+            });
+            for reading in [Provisional, Verdict, Verdict] {
+                sequence_reading(
+                    &mut app,
+                    pane_id,
+                    Some(Agent::Pi),
+                    AgentState::Idle,
+                    reading,
+                );
+                let terminal = &app.terminals[&terminal_id];
+                assert_eq!(terminal.last_agent_state_change_seq, Some(41));
+                assert_eq!(terminal.last_agent_completion_seq, completed.then_some(41));
+                assert_eq!(app.next_agent_state_change_seq, 73);
+                assert!(app.pending_agent_notifications.is_empty());
+                assert_eq!(
+                    app.workspaces[0].pane_state(pane_id).unwrap().seen,
+                    !completed
+                );
+            }
+            sequence_reading(
+                &mut app,
+                pane_id,
+                Some(Agent::Pi),
+                AgentState::Working,
+                Verdict,
+            );
+            assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
+            sequence_reading(
+                &mut app,
+                pane_id,
+                Some(Agent::Pi),
+                AgentState::Idle,
+                Verdict,
+            );
+            assert_eq!(
+                app.terminals[&terminal_id].last_agent_completion_seq,
+                Some(75)
+            );
+            app.assert_invariants_for_test();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_baseline_survives_a_second_import_during_reacquisition() {
+        let (mut app, pane_id, terminal_id) = handoff_sequence_probe(AgentState::Idle, true);
+        app.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
+        });
+        let terminal = &app.terminals[&terminal_id];
+        let baseline = serde_json::from_value(
+            serde_json::to_value(terminal.handoff_sequence_baseline()).unwrap(),
+        )
+        .unwrap();
+        let (mut again, pane_id, terminal_id) = handoff_sequence_probe(AgentState::Idle, true);
+        again
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .restore_handoff_sequences(Some(41), Some(41), Some(baseline));
+        sequence_reading(
+            &mut again,
+            pane_id,
+            Some(Agent::Pi),
+            AgentState::Idle,
+            crate::events::StatusReading::Verdict,
+        );
+        assert_eq!(
+            again.terminals[&terminal_id].last_agent_completion_seq,
+            Some(41)
+        );
+        assert_eq!(again.next_agent_state_change_seq, 73);
+        again.assert_invariants_for_test();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_replacement_and_unknown_verdict_retire_old_work() {
+        for agent in [Some(Agent::Codex), None] {
+            let (mut app, pane_id, terminal_id) = handoff_sequence_probe(AgentState::Idle, true);
+            sequence_reading(
+                &mut app,
+                pane_id,
+                agent,
+                AgentState::Unknown,
+                crate::events::StatusReading::Verdict,
+            );
+            assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
+            sequence_reading(
+                &mut app,
+                pane_id,
+                agent,
+                AgentState::Idle,
+                crate::events::StatusReading::Verdict,
+            );
+            assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
+            app.assert_invariants_for_test();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_session_replacement_retires_old_work() {
+        let (mut app, pane_id, terminal_id) = handoff_sequence_probe(AgentState::Idle, true);
+        app.terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path("/session/old").unwrap(),
+            });
+        app.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
+        });
+        app.handle_app_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            seq: Some(1),
+            session_ref: crate::agent_resume::AgentSessionRef::path("/session/new"),
+            session_start_source: Some("startup".into()),
+        });
+        assert_eq!(
+            app.terminals[&terminal_id]
+                .persisted_agent_session
+                .as_ref()
+                .unwrap()
+                .session_ref
+                .value,
+            "/session/new"
+        );
+        assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
+        sequence_reading(
+            &mut app,
+            pane_id,
+            Some(Agent::Pi),
+            AgentState::Idle,
+            crate::events::StatusReading::Verdict,
+        );
+        assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
+        app.assert_invariants_for_test();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_working_baseline_distinguishes_completion_from_cancellation() {
+        for cancelled in [false, true] {
+            let (mut app, pane_id, terminal_id) =
+                handoff_sequence_probe(AgentState::Working, false);
+            app.handle_app_event(AppEvent::HookStateReported {
+                pane_id,
+                source: "custom:sequence-test".into(),
+                agent_label: "pi".into(),
+                state: AgentState::Idle,
+                message: None,
+                seq: Some(1),
+                session_ref: None,
+                cancelled,
+            });
+            assert_eq!(
+                app.terminals[&terminal_id].last_agent_completion_seq,
+                (!cancelled).then_some(74)
+            );
+            app.assert_invariants_for_test();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_exit_respawn_and_expiry_do_not_resurrect_completion() {
+        for cause in ["exit", "respawn", "expiry"] {
+            let (mut app, pane_id, terminal_id) = handoff_sequence_probe(AgentState::Idle, true);
+            match cause {
+                "exit" => {
+                    app.handle_app_event(AppEvent::AgentProcessDetected {
+                        pane_id,
+                        agent: Agent::Pi,
+                        observed_at: Instant::now(),
+                        reading: crate::events::StatusReading::Provisional,
+                    });
+                    app.handle_app_event(AppEvent::StateChanged {
+                        pane_id,
+                        agent: Some(Agent::Pi),
+                        state: AgentState::Idle,
+                        visible_blocker: false,
+                        visible_working: false,
+                        process_exited: true,
+                        observed_at: Instant::now(),
+                        reading: crate::events::StatusReading::Verdict,
+                    });
+                }
+                "respawn" => {
+                    app.clear_agent_identity_after_respawn(&terminal_id);
+                }
+                _ => {
+                    let deadline = app.workspaces[0]
+                        .pane_state(pane_id)
+                        .unwrap()
+                        .agent_status_resolution_due_at()
+                        .unwrap();
+                    app.resolve_agent_status_for_pane_at(pane_id, deadline);
+                }
+            }
+            assert_eq!(
+                app.terminals[&terminal_id].last_agent_completion_seq, None,
+                "{cause}"
+            );
+            sequence_reading(
+                &mut app,
+                pane_id,
+                Some(Agent::Pi),
+                AgentState::Idle,
+                crate::events::StatusReading::Verdict,
+            );
+            assert_eq!(
+                app.terminals[&terminal_id].last_agent_completion_seq, None,
+                "{cause}"
+            );
+            app.assert_invariants_for_test();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_deadline_does_not_turn_a_provisional_idle_into_completion() {
+        let (mut app, pane_id, terminal_id) = handoff_sequence_probe(AgentState::Working, false);
+        sequence_reading(
+            &mut app,
+            pane_id,
+            Some(Agent::Pi),
+            AgentState::Idle,
+            crate::events::StatusReading::Provisional,
+        );
+        let deadline = app.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .agent_status_resolution_due_at()
+            .unwrap();
+        app.resolve_agent_status_for_pane_at(pane_id, deadline);
+        assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
+        sequence_reading(
+            &mut app,
+            pane_id,
+            Some(Agent::Pi),
+            AgentState::Idle,
+            crate::events::StatusReading::Verdict,
+        );
+        assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
+        app.assert_invariants_for_test();
     }
 
     #[test]

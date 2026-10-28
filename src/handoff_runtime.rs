@@ -34,6 +34,8 @@ pub(crate) struct HandoffRuntimeState {
     pub last_agent_state_change_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_agent_completion_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_baseline: Option<crate::terminal::state::HandoffSequenceBaseline>,
 }
 
 #[cfg(unix)]

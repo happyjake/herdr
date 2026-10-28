@@ -33,6 +33,20 @@ pub(crate) struct HandoffAgentState {
     acquisition_pending: bool,
 }
 
+/// A comparison point for sequence continuity, never detection authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandoffSequenceBaseline {
+    agent_label: Option<String>,
+    state: AgentState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandoffSequenceReading {
+    NotRestoring,
+    Preserve,
+    Transition,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SuppressedFullLifecycleHookReport {
     agent_label: String,
@@ -192,6 +206,7 @@ pub struct TerminalState {
     pub state: AgentState,
     pub last_agent_state_change_seq: Option<u64>,
     pub last_agent_completion_seq: Option<u64>,
+    pending_handoff_sequence_baseline: Option<HandoffSequenceBaseline>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
@@ -255,6 +270,7 @@ impl TerminalState {
             state: AgentState::Unknown,
             last_agent_state_change_seq: None,
             last_agent_completion_seq: None,
+            pending_handoff_sequence_baseline: None,
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
@@ -336,9 +352,86 @@ impl TerminalState {
         &mut self,
         state_change_seq: Option<u64>,
         completion_seq: Option<u64>,
+        baseline: Option<HandoffSequenceBaseline>,
     ) {
         self.last_agent_state_change_seq = state_change_seq;
         self.last_agent_completion_seq = completion_seq;
+        self.pending_handoff_sequence_baseline = baseline.filter(|baseline| {
+            baseline.state != self.state
+                || baseline.agent_label.as_deref() != self.effective_agent_label()
+        });
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn handoff_sequence_baseline(&self) -> HandoffSequenceBaseline {
+        self.pending_handoff_sequence_baseline
+            .clone()
+            .unwrap_or_else(|| HandoffSequenceBaseline {
+                agent_label: self.effective_agent_label().map(str::to_owned),
+                state: self.state,
+            })
+    }
+
+    pub(crate) fn reconcile_handoff_sequence_reading(
+        &mut self,
+        mutation: &mut TerminalStateMutation,
+        reading: crate::events::StatusReading,
+    ) -> HandoffSequenceReading {
+        use crate::events::StatusReading;
+        let Some(baseline) = self.pending_handoff_sequence_baseline.as_ref() else {
+            return HandoffSequenceReading::NotRestoring;
+        };
+        let replaced = mutation.session_ref_changed
+            || mutation.agent_released
+            || self
+                .effective_agent_label()
+                .is_some_and(|label| baseline.agent_label.as_deref() != Some(label));
+        if replaced {
+            self.pending_handoff_sequence_baseline = None;
+            return HandoffSequenceReading::NotRestoring;
+        }
+        if matches!(
+            reading,
+            StatusReading::Provisional | StatusReading::DisplayOnly
+        ) || (reading == StatusReading::Incidental
+            && mutation
+                .effective_state_change
+                .as_ref()
+                .is_none_or(|change| change.previous_state == change.state))
+        {
+            return HandoffSequenceReading::Preserve;
+        }
+        let Some(baseline) = self.pending_handoff_sequence_baseline.take() else {
+            return HandoffSequenceReading::NotRestoring;
+        };
+        let change = mutation
+            .effective_state_change
+            .get_or_insert_with(|| self.unchanged_effective_state_change_at(Instant::now()));
+        change.previous_state = baseline.state;
+        change.previous_known_agent = baseline
+            .agent_label
+            .as_deref()
+            .and_then(crate::detect::parse_agent_label);
+        change.previous_agent_label = baseline.agent_label;
+        if change.previous_state == change.state
+            && change.previous_agent_label == change.agent_label
+        {
+            HandoffSequenceReading::Preserve
+        } else {
+            HandoffSequenceReading::Transition
+        }
+    }
+
+    /// A restore deadline is not evidence of newly completed work.
+    pub(crate) fn resolve_handoff_sequence_baseline(&mut self) -> Option<AgentState> {
+        let baseline = self.pending_handoff_sequence_baseline.take()?;
+        if baseline.state == self.state
+            && baseline.agent_label.as_deref() == self.effective_agent_label()
+        {
+            return None;
+        }
+        self.last_agent_completion_seq = None;
+        Some(baseline.state)
     }
 
     #[cfg(unix)]
@@ -2631,6 +2724,7 @@ impl TerminalState {
         self.state = AgentState::Unknown;
         self.last_agent_state_change_seq = None;
         self.last_agent_completion_seq = None;
+        self.pending_handoff_sequence_baseline = None;
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.observed_agent_process = None;

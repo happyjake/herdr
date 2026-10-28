@@ -2505,6 +2505,7 @@ impl PaneRuntime {
             agent_state: None,
             last_agent_state_change_seq: None,
             last_agent_completion_seq: None,
+            sequence_baseline: None,
         }
     }
 
@@ -2741,6 +2742,7 @@ impl PaneRuntime {
             agent_state: _,
             last_agent_state_change_seq: _,
             last_agent_completion_seq: _,
+            sequence_baseline: _,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
