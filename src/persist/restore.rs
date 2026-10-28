@@ -450,6 +450,10 @@ fn unavailable_restored_terminal(
     terminal.restore_error = Some(reason);
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
+        terminal.name_kept_through = pane
+            .name_kept_through
+            .clone()
+            .filter(|_| terminal.manual_label.is_some());
         terminal.restore_flag(pane.flag.clone(), pane.flag_set_through);
         terminal.ended_agent = pane.ended_agent.clone();
         terminal.started_by = pane.started_by.clone();
@@ -1216,10 +1220,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let checkout = root.join("checkout");
+        let surrounding_repo = crate::workspace::git_space_metadata(&checkout);
         std::fs::create_dir_all(root.join(".git/objects")).unwrap();
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         let ancestor = crate::workspace::git_space_metadata(&root).unwrap();
-        let checkout = root.join("checkout");
         let membership = crate::workspace::WorktreeSpaceMembership {
             key: "original-repo-key".into(),
             label: "herdr".into(),
@@ -1276,7 +1281,12 @@ mod tests {
             Some(linked)
         );
         std::fs::remove_dir_all(root).unwrap();
-        assert!(crate::workspace::git_space_metadata(&checkout).is_none());
+        // Temporary files may live inside a checkout. Removing the fixture
+        // restores discovery of its surroundings, not necessarily no repository.
+        assert_eq!(
+            crate::workspace::git_space_metadata(&checkout),
+            surrounding_repo
+        );
         assert_eq!(
             restored_worktree_space_membership(Some(membership.clone())),
             Some(membership)
@@ -2015,6 +2025,73 @@ mod tests {
         for (_, runtime) in runtimes {
             runtime.shutdown();
         }
+    }
+
+    fn assert_unavailable_restore_preserves_name_keep_provenance(missing_cwd: bool) {
+        for label in [Some("build cache".to_string()), None] {
+            let (mut snapshot, _) = snapshot_with_saved_pane_history();
+            let pane = snapshot.workspaces[0].tabs[0]
+                .panes
+                .values_mut()
+                .next()
+                .unwrap();
+            let missing = pane.cwd.join("__herdr_missing_keep_restore_path__");
+            assert!(!missing.exists());
+            if missing_cwd {
+                pane.cwd = missing.clone();
+            }
+            pane.label = label.clone();
+            pane.name_kept_through = Some("2026-10-28T01:02:03.456Z".into());
+            let (events, _event_rx) = mpsc::channel(4);
+            let (workspaces, terminals, runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                if missing_cwd {
+                    test_restore_shell()
+                } else {
+                    missing.to_str().unwrap()
+                },
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            assert!(runtimes.is_empty());
+            let terminal = terminals.values().next().unwrap();
+            let reason = terminal.restore_error.as_deref().expect("unavailable pane");
+            assert!(reason.contains(if missing_cwd {
+                "Saved directory is unavailable"
+            } else {
+                "Could not start the saved shell"
+            }));
+            assert_eq!(terminal.manual_label, label);
+            let expected = label.as_ref().map(|_| "2026-10-28T01:02:03.456Z");
+            assert_eq!(terminal.name_kept_through.as_deref(), expected);
+
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+            let captured = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+            let saved = captured.workspaces[0].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap();
+            assert_eq!(saved.label, label);
+            assert_eq!(saved.name_kept_through.as_deref(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_directory_restore_preserves_name_keep_provenance() {
+        assert_unavailable_restore_preserves_name_keep_provenance(true);
+    }
+
+    #[tokio::test]
+    async fn missing_shell_restore_preserves_name_keep_provenance() {
+        assert_unavailable_restore_preserves_name_keep_provenance(false);
     }
 
     #[tokio::test]
