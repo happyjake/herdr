@@ -332,6 +332,16 @@ impl TerminalState {
     }
 
     #[cfg(unix)]
+    pub(crate) fn restore_handoff_sequences(
+        &mut self,
+        state_change_seq: Option<u64>,
+        completion_seq: Option<u64>,
+    ) {
+        self.last_agent_state_change_seq = state_change_seq;
+        self.last_agent_completion_seq = completion_seq;
+    }
+
+    #[cfg(unix)]
     pub(crate) fn handoff_agent_state(&self) -> Option<HandoffAgentState> {
         let authority = self
             .hook_authority

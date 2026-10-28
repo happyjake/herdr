@@ -2065,6 +2065,19 @@ impl AppState {
         self.update_terminal_state_with_completion_policy(pane_id, reading, false, update)
     }
 
+    /// Import allocation state once, before any restored terminal can report.
+    /// Terminal values also bound the floor when an older exporter omitted it.
+    #[cfg(unix)]
+    pub(crate) fn restore_agent_sequence_high_water_mark(&mut self, carried: u64) {
+        self.next_agent_state_change_seq = self.next_agent_state_change_seq.max(carried);
+        for terminal in self.terminals.values() {
+            self.next_agent_state_change_seq = self
+                .next_agent_state_change_seq
+                .max(terminal.last_agent_state_change_seq.unwrap_or(0))
+                .max(terminal.last_agent_completion_seq.unwrap_or(0));
+        }
+    }
+
     fn update_terminal_state_with_completion_policy<F>(
         &mut self,
         pane_id: PaneId,
@@ -3620,6 +3633,37 @@ mod tests {
             );
         }
         app.assert_invariants_for_test();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_floor_bounds_the_first_new_state_change() {
+        for (carried, state_seq, completion_seq, floor) in
+            [(71, 23, 23, 71), (0, 89, 23, 89), (1, 23, 91, 91)]
+        {
+            let mut app = app_with_workspaces(&["active"]);
+            let pane_id = app.workspaces[0].tabs[0].root_pane;
+            let terminal_id = app.workspaces[0].terminal_id(pane_id).unwrap().clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.restore_handoff_sequences(Some(state_seq), Some(completion_seq));
+            app.restore_agent_sequence_high_water_mark(carried);
+            assert_eq!(app.next_agent_state_change_seq, floor);
+            app.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Pi),
+                state: AgentState::Working,
+                visible_blocker: false,
+                visible_working: true,
+                process_exited: false,
+                observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Verdict,
+            });
+            assert_eq!(
+                app.terminals[&terminal_id].last_agent_state_change_seq,
+                Some(floor + 1)
+            );
+            assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
+        }
     }
 
     #[test]

@@ -661,6 +661,13 @@ fn restore_tab(
         let handoff_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
+        #[cfg(unix)]
+        let handoff_sequences = imported_runtime.as_ref().map(|imported| {
+            (
+                imported.state.last_agent_state_change_seq,
+                imported.state.last_agent_completion_seq,
+            )
+        });
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -821,6 +828,10 @@ fn restore_tab(
                         terminal.full_lifecycle_hook_authority_active(),
                     );
                     runtime.set_self_reported_agent_active(terminal.self_reported_agent_active());
+                }
+                #[cfg(unix)]
+                if let Some((state_change_seq, completion_seq)) = handoff_sequences {
+                    terminal.restore_handoff_sequences(state_change_seq, completion_seq);
                 }
                 panes.insert(*id, restored_pane_state(&terminal, was_imported));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -3513,6 +3524,89 @@ mod tests {
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_restores_completion_sequences_but_cold_restore_does_not() {
+        for completion in [None, Some(23_u64)] {
+            let (snapshot, _) = snapshot_with_saved_pane_history();
+            let (events, _events_rx) = mpsc::channel(32);
+            let (workspaces, mut terminals, runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let terminal = terminals.values_mut().next().unwrap();
+            terminal.last_agent_state_change_seq = Some(23);
+            terminal.last_agent_completion_seq = completion;
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+            let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0);
+            let pane_id = workspaces[0].tabs[0].root_pane;
+            let runtime = runtimes.values().next().unwrap();
+            runtime
+                .pause_handoff_reader(std::time::Duration::from_secs(2))
+                .unwrap();
+            let mut encoded =
+                serde_json::to_value(runtime.handoff_runtime_state(pane_id.raw())).unwrap();
+            encoded["last_agent_state_change_seq"] = serde_json::json!(23);
+            encoded["last_agent_completion_seq"] = serde_json::json!(completion);
+            let state = serde_json::from_value(encoded).unwrap();
+            let mut imports = HashMap::from([(
+                pane_id.raw(),
+                crate::handoff_runtime::ImportedHandoffRuntime {
+                    master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                    state,
+                },
+            )]);
+            let (_, imported, imported_runtimes) = restore_handoff(
+                &snapshot,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                &mut imports,
+                events.clone(),
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+            .unwrap();
+            let restored = imported.values().next().unwrap();
+            let carried = (
+                restored.last_agent_state_change_seq,
+                restored.last_agent_completion_seq,
+            );
+            drop(imported_runtimes);
+            drop(runtimes);
+            let (_, cold, cold_runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                4096,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let restarted = cold.values().next().unwrap();
+            let reset = (
+                restarted.last_agent_state_change_seq,
+                restarted.last_agent_completion_seq,
+            );
+            drop(cold_runtimes);
+            assert_eq!(carried, (Some(23), completion));
+            assert_eq!(reset, (None, None));
+        }
     }
 
     #[tokio::test]

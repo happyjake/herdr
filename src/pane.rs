@@ -2503,6 +2503,8 @@ impl PaneRuntime {
             terminal_title: self.terminal_title(),
             initial_history_ansi: None,
             agent_state: None,
+            last_agent_state_change_seq: None,
+            last_agent_completion_seq: None,
         }
     }
 
@@ -2737,6 +2739,8 @@ impl PaneRuntime {
             terminal_title,
             initial_history_ansi,
             agent_state: _,
+            last_agent_state_change_seq: _,
+            last_agent_completion_seq: _,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;

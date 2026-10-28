@@ -89,12 +89,11 @@ impl HeadlessServer {
                 continue;
             };
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
-            handoff_runtime.agent_state = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .and_then(|terminal| terminal.handoff_agent_state());
+            if let Some(terminal) = self.app.state.terminals.get(terminal_id) {
+                handoff_runtime.agent_state = terminal.handoff_agent_state();
+                handoff_runtime.last_agent_state_change_seq = terminal.last_agent_state_change_seq;
+                handoff_runtime.last_agent_completion_seq = terminal.last_agent_completion_seq;
+            }
             handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi(replay_budget);
             handoff_entries.push((terminal_id.clone(), handoff_runtime));
         }
@@ -103,7 +102,7 @@ impl HeadlessServer {
             .iter()
             .map(|(_, runtime)| runtime.clone())
             .collect();
-        let manifest = crate::server::handoff::manifest_for(
+        let mut manifest = crate::server::handoff::manifest_for(
             snapshot,
             panes,
             params.expected_protocol,
@@ -111,6 +110,7 @@ impl HeadlessServer {
             self.api_window_title.clone(),
             self.host_shutdown_intent.get(),
         );
+        manifest.next_agent_state_change_seq = self.app.state.next_agent_state_change_seq;
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
             &socket_path,

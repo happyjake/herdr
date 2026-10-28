@@ -753,6 +753,7 @@ impl App {
             u32,
             crate::handoff_runtime::ImportedHandoffRuntime,
         >,
+        next_agent_state_change_seq: u64,
     ) -> io::Result<Self> {
         let mut app = Self::try_new(
             config,
@@ -786,6 +787,8 @@ impl App {
         app.state.pane_id_aliases = pane_id_aliases;
         app.state.workspaces = workspaces;
         app.state.terminals = terminals;
+        app.state
+            .restore_agent_sequence_high_water_mark(next_agent_state_change_seq);
         app.terminal_runtimes = runtimes.into();
         app.state.active = snapshot
             .active

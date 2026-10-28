@@ -171,6 +171,9 @@ pub(crate) struct HandoffManifest {
     pub expected_protocol: Option<u32>,
     pub snapshot: crate::persist::SessionSnapshot,
     pub panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+    /// Includes sequences allocated to terminals that have since closed.
+    #[serde(default)]
+    pub next_agent_state_change_seq: u64,
     /// An outer window title set over the API outlives the server that took the
     /// call, so a handoff carries it rather than falling back to the config.
     /// Absent from manifests written before this field existed.
@@ -621,6 +624,7 @@ pub(crate) fn manifest_for(
         expected_protocol,
         snapshot,
         panes,
+        next_agent_state_change_seq: 0,
         api_window_title,
         host_shutdown_intent,
         extensions: vec![EXTENSION_REPLAY_FRAMES.to_string()],
@@ -1106,6 +1110,42 @@ mod tests {
     }
 
     #[test]
+    fn handoff_sequence_fields_round_trip_and_legacy_manifests_default_to_empty() {
+        let manifest = manifest_for(
+            empty_snapshot(),
+            vec![manifest_pane(1, false, None)],
+            None,
+            None,
+            None,
+            None,
+        );
+        let legacy = serde_json::to_value(manifest).unwrap();
+        let mut current = legacy.clone();
+        current["next_agent_state_change_seq"] = serde_json::json!(71);
+        current["panes"][0]["last_agent_state_change_seq"] = serde_json::json!(23);
+        current["panes"][0]["last_agent_completion_seq"] = serde_json::json!(23);
+        let decoded: HandoffManifest = serde_json::from_value(current).unwrap();
+        let encoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(encoded["next_agent_state_change_seq"], 71);
+        assert_eq!(encoded["panes"][0]["last_agent_state_change_seq"], 23);
+        assert_eq!(encoded["panes"][0]["last_agent_completion_seq"], 23);
+
+        let mut legacy = legacy;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("next_agent_state_change_seq");
+        let pane = legacy["panes"][0].as_object_mut().unwrap();
+        pane.remove("last_agent_state_change_seq");
+        pane.remove("last_agent_completion_seq");
+        let decoded: HandoffManifest = serde_json::from_value(legacy).unwrap();
+        let encoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(encoded["next_agent_state_change_seq"], 0);
+        assert!(encoded["panes"][0]["last_agent_completion_seq"].is_null());
+        assert!(encoded["panes"][0]["last_agent_state_change_seq"].is_null());
+    }
+
+    #[test]
     fn a_manifest_written_before_the_host_shutdown_field_still_loads() {
         let manifest = manifest_for(empty_snapshot(), Vec::new(), None, None, None, None);
         let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
@@ -1208,6 +1248,8 @@ mod tests {
             }),
             initial_history_ansi: initial_history_ansi.map(str::to_string),
             agent_state: None,
+            last_agent_state_change_seq: None,
+            last_agent_completion_seq: None,
         }
     }
 

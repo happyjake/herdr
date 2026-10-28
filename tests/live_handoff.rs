@@ -2541,6 +2541,168 @@ fn live_handoff_keeps_the_date_of_a_working_agent_with_a_resumable_session() {
 }
 
 #[test]
+fn live_handoff_preserves_completion_sequences_and_the_allocation_floor() {
+    let _lock = test_lock();
+    struct Session {
+        base: PathBuf,
+        socket: PathBuf,
+        server: Option<SpawnedHerdr>,
+    }
+    impl Drop for Session {
+        fn drop(&mut self) {
+            let _ = try_request(
+                &self.socket,
+                serde_json::json!({
+                    "id": "stop", "method": "server.stop", "params": {}
+                }),
+            );
+            drop(self.server.take());
+            cleanup_test_base(&self.base);
+        }
+    }
+    let base = unique_test_dir();
+    let runtime_dir = base.join("runtime");
+    let socket = runtime_dir.join("herdr.sock");
+    register_runtime_dir(&runtime_dir);
+    let server = spawn_server(&base.join("config"), &runtime_dir, &socket);
+    let mut session = Session {
+        base,
+        socket,
+        server: Some(server),
+    };
+    wait_for_socket(&session.socket, Duration::from_secs(10));
+    let created = request(
+        &session.socket,
+        serde_json::json!({
+            "id": "create", "method": "workspace.create", "params": {"cwd": session.base}
+        }),
+    );
+    let workspace = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let completed = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let new_pane = || {
+        let response = request(
+            &session.socket,
+            serde_json::json!({
+                "id": "tab", "method": "tab.create", "params": {"workspace_id": workspace, "focus": false}
+            }),
+        );
+        response["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let idle = new_pane();
+    let retired = new_pane();
+    let report = |pane: &str, state: &str, seq: u64| {
+        assert_ok(request(
+            &session.socket,
+            serde_json::json!({
+                "id": "report", "method": "pane.report_agent", "params": {
+                    "pane_id": pane, "agent": "pi", "source": "custom:sequence-test",
+                    "state": state, "seq": seq
+                }
+            }),
+        ));
+    };
+    let pane = |pane_id: &str| {
+        request(
+            &session.socket,
+            serde_json::json!({
+                "id": "get", "method": "pane.get", "params": {"pane_id": pane_id}
+            }),
+        )["result"]["pane"]
+            .clone()
+    };
+    report(completed, "working", 1);
+    report(completed, "idle", 2);
+    let original = pane(completed)["completion_seq"]
+        .as_u64()
+        .expect("completed work");
+    report(&idle, "idle", 1);
+    assert!(pane(&idle)["completion_seq"].is_null());
+    report(&retired, "working", 1);
+    report(&retired, "idle", 2);
+    let floor = pane(&retired)["completion_seq"].as_u64().unwrap();
+    assert!(floor > original);
+    assert_ok(request(
+        &session.socket,
+        serde_json::json!({
+            "id": "close", "method": "pane.close", "params": {"pane_id": retired}
+        }),
+    ));
+
+    for expected in [original, floor + 2] {
+        assert_ok(request(
+            &session.socket,
+            serde_json::json!({
+                "id": "handoff", "method": "server.live_handoff", "params": {}
+            }),
+        ));
+        drop(session.server.take());
+        wait_for_api(&session.socket, Duration::from_secs(10));
+        assert_eq!(pane(completed)["completion_seq"], expected);
+        assert!(pane(&idle)["completion_seq"].is_null());
+
+        for (method, collection) in [("pane.list", "panes"), ("session.snapshot", "snapshot")] {
+            let response = request(
+                &session.socket,
+                serde_json::json!({
+                    "id": "read", "method": method, "params": {}
+                }),
+            );
+            let rows = if collection == "snapshot" {
+                &response["result"][collection]["panes"]
+            } else {
+                &response["result"][collection]
+            };
+            let rows = rows.as_array().expect("pane collection");
+            for (id, sequence) in [(completed, Some(expected)), (idle.as_str(), None)] {
+                let row = rows.iter().find(|row| row["pane_id"] == id).unwrap();
+                assert_eq!(
+                    row["completion_seq"],
+                    serde_json::json!(sequence),
+                    "{method}"
+                );
+            }
+        }
+
+        for id in [completed, idle.as_str()] {
+            let mut stream = UnixStream::connect(&session.socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({
+                    "id": "subscribe", "method": "events.subscribe", "params": {
+                        "subscriptions": [{"type": "pane.agent_status_changed", "pane_id": id,
+                            "agent_status": pane(id)["agent_status"]}]
+                    }
+                })
+            )
+            .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let ack: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(ack["result"]["type"], "subscription_started");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(event["data"]["completion_seq"], pane(id)["completion_seq"]);
+        }
+        if expected == original {
+            report(completed, "working", 3);
+            report(completed, "idle", 4);
+            assert_eq!(pane(completed)["completion_seq"], floor + 2);
+        }
+    }
+}
+
+#[test]
 fn live_handoff_keeps_an_unseen_completion_done() {
     let _lock = test_lock();
     let base = unique_test_dir();
