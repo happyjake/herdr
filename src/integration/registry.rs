@@ -529,3 +529,131 @@ pub(crate) fn parse_integration_version(content: &str) -> Option<u32> {
             .ok()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Versions shipped in v0.9.5, before direct-socket hooks used the report guard.
+    macro_rules! released_hook_is_outdated {
+        ($test:ident, $released:literal, $version:ident, $asset:ident) => {
+            #[test]
+            fn $test() {
+                let path = std::env::temp_dir().join(format!(
+                    "herdr-hook-migration-{}-{}",
+                    std::process::id(),
+                    stringify!($test),
+                ));
+                fs::write(
+                    &path,
+                    concat!("# HERDR_INTEGRATION_VERSION=", $released, "\n"),
+                )
+                .unwrap();
+                let released = integration_state_for_path(&path, super::super::$version);
+                fs::write(&path, super::super::$asset).unwrap();
+                let upgraded = integration_state_for_path(&path, super::super::$version);
+                fs::remove_file(&path).unwrap();
+
+                assert_eq!(
+                    released,
+                    (
+                        super::super::IntegrationStatusKind::Outdated,
+                        Some($released)
+                    )
+                );
+                assert_eq!(
+                    upgraded,
+                    (
+                        super::super::IntegrationStatusKind::Current,
+                        Some(super::super::$version)
+                    )
+                );
+            }
+        };
+    }
+
+    released_hook_is_outdated!(
+        released_pi_hook_is_outdated,
+        9,
+        PI_INTEGRATION_VERSION,
+        PI_EXTENSION_ASSET
+    );
+    released_hook_is_outdated!(
+        released_omp_hook_is_outdated,
+        10,
+        OMP_INTEGRATION_VERSION,
+        OMP_EXTENSION_ASSET
+    );
+    released_hook_is_outdated!(
+        released_claude_hook_is_outdated,
+        11,
+        CLAUDE_INTEGRATION_VERSION,
+        CLAUDE_HOOK_ASSET
+    );
+    released_hook_is_outdated!(
+        released_codex_hook_is_outdated,
+        10,
+        CODEX_INTEGRATION_VERSION,
+        CODEX_HOOK_ASSET
+    );
+    released_hook_is_outdated!(
+        released_kimi_hook_is_outdated,
+        8,
+        KIMI_INTEGRATION_VERSION,
+        KIMI_HOOK_ASSET
+    );
+    released_hook_is_outdated!(
+        released_copilot_hook_is_outdated,
+        4,
+        COPILOT_INTEGRATION_VERSION,
+        COPILOT_HOOK_ASSET
+    );
+    released_hook_is_outdated!(
+        released_devin_hook_is_outdated,
+        3,
+        DEVIN_INTEGRATION_VERSION,
+        DEVIN_HOOK_ASSET
+    );
+    released_hook_is_outdated!(
+        released_droid_hook_is_outdated,
+        4,
+        DROID_INTEGRATION_VERSION,
+        DROID_HOOK_ASSET
+    );
+    released_hook_is_outdated!(
+        released_opencode_hook_is_outdated,
+        13,
+        OPENCODE_INTEGRATION_VERSION,
+        OPENCODE_PLUGIN_ASSET
+    );
+    released_hook_is_outdated!(
+        released_kilo_hook_is_outdated,
+        4,
+        KILO_INTEGRATION_VERSION,
+        KILO_PLUGIN_ASSET
+    );
+    released_hook_is_outdated!(
+        released_cursor_hook_is_outdated,
+        2,
+        CURSOR_INTEGRATION_VERSION,
+        CURSOR_HOOK_ASSET
+    );
+    released_hook_is_outdated!(
+        released_antigravity_cli_hook_is_outdated,
+        4,
+        ANTIGRAVITY_CLI_INTEGRATION_VERSION,
+        ANTIGRAVITY_CLI_HOOK_ASSET
+    );
+    released_hook_is_outdated!(
+        released_mastracode_hook_is_outdated,
+        3,
+        MASTRACODE_INTEGRATION_VERSION,
+        MASTRACODE_HOOK_ASSET
+    );
+    released_hook_is_outdated!(
+        released_grok_hook_is_outdated,
+        3,
+        GROK_INTEGRATION_VERSION,
+        GROK_HOOK_ASSET
+    );
+}

@@ -38,7 +38,7 @@ const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/herdr-agent-state.ts");
 const PI_INTEGRATION_VERSION: u32 = 10;
 const OMP_EXTENSION_INSTALL_NAME: &str = "herdr-omp-agent-state.ts";
 const OMP_EXTENSION_ASSET: &str = include_str!("assets/omp/herdr-agent-state.ts");
-const OMP_INTEGRATION_VERSION: u32 = 10;
+const OMP_INTEGRATION_VERSION: u32 = 11;
 const CLAUDE_HOOK_INSTALL_NAME: &str = if cfg!(windows) {
     "herdr-agent-state.ps1"
 } else {
@@ -49,7 +49,7 @@ const CLAUDE_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/claude/herdr-agent-state.sh")
 };
-const CLAUDE_INTEGRATION_VERSION: u32 = 11;
+const CLAUDE_INTEGRATION_VERSION: u32 = 12;
 const CODEX_HOOK_INSTALL_NAME: &str = if cfg!(windows) {
     "herdr-agent-state.ps1"
 } else {
@@ -60,7 +60,7 @@ const CODEX_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/codex/herdr-agent-state.sh")
 };
-const CODEX_INTEGRATION_VERSION: u32 = 10;
+const CODEX_INTEGRATION_VERSION: u32 = 11;
 const KIMI_HOOK_INSTALL_NAME: &str = if cfg!(windows) {
     "herdr-agent-state.ps1"
 } else {
@@ -71,7 +71,7 @@ const KIMI_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/kimi/herdr-agent-state.sh")
 };
-const KIMI_INTEGRATION_VERSION: u32 = 8;
+const KIMI_INTEGRATION_VERSION: u32 = 9;
 const KIMI_CONFIG_BLOCK_BEGIN: &str = "# >>> herdr kimi integration";
 const KIMI_CONFIG_BLOCK_END: &str = "# <<< herdr kimi integration";
 const KIMI_MIN_VERSION: &str = "0.14.0";
@@ -113,7 +113,7 @@ const COPILOT_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/copilot/herdr-agent-state.sh")
 };
-const COPILOT_INTEGRATION_VERSION: u32 = 4;
+const COPILOT_INTEGRATION_VERSION: u32 = 5;
 const COPILOT_HOOK_EVENTS: [&str; 1] = ["SessionStart"];
 const COPILOT_REMOVED_LIFECYCLE_HOOK_EVENTS: [&str; 9] = [
     "UserPromptSubmit",
@@ -136,7 +136,7 @@ const DEVIN_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/devin/herdr-agent-state.sh")
 };
-const DEVIN_INTEGRATION_VERSION: u32 = 3;
+const DEVIN_INTEGRATION_VERSION: u32 = 4;
 const DEVIN_HOOK_EVENTS: [(&str, &str); 6] = [
     ("SessionStart", "session"),
     ("UserPromptSubmit", "session"),
@@ -163,7 +163,7 @@ const DROID_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/droid/herdr-agent-state.sh")
 };
-const DROID_INTEGRATION_VERSION: u32 = 4;
+const DROID_INTEGRATION_VERSION: u32 = 5;
 const DROID_HOOK_EVENTS: [(&str, &str); 1] = [("SessionStart", "session")];
 const DROID_REMOVED_LIFECYCLE_HOOK_EVENTS: [(&str, &str); 9] = [
     ("SessionStart", "idle"),
@@ -184,10 +184,10 @@ const OPENCODE_TUI_PLUGIN_ASSET: &str = include_str!("assets/opencode/herdr-tui-
 const OPENCODE_V2_TUI_PLUGIN_DIR: &str = "herdr-opencode";
 const OPENCODE_V2_TUI_PLUGIN_SPEC: &str = "./herdr-opencode";
 const OPENCODE_V2_TUI_PLUGIN_ASSET: &str = include_str!("assets/opencode/tui.js");
-const OPENCODE_INTEGRATION_VERSION: u32 = 13;
+const OPENCODE_INTEGRATION_VERSION: u32 = 14;
 const KILO_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state.js";
 const KILO_PLUGIN_ASSET: &str = include_str!("assets/kilo/herdr-agent-state.js");
-const KILO_INTEGRATION_VERSION: u32 = 4;
+const KILO_INTEGRATION_VERSION: u32 = 5;
 const HERMES_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state";
 const HERMES_PLUGIN_MANIFEST_INSTALL_NAME: &str = "plugin.yaml";
 const HERMES_PLUGIN_INIT_INSTALL_NAME: &str = "__init__.py";
@@ -254,7 +254,7 @@ const CURSOR_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/cursor/herdr-agent-state.sh")
 };
-const CURSOR_INTEGRATION_VERSION: u32 = 2;
+const CURSOR_INTEGRATION_VERSION: u32 = 3;
 #[cfg(windows)]
 const ANTIGRAVITY_CLI_HOOK_INSTALL_NAME: &str = "herdr-agent-state.ps1";
 #[cfg(not(windows))]
@@ -265,7 +265,7 @@ const ANTIGRAVITY_CLI_HOOK_ASSET: &str =
 #[cfg(not(windows))]
 const ANTIGRAVITY_CLI_HOOK_ASSET: &str =
     include_str!("assets/antigravity_cli/herdr-agent-state.sh");
-const ANTIGRAVITY_CLI_INTEGRATION_VERSION: u32 = 4;
+const ANTIGRAVITY_CLI_INTEGRATION_VERSION: u32 = 5;
 /// Antigravity CLI keys `hooks.json` by hook name, so every Herdr entry lives
 /// under one Herdr-owned block that install rewrites and uninstall removes.
 const ANTIGRAVITY_CLI_HOOK_BLOCK_NAME: &str = "herdr";
@@ -291,7 +291,7 @@ const MASTRACODE_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/mastracode/herdr-agent-state.sh")
 };
-const MASTRACODE_INTEGRATION_VERSION: u32 = 3;
+const MASTRACODE_INTEGRATION_VERSION: u32 = 4;
 const MASTRACODE_HOOK_TIMEOUT_MS: u64 = 10_000;
 const MASTRACODE_REMOVED_HOOK_EVENTS: [(&str, &str); 2] =
     [("SessionStart", "idle"), ("SessionEnd", "release")];
@@ -319,7 +319,7 @@ const GROK_HOOK_ASSET: &str = if cfg!(windows) {
 } else {
     include_str!("assets/grok/herdr-agent-state.sh")
 };
-const GROK_INTEGRATION_VERSION: u32 = 3;
+const GROK_INTEGRATION_VERSION: u32 = 4;
 
 pub(crate) const INSTALL_WARNING_PREFIX: &str = "warning:";
 
