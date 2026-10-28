@@ -258,6 +258,7 @@ fn reply_to_probe_with_flag(
         },
         Method::PaneRead(_) => ResponseResult::PaneRead {
             read: PaneReadResult {
+                cols: None,
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 tab_id: "tab_1".into(),

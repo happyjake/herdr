@@ -746,6 +746,10 @@ herdr pane read w1:p1 --source detection
 `recent-unwrapped` 对日志很有用,因为它忽略软折行。
 `detection` 返回智能体屏幕检测使用的底部缓冲区快照。
 
+`pane.read` 和 `agent.read` 的 `read.cols` 表示当前终端宽度（列数），
+客户端可用它判断输出的折行。旧服务器不提供这个可选字段；字段缺失时，
+客户端应保持不依赖终端宽度的行为。
+
 ## 等待状态
 
 用等待来协调智能体和脚本。

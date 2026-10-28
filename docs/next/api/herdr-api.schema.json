@@ -7503,6 +7503,16 @@
         },
         "PaneReadResult": {
           "properties": {
+            "cols": {
+              "description": "Current terminal width in columns. Older servers omit this field.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "effective_offset": {
               "description": "Echoed on offset reads: the requested offset_from_bottom clamped at\nthe top of scrollback. Absent when the request carried no offset.",
               "format": "uint64",
@@ -9865,6 +9875,16 @@
         },
         "PaneReadResult": {
           "properties": {
+            "cols": {
+              "description": "Current terminal width in columns. Older servers omit this field.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "effective_offset": {
               "description": "Echoed on offset reads: the requested offset_from_bottom clamped at\nthe top of scrollback. Absent when the request carried no offset.",
               "format": "uint64",

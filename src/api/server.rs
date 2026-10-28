@@ -2424,6 +2424,7 @@ mod tests {
                             id: msg.request.id,
                             result: ResponseResult::PaneRead {
                                 read: crate::api::schema::PaneReadResult {
+                                    cols: None,
                                     pane_id: "pane_1".into(),
                                     workspace_id: "ws_1".into(),
                                     tab_id: "tab_1".into(),
@@ -2793,6 +2794,7 @@ mod tests {
                     }
                     Method::PaneRead(params) => ResponseResult::PaneRead {
                         read: crate::api::schema::PaneReadResult {
+                            cols: None,
                             pane_id: params.pane_id,
                             workspace_id: "ws_1".into(),
                             tab_id: "tab_1".into(),

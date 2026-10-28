@@ -1817,6 +1817,7 @@ mod tests {
                 _ => crate::pane::strip_ansi(row),
             });
             crate::api::schema::PaneReadResult {
+                cols: None,
                 pane_id: "wG4:p1".into(),
                 workspace_id: "wG4".into(),
                 tab_id: "wG4:t1".into(),
@@ -1838,6 +1839,7 @@ mod tests {
             let bottom = total - landed;
             let top = bottom.saturating_sub(lines.min(1000) as usize);
             crate::api::schema::PaneReadResult {
+                cols: None,
                 pane_id: "wG4:p1".into(),
                 workspace_id: "wG4".into(),
                 tab_id: "wG4:t1".into(),

@@ -1029,6 +1029,9 @@ pub struct PaneReadResult {
     pub pane_id: String,
     pub workspace_id: String,
     pub tab_id: String,
+    /// Current terminal width in columns. Older servers omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
     pub source: ReadSource,
     pub format: ReadFormat,
     pub text: String,

@@ -1469,6 +1469,28 @@ fn subscribe_request_parses_live_only_replay_opt_out() {
 }
 
 #[test]
+fn pane_read_width_is_optional_for_legacy_responses() {
+    let mut value = serde_json::json!({
+        "pane_id": "w1:p1",
+        "workspace_id": "w1",
+        "tab_id": "w1:t1",
+        "source": "recent",
+        "format": "text",
+        "text": "prompt",
+        "revision": 0,
+        "truncated": false
+    });
+    let legacy: PaneReadResult = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(legacy.cols, None);
+    assert!(serde_json::to_value(legacy).unwrap().get("cols").is_none());
+
+    value["cols"] = serde_json::json!(73);
+    let current: PaneReadResult = serde_json::from_value(value).unwrap();
+    assert_eq!(current.cols, Some(73));
+    assert_eq!(serde_json::to_value(current).unwrap()["cols"], 73);
+}
+
+#[test]
 fn subscription_event_envelope_round_trips() {
     let event = SubscriptionEventEnvelope {
         event: SubscriptionEventKind::PaneOutputMatched,
@@ -1476,6 +1498,7 @@ fn subscription_event_envelope_round_trips() {
             pane_id: "p_1_1".into(),
             matched_line: "auth: received".into(),
             read: PaneReadResult {
+                cols: None,
                 pane_id: "p_1_1".into(),
                 workspace_id: "w_1".into(),
                 tab_id: "t_1_1".into(),

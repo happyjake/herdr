@@ -4579,6 +4579,7 @@ fn terminal_control_rejects_attach_during_alt_screen_read() {
                 respond_to,
                 "fallback".into(),
                 api::schema::PaneReadResult {
+                    cols: None,
                     pane_id: "w1:p1".into(),
                     workspace_id: "w1".into(),
                     tab_id: "w1:t1".into(),

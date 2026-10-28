@@ -1758,6 +1758,7 @@ impl App {
                     pane_id: public_pane_id,
                     workspace_id,
                     tab_id: self.public_tab_id(ws_idx, resolved.tab_idx).unwrap(),
+                    cols: Some(pane.current_size().1),
                     source: params.source,
                     format: params.format,
                     text,
@@ -4376,6 +4377,27 @@ mod tests {
             offset_read_params(public_pane_id, ReadSource::Recent, 10, Some(20)),
         ));
         assert_eq!(below_top.has_more, Some(true));
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_reports_current_column_width_after_resize() {
+        let (mut app, public_pane_id, pane_id) = app_with_offset_read_runtime();
+        for cols in [20, 73] {
+            app.lookup_runtime(0, pane_id)
+                .expect("pane runtime")
+                .0
+                .resize(5, cols, 0, 0);
+            for source in [ReadSource::Recent, ReadSource::RecentUnwrapped] {
+                for offset in [None, Some(0), Some(10)] {
+                    let response: serde_json::Value = serde_json::from_str(&app.handle_pane_read(
+                        "width".into(),
+                        offset_read_params(public_pane_id.clone(), source, 10, offset),
+                    ))
+                    .unwrap();
+                    assert_eq!(response["result"]["read"]["cols"], cols);
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -1472,6 +1472,11 @@ herdr pane read w1:p1 --source detection
 `recent-unwrapped` is useful for logs because it ignores soft wrapping.
 `detection` returns the bottom-buffer snapshot used by agent screen detection.
 
+`pane.read` and `agent.read` include `read.cols`, the terminal's current width
+in columns. Clients can use it to interpret wrapped output. Older servers
+omit this optional field; clients should keep width-independent behavior
+when it is absent.
+
 To page back through history, pass `offset_from_bottom` with source `recent`
 (counted in physical rows) or `recent_unwrapped` (counted in logical lines);
 other sources refuse it. The window of `lines` is read that far above the

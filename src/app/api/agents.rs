@@ -378,6 +378,7 @@ impl App {
                         .public_tab_id(resolved.ws_idx, resolved.tab_idx)
                         .unwrap(),
                     source: params.source,
+                    cols: Some(pane.current_size().1),
                     format: params.format,
                     text,
                     revision: 0,
@@ -1119,6 +1120,36 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "agent_not_ready");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_read_reports_current_column_width() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(73, 5, b"> ");
+        app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+        let response = app.handle_agent_read(
+            "width".into(),
+            crate::api::schema::AgentReadParams {
+                target,
+                source: crate::api::schema::ReadSource::Visible,
+                lines: Some(5),
+                format: crate::api::schema::ReadFormat::Text,
+                strip_ansi: true,
+                offset_from_bottom: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneRead { read } = success.result else {
+            panic!("expected pane read response");
+        };
+        assert_eq!(read.cols, Some(73));
     }
 
     #[tokio::test]

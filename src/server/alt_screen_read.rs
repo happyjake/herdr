@@ -494,6 +494,7 @@ mod tests {
             respond_to,
             "fallback".into(),
             PaneReadResult {
+                cols: None,
                 pane_id: "w1:p1".into(),
                 workspace_id: "w1".into(),
                 tab_id: "w1:t1".into(),
@@ -525,6 +526,45 @@ mod tests {
             panic!("expected pane read response");
         };
         read.text
+    }
+
+    #[test]
+    fn completed_read_preserves_column_width() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let guard = rt.enter();
+        let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(73, 5, 8);
+        runtime.test_process_pty_bytes(&draw(&["first", "second", "third"], true));
+        let started = Instant::now();
+        let (mut pending, response_rx) = pending_read(&runtime, started, 8);
+        pending.read.cols = Some(73);
+
+        for step in 0..3 {
+            pending = pending
+                .poll(
+                    Some(&runtime),
+                    started + INITIAL_QUIET + STEP_TIMEOUT * step,
+                )
+                .expect("read in progress");
+            input_rx.try_recv().expect("scroll probe or restoration");
+        }
+        assert!(pending
+            .poll(Some(&runtime), started + INITIAL_QUIET + STEP_TIMEOUT * 3)
+            .is_none());
+        let response: SuccessResponse =
+            serde_json::from_str(&response_rx.recv_timeout(Duration::from_millis(50)).unwrap())
+                .unwrap();
+        let ResponseResult::PaneRead { read } = response.result else {
+            panic!("expected pane read response");
+        };
+        assert_eq!(read.cols, Some(73));
+        assert!(read.text.contains("second"));
+
+        drop(runtime);
+        drop(guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
     }
 
     #[test]
