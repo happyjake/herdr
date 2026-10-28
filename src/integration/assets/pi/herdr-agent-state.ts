@@ -5,6 +5,7 @@
 // HERDR_INTEGRATION_VERSION=10
 // @ts-nocheck
 
+import { execFile } from "node:child_process";
 import net from "node:net";
 import path from "node:path";
 
@@ -19,10 +20,25 @@ function enabled() {
   return HERDR_ENV === "1" && !!socketPath && !!paneId;
 }
 
-function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
+// Keep transport retries and selection checks in the hook; the CLI owns
+// the process-ancestry decision shared with pane report commands.
+function reportAllowed(request, timeoutMs = 500) {
+  const command = request.method.slice("pane.".length).replaceAll("_", "-");
+  return new Promise((resolve) => {
+    execFile(process.env.HERDR_BIN_PATH || "herdr",
+      ["pane", command, "--hook-json", JSON.stringify(request), "--check-only"],
+      { timeout: timeoutMs, windowsHide: true },
+      (error, stdout) => resolve(error ? undefined : stdout.trim() === "true"));
+  });
+}
+
+async function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
   if (!enabled()) {
     return Promise.resolve(true);
   }
+
+  const allowed = await reportAllowed(request, timeoutMs);
+  if (allowed !== true) return allowed === false;
 
   return new Promise((resolve) => {
     let done = false;

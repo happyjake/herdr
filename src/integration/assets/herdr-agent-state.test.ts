@@ -1,8 +1,16 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, mock, test } from "bun:test";
 import { rm } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// These tests exercise hook transport and lifecycle ordering. The native
+// ancestry decision is covered by the CLI's process-table tests.
+mock.module("node:child_process", () => ({
+  execFile(_file: string, _args: string[], _options: unknown, done: Function) {
+    queueMicrotask(() => done(null, "true\n"));
+  },
+}));
 
 const originalPlatform = process.platform;
 const originalArgv = process.argv;
@@ -153,6 +161,7 @@ for (const socketPlugin of socketPlugins) {
       },
     });
 
+    await waitFor(() => connectedEndpoint() !== undefined);
     expect(connectedEndpoint()).toBe(`\\\\.\\pipe\\${markerPath}`);
   });
 }
@@ -190,6 +199,7 @@ for (const integration of integrations) {
       },
     );
 
+    await waitFor(() => connectedEndpoint() !== undefined);
     expect(connectedEndpoint()).toBe(`\\\\.\\pipe\\${markerPath}`);
   });
 

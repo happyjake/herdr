@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, expect, mock, test } from "bun:test";
 
+// These tests exercise hook transport and lifecycle ordering. The native
+// ancestry decision is covered by the CLI's process-table tests.
+mock.module("node:child_process", () => ({
+  execFile(_file: string, _args: string[], _options: unknown, done: Function) {
+    queueMicrotask(() => done(null, "true\n"));
+  },
+}));
+
 const originalArgv = process.argv;
 afterEach(() => { process.argv = originalArgv; });
 

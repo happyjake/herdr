@@ -21,6 +21,7 @@ import json
 import os
 import random
 import socket
+import subprocess
 import time
 
 source = "herdr:copilot"
@@ -77,6 +78,20 @@ request = {
         "seq": time.time_ns(),
     },
 }
+
+try:
+    report = json.loads(request) if isinstance(request, str) else request
+    command = report["method"][len("pane."):].replace("_", "-")
+    checked = subprocess.run(
+        [os.environ.get("HERDR_BIN_PATH") or "herdr", "pane", command,
+         "--hook-json", json.dumps(report), "--check-only"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, timeout=1, check=False,
+    )
+    if checked.returncode != 0 or checked.stdout.strip() != b"true":
+        raise SystemExit(0)
+except Exception:
+    raise SystemExit(0)
 
 try:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

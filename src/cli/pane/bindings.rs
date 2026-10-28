@@ -436,6 +436,28 @@ impl Leaf {
     }
 
     pub(super) fn request(&self, args: &[String]) -> Result<Request, ParseError> {
+        // Hook assets already own a JSON report, including optional fields
+        // newer than the flags. Keep that envelope intact through the CLI guard.
+        if matches!(self.name, "report-agent" | "report-agent-session") {
+            let json_args = args.strip_suffix(&["--check-only".into()]).unwrap_or(args);
+            if let [flag, json] = json_args {
+                if flag == "--hook-json" {
+                    let request: Request = serde_json::from_str(json)
+                        .map_err(|error| ParseError::Usage(error.to_string()))?;
+                    let matches = matches!(
+                        (self.name, &request.method),
+                        ("report-agent", Method::PaneReportAgent(_))
+                            | ("report-agent-session", Method::PaneReportAgentSession(_))
+                    );
+                    if !matches {
+                        return Err(ParseError::Usage(
+                            "hook report method does not match command".into(),
+                        ));
+                    }
+                    return Ok(request);
+                }
+            }
+        }
         let mut method = projection::parse(
             self.command().bin_name(format!("herdr pane {}", self.name)),
             args,

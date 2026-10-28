@@ -792,6 +792,21 @@ pub(crate) fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
     process_ppid_and_comm_from_stat(&stat)
 }
 
+pub(crate) fn hook_report_process(pid: u32) -> Option<(u32, super::ForegroundProcess)> {
+    let (parent, name) = process_parent_and_name(pid)?;
+    let argv = process_argv(pid);
+    Some((
+        parent,
+        super::ForegroundProcess {
+            pid,
+            name,
+            argv0: argv.as_ref().and_then(|args| args.first().cloned()),
+            cmdline: None,
+            argv,
+        },
+    ))
+}
+
 /// Parent pid and controlling terminal device of `pid`; the terminal is
 /// `None` for a process without one (`tty_nr` is 0).
 pub(crate) fn process_parent_and_tty(pid: u32) -> Option<(u32, Option<u64>)> {

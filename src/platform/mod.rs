@@ -151,6 +151,11 @@ pub struct ForegroundProcess {
     pub cmdline: Option<String>,
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn hook_report_process(_pid: u32) -> Option<(u32, ForegroundProcess)> {
+    None
+}
+
 /// One living process in a session-search snapshot. Start time uses UTC
 /// `ps lstart` text, matching the Claude running-session registry.
 #[derive(Clone)]

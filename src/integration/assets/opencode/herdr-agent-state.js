@@ -4,7 +4,21 @@
 // HERDR_INTEGRATION_ID=opencode
 // HERDR_INTEGRATION_VERSION=13
 
+import { execFile } from "node:child_process";
 import net from "node:net";
+
+// Keep transport retries and selection checks in the hook; the CLI owns
+// the process-ancestry decision shared with pane report commands.
+function reportAllowed(request, timeoutMs = 500) {
+  const command = request.method.slice("pane.".length).replaceAll("_", "-");
+  return new Promise((resolve) => {
+    execFile(process.env.HERDR_BIN_PATH || "herdr",
+      ["pane", command, "--hook-json", JSON.stringify(request), "--check-only"],
+      { timeout: timeoutMs, windowsHide: true },
+      (error, stdout) => resolve(error ? undefined : stdout.trim() === "true"));
+  });
+}
+
 
 const SOURCE = "herdr:opencode";
 const AGENT = "opencode";
@@ -58,7 +72,7 @@ function request(method, params) {
   return pending;
 }
 
-function requestOnce(method, params) {
+async function requestOnce(method, params) {
   const paneId = process.env.HERDR_PANE_ID;
   const socketPath = process.env.HERDR_SOCKET_PATH;
 
@@ -83,6 +97,9 @@ function requestOnce(method, params) {
       ...params,
     },
   };
+
+  const allowed = await reportAllowed(request);
+  if (allowed !== true) return allowed === false;
 
   return new Promise((resolve) => {
     const client = net.createConnection(socketEndpoint, () => {

@@ -2102,6 +2102,12 @@ fn foreground_process_from_entry(entry: &WindowsProcessEntry) -> super::Foregrou
     }
 }
 
+pub(crate) fn hook_report_process(pid: u32) -> Option<(u32, super::ForegroundProcess)> {
+    let snapshot = cached_foreground_processes();
+    let entry = snapshot.entry(pid)?;
+    Some((entry.parent_pid, foreground_process_from_entry(entry)))
+}
+
 fn snapshot_processes() -> Vec<WindowsProcessEntry> {
     #[cfg(test)]
     PROCESS_INSPECTION_COUNTS.with_borrow_mut(|counts| counts.snapshots += 1);

@@ -1,4 +1,5 @@
 pub(crate) mod bindings;
+mod report_guard;
 
 use clap::ArgMatches;
 
@@ -36,6 +37,21 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         }
         Err(ParseError::Clap(error)) => return super::print_clap_error(&error),
     };
+    if matches!(
+        request.method,
+        Method::PaneReportAgent(_) | Method::PaneReportAgentSession(_)
+    ) {
+        let skip = report_guard::should_skip();
+        if args.get(1).is_some_and(|arg| arg == "--hook-json")
+            && args.last().is_some_and(|arg| arg == "--check-only")
+        {
+            println!("{}", !skip);
+            return Ok(0);
+        }
+        if skip {
+            return Ok(0);
+        }
+    }
     if matches!(leaf.output, bindings::Output::Quiet) {
         return super::send_ok_request(request.method);
     }

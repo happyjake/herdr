@@ -1037,6 +1037,21 @@ pub(crate) fn process_parent_and_name(pid: u32) -> Option<(u32, String)> {
     Some((info.pbi_ppid, name))
 }
 
+pub(crate) fn hook_report_process(pid: u32) -> Option<(u32, ForegroundProcess)> {
+    let (parent, name) = process_parent_and_name(pid)?;
+    let argv = process_argv(pid);
+    Some((
+        parent,
+        ForegroundProcess {
+            pid,
+            name,
+            argv0: process_argv0_name(pid),
+            cmdline: None,
+            argv,
+        },
+    ))
+}
+
 /// Parent pid and controlling terminal device of `pid`; the terminal is
 /// `None` for a process without one (the kernel reports `NODEV`).
 pub(crate) fn process_parent_and_tty(pid: u32) -> Option<(u32, Option<u64>)> {
