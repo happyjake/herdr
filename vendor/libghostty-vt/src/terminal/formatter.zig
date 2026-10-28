@@ -1172,9 +1172,10 @@ pub const PageFormatter = struct {
         else
             true;
 
-        // Track hyperlink state for HTML output. We need to close </a> tags
-        // when the hyperlink changes or ends.
+        // IDs are page-local. Remember rejected VT targets too so validation
+        // runs once per hyperlink run rather than once per cell.
         var current_hyperlink_id: ?hyperlink.Id = null;
+        var hyperlink_open = false;
 
         for (start_y..end_y + 1) |y_usize| {
             const y: size.CellCountInt = @intCast(y_usize);
@@ -1345,6 +1346,11 @@ pub const PageFormatter = struct {
 
                     // Cells with no text are blank
                     if (!cell.hasText()) {
+                        if (comptime emit == .vt) {
+                            if (hyperlink_open) try self.formatHyperlinkClose(emit, writer);
+                            hyperlink_open = false;
+                            current_hyperlink_id = null;
+                        }
                         blank_cells += 1;
                         continue;
                     }
@@ -1456,10 +1462,7 @@ pub const PageFormatter = struct {
 
                 // Hyperlink state
                 hyperlink: {
-                    // We currently only emit hyperlinks for HTML. In the
-                    // future we can support emitting OSC 8 hyperlinks for
-                    // VT output as well.
-                    if (comptime emit != .html) break :hyperlink;
+                    if (comptime emit == .plain) break :hyperlink;
 
                     // Get the hyperlink ID. This ID is our internal ID,
                     // not necessarily the OSC8 ID.
@@ -1472,16 +1475,14 @@ pub const PageFormatter = struct {
                     // identical hyperlink state and we do nothing.
                     if (current_hyperlink_id == link_id_) break :hyperlink;
 
-                    // If our prior hyperlink ID was non-null, we need to
-                    // close it because the ID has changed.
-                    if (current_hyperlink_id != null) {
+                    // Close any emitted link before changing the target.
+                    if (hyperlink_open) {
                         try self.formatHyperlinkClose(emit, writer);
-                        current_hyperlink_id = null;
+                        hyperlink_open = false;
                     }
+                    current_hyperlink_id = link_id_;
 
-                    // Set our current hyperlink ID
                     const link_id = link_id_ orelse break :hyperlink;
-                    current_hyperlink_id = link_id;
 
                     // Emit the opening hyperlink tag
                     const uri = uri: {
@@ -1491,11 +1492,15 @@ pub const PageFormatter = struct {
                         );
                         break :uri link.uri.offset.ptr(self.page.memory)[0..link.uri.len];
                     };
+                    if (comptime emit == .vt) {
+                        if (!validVtHyperlinkUri(uri)) break :hyperlink;
+                    }
                     try self.formatHyperlinkOpen(
                         emit,
                         writer,
                         uri,
                     );
+                    hyperlink_open = true;
 
                     // If we have a point map, we map the hyperlink to
                     // this cell.
@@ -1550,13 +1555,21 @@ pub const PageFormatter = struct {
                     },
                 }
             }
+
+            // Each VT row is independently safe to consume, including soft
+            // wraps and reads that end partway through an active hyperlink.
+            if (comptime emit == .vt) {
+                if (hyperlink_open) try self.formatHyperlinkClose(emit, writer);
+                hyperlink_open = false;
+                current_hyperlink_id = null;
+            }
         }
 
         // If the style is non-default, we need to close our style tag.
         if (!style.default()) try self.formatStyleClose(emit, writer);
 
-        // Close any open hyperlink for HTML output
-        if (current_hyperlink_id != null) try self.formatHyperlinkClose(emit, writer);
+        // Close any hyperlink still open at the selection boundary.
+        if (hyperlink_open) try self.formatHyperlinkClose(emit, writer);
 
         // Close the monospace wrapper for HTML output
         if (comptime emit == .html) {
@@ -1592,7 +1605,7 @@ pub const PageFormatter = struct {
     ///   - The codepoint map is empty.
     ///   - For styled formats, `run_style_id` is the valid interned
     ///     page-local id of the currently active style.
-    ///   - For HTML, no hyperlink is currently open.
+    ///   - For styled formats, hyperlink transitions take the slow path.
     ///
     /// `run_x`/`run_y` are the page coordinates of `cells[0]`, used for
     /// point map tracking.
@@ -1658,6 +1671,10 @@ pub const PageFormatter = struct {
                 // blank; anything else (including spaces) is written
                 // so that styling is preserved.
                 if (cp == 0 and cell.wide == .narrow and run_style_id == 0) {
+                    // Blank gaps must not inherit the preceding VT link.
+                    if (comptime emit == .vt) {
+                        if (run_hyperlink_id != null) break;
+                    }
                     pending += 1;
                     continue;
                 }
@@ -1677,9 +1694,9 @@ pub const PageFormatter = struct {
 
             // Hyperlink state must be stable within a run: any non-blank
             // cell must belong to the currently open hyperlink (or none).
-            // Transitions take the slow path. This is checked after blank
-            // accounting because blank cells never touch hyperlink state.
-            if (comptime emit == .html) {
+            // Transitions take the slow path. Blank VT gaps already return
+            // to the slow path above to close the preceding link.
+            if (comptime emit != .plain) {
                 if (cell.hyperlink) {
                     const run_id = run_hyperlink_id orelse break;
                     const cell_id = self.page.lookupHyperlink(cell) orelse break;
@@ -2073,6 +2090,18 @@ pub const PageFormatter = struct {
         }
     }
 
+    // OSC payloads must never contain a terminator or another control
+    // sequence. Reject unsafe targets instead of changing their meaning.
+    fn validVtHyperlinkUri(uri: []const u8) bool {
+        if (uri.len == 0 or uri.len > 4096) return false;
+        const view = std.unicode.Utf8View.init(uri) catch return false;
+        var it = view.iterator();
+        while (it.nextCodepoint()) |cp| {
+            if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return false;
+        }
+        return true;
+    }
+
     fn formatHyperlinkOpen(
         self: PageFormatter,
         comptime emit: Format,
@@ -2080,7 +2109,12 @@ pub const PageFormatter = struct {
         uri: []const u8,
     ) std.Io.Writer.Error!void {
         switch (emit) {
-            .plain, .vt => unreachable,
+            .plain => unreachable,
+            .vt => {
+                try writer.writeAll("\x1b]8;;");
+                try writer.writeAll(uri);
+                try writer.writeAll("\x1b\\");
+            },
 
             // layout since we're primarily using it as a CSS wrapper.
             .html => {
@@ -2102,7 +2136,8 @@ pub const PageFormatter = struct {
     ) std.Io.Writer.Error!void {
         const str: []const u8 = switch (emit) {
             .html => "</a>",
-            .plain, .vt => return,
+            .vt => "\x1b]8;;\x1b\\",
+            .plain => return,
         };
 
         try writer.writeAll(str);
@@ -2119,6 +2154,65 @@ pub const PageFormatter = struct {
         }
     }
 };
+
+test "Page VT hyperlink URI validation" {
+    const valid = PageFormatter.validVtHyperlinkUri;
+    try std.testing.expect(valid("https://example.com/文?a=1&b=2#fragment"));
+    try std.testing.expect(valid(&([_]u8{'x'} ** 4096)));
+    try std.testing.expect(!valid(&([_]u8{'x'} ** 4097)));
+    try std.testing.expect(!valid(""));
+    try std.testing.expect(!valid("https://example.com/\xff"));
+    for (0..0xa0) |cp| {
+        if (cp >= 0x20 and cp < 0x7f) continue;
+        var buf: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(@intCast(cp), &buf);
+        try std.testing.expect(!valid(buf[0..len]));
+    }
+}
+
+test "Page VT hyperlinks validate stored targets and preserve point maps" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "https://example.com/文?a=1&b=2",
+        &([_]u8{'x'} ** 4096),
+        &([_]u8{'x'} ** 4097),
+        "https://example.com/\x1b\\\x1b[31m",
+        "https://example.com/\x07",
+        "https://example.com/\xc2\x9c",
+        "https://example.com/\xff",
+    }, 0..) |uri, i| {
+        var t = try Terminal.init(std.testing.io, alloc, .{ .cols = 20, .rows = 2 });
+        defer t.deinit(alloc);
+        // Reserve storage up front to isolate serialization from page growth.
+        while (t.screens.active.cursor.page_pin.node.capacity().string_bytes < uri.len * 2) {
+            _ = try t.screens.active.increaseCapacity(t.screens.active.cursor.page_pin.node, .string_bytes);
+        }
+        // Insert directly into the terminal model so parser rejection cannot
+        // mask a missing formatter safety check.
+        try t.screens.active.startHyperlink(uri, null);
+        try t.printString("label");
+        const page = t.screens.active.pages.pages.last.?.page();
+        var formatter: PageFormatter = .init(page, .vt);
+        var points: std.ArrayList(Coordinate) = .empty;
+        defer points.deinit(alloc);
+        formatter.point_map = .{ .alloc = alloc, .map = &points };
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+        try formatter.format(&builder.writer);
+        const output = builder.writer.buffered();
+        try std.testing.expectEqual(output.len, points.items.len);
+        if (i < 2) {
+            const expected = try std.fmt.allocPrint(alloc, "\x1b]8;;{s}\x1b\\label\x1b]8;;\x1b\\", .{uri});
+            defer alloc.free(expected);
+            try std.testing.expectEqualStrings(expected, output);
+            for (points.items[output.len - 7 ..]) |point| {
+                try std.testing.expectEqual(Coordinate{ .x = 4, .y = 0 }, point);
+            }
+        } else {
+            try std.testing.expectEqualStrings("label", output);
+        }
+    }
+}
 
 test "Page plain single line" {
     const testing = std.testing;

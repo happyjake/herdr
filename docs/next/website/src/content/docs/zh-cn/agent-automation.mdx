@@ -85,6 +85,8 @@ herdr agent rename w1:p2 reviewer
 
 在 CLI 中,`pane read` 和 `agent read` 都直接打印终端文本。默认输出去除 ANSI 转义的 UTF-8 文本;来源包含样式时,使用 `--format ansi` 或 `--ansi` 保留终端转义。`detection` 来源始终是纯文本。对 recent 类来源,`--lines N` 会在可选的取消折行之前选择最后 N 个已渲染终端行;省略时默认读取 80 行。对 `visible` 和 `detection`,省略 `--lines` 会返回完整快照,指定时保留按换行分隔的最后 N 行。socket API 在 `.result.read.text` 返回文本。
 
+`visible`、`recent` 和 `recent-unwrapped` 的 ANSI 读取会在标签周围保留 OSC 8 超链接目标。每个链接都会在渲染行末和读取边界关闭。空目标、超过 4096 字节的目标、无效 UTF-8 以及包含控制字符的目标会被省略，但标签仍可读取。纯文本读取保持不变。
+
 ## 备用屏幕历史读取
 
 Claude Code 和 OpenCode 等全屏智能体会把对话历史绘制在终端的备用屏幕中,而不是写入 Herdr 的主机回滚缓冲区。当已识别的智能体处于 idle、对话位于底部,且 `--lines` 请求的行数超过可见屏幕时,`recent` 或 `recent-unwrapped` 文本读取会自动使用智能体的鼠标滚动界面。Herdr 会收集相互重叠的页面,并在完成读取前把视口恢复到底部。当窗格中包含该智能体时,`pane read` 也会自动采用相同行为,无需额外选项。

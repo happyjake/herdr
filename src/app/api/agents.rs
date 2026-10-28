@@ -1123,6 +1123,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_read_preserves_osc8_hyperlinks() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            40,
+            5,
+            100_000,
+            b"\x1b]8;;https://example.com\x1b\\docs\x1b]8;;\x1b\\\r\nplain",
+        );
+        app.state.insert_test_runtime(pane_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+        for source in [
+            crate::api::schema::ReadSource::Recent,
+            crate::api::schema::ReadSource::RecentUnwrapped,
+        ] {
+            for offset in [None, Some(0), Some(1)] {
+                let response = app.handle_agent_read(
+                    "read".into(),
+                    crate::api::schema::AgentReadParams {
+                        target: target.clone(),
+                        source,
+                        lines: Some(1),
+                        format: crate::api::schema::ReadFormat::Ansi,
+                        strip_ansi: false,
+                        offset_from_bottom: offset,
+                    },
+                );
+                let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+                let ResponseResult::PaneRead { read } = success.result else {
+                    panic!("expected pane read response");
+                };
+                if offset == Some(1) {
+                    assert_eq!(
+                        read.text,
+                        "\x1b]8;;https://example.com\x1b\\docs\x1b]8;;\x1b\\"
+                    );
+                } else {
+                    assert_eq!(read.text, "plain");
+                }
+                assert_eq!(read.cols, Some(40));
+                assert_eq!(read.effective_offset, offset);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn agent_read_reports_current_column_width() {
         let mut app = app_with_agent();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;

@@ -4,6 +4,45 @@ This file tracks intentional local changes applied on top of the vendored
 `libghostty-vt` source. Remove a patch only when the vendored source commit
 contains the upstream behavior and the listed verification still passes.
 
+## 0009 preserve OSC 8 hyperlinks in VT selections
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0009-vt-hyperlink-selection.patch`
+
+herdr issue: none
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
+
+local files:
+
+- `vendor/libghostty-vt/src/terminal/formatter.zig`
+
+reason: The terminal retains OSC 8 targets on cells, but the page formatter
+emits their links only in HTML. VT selections now emit OSC 8 around linked
+runs, closing before blank gaps and at every rendered row and selection
+boundary. Targets must be nonempty valid UTF-8, contain no C0, DEL, or C1
+controls, and fit within 4096 bytes. Validation occurs once per run, and
+plain output, cell geometry, and row selection are unchanged.
+
+remove when: the vendored VT formatter preserves cell hyperlinks with the
+same URI validation and closure guarantees, and the checks below pass
+without this patch.
+
+verification:
+
+```sh
+cargo test --offline -p herdr --bin herdr api_pane_read_
+cargo test --offline -p herdr --bin herdr agent_read_
+cargo test --offline -p ghostty-vt
+(cd vendor/libghostty-vt && zig build test-lib-vt -Demit-lib-vt -Demit-xcframework=false -Dtest-filter=formatter)
+python3 -m unittest scripts.test_vendor_libghostty_vt
+```
+
 ## 0002 expose modifyOtherKeys mode through terminal data
 
 status: active

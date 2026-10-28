@@ -4589,6 +4589,245 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_pane_read_preserves_osc8_hyperlinks_in_ansi_formats() {
+        for terminator in ["\x07", "\x1b\\"] {
+            let (mut app, public_pane_id) = app_with_test_workspace();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let input =
+                format!("\x1b]8;;https://example.com{terminator}docs\x1b]8;;{terminator}\r\n");
+            let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                40,
+                5,
+                100_000,
+                input.as_bytes(),
+            );
+            app.state.insert_test_runtime(pane_id, runtime);
+            for source in [
+                ReadSource::Visible,
+                ReadSource::Recent,
+                ReadSource::RecentUnwrapped,
+            ] {
+                let mut params = offset_read_params(public_pane_id.clone(), source, 10, None);
+                let plain = pane_read_result(&app.handle_pane_read("text".into(), params.clone()));
+                assert_eq!(plain.text.trim_end(), "docs");
+                params.format = ReadFormat::Ansi;
+                let response = app.handle_pane_read("ansi".into(), params);
+                // The JSON-escaped form must carry the same OSC payload.
+                assert!(response.contains(r"\u001b]8;;https://example.com"));
+                let read = pane_read_result(&response);
+                assert_eq!(
+                    read.text, "\x1b]8;;https://example.com\x1b\\docs\x1b]8;;\x1b\\",
+                    "{source:?} {terminator:?}"
+                );
+                assert_eq!(read.cols, Some(40));
+                assert_eq!(read.truncated, plain.truncated);
+                assert_eq!(read.effective_offset, plain.effective_offset);
+                assert_eq!(read.has_more, plain.has_more);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_osc8_preserves_cell_runs_styles_and_unicode() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let input = concat!(
+            "pre \x1b]8;id=first;https://example.com/a?x=1&y=2\x1b\\",
+            "\x1b[1;31mA界e\u{301}\x1b[0m",
+            "\x1b]8;;https://example.org\x07B\x1b]8;;\x07 tail",
+        );
+        let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            40,
+            5,
+            100_000,
+            input.as_bytes(),
+        );
+        app.state.insert_test_runtime(pane_id, runtime);
+        let mut params = offset_read_params(public_pane_id, ReadSource::Recent, 10, None);
+        params.format = ReadFormat::Ansi;
+        let read = pane_read_result(&app.handle_pane_read("req".into(), params));
+        assert!(read.text.contains("\x1b[1m"), "{:?}", read.text);
+        assert!(read.text.contains("\x1b[38;5;1m"), "{:?}", read.text);
+        assert_eq!(read.text.matches("\x1b]8;;\x1b\\").count(), 2);
+
+        // Reparse the actual API response through the terminal consumer:
+        // wide-cell spacers and combining characters must not shift links.
+        let mut replay = crate::ghostty::Terminal::new(40, 5, 0).unwrap();
+        replay.write(read.text.as_bytes());
+        assert_eq!(
+            replay.read_text_viewport((0, 0), (39, 0), false).unwrap(),
+            "pre A界e\u{301}B tail"
+        );
+        for col in 0..14 {
+            let expected = match col {
+                4..=7 => Some("https://example.com/a?x=1&y=2"),
+                8 => Some("https://example.org"),
+                _ => None,
+            };
+            assert_eq!(
+                replay.viewport_hyperlink_uri(col, 0).unwrap().as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_osc8_closes_before_blank_gaps_and_at_read_boundary() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            40, 5, 100_000,
+            b"\x1b]8;;https://example.com\x1b\\a\x1b]8;;\x1b\\\x1b[3Cb\r\n\x1b]8;;https://example.org\x1b\\last",
+        );
+        app.state.insert_test_runtime(pane_id, runtime);
+        let mut params = offset_read_params(public_pane_id, ReadSource::Recent, 10, None);
+        params.format = ReadFormat::Ansi;
+        let read = pane_read_result(&app.handle_pane_read("req".into(), params));
+        assert_eq!(
+            read.text,
+            concat!(
+                "\x1b]8;;https://example.com\x1b\\a\x1b]8;;\x1b\\   b\r\n",
+                "\x1b]8;;https://example.org\x1b\\last\x1b]8;;\x1b\\",
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_osc8_keeps_wrap_offset_and_truncation_semantics() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let input = format!(
+            "\x1b]8;;https://example.com\x1b\\{}\r\n\r\nlast",
+            "abcdefghij".repeat(9)
+        );
+        let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            10,
+            3,
+            100_000,
+            input.as_bytes(),
+        );
+        app.state.insert_test_runtime(pane_id, runtime);
+        for source in [ReadSource::Recent, ReadSource::RecentUnwrapped] {
+            for offset in [None, Some(0), Some(1), Some(3), Some(100)] {
+                for lines in [2, 20] {
+                    let mut params =
+                        offset_read_params(public_pane_id.clone(), source, lines, offset);
+                    let plain =
+                        pane_read_result(&app.handle_pane_read("text".into(), params.clone()));
+                    params.format = ReadFormat::Ansi;
+                    let read = pane_read_result(&app.handle_pane_read("ansi".into(), params));
+                    let visible = crate::pane::strip_ansi(&read.text).replace('\r', "");
+                    assert_eq!(
+                        visible.trim_end_matches('\n'),
+                        plain.text.trim_end_matches('\n')
+                    );
+                    assert_eq!(read.cols, Some(10));
+                    assert_eq!(read.truncated, plain.truncated);
+                    assert_eq!(read.effective_offset, plain.effective_offset);
+                    assert_eq!(read.has_more, plain.has_more);
+                    assert!(read.text.contains("\x1b]8;;https://example.com\x1b\\"));
+                    for line in read.text.lines() {
+                        let mut active = false;
+                        for osc in line.split("\x1b]8;;").skip(1) {
+                            let (uri, _) = osc.split_once("\x1b\\").unwrap();
+                            assert_ne!(active, !uri.is_empty(), "unbalanced link: {line:?}");
+                            active = !uri.is_empty();
+                        }
+                        assert!(!active, "link leaked past line: {line:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_osc8_survives_scrollback_pages_and_stitched_spans() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let mut input = String::from("\x1b]8;;https://example.com\x1b\\");
+        for row in 0..400 {
+            if row > 0 {
+                input.push_str("\r\n");
+            }
+            input.push_str(&format!("line {row:03}"));
+        }
+        let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            80,
+            5,
+            1_000_000,
+            input.as_bytes(),
+        );
+        app.state.insert_test_runtime(pane_id, runtime);
+        let mut params = offset_read_params(public_pane_id.clone(), ReadSource::Recent, 1000, None);
+        params.format = ReadFormat::Ansi;
+        let read = pane_read_result(&app.handle_pane_read("all".into(), params));
+        assert_eq!(
+            read.text
+                .matches("\x1b]8;;https://example.com\x1b\\")
+                .count(),
+            400
+        );
+        assert_eq!(read.text.matches("\x1b]8;;\x1b\\").count(), 400);
+        for (row, line) in read.text.lines().enumerate() {
+            assert_eq!(
+                line,
+                format!("\x1b]8;;https://example.com\x1b\\line {row:03}\x1b]8;;\x1b\\")
+            );
+        }
+        let mut params = offset_read_params(public_pane_id, ReadSource::RecentUnwrapped, 10, None);
+        params.span = Some(crate::api::schema::ReadSpan {
+            min_lines: 25,
+            max_lines: 40,
+        });
+        let plain = pane_read_result(&app.handle_pane_read("span-text".into(), params.clone()));
+        params.format = ReadFormat::Ansi;
+        let read = pane_read_result(&app.handle_pane_read("span-ansi".into(), params));
+        assert_eq!(crate::pane::strip_ansi(&read.text), plain.text);
+        assert_eq!(
+            read.text
+                .matches("\x1b]8;;https://example.com\x1b\\")
+                .count(),
+            plain.text.lines().count()
+        );
+        assert_eq!(read.cols, plain.cols);
+        assert_eq!(read.truncated, plain.truncated);
+        assert_eq!(read.effective_offset, plain.effective_offset);
+        assert_eq!(read.has_more, plain.has_more);
+    }
+
+    #[tokio::test]
+    async fn api_pane_read_osc8_rejects_unsafe_empty_and_oversized_targets() {
+        for uri in [
+            String::new(),
+            "x".repeat(4097),
+            "https://example.com/\u{7f}bad".into(),
+            "https://example.com/\u{80}bad".into(),
+            "https://example.com/\u{9c}bad".into(),
+            "https://example.com/\u{9f}bad".into(),
+        ] {
+            let (mut app, public_pane_id) = app_with_test_workspace();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let input = format!(
+                "\x1b]8;;https://example.org\x1b\\ok\x1b]8;;\x1b\\\x1b]8;;{uri}\x1b\\label"
+            );
+            let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                40,
+                5,
+                100_000,
+                input.as_bytes(),
+            );
+            app.state.insert_test_runtime(pane_id, runtime);
+            let mut params = offset_read_params(public_pane_id, ReadSource::Recent, 10, None);
+            params.format = ReadFormat::Ansi;
+            let read = pane_read_result(&app.handle_pane_read("req".into(), params));
+            assert_eq!(
+                read.text, "\x1b]8;;https://example.org\x1b\\ok\x1b]8;;\x1b\\label",
+                "URI: {uri:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn api_pane_read_offset_pages_walk_scrollback() {
         let (mut app, public_pane_id, _pane) = app_with_offset_read_runtime();
 

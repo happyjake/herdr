@@ -85,6 +85,8 @@ A timeout or `agent_prompt_stalled` does not prove that no input was sent. Read 
 
 At the CLI, both `pane read` and `agent read` print terminal text directly. The default is UTF-8 text with ANSI escapes stripped; use `--format ansi` or `--ansi` to preserve terminal escapes where the source exposes them. The `detection` source is always plain text. For recent sources, `--lines N` selects the last N rendered terminal rows before optional unwrapping; without it, reads default to 80 rows. For `visible` and `detection`, omitting `--lines` returns the full snapshot, while specifying it keeps the last N newline-delimited lines. The socket API returns the text at `.result.read.text`.
 
+ANSI reads from `visible`, `recent`, and `recent-unwrapped` preserve OSC 8 hyperlink targets around their labels. Each link closes at the end of a rendered row and the read boundary. Empty targets, targets over 4096 bytes, invalid UTF-8, and targets containing control characters are omitted; their labels remain readable. Plain-text reads are unchanged.
+
 ## Alternate-screen history reads
 
 Full-screen agents such as Claude Code and OpenCode render transcript history in the terminal's alternate screen instead of Herdr's host scrollback. For an idle, recognized agent at the bottom of its transcript, text reads from `recent` or `recent-unwrapped` automatically use the agent's mouse-scroll interface when `--lines` requests more than the visible screen. Herdr collects overlapping pages and returns the viewport to the bottom before completing the read. The same behavior applies to `pane read` when the pane contains that agent; it requires no additional option.
