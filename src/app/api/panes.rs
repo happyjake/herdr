@@ -4379,6 +4379,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_pane_read_offset_preserves_truncation_with_blank_screen_rows() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let runtime = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+            80,
+            40,
+            100_000,
+            b"first\r\nsecond\r\n> ",
+        );
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        for source in [ReadSource::Recent, ReadSource::RecentUnwrapped] {
+            for format in [ReadFormat::Text, ReadFormat::Ansi] {
+                for (lines, truncated) in [(10, true), (60, false)] {
+                    let mut params =
+                        offset_read_params(public_pane_id.clone(), source, lines, None);
+                    params.format = format;
+                    let omitted =
+                        pane_read_result(&app.handle_pane_read("legacy".into(), params.clone()));
+                    params.offset_from_bottom = Some(0);
+                    let zero = pane_read_result(&app.handle_pane_read("offset".into(), params));
+
+                    assert_eq!(omitted.truncated, truncated);
+                    assert_eq!(zero.text, omitted.text);
+                    assert_eq!(zero.has_more, Some(false));
+                    assert_eq!(zero.truncated, omitted.truncated, "{source:?} {format:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn api_pane_read_offset_zero_and_omitted_match_legacy_reads() {
         let (mut app, public_pane_id, _pane) = app_with_offset_read_runtime();
 

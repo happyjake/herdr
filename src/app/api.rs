@@ -135,7 +135,7 @@ fn pane_read_window(
             }
             (
                 window.text,
-                window.has_more,
+                window.truncated,
                 Some(window.effective_offset as u64),
                 Some(window.has_more),
             )

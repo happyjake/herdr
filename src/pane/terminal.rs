@@ -77,6 +77,9 @@ pub struct RecentReadRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecentReadWindow {
     pub text: String,
+    /// Legacy read limit predicate, including blank rendered screen rows.
+    /// Paging uses `has_more` instead, which only counts content above the window.
+    pub truncated: bool,
     pub effective_offset: usize,
     pub has_more: bool,
     pub offset_unsupported: bool,
@@ -3330,6 +3333,7 @@ fn ghostty_recent_read_at_offset(
             if !fallback.text.trim().is_empty() {
                 return Ok(RecentReadWindow {
                     text: fallback.text,
+                    truncated: fallback.truncated,
                     ..window
                 });
             }
@@ -3362,6 +3366,9 @@ fn ghostty_recent_read_at_offset_for_terminal(
         unwrapped,
         ansi,
     } = request;
+    let truncated = terminal
+        .total_rows()
+        .is_ok_and(|total_rows| total_rows > lines);
     if offset_from_bottom == 0 {
         // The zero-offset window is byte-identical to today's reads, floor
         // guard included; only the echo fields are new.
@@ -3378,6 +3385,7 @@ fn ghostty_recent_read_at_offset_for_terminal(
         };
         return Ok(RecentReadWindow {
             text,
+            truncated,
             effective_offset: 0,
             has_more,
             offset_unsupported: false,
@@ -3385,7 +3393,10 @@ fn ghostty_recent_read_at_offset_for_terminal(
         });
     }
     let Some((_, mut end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
-        return Ok(RecentReadWindow::default());
+        return Ok(RecentReadWindow {
+            truncated,
+            ..RecentReadWindow::default()
+        });
     };
     // Zero-offset formatting drops blank rows after its last returned line.
     // Use that same line as offset zero, even when the cursor is below it.
@@ -3410,7 +3421,10 @@ fn ghostty_recent_read_at_offset_for_terminal(
             break;
         }
         let Some(previous) = end.checked_sub(1) else {
-            return Ok(RecentReadWindow::default());
+            return Ok(RecentReadWindow {
+                truncated,
+                ..RecentReadWindow::default()
+            });
         };
         end = previous;
     }
@@ -3451,6 +3465,7 @@ fn ghostty_recent_read_at_offset_for_terminal(
     }
     Ok(RecentReadWindow {
         text,
+        truncated,
         effective_offset,
         has_more: start > 0,
         offset_unsupported: false,
@@ -7214,6 +7229,7 @@ mod tests {
                         text: "older\n\nbottom".into(),
                         effective_offset: 0,
                         has_more: true,
+                        truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
                     },
@@ -7223,6 +7239,7 @@ mod tests {
                         text: "oldest\nolder".into(),
                         effective_offset: 1,
                         has_more: true,
+                        truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
                     },
@@ -7230,6 +7247,7 @@ mod tests {
                         text: "oldest\nolder".into(),
                         effective_offset: 1,
                         has_more: false,
+                        truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
                     },
@@ -7282,6 +7300,7 @@ mod tests {
                             text: held.into(),
                             effective_offset: 0,
                             has_more: true,
+                            truncated: true,
                             offset_unsupported: false,
                             top_is_wrap_tail: true,
                         }
@@ -7290,6 +7309,7 @@ mod tests {
                             text: above.into(),
                             effective_offset: 1,
                             has_more: false,
+                            truncated: true,
                             offset_unsupported: false,
                             top_is_wrap_tail: false,
                         }
@@ -7320,6 +7340,7 @@ mod tests {
                         text: format!("{tail}\r\nL1\r\nL2\r\n"),
                         effective_offset: 0,
                         has_more: true,
+                        truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: true,
                     },
@@ -7327,6 +7348,7 @@ mod tests {
                         text: format!("L-1\r\n{above}\r\nL1"),
                         effective_offset: 1,
                         has_more: false,
+                        truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
                     },
