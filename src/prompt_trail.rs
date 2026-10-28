@@ -402,7 +402,9 @@ fn pi_prompt(line: &Value) -> Option<String> {
         Value::Array(blocks) => join_text_blocks(blocks, "text"),
         _ => return None,
     };
-    let text = clean(&text);
+    // Recover the invocation while the expansion's line breaks are intact,
+    // before whitespace cleanup and either prompt-trail length limit.
+    let text = clean(&crate::preface::pi::typed(&text));
     (!text.is_empty()).then_some(text)
 }
 
@@ -1331,6 +1333,37 @@ pub(crate) mod tests {
         );
         assert_eq!(trail.title, None);
         assert_eq!(trail.newest_at, Some(1772795100));
+    }
+
+    #[test]
+    fn a_pi_skill_invocation_survives_the_prompt_trail_cut() {
+        // Same record envelope as preface/fixtures/pi-record.jsonl; the body
+        // is synthetic so no installed skill's instructions are copied here.
+        let expanded = format!(
+            "<skill name=\"neutral-skill\" location=\"/skills/neutral-skill/SKILL.md\">\n{}\n</skill>\n\nDraw the module map.",
+            "Synthetic instructions. ".repeat(40),
+        );
+        for content in [
+            serde_json::json!(expanded),
+            serde_json::json!([{ "type": "text", "text": expanded }]),
+        ] {
+            let record = lines(&[serde_json::json!({
+                "type": "message",
+                "timestamp": "2026-03-06T11:00:00Z",
+                "message": { "role": "user", "content": content },
+            })]);
+            let trail = read_lines(record.as_bytes(), PromptTrailAgent::Pi, Bounds::DEFAULT)
+                .expect("readable skill turn");
+            assert_eq!(trail.count, 1);
+            assert_eq!(
+                trail.first.as_ref().unwrap().text,
+                "/skill:neutral-skill Draw the module map."
+            );
+            assert_eq!(
+                texts(&trail.recent),
+                ["/skill:neutral-skill Draw the module map."]
+            );
+        }
     }
 
     #[test]

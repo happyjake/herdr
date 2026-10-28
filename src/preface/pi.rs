@@ -146,7 +146,7 @@ fn text(content: &Value) -> Option<String> {
 /// the skill's whole body into the message ahead of the person's request;
 /// that body is the harness's instructions, so only the invocation and the
 /// request are kept, as `/skill:name request`.
-fn typed(text: &str) -> String {
+pub(crate) fn typed(text: &str) -> String {
     match skill_block(text) {
         Some((name, Some(request))) => format!("/skill:{name} {request}"),
         Some((name, None)) => format!("/skill:{name}"),
