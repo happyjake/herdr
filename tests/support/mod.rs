@@ -44,6 +44,11 @@ pub fn register_spawned_herdr_pid(pid: Option<u32>) {
 /// Asks a spawned herdr process to exit. portable-pty's `kill` sends SIGHUP,
 /// which the server deliberately ignores.
 pub fn stop_spawned_herdr(child: &mut (dyn portable_pty::Child + Send + Sync)) {
+    // Diagnostics may already have reaped an exited child. Its PID must no
+    // longer be signalled, because the operating system can reuse it.
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
     match child.process_id() {
         Some(pid) => unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
@@ -52,6 +57,58 @@ pub fn stop_spawned_herdr(child: &mut (dyn portable_pty::Child + Send + Sync)) {
             let _ = child.kill();
         }
     }
+}
+
+/// A bounded diagnostic snapshot taken only when a test is already failing.
+pub fn spawned_pty_diagnostics(
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+    master: &dyn portable_pty::MasterPty,
+) -> String {
+    let status = match child.try_wait() {
+        Ok(Some(status)) => format!("exit code: {} ({status})", status.exit_code()),
+        Ok(None) => "still running".into(),
+        Err(error) => format!("exit status unavailable: {error}"),
+    };
+    let mut diagnostic = format!("spawned child: {status}\n");
+    let Some(fd) = master.as_raw_fd() else {
+        return format!("{diagnostic}PTY descriptor unavailable");
+    };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return format!(
+            "{diagnostic}PTY flags unavailable: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // Duplicated PTY readers share file status flags. Restore them even on
+    // an error; successful tests never enter this diagnostic path.
+    struct RestoreFlags(libc::c_int, libc::c_int);
+    impl Drop for RestoreFlags {
+        fn drop(&mut self) {
+            unsafe { libc::fcntl(self.0, libc::F_SETFL, self.1) };
+        }
+    }
+    let _restore = RestoreFlags(fd, flags);
+    let mut reader = match master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => return format!("{diagnostic}PTY reader unavailable: {error}"),
+    };
+    let mut output = Vec::new();
+    let deadline = Instant::now() + Duration::from_millis(50);
+    const MAX_OUTPUT: usize = 32 * 1024;
+    let mut buffer = [0; 4096];
+    while output.len() < MAX_OUTPUT && Instant::now() < deadline {
+        let remaining = buffer.len().min(MAX_OUTPUT - output.len());
+        match reader.read(&mut buffer[..remaining]) {
+            Ok(0) => break,
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    diagnostic.push_str("PTY output (up to 32768 bytes):\n");
+    diagnostic.push_str(&String::from_utf8_lossy(&output));
+    diagnostic
 }
 
 pub fn unregister_spawned_herdr_pid(pid: Option<u32>) {
@@ -122,6 +179,24 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("socket did not appear at {}", path.display());
+}
+
+pub fn wait_for_socket_with_diagnostics(
+    path: &Path,
+    timeout: Duration,
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+    master: &dyn portable_pty::MasterPty,
+) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() && UnixStream::connect(path).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    // Gather evidence before invoking the panic hook, which reaps children.
+    let diagnostic = spawned_pty_diagnostics(child, master);
+    panic!("socket did not appear at {}\n{diagnostic}", path.display());
 }
 
 pub fn wait_for_file(path: &Path, timeout: Duration) {
