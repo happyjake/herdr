@@ -422,6 +422,7 @@ fn clear_pane_name_publishes_a_cleared_label() {
             pane_id: "pane_1".into(),
             label: None,
             source: None,
+            kept_through: None,
         })
     );
 }

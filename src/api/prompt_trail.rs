@@ -722,6 +722,7 @@ mod tests {
             flag: None,
             label_source: None,
             label_at: None,
+            name_kept_through: None,
             revision: 4,
         }
     }

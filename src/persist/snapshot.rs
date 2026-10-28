@@ -183,6 +183,8 @@ pub struct PaneSnapshot {
     /// reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_kept_through: Option<String>,
 }
 
 /// The socket API's name for a status, as stored in a snapshot.
@@ -461,6 +463,7 @@ fn capture_tab(
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
         let label_source = terminal.and_then(|terminal| terminal.label_source);
         let label_at = terminal.and_then(|terminal| terminal.label_at);
+        let name_kept_through = terminal.and_then(|terminal| terminal.name_kept_through.clone());
         let pinned = terminal.is_some_and(|terminal| terminal.pinned);
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
@@ -529,6 +532,7 @@ fn capture_tab(
                 flag_set_through: terminal.and_then(|terminal| terminal.flag_set_through),
                 label_source,
                 label_at,
+                name_kept_through,
             },
         );
     }
@@ -1120,6 +1124,26 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_pane_keeps_the_prompt_covered_by_a_verdict() {
+        let mut state = state_with_workspaces(&["keep-capture"]);
+        let terminal = state.terminals.values_mut().next().unwrap();
+        terminal.set_manual_label_from_at("beacon relay".into(), None, 1_700_000_000);
+        terminal
+            .keep_manual_label_through("beacon relay", "2026-10-28T01:02:03.456Z")
+            .unwrap();
+        let snapshot = capture_from_state(&state);
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap();
+        let json = serde_json::to_value(pane).unwrap();
+        assert_eq!(json["name_kept_through"], "2026-10-28T01:02:03.456Z");
+        let restored: PaneSnapshot = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), json);
+    }
+
+    #[test]
     fn a_captured_pane_carries_whose_its_label_is_and_when_it_was_written() {
         let mut state = state_with_workspaces(&["provenance-capture"]);
         let root = state.workspaces[0].tabs[0].root_pane;
@@ -1262,6 +1286,7 @@ mod tests {
                 flag_set_through: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             },
         );
         panes.insert(
@@ -1289,6 +1314,7 @@ mod tests {
                 flag_set_through: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             },
         );
 
@@ -2056,6 +2082,7 @@ mod tests {
                 flag_set_through: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             },
         );
         panes.insert(
@@ -2085,6 +2112,7 @@ mod tests {
                 flag_set_through: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             },
         );
 

@@ -1620,10 +1620,36 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if let Some(through) = params.kept_through.as_deref() {
+            let Some(label) = params
+                .label
+                .as_deref()
+                .filter(|label| terminal.manual_label.as_deref() == Some(*label))
+            else {
+                return encode_error(
+                    id,
+                    "label_mismatch",
+                    "kept_through requires the unchanged standing label",
+                );
+            };
+            let changed = match terminal.keep_manual_label_through(label, through) {
+                Ok(changed) => changed,
+                Err(message) => return encode_error(id, "invalid_request", message),
+            };
+            if changed {
+                self.state.mark_session_dirty();
+                self.emit_pane_kept_presentation_changed(ws_idx, pane_id);
+            }
+            let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+                return pane_not_found(id, &params.pane_id);
+            };
+            return encode_success(id, ResponseResult::PaneInfo { pane });
+        }
         let before = (
             terminal.manual_label.clone(),
             terminal.label_source,
             terminal.label_at,
+            terminal.name_kept_through.clone(),
         );
         match params.label.map(|label| label.trim().to_string()) {
             // A name committed again in the same words is still a name
@@ -1639,6 +1665,7 @@ impl App {
                 terminal.manual_label.clone(),
                 terminal.label_source,
                 terminal.label_at,
+                terminal.name_kept_through.clone(),
             );
         self.state.mark_session_dirty();
         if kept_changed {
@@ -2732,6 +2759,219 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    #[test]
+    fn pane_keep_verdict_preserves_the_label_and_its_write_time() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let terminal = app.state.terminals.values_mut().next().unwrap();
+        terminal.set_manual_label_from_at(
+            "beacon relay".into(),
+            Some(crate::api::schema::LabelSource::Editor),
+            1_700_000_000,
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "keep", "method": "pane.rename", "params": {
+                "pane_id": pane_id, "label": "beacon relay", "source": "editor",
+                "kept_through": "2026-10-28T01:02:03.456Z"
+            }
+        }))
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        let pane = &response["result"]["pane"];
+        assert_eq!(pane["label"], "beacon relay");
+        assert_eq!(pane["label_at"], 1_700_000_000u64);
+        assert_eq!(pane["label_source"], "editor");
+        assert_eq!(pane["name_kept_through"], "2026-10-28T01:02:03.456Z");
+        let round_trip: crate::api::schema::PaneInfo =
+            serde_json::from_value(pane.clone()).unwrap();
+        assert_eq!(serde_json::to_value(round_trip).unwrap(), *pane);
+        let snapshot = serde_json::to_value(app.session_snapshot()).unwrap();
+        assert_eq!(
+            snapshot["panes"][0]["name_kept_through"],
+            "2026-10-28T01:02:03.456Z"
+        );
+        let events = app.event_hub.events_after(0);
+        let status = events
+            .iter()
+            .find(|(_, event)| event.event == crate::api::schema::EventKind::PaneAgentStatusChanged)
+            .unwrap();
+        let status = serde_json::to_value(&status.1.data).unwrap();
+        assert_eq!(status["name_kept_through"], "2026-10-28T01:02:03.456Z");
+    }
+
+    #[test]
+    fn pane_keep_verdict_is_monotonic_and_cannot_rename_a_stale_label() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let before = serde_json::to_value(app.session_snapshot()).unwrap();
+        assert_eq!(
+            before["panes"][0].get("name_kept_through"),
+            Some(&serde_json::Value::Null)
+        );
+        let terminal = app.state.terminals.values_mut().next().unwrap();
+        terminal.set_manual_label_from_at("beacon relay".into(), None, 1_700_000_000);
+        for (label, through, expected_error) in [
+            ("beacon relay", "2026-10-28T01:02:03.456Z", false),
+            ("beacon relay", "2026-10-28T02:02:03.455+01:00", false),
+            ("beacon relay", "2026-10-28T02:02:03.456+01:00", false),
+            ("stale name", "2026-10-29T01:02:03Z", true),
+            ("beacon relay", "not a date", true),
+            ("beacon relay", "2026-02-30T00:00:00Z", true),
+        ] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "keep", "method": "pane.rename", "params": {
+                    "pane_id": pane_id, "label": label, "kept_through": through
+                }
+            }))
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(
+                response.get("error").is_some(),
+                expected_error,
+                "{response}"
+            );
+            let pane = &serde_json::to_value(app.session_snapshot()).unwrap()["panes"][0];
+            assert_eq!(pane["label"], "beacon relay");
+            assert_eq!(pane["label_at"], 1_700_000_000u64);
+            assert_eq!(pane["name_kept_through"], "2026-10-28T01:02:03.456Z");
+        }
+        assert_eq!(
+            app.event_hub.events_after(0).len(),
+            1,
+            "only the first keep changes provenance"
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "rename", "method": "pane.rename", "params": {
+                "pane_id": pane_id, "label": "new beacon relay"
+            }
+        }))
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        let pane = &response["result"]["pane"];
+        assert_eq!(
+            pane.get("name_kept_through"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(pane["label_at"].as_u64().unwrap() > 1_700_000_000);
+    }
+
+    #[test]
+    fn pane_keep_verdict_rejects_label_mismatch_without_changing_anything() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let terminal = app.state.terminals.values_mut().next().unwrap();
+        terminal.set_manual_label_from_at("beacon relay".into(), None, 1_700_000_000);
+        terminal
+            .keep_manual_label_through("beacon relay", "2026-10-28T01:02:03.456Z")
+            .unwrap();
+        let before = serde_json::to_value(app.session_snapshot()).unwrap();
+        let sequence = app.event_hub.current_sequence();
+        for label in [Some("stale label"), Some(" beacon relay "), None] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "keep", "method": "pane.rename", "params": {
+                    "pane_id": pane_id, "label": label, "source": "editor",
+                    "kept_through": "2026-10-29T00:00:00Z"
+                }
+            }))
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(response["error"]["code"], "label_mismatch");
+            assert_eq!(
+                serde_json::to_value(app.session_snapshot()).unwrap(),
+                before
+            );
+            assert_eq!(app.event_hub.current_sequence(), sequence);
+        }
+    }
+
+    #[test]
+    fn pane_keep_verdict_survives_rewriting_the_same_label() {
+        let (mut app, pane_id) = app_with_test_workspace();
+        let terminal = app.state.terminals.values_mut().next().unwrap();
+        terminal.set_manual_label_from_at("beacon relay".into(), None, 1_700_000_000);
+        terminal
+            .keep_manual_label_through("beacon relay", "2026-10-28T01:02:03.456Z")
+            .unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "rename", "method": "pane.rename", "params": {
+                "pane_id": pane_id, "label": "beacon relay"
+            }
+        }))
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(
+            response["result"]["pane"]["name_kept_through"],
+            "2026-10-28T01:02:03.456Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_keep_verdict_clears_only_on_an_applied_session_change() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let report = |app: &mut App, seq, session: &str, reason: &str| {
+            app.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
+                pane_id,
+                source: "herdr:claude".into(),
+                agent_label: "claude".into(),
+                seq: Some(seq),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session),
+                session_start_source: Some(reason.into()),
+            });
+        };
+        report(&mut app, 1, "first", "startup");
+        let terminal = app.state.terminals.values_mut().next().unwrap();
+        terminal.set_manual_label_from_at("beacon relay".into(), None, 1_700_000_000);
+        terminal
+            .keep_manual_label_through("beacon relay", "2026-10-28T01:02:03.456Z")
+            .unwrap();
+        let first_session = requested_pane_info(&mut app, &public_pane_id)["agent_session"].clone();
+        report(&mut app, 2, "first", "resume");
+        assert_eq!(
+            requested_pane_info(&mut app, &public_pane_id)["name_kept_through"],
+            "2026-10-28T01:02:03.456Z"
+        );
+        let sequence = app.event_hub.current_sequence();
+        report(&mut app, 3, "second", "clear");
+        let pane = requested_pane_info(&mut app, &public_pane_id);
+        assert_ne!(
+            pane["agent_session"], first_session,
+            "the new session must actually be applied"
+        );
+        assert_eq!(
+            pane.get("name_kept_through"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(pane["label"], "beacon relay");
+        assert_eq!(pane["label_at"], 1_700_000_000u64);
+        let events = app.event_hub.events_after(sequence);
+        let status = events
+            .iter()
+            .find(|(_, event)| event.event == crate::api::schema::EventKind::PaneAgentStatusChanged)
+            .expect("clear is published even when status stays the same");
+        assert_eq!(
+            serde_json::to_value(&status.1.data)
+                .unwrap()
+                .get("name_kept_through"),
+            Some(&serde_json::Value::Null)
+        );
+        app.state
+            .terminals
+            .values_mut()
+            .next()
+            .unwrap()
+            .keep_manual_label_through("beacon relay", "2026-10-29T00:00:00Z")
+            .unwrap();
+        report(&mut app, 1, "first", "startup");
+        assert_eq!(
+            requested_pane_info(&mut app, &public_pane_id)["name_kept_through"],
+            "2026-10-29T00:00:00Z",
+            "ignored reports cannot clear provenance"
+        );
     }
 
     #[test]

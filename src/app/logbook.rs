@@ -379,6 +379,7 @@ mod tests {
                 pane_id: pane.into(),
                 label: label.map(str::to_owned),
                 source,
+                kept_through: None,
             }),
         });
         assert!(
@@ -992,6 +993,7 @@ mod tests {
                     pane_id: action_pane.clone(),
                     label: Some("queued label".into()),
                     source: None,
+                    kept_through: None,
                 }),
             });
             let closed = app.handle_api_request(Request {

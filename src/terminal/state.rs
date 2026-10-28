@@ -180,6 +180,8 @@ pub struct TerminalState {
     /// every writer of a label, so a client can tell a name older than the
     /// work from one written since.
     pub label_at: Option<u64>,
+    /// Newest prompt covered by a keep verdict for the standing label.
+    pub name_kept_through: Option<String>,
     /// Whether the user has pinned this terminal. Kept, never derived: it is
     /// set only by an explicit request, persists with the session, and says
     /// nothing about the label, the agent, or anything the terminal does.
@@ -253,6 +255,7 @@ impl TerminalState {
             manual_label: None,
             label_source: None,
             label_at: None,
+            name_kept_through: None,
             pinned: false,
             started_by: None,
             session_reported: false,
@@ -2383,6 +2386,9 @@ impl TerminalState {
             self.clear_manual_label();
             return;
         }
+        if self.manual_label.as_deref() != Some(&label) {
+            self.name_kept_through = None;
+        }
         self.manual_label = Some(label);
         self.label_source = source;
         self.label_at = Some(now_unix);
@@ -2392,6 +2398,30 @@ impl TerminalState {
         self.manual_label = None;
         self.label_source = None;
         self.label_at = None;
+        self.name_kept_through = None;
+    }
+
+    pub fn keep_manual_label_through(
+        &mut self,
+        label: &str,
+        through: &str,
+    ) -> Result<bool, &'static str> {
+        if self.manual_label.as_deref() != Some(label) {
+            return Err("kept_through requires the unchanged standing label");
+        }
+        let format = time::format_description::well_known::Rfc3339;
+        let through_at = time::OffsetDateTime::parse(through, &format)
+            .map_err(|_| "kept_through must be an ISO 8601 timestamp with an offset")?;
+        if self
+            .name_kept_through
+            .as_deref()
+            .and_then(|value| time::OffsetDateTime::parse(value, &format).ok())
+            .is_some_and(|previous| previous >= through_at)
+        {
+            return Ok(false);
+        }
+        self.name_kept_through = Some(through.to_string());
+        Ok(true)
     }
 
     /// Put a captured label back exactly as it stood: its words, whose it
@@ -2412,6 +2442,7 @@ impl TerminalState {
         self.label_source = label.as_ref().and(source);
         self.label_at = label.as_ref().and(at);
         self.manual_label = label;
+        self.name_kept_through = None;
     }
 
     pub fn set_flag(

@@ -2239,6 +2239,7 @@ mod tests {
     #[test]
     fn pong_advertises_the_credential_registry_capability() {
         let server = start_test_server_with_capabilities(Some(ServerCapabilities {
+            pane_name_keep_verdicts: false,
             live_handoff: false,
             detached_server_daemon: false,
             endpoint_protocol_generation: None,

@@ -948,6 +948,7 @@ fn a_rename_says_nothing_about_a_source_unless_it_has_one() {
             pane_id: "wG4:p1".into(),
             label: Some("beacon relay".into()),
             source: None,
+            kept_through: None,
         })
     );
     let json = serde_json::to_value(&plain).unwrap();
@@ -962,6 +963,7 @@ fn a_rename_says_nothing_about_a_source_unless_it_has_one() {
             pane_id: "wG4:p1".into(),
             label: Some("beacon relay".into()),
             source: Some(LabelSource::Editor),
+            kept_through: None,
         }),
     };
     let json = serde_json::to_value(&from_a_namer).unwrap();
@@ -1038,6 +1040,7 @@ fn pane_info_always_states_whose_the_label_is_and_when_it_was_written() {
         label: Some("beacon relay".into()),
         label_source: Some(LabelSource::Editor),
         label_at: Some(1_700_000_000),
+        name_kept_through: None,
         ..pane
     };
     let json = serde_json::to_value(&named).unwrap();
@@ -1060,6 +1063,7 @@ fn the_status_event_carries_the_labels_provenance_beside_the_label() {
         label: Some("beacon relay".into()),
         label_source: Some(LabelSource::Editor),
         label_at: Some(1_700_000_000),
+        name_kept_through: None,
         pinned: false,
         flag: None,
     };
@@ -1075,6 +1079,7 @@ fn the_status_event_carries_the_labels_provenance_beside_the_label() {
     let nobodys = PaneAgentStatusChangedEvent {
         label_source: None,
         label_at: None,
+        name_kept_through: None,
         ..event
     };
     let json = serde_json::to_value(&nobodys).unwrap();
@@ -1573,6 +1578,17 @@ fn server_advertises_cancelled_agent_reports() {
 }
 
 #[test]
+fn server_advertises_name_keep_verdicts() {
+    let current = serde_json::to_value(crate::api::server_capabilities()).unwrap();
+    assert_eq!(current["pane_name_keep_verdicts"], true);
+    let legacy: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+    assert_eq!(
+        serde_json::to_value(legacy).unwrap()["pane_name_keep_verdicts"],
+        false
+    );
+}
+
+#[test]
 fn server_advertises_agent_prompt_expectations() {
     assert!(crate::api::server_capabilities().agent_prompt_expectations);
     let predating: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
@@ -1617,6 +1633,7 @@ fn success_response_round_trips() {
                 }),
                 agent_report_cancelled: false,
                 agent_prompt_expectations: true,
+                pane_name_keep_verdicts: false,
                 turn_index: true,
                 agent_settings: true,
                 preface: true,
@@ -1771,6 +1788,7 @@ fn worktree_request_and_response_round_trip() {
                 flag: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -2212,6 +2230,7 @@ fn create_response_round_trips_with_root_pane() {
                 flag: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
                 revision: 0,
             },
         },

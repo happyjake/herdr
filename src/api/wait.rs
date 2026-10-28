@@ -828,6 +828,7 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
                     label: data.label,
                     label_source: data.label_source,
                     label_at: data.label_at,
+                    name_kept_through: data.name_kept_through,
                     pinned: data.pinned,
                     flag: data.flag,
                 },

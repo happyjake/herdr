@@ -1664,6 +1664,7 @@ mod tests {
             flag: None,
             label_source: None,
             label_at: None,
+            name_kept_through: None,
             revision: 0,
         }
     }
@@ -1963,6 +1964,7 @@ mod tests {
                 file_attachments: Some(crate::api::attachment::file_attachments_capability()),
                 agent_report_cancelled: false,
                 agent_prompt_expectations: false,
+                pane_name_keep_verdicts: false,
                 turn_index: false,
                 agent_settings: false,
                 preface: false,

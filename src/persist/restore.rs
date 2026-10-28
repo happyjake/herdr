@@ -679,6 +679,9 @@ fn restore_tab(
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
                 .with_pending_agent_resume_plan(plan);
             terminal.restore_manual_label(saved_label, saved_label_source, saved_label_at);
+            terminal.name_kept_through = saved_pane
+                .and_then(|pane| pane.name_kept_through.clone())
+                .filter(|_| terminal.manual_label.is_some());
             terminal.set_pinned(saved_pinned);
             terminal.restore_flag(saved_flag, saved_flag_set_through);
             terminal.ended_agent = saved_pane.and_then(|pane| pane.ended_agent.clone());
@@ -783,6 +786,9 @@ fn restore_tab(
                     }
                 }
                 terminal.restore_manual_label(saved_label, saved_label_source, saved_label_at);
+                terminal.name_kept_through = saved_pane
+                    .and_then(|pane| pane.name_kept_through.clone())
+                    .filter(|_| terminal.manual_label.is_some());
                 terminal.set_pinned(saved_pinned);
                 terminal.restore_flag(saved_flag, saved_flag_set_through);
                 terminal.ended_agent = saved_pane.and_then(|pane| pane.ended_agent.clone());
@@ -1740,6 +1746,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -1902,6 +1909,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -1972,6 +1980,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_preserves_the_prompt_covered_by_a_keep_verdict() {
+        let (mut snapshot, _) = snapshot_with_saved_pane_history();
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .values_mut()
+            .next()
+            .unwrap();
+        pane.label = Some("beacon relay".into());
+        pane.label_at = Some(1_700_000_000);
+        pane.name_kept_through = Some("2026-10-28T01:02:03.456Z".into());
+        let (events, event_rx) = mpsc::channel(4);
+        let (_, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let terminal = terminals.values().next().unwrap();
+        assert_eq!(terminal.manual_label.as_deref(), Some("beacon relay"));
+        assert_eq!(terminal.label_at, Some(1_700_000_000));
+        assert_eq!(
+            terminal.name_kept_through.as_deref(),
+            Some("2026-10-28T01:02:03.456Z")
+        );
+        drop(event_rx);
+        for (_, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
     async fn restore_carries_whose_a_label_is_and_defaults_an_older_session_to_nobodys() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
@@ -2013,6 +2059,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: Some(crate::api::schema::LabelSource::Editor),
                             label_at: Some(1_700_000_000),
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -2140,6 +2187,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -2243,6 +2291,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -2371,6 +2420,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -2506,6 +2556,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -2606,6 +2657,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -2702,6 +2754,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -2791,6 +2844,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -2880,6 +2934,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -2971,6 +3026,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -3065,6 +3121,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -3159,6 +3216,7 @@ mod tests {
                                 flag_set_through: None,
                                 label_source: None,
                                 label_at: None,
+                                name_kept_through: None,
                             },
                         ),
                         (
@@ -3186,6 +3244,7 @@ mod tests {
                                 flag_set_through: None,
                                 label_source: None,
                                 label_at: None,
+                                name_kept_through: None,
                             },
                         ),
                     ]),
@@ -3255,6 +3314,7 @@ mod tests {
                     flag_set_through: None,
                     label_source: None,
                     label_at: None,
+                    name_kept_through: None,
                 },
             )
         };
@@ -3287,6 +3347,7 @@ mod tests {
             flag_set_through: None,
             label_source: None,
             label_at: None,
+            name_kept_through: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -3455,6 +3516,7 @@ mod tests {
                             flag_set_through: None,
                             label_source: None,
                             label_at: None,
+                            name_kept_through: None,
                         },
                     )]),
                     zoomed: false,
@@ -4214,6 +4276,7 @@ mod tests {
                 flag_set_through: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             },
         );
         let mut history = SessionHistorySnapshot {

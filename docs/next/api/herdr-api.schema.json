@@ -780,6 +780,13 @@
                   "default": null,
                   "description": "Who wrote that label, when it was not a person. Always\nserialized, for the same reason the label is."
                 },
+                "name_kept_through": {
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -1029,6 +1036,14 @@
               "default": false,
               "description": "Whether the pane's live terminal state currently reports mouse input.\nAdditive: payloads from older servers omit this and deserialize false.",
               "type": "boolean"
+            },
+            "name_kept_through": {
+              "default": null,
+              "description": "ISO 8601 timestamp of the newest prompt covered by a keep verdict for\nthe standing label. Null before a verdict, or after a label or session change.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "pane_id": {
               "type": "string"
@@ -3388,6 +3403,13 @@
         },
         "PaneRenameParams": {
           "properties": {
+            "kept_through": {
+              "description": "ISO 8601 timestamp of the newest prompt covered by a keep verdict.\nRequires the unchanged standing label. Updates provenance only;\nthe label, its source and its write time remain unchanged.\nA different label is rejected with label_mismatch; older verdicts\nare ignored. Requires the pane_name_keep_verdicts capability.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "label": {
               "type": [
                 "string",
@@ -7415,6 +7437,13 @@
               "default": null,
               "description": "Who wrote that label, when it was not a person. Always serialized,\nfor the same reason the label is."
             },
+            "name_kept_through": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
             },
@@ -8708,6 +8737,13 @@
                   "default": null,
                   "description": "Who wrote that label, when it was not a person. Always\nserialized, for the same reason the label is."
                 },
+                "name_kept_through": {
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "pane_id": {
                   "type": "string"
                 },
@@ -9418,6 +9454,14 @@
               "default": false,
               "description": "Whether the pane's live terminal state currently reports mouse input.\nAdditive: payloads from older servers omit this and deserialize false.",
               "type": "boolean"
+            },
+            "name_kept_through": {
+              "default": null,
+              "description": "ISO 8601 timestamp of the newest prompt covered by a keep verdict for\nthe standing label. Null before a verdict, or after a label or session change.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "pane_id": {
               "type": "string"
@@ -12741,6 +12785,11 @@
               "type": "boolean"
             },
             "live_handoff": {
+              "type": "boolean"
+            },
+            "pane_name_keep_verdicts": {
+              "default": false,
+              "description": "Whether pane.rename accepts kept_through without rewriting the label.\nClients must omit kept_through unless this capability is advertised.",
               "type": "boolean"
             },
             "preface": {

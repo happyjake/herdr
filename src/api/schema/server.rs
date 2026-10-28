@@ -274,6 +274,10 @@ pub struct ServerCapabilities {
     /// (false) in pongs of servers that predate it.
     #[serde(default)]
     pub agent_prompt_expectations: bool,
+    /// Whether pane.rename accepts kept_through without rewriting the label.
+    /// Clients must omit kept_through unless this capability is advertised.
+    #[serde(default)]
+    pub pane_name_keep_verdicts: bool,
     /// Supports `pane.turn_index` for pi session records, and for agy
     /// conversation transcripts on servers that read them.
     #[serde(default)]

@@ -401,6 +401,7 @@ impl App {
             flag: terminal.flag.clone(),
             label_source: terminal.label_source,
             label_at: terminal.label_at,
+            name_kept_through: terminal.name_kept_through.clone(),
             revision: terminal.revision,
         })
     }

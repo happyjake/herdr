@@ -380,6 +380,13 @@ crate::cli::projection::cli_params! {
         /// it, keeps no source, and every name there reads as a person's.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub source: Option<LabelSource> => Field::new(None::<LabelSource>),
+        /// ISO 8601 timestamp of the newest prompt covered by a keep verdict.
+        /// Requires the unchanged standing label. Updates provenance only;
+        /// the label, its source and its write time remain unchanged.
+        /// A different label is rejected with label_mismatch; older verdicts
+        /// are ignored. Requires the pane_name_keep_verdicts capability.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kept_through: Option<String> => Field::new(None::<String>),
     }
 }
 
@@ -747,6 +754,10 @@ pub struct PaneInfo {
     /// time was kept.
     #[serde(default)]
     pub label_at: Option<u64>,
+    /// ISO 8601 timestamp of the newest prompt covered by a keep verdict for
+    /// the standing label. Null before a verdict, or after a label or session change.
+    #[serde(default)]
+    pub name_kept_through: Option<String>,
     pub revision: u64,
 }
 

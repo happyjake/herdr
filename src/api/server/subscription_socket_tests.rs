@@ -253,6 +253,7 @@ fn reply_to_probe_with_flag(
                 flag,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
                 revision: 0,
             },
         },

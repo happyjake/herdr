@@ -2431,6 +2431,7 @@ mod tests {
                 pane_id: "w1:p1".into(),
                 label: Some("logs".into()),
                 source: None,
+                kept_through: None,
             }),
         };
         let worktree_list = crate::api::schema::Request {
@@ -2734,6 +2735,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 label: Some("reviewer".into()),
                 source: None,
+                kept_through: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2761,6 +2763,7 @@ mod tests {
                 pane_id,
                 label: None,
                 source: None,
+                kept_through: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3226,6 +3229,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 label: Some("reviewer".into()),
                 source: None,
+                kept_through: None,
             }),
         });
         let renamed = app.event_hub.events_after(sequence);
@@ -3243,6 +3247,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 label: None,
                 source: None,
+                kept_through: None,
             }),
         });
         let cleared = app.event_hub.events_after(sequence);
@@ -3287,6 +3292,7 @@ mod tests {
             seen: true,
             presentation: empty_presentation,
             agent_name_changed: false,
+            name_keep_verdict_cleared: false,
             agent_released: false,
             agent_release_status: None,
             suppress_completion: false,
@@ -3351,6 +3357,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 label: Some("reviewer".into()),
                 source: None,
+                kept_through: None,
             }),
         });
 
@@ -3382,6 +3389,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 label: None,
                 source: None,
+                kept_through: None,
             }),
         });
 
@@ -3414,6 +3422,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 label: Some("reviewer".into()),
                 source: Some(crate::api::schema::LabelSource::Editor),
+                kept_through: None,
             }),
         });
         let written_at = app.pane_info(0, pane).unwrap().label_at;
@@ -3426,6 +3435,7 @@ mod tests {
                 pane_id,
                 label: Some("  reviewer  ".into()),
                 source: None,
+                kept_through: None,
             }),
         });
 
@@ -3462,6 +3472,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 label: Some("beacon relay".into()),
                 source: Some(crate::api::schema::LabelSource::Editor),
+                kept_through: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3477,6 +3488,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 label: Some("frame drops".into()),
                 source: None,
+                kept_through: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3494,6 +3506,7 @@ mod tests {
                 pane_id,
                 label: None,
                 source: Some(crate::api::schema::LabelSource::Editor),
+                kept_through: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3521,6 +3534,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 label: Some("beacon relay".into()),
                 source: None,
+                kept_through: None,
             }),
         });
 
@@ -3531,6 +3545,7 @@ mod tests {
                 pane_id,
                 label: Some("beacon relay".into()),
                 source: Some(crate::api::schema::LabelSource::Editor),
+                kept_through: None,
             }),
         });
 
@@ -3589,6 +3604,7 @@ mod tests {
             seen: true,
             presentation: empty_presentation,
             agent_name_changed: false,
+            name_keep_verdict_cleared: false,
             agent_released: false,
             agent_release_status: None,
             suppress_completion: false,
@@ -3609,6 +3625,7 @@ mod tests {
                 pane_id,
                 label: Some("reviewer".into()),
                 source: None,
+                kept_through: None,
             }),
         });
 
@@ -3640,6 +3657,7 @@ mod tests {
                 pane_id,
                 label: Some("reviewer".into()),
                 source: None,
+                kept_through: None,
             }),
         });
 

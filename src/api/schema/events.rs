@@ -430,6 +430,8 @@ pub struct PaneAgentStatusChangedEvent {
     /// the same reason.
     #[serde(default)]
     pub label_at: Option<u64>,
+    #[serde(default)]
+    pub name_kept_through: Option<String>,
     /// Whether the user has pinned the pane, always serialized for the same
     /// reason the label is: a subscriber reads an absent key as a server that
     /// predates the pin, not as an unpinned pane.
@@ -594,6 +596,8 @@ pub enum EventData {
         /// for the same reason.
         #[serde(default)]
         label_at: Option<u64>,
+        #[serde(default)]
+        name_kept_through: Option<String>,
         /// Whether the user has pinned the pane, always serialized for the same
         /// reason the label is.
         #[serde(default)]

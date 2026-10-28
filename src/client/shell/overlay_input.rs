@@ -992,6 +992,7 @@ impl ClientShellState {
                     // The desk's own rename is a person's own words, and
                     // claims no source.
                     source: None,
+                    kept_through: None,
                 },
             )),
         };

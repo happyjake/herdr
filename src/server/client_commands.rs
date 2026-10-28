@@ -254,13 +254,14 @@ mod tests {
             actual.remove("pane.link.resolve").as_deref(),
             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
         );
-        // pane.rename carries an optional `source` (who wrote the name) that a
-        // v1 client never sends; freeze the extended shape here, next to the
-        // published one it extends.
+        // pane.rename carries optional `source` and `kept_through` provenance
+        // that a v1 client never sends. The latter requires the advertised
+        // pane_name_keep_verdicts capability. Freeze the extended shape here,
+        // next to the published one it extends.
         expected.remove("pane.rename");
         assert_eq!(
             actual.remove("pane.rename").as_deref(),
-            Some("b0056f475b6042078c05bdad90bc4f3d10934d6af11e4b2cc98d2e6ddb362f13")
+            Some("67b8a7a5ecc07a0c5bd7dcb1ff039164d1b4371959474649f25dddd939de2e69")
         );
         // pane.edit_scrollback carries an optional `line` to open the editor
         // at; a v1 client omits it and gets the dump opened as before.

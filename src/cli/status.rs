@@ -431,6 +431,7 @@ mod tests {
                 file_attachments: None,
                 agent_report_cancelled: false,
                 agent_prompt_expectations: false,
+                pane_name_keep_verdicts: false,
                 turn_index: false,
                 agent_settings: false,
                 preface: false,

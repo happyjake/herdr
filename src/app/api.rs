@@ -24,6 +24,7 @@ pub(crate) struct KeptPanePresentation {
     label: Option<String>,
     label_source: Option<crate::api::schema::LabelSource>,
     label_at: Option<u64>,
+    name_kept_through: Option<String>,
     pinned: bool,
     flag: Option<crate::api::schema::PaneFlag>,
 }
@@ -34,6 +35,7 @@ impl KeptPanePresentation {
             label: terminal.manual_label.clone(),
             label_source: terminal.label_source,
             label_at: terminal.label_at,
+            name_kept_through: terminal.name_kept_through.clone(),
             pinned: terminal.pinned,
             flag: terminal.flag.clone(),
         }
@@ -65,6 +67,7 @@ fn pane_agent_status_changed_event(
             label: kept.label,
             label_source: kept.label_source,
             label_at: kept.label_at,
+            name_kept_through: kept.name_kept_through.clone(),
             pinned: kept.pinned,
             flag: kept.flag,
         },
@@ -861,7 +864,8 @@ impl App {
         }
 
         let agent_status = update.reported_status;
-        if update.previous_reported_status != agent_status
+        if update.name_keep_verdict_cleared
+            || update.previous_reported_status != agent_status
             || (!update.status_unresolved && update.previous_presentation != update.presentation)
         {
             let event = pane_agent_status_changed_event(

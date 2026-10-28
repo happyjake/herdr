@@ -209,6 +209,7 @@ fn pane_scroll_result(
             flag: None,
             label_source: None,
             label_at: None,
+            name_kept_through: None,
             revision: 0,
         },
     }

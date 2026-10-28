@@ -78,6 +78,7 @@ struct PanePresentationSnapshot {
     label: Option<String>,
     label_source: Option<crate::api::schema::LabelSource>,
     label_at: Option<u64>,
+    name_kept_through: Option<String>,
     pinned: bool,
     flag: Option<crate::api::schema::PaneFlag>,
 }
@@ -91,6 +92,7 @@ impl PanePresentationSnapshot {
             label: pane.label.clone(),
             label_source: pane.label_source,
             label_at: pane.label_at,
+            name_kept_through: pane.name_kept_through.clone(),
             pinned: pane.pinned,
             flag: pane.flag.clone(),
         }
@@ -109,6 +111,7 @@ impl PanePresentationSnapshot {
             label: kept.label.clone(),
             label_source: kept.label_source,
             label_at: kept.label_at,
+            name_kept_through: kept.name_kept_through.clone(),
             pinned: kept.pinned,
             flag: kept.flag.clone(),
         }
@@ -122,6 +125,7 @@ struct KeptPresentation {
     label: Option<String>,
     label_source: Option<crate::api::schema::LabelSource>,
     label_at: Option<u64>,
+    name_kept_through: Option<String>,
     pinned: bool,
     flag: Option<crate::api::schema::PaneFlag>,
 }
@@ -268,6 +272,7 @@ impl ActiveSubscription {
                         label: probe.label,
                         label_source: probe.label_source,
                         label_at: probe.label_at,
+                        name_kept_through: probe.name_kept_through.clone(),
                         pinned: probe.pinned,
                         flag: probe.flag.clone(),
                     });
@@ -488,6 +493,7 @@ impl ActiveAgentStatusChangedSubscription {
             label,
             label_source,
             label_at,
+            name_kept_through,
             pinned,
             flag,
         } = event.data
@@ -511,6 +517,7 @@ impl ActiveAgentStatusChangedSubscription {
                 label: known.label.clone(),
                 label_source: known.label_source,
                 label_at: known.label_at,
+                name_kept_through: known.name_kept_through.clone(),
                 pinned: known.pinned,
                 flag: known.flag.clone(),
             },
@@ -518,6 +525,7 @@ impl ActiveAgentStatusChangedSubscription {
                 label,
                 label_source,
                 label_at,
+                name_kept_through,
                 pinned,
                 flag,
             },
@@ -551,6 +559,7 @@ impl ActiveAgentStatusChangedSubscription {
                 label: kept.label,
                 label_source: kept.label_source,
                 label_at: kept.label_at,
+                name_kept_through: kept.name_kept_through.clone(),
                 pinned: kept.pinned,
                 flag: kept.flag.clone(),
             }),
@@ -626,6 +635,7 @@ impl ActiveAgentStatusChangedSubscription {
                 label: pane.label,
                 label_source: pane.label_source,
                 label_at: pane.label_at,
+                name_kept_through: pane.name_kept_through.clone(),
                 pinned: pane.pinned,
                 flag: pane.flag.clone(),
             }),
@@ -798,6 +808,7 @@ mod tests {
                 label: label.map(str::to_string),
                 label_source,
                 label_at,
+                name_kept_through: None,
                 pinned,
                 flag: None,
             },
@@ -858,6 +869,7 @@ mod tests {
             flag: None,
             label_source: None,
             label_at: None,
+            name_kept_through: None,
             revision: 0,
         }
     }
@@ -1036,6 +1048,7 @@ mod tests {
                         label: None,
                         label_source: None,
                         label_at: None,
+                        name_kept_through: None,
                         pinned: false,
                         flag: None,
                     }),
@@ -1130,6 +1143,7 @@ mod tests {
                 flag: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             }),
             last_sequence,
             probe_sequence: event_hub.current_sequence(),
@@ -1173,6 +1187,7 @@ mod tests {
                 flag: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             }),
             last_sequence,
             probe_sequence: event_hub.current_sequence(),
@@ -1190,6 +1205,7 @@ mod tests {
                 flag: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             }),
             request_prefix: "test".into(),
         };
@@ -1227,6 +1243,7 @@ mod tests {
             flag: None,
             label_source: None,
             label_at: None,
+            name_kept_through: None,
         };
         let json = serde_json::to_value(&unset).expect("serialize event");
         assert!(
@@ -1417,6 +1434,7 @@ mod tests {
             flag: None,
             label_source: None,
             label_at: None,
+            name_kept_through: None,
         };
         let json = serde_json::to_value(&unpinned).expect("serialize event");
         assert_eq!(
@@ -1503,6 +1521,7 @@ mod tests {
             label: label.map(str::to_string),
             label_source,
             label_at,
+            name_kept_through: None,
             ..pane_info_with_scroll(None)
         }
     }
@@ -1510,6 +1529,53 @@ mod tests {
     /// Whose a name is, and when it was written, are kept fields like the
     /// label itself: a change to either alone is news, even when the words
     /// have not moved.
+    #[test]
+    fn keep_verdict_provenance_survives_status_subscription_replay() {
+        let mut pane = pane_info_labelled_by(Some("reviewer"), None, Some(1_700_000_000));
+        pane.name_kept_through = Some("2026-10-28T01:02:03.456Z".into());
+        let event_hub = EventHub::default();
+        event_hub.push(kept_presentation_event(
+            None,
+            Some("reviewer"),
+            None,
+            Some(1_700_000_000),
+            false,
+        ));
+        let mut subscription = ActiveAgentStatusChangedSubscription {
+            pane_id: "pane_1".into(),
+            status_filter: None,
+            last_status: Some(AgentStatus::Working),
+            last_presentation: Some(PanePresentationSnapshot::from(&pane)),
+            last_sequence: 0,
+            probe_sequence: event_hub.current_sequence(),
+            initial_event: None,
+            request_prefix: "test".into(),
+        };
+        let event = subscription
+            .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
+            .unwrap();
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("status event")
+        };
+        assert_eq!(
+            data.name_kept_through.as_deref(),
+            Some("2026-10-28T01:02:03.456Z")
+        );
+        pane.name_kept_through = Some("2026-10-28T01:02:04Z".into());
+        let event = subscription
+            .event_from_snapshot(pane.clone())
+            .expect("provenance alone is news");
+        let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
+            panic!("status event")
+        };
+        assert_eq!(
+            data.name_kept_through.as_deref(),
+            Some("2026-10-28T01:02:04Z")
+        );
+        assert_eq!(data.label_at, Some(1_700_000_000));
+        assert!(subscription.event_from_snapshot(pane).is_none());
+    }
+
     #[test]
     fn a_change_of_only_whose_the_name_is_still_publishes() {
         let mut subscription = ActiveAgentStatusChangedSubscription {
@@ -1847,6 +1913,7 @@ mod tests {
                 flag: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             }),
             last_sequence,
             probe_sequence: event_hub.current_sequence(),
@@ -1864,6 +1931,7 @@ mod tests {
                 flag: None,
                 label_source: None,
                 label_at: None,
+                name_kept_through: None,
             }),
             request_prefix: "test".into(),
         };

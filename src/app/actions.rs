@@ -184,6 +184,7 @@ pub struct PaneStateUpdate {
     pub seen: bool,
     pub presentation: crate::terminal::EffectivePresentation,
     pub agent_name_changed: bool,
+    pub name_keep_verdict_cleared: bool,
     pub agent_released: bool,
     pub agent_release_status: Option<crate::api::schema::AgentStatus>,
     pub suppress_completion: bool,
@@ -215,6 +216,7 @@ impl PaneStateUpdate {
             seen: pane.seen,
             presentation,
             agent_name_changed: false,
+            name_keep_verdict_cleared: false,
             agent_released: false,
             agent_release_status: None,
             suppress_completion: true,
@@ -374,6 +376,7 @@ impl AppState {
                     seen,
                     presentation: change.presentation.clone(),
                     agent_name_changed: false,
+                    name_keep_verdict_cleared: false,
                     agent_released: false,
                     agent_release_status: None,
                     suppress_completion: false,
@@ -2119,6 +2122,7 @@ impl AppState {
             mutation,
             managed_changed,
             agent_name_changed,
+            name_keep_verdict_cleared,
             unchanged_change,
             suppress_acquisition_completion,
             completion_reset,
@@ -2139,6 +2143,8 @@ impl AppState {
                 terminal.reconcile_handoff_sequence_reading(&mut mutation, reading);
             let preserve_handoff_sequences =
                 handoff_reading == crate::terminal::state::HandoffSequenceReading::Preserve;
+            let name_keep_verdict_cleared =
+                mutation.session_ref_changed && terminal.name_kept_through.take().is_some();
             let completion_reset = !preserve_handoff_sequences
                 && (mutation.session_ref_changed
                     || mutation
@@ -2153,12 +2159,14 @@ impl AppState {
             let agent_name_changed = terminal.agent_name != previous_agent_name;
             let unchanged_change = (mutation.agent_released
                 || agent_name_changed
+                || name_keep_verdict_cleared
                 || (completion_reset && had_completion))
                 .then(|| terminal.unchanged_effective_state_change_at(now));
             (
                 mutation,
                 managed_changed,
                 agent_name_changed,
+                name_keep_verdict_cleared,
                 unchanged_change,
                 suppress_acquisition_completion,
                 completion_reset,
@@ -2239,6 +2247,7 @@ impl AppState {
             seen,
             presentation: change.presentation.clone(),
             agent_name_changed,
+            name_keep_verdict_cleared,
             agent_released,
             agent_release_status: agent_released.then_some(reported_status),
             suppress_completion,
