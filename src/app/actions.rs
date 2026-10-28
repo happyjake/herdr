@@ -728,12 +728,12 @@ impl AppState {
         now_unix: u64,
         about: Option<(PaneId, crate::events::StatusReading)>,
     ) -> bool {
-        let terminals = &self.terminals;
+        let terminals = &mut self.terminals;
         let mut changed = false;
         for (ws_idx, ws) in self.workspaces.iter_mut().enumerate() {
             for tab in &mut ws.tabs {
                 for (pane_id, pane) in tab.panes.iter_mut() {
-                    let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
+                    let Some(terminal) = terminals.get_mut(&pane.attached_terminal_id) else {
                         continue;
                     };
                     let reading = match about {
@@ -744,17 +744,25 @@ impl AppState {
                     let had_window = pane.agent_status_resolution_due_at().is_some();
                     let previous = pane.agent_status();
                     changed |= pane.record_agent_status_at(status, now_unix, reading);
-                    // Reconciliation can settle a bystander before its timer
-                    // runs. Retain its transition for the API event publisher.
-                    if had_window
-                        && pane.agent_status_resolution_due_at().is_none()
-                        && about.is_none_or(|(subject, _)| subject != *pane_id)
-                    {
-                        self.pending_agent_status_resolutions.push(
-                            PaneStateUpdate::status_resolution(
-                                ws_idx, *pane_id, previous, pane, terminal,
-                            ),
-                        );
+                    if had_window && pane.agent_status_resolution_due_at().is_none() {
+                        // Once reconciliation closes the window its timer has
+                        // nothing left to resolve. Retire the sequence baseline
+                        // here too, before publishing the resolved terminal facts.
+                        let sequence_resolution = terminal.resolve_handoff_sequence_baseline();
+                        if sequence_resolution.is_some_and(|previous| previous != terminal.state) {
+                            self.next_agent_state_change_seq += 1;
+                            terminal.last_agent_state_change_seq =
+                                Some(self.next_agent_state_change_seq);
+                        }
+                        changed |= sequence_resolution.is_some();
+                        // A bystander has no subject event to publish its change.
+                        if about.is_none_or(|(subject, _)| subject != *pane_id) {
+                            self.pending_agent_status_resolutions.push(
+                                PaneStateUpdate::status_resolution(
+                                    ws_idx, *pane_id, previous, pane, terminal,
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -4147,6 +4155,132 @@ mod tests {
             assert_eq!(
                 app.terminals[&terminal_id].last_agent_completion_seq, None,
                 "{cause}"
+            );
+            app.assert_invariants_for_test();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_clock_reconciliation_retires_expired_baselines() {
+        use crate::events::StatusReading::{Provisional, Verdict};
+        for (before, completed) in [(AgentState::Working, false), (AgentState::Idle, true)] {
+            for caller in ["snapshot", "bystander", "provisional"] {
+                let (mut app, pane_id, terminal_id) = handoff_sequence_probe(before, completed);
+                app.workspaces.push(Workspace::test_new("foreground"));
+                app.ensure_test_terminals();
+                app.active = Some(1);
+                app.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+                app.toast_config.delay_seconds = 0;
+                let other = app.workspaces[1].tabs[0].root_pane;
+                app.handle_app_event(AppEvent::AgentProcessDetected {
+                    pane_id,
+                    agent: Agent::Pi,
+                    observed_at: Instant::now(),
+                    reading: Provisional,
+                });
+                let deadline = app.workspaces[0]
+                    .pane_state(pane_id)
+                    .unwrap()
+                    .agent_status_resolution_due_at()
+                    .unwrap();
+                app.sync_agent_status_clocks_at(deadline - 1);
+                assert_eq!(
+                    app.workspaces[0]
+                        .pane_state(pane_id)
+                        .unwrap()
+                        .agent_status_resolution_due_at(),
+                    Some(deadline)
+                );
+                match caller {
+                    "snapshot" => {
+                        app.sync_agent_status_clocks_at(deadline);
+                    }
+                    "bystander" => {
+                        app.sync_agent_status_clocks_about_at(deadline, other, Verdict);
+                    }
+                    _ => {
+                        app.sync_agent_status_clocks_about_at(deadline, pane_id, Provisional);
+                    }
+                }
+                assert_eq!(
+                    app.workspaces[0]
+                        .pane_state(pane_id)
+                        .unwrap()
+                        .agent_status_resolution_due_at(),
+                    None
+                );
+                assert_eq!(
+                    app.terminals[&terminal_id].last_agent_completion_seq, None,
+                    "expired facts must be cleared before the next read: {caller}"
+                );
+                assert!(app.resolve_due_agent_status_windows_at(deadline).is_empty());
+                sequence_reading(
+                    &mut app,
+                    pane_id,
+                    Some(Agent::Pi),
+                    AgentState::Idle,
+                    Verdict,
+                );
+                assert_eq!(
+                    app.terminals[&terminal_id].last_agent_completion_seq, None,
+                    "baseline={before:?}, caller={caller}"
+                );
+                assert!(!app
+                    .toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.kind == ToastKind::Finished));
+                assert!(app.pending_agent_notifications.is_empty());
+                app.assert_invariants_for_test();
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_clock_expiry_preserves_matching_idle_facts() {
+        for completed in [false, true] {
+            let (mut app, pane_id, terminal_id) =
+                handoff_sequence_probe(AgentState::Idle, completed);
+            app.handle_app_event(AppEvent::AgentProcessDetected {
+                pane_id,
+                agent: Agent::Pi,
+                observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Provisional,
+            });
+            sequence_reading(
+                &mut app,
+                pane_id,
+                Some(Agent::Pi),
+                AgentState::Idle,
+                crate::events::StatusReading::Provisional,
+            );
+            let deadline = app.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .agent_status_resolution_due_at()
+                .unwrap();
+            app.sync_agent_status_clocks_at(deadline);
+            assert!(app.resolve_due_agent_status_windows_at(deadline).is_empty());
+            sequence_reading(
+                &mut app,
+                pane_id,
+                Some(Agent::Pi),
+                AgentState::Idle,
+                crate::events::StatusReading::Verdict,
+            );
+            assert_eq!(
+                app.terminals[&terminal_id].last_agent_state_change_seq,
+                Some(41)
+            );
+            assert_eq!(
+                app.terminals[&terminal_id].last_agent_completion_seq,
+                completed.then_some(41)
+            );
+            assert_eq!(app.next_agent_state_change_seq, 73);
+            assert_eq!(
+                app.workspaces[0].pane_state(pane_id).unwrap().seen,
+                !completed
             );
             app.assert_invariants_for_test();
         }
