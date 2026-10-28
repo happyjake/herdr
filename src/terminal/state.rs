@@ -38,6 +38,9 @@ pub(crate) struct HandoffAgentState {
 pub(crate) struct HandoffSequenceBaseline {
     agent_label: Option<String>,
     state: AgentState,
+    /// Older baselines only establish work through an explicit Working state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_eligible: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +372,7 @@ impl TerminalState {
             .unwrap_or_else(|| HandoffSequenceBaseline {
                 agent_label: self.effective_agent_label().map(str::to_owned),
                 state: self.state,
+                completion_eligible: Some(!self.agent_process_acquisition_pending),
             })
     }
 
@@ -390,6 +394,13 @@ impl TerminalState {
             self.pending_handoff_sequence_baseline = None;
             return HandoffSequenceReading::NotRestoring;
         }
+        // Work can begin after import, before the first classification. Keep
+        // that evidence if another handoff happens during reacquisition.
+        if self.state == AgentState::Working && !self.agent_process_acquisition_pending {
+            if let Some(baseline) = self.pending_handoff_sequence_baseline.as_mut() {
+                baseline.completion_eligible = Some(true);
+            }
+        }
         if matches!(
             reading,
             StatusReading::Provisional | StatusReading::DisplayOnly
@@ -404,6 +415,9 @@ impl TerminalState {
         let Some(baseline) = self.pending_handoff_sequence_baseline.take() else {
             return HandoffSequenceReading::NotRestoring;
         };
+        self.agent_process_acquisition_pending = !baseline
+            .completion_eligible
+            .unwrap_or(baseline.state == AgentState::Working);
         let change = mutation
             .effective_state_change
             .get_or_insert_with(|| self.unchanged_effective_state_change_at(Instant::now()));

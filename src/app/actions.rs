@@ -2141,8 +2141,7 @@ impl AppState {
                 terminal.last_agent_completion_seq = None;
             }
             let managed_changed = terminal.reconcile_managed_agent_at(now, false);
-            let suppress_acquisition_completion = terminal.finish_agent_process_acquisition()
-                && handoff_reading != crate::terminal::state::HandoffSequenceReading::Transition;
+            let suppress_acquisition_completion = terminal.finish_agent_process_acquisition();
             let agent_name_changed = terminal.agent_name != previous_agent_name;
             let unchanged_change = (mutation.agent_released
                 || agent_name_changed
@@ -3900,6 +3899,177 @@ mod tests {
             crate::events::StatusReading::Verdict,
         );
         assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq, None);
+        app.assert_invariants_for_test();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_blocked_startup_preserves_completion_eligibility() {
+        use crate::events::StatusReading::{Provisional, Verdict};
+        for worked_before_handoff in [false, true] {
+            for classify_blocked_first in [false, true] {
+                for imports in [1, 2] {
+                    let (mut app, pane_id, terminal_id) =
+                        handoff_sequence_probe(AgentState::Blocked, false);
+                    app.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+                    app.toast_config.delay_seconds = 0;
+                    app.workspaces.push(Workspace::test_new("foreground"));
+                    app.ensure_test_terminals();
+                    app.active = Some(1);
+                    let mut old = crate::terminal::TerminalState::new(
+                        terminal_id.clone(),
+                        app.terminals[&terminal_id].cwd.clone(),
+                    );
+                    old.set_detected_agent_process_at(Agent::Pi, Instant::now());
+                    if worked_before_handoff {
+                        old.set_detected_state(Some(Agent::Pi), AgentState::Working);
+                    }
+                    old.set_detected_state(Some(Agent::Pi), AgentState::Blocked);
+                    let baseline = serde_json::from_value(
+                        serde_json::to_value(old.handoff_sequence_baseline()).unwrap(),
+                    )
+                    .unwrap();
+                    app.terminals
+                        .get_mut(&terminal_id)
+                        .unwrap()
+                        .restore_handoff_sequences(Some(41), None, Some(baseline));
+                    for _ in 0..imports {
+                        app.handle_app_event(AppEvent::AgentProcessDetected {
+                            pane_id,
+                            agent: Agent::Pi,
+                            observed_at: Instant::now(),
+                            reading: Provisional,
+                        });
+                        let terminal = &app.terminals[&terminal_id];
+                        let baseline = serde_json::from_value(
+                            serde_json::to_value(terminal.handoff_sequence_baseline()).unwrap(),
+                        )
+                        .unwrap();
+                        app.terminals
+                            .get_mut(&terminal_id)
+                            .unwrap()
+                            .restore_handoff_sequences(Some(41), None, Some(baseline));
+                    }
+                    if classify_blocked_first {
+                        sequence_reading(
+                            &mut app,
+                            pane_id,
+                            Some(Agent::Pi),
+                            AgentState::Blocked,
+                            Verdict,
+                        );
+                    }
+                    sequence_reading(
+                        &mut app,
+                        pane_id,
+                        Some(Agent::Pi),
+                        AgentState::Idle,
+                        Verdict,
+                    );
+                    assert_eq!(app.terminals[&terminal_id].last_agent_completion_seq,
+                        worked_before_handoff.then_some(74),
+                        "worked={worked_before_handoff}, blocked verdict={classify_blocked_first}, imports={imports}");
+                    assert_eq!(
+                        app.toast
+                            .as_ref()
+                            .is_some_and(|toast| toast.kind == ToastKind::Finished),
+                        worked_before_handoff
+                    );
+                    assert!(app.pending_agent_notifications.is_empty());
+                    app.assert_invariants_for_test();
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_legacy_baseline_requires_evidence_of_work() {
+        for before in [AgentState::Blocked, AgentState::Working] {
+            let (mut app, pane_id, terminal_id) = handoff_sequence_probe(before, false);
+            let mut legacy =
+                serde_json::to_value(app.terminals[&terminal_id].handoff_sequence_baseline())
+                    .unwrap();
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("completion_eligible");
+            let baseline = serde_json::from_value(legacy).unwrap();
+            app.terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .restore_handoff_sequences(Some(41), None, Some(baseline));
+            app.handle_app_event(AppEvent::AgentProcessDetected {
+                pane_id,
+                agent: Agent::Pi,
+                observed_at: Instant::now(),
+                reading: crate::events::StatusReading::Provisional,
+            });
+            sequence_reading(
+                &mut app,
+                pane_id,
+                Some(Agent::Pi),
+                AgentState::Idle,
+                crate::events::StatusReading::Verdict,
+            );
+            assert_eq!(
+                app.terminals[&terminal_id].last_agent_completion_seq,
+                (before == AgentState::Working).then_some(74)
+            );
+            app.assert_invariants_for_test();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_sequence_startup_can_observe_work_before_classification() {
+        let (mut app, pane_id, terminal_id) = handoff_sequence_probe(AgentState::Blocked, false);
+        let mut encoded =
+            serde_json::to_value(app.terminals[&terminal_id].handoff_sequence_baseline()).unwrap();
+        encoded["completion_eligible"] = serde_json::json!(false);
+        let baseline = serde_json::from_value(encoded).unwrap();
+        app.terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .restore_handoff_sequences(Some(41), None, Some(baseline));
+        app.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
+        });
+        sequence_reading(
+            &mut app,
+            pane_id,
+            Some(Agent::Pi),
+            AgentState::Working,
+            crate::events::StatusReading::Provisional,
+        );
+        let baseline = serde_json::from_value(
+            serde_json::to_value(app.terminals[&terminal_id].handoff_sequence_baseline()).unwrap(),
+        )
+        .unwrap();
+        app.terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .restore_handoff_sequences(Some(41), None, Some(baseline));
+        app.handle_app_event(AppEvent::AgentProcessDetected {
+            pane_id,
+            agent: Agent::Pi,
+            observed_at: Instant::now(),
+            reading: crate::events::StatusReading::Provisional,
+        });
+        sequence_reading(
+            &mut app,
+            pane_id,
+            Some(Agent::Pi),
+            AgentState::Idle,
+            crate::events::StatusReading::Verdict,
+        );
+        assert_eq!(
+            app.terminals[&terminal_id].last_agent_completion_seq,
+            Some(74)
+        );
         app.assert_invariants_for_test();
     }
 
