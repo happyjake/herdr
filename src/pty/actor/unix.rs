@@ -493,7 +493,8 @@ struct ActiveSubmission {
 struct PendingWrite {
     bytes: Bytes,
     boundary: Option<SubmissionBoundary>,
-    record_activity: bool,
+    // Terminal responses have no activity policy; input either records or preserves it.
+    input_activity: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,7 +529,7 @@ impl PtyIoActorRunner {
             self.pending_writes.push_back(PendingWrite {
                 bytes,
                 boundary: None,
-                record_activity: false,
+                input_activity: None,
             });
         }
     }
@@ -537,13 +538,13 @@ impl PtyIoActorRunner {
         &mut self,
         bytes: Bytes,
         boundary: SubmissionBoundary,
-        record_activity: bool,
+        input_activity: Option<bool>,
     ) {
         if !bytes.is_empty() {
             self.pending_writes.push_back(PendingWrite {
                 bytes,
                 boundary: Some(boundary),
-                record_activity,
+                input_activity,
             });
         }
     }
@@ -575,7 +576,7 @@ impl PtyIoActorRunner {
                 SubmissionPhase::WaitingUntil(Instant::now() + submission.delay)
             }
             (false, true) => {
-                self.enqueue_submission_write(prefix, SubmissionBoundary::Text, false);
+                self.enqueue_submission_write(prefix, SubmissionBoundary::Text, None);
                 SubmissionPhase::WritingText {
                     uncommitted_guard: guard,
                 }
@@ -584,7 +585,7 @@ impl PtyIoActorRunner {
                 self.enqueue_submission_write(
                     text,
                     SubmissionBoundary::Text,
-                    submission.record_activity,
+                    Some(submission.record_activity),
                 );
                 SubmissionPhase::WritingText {
                     uncommitted_guard: guard,
@@ -595,7 +596,7 @@ impl PtyIoActorRunner {
                 self.enqueue_submission_write(
                     text,
                     SubmissionBoundary::Text,
-                    submission.record_activity,
+                    Some(submission.record_activity),
                 );
                 SubmissionPhase::WritingText {
                     uncommitted_guard: guard,
@@ -755,13 +756,16 @@ impl PtyIoActorRunner {
                 if self.state == ActorState::Running && !bytes.is_empty() {
                     self.enqueue_write(bytes);
                     if let Some(write) = self.pending_writes.back_mut() {
-                        write.record_activity = true;
+                        write.input_activity = Some(true);
                     }
                 }
             }
             PtyIoDataCommand::WriteInputWithoutActivity(bytes) => {
-                if self.state == ActorState::Running {
+                if self.state == ActorState::Running && !bytes.is_empty() {
                     self.enqueue_write(bytes);
+                    if let Some(write) = self.pending_writes.back_mut() {
+                        write.input_activity = Some(false);
+                    }
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
@@ -1023,7 +1027,7 @@ impl PtyIoActorRunner {
                     SubmissionBoundary::Enter,
                     self.active_submission
                         .as_ref()
-                        .is_some_and(|submission| submission.record_activity),
+                        .map(|submission| submission.record_activity),
                 );
             }
         }
@@ -1115,13 +1119,14 @@ impl PtyIoActorRunner {
                     ));
                 }
                 Ok(written) => {
-                    if self.current_write_offset == 0
-                        && self
+                    if self.current_write_offset == 0 {
+                        if let Some(record_activity) = self
                             .pending_writes
                             .front()
-                            .is_some_and(|write| write.record_activity)
-                    {
-                        self.input_activity.record();
+                            .and_then(|write| write.input_activity)
+                        {
+                            self.input_activity.input_delivered(record_activity);
+                        }
                     }
                     self.commit_active_submission_write();
                     self.current_write_offset += written;
@@ -1272,7 +1277,7 @@ mod tests {
         runner.enqueue_submission_write(
             Bytes::from_static(b"prompt"),
             SubmissionBoundary::Text,
-            true,
+            Some(true),
         );
         runner.enqueue_write(Bytes::from_static(b"response"));
 
@@ -1304,6 +1309,7 @@ mod tests {
     fn input_activity_records_delivery_but_not_rejection_or_terminal_responses() {
         let activity = Arc::new(crate::terminal::activity::InputActivity::default());
         activity.restore(100);
+        activity.observe_foreground(Some(42));
         let (socket, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let handle = PtyIoActor::spawn(PtyIoActorConfig {
@@ -1327,13 +1333,19 @@ mod tests {
                 Bytes::from_static(b"\r"),
                 Duration::ZERO,
                 Some(Box::new(|| Err(std::io::Error::other("refused")))),
-                true,
+                false,
             )
             .unwrap();
         assert!(rejected
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .is_err());
+        activity.observe_foreground(Some(43));
+        assert!(
+            activity.get() > 100,
+            "responses and rejected input must not suppress jobs"
+        );
+        activity.restore(100);
         let synthetic = handle
             .queue_input_submission(
                 Bytes::new(),
@@ -1351,6 +1363,7 @@ mod tests {
         let mut synthetic = [0; 10];
         peer.read_exact(&mut synthetic).unwrap();
         assert_eq!(&synthetic, b"synthetic\r");
+        activity.observe_foreground(Some(44));
         assert_eq!(activity.get(), 100);
 
         let delivered = handle
@@ -1371,6 +1384,9 @@ mod tests {
         peer.read_exact(&mut input).unwrap();
         assert_eq!(&input, b"input\r");
         assert!(activity.get() > 100);
+        activity.restore(100);
+        activity.observe_foreground(Some(45));
+        assert!(activity.get() > 100, "real input ends suppression");
         handle.shutdown();
     }
 
@@ -2383,12 +2399,12 @@ mod tests {
                 PendingWrite {
                     bytes: Bytes::from_static(b"live-light"),
                     boundary: None,
-                    record_activity: false,
+                    input_activity: None,
                 },
                 PendingWrite {
                     bytes: Bytes::from_static(b"query-light"),
                     boundary: None,
-                    record_activity: false,
+                    input_activity: None,
                 },
             ])
         );

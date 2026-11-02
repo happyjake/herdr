@@ -463,7 +463,9 @@ fn send_wheel(
     for _ in 0..events {
         bytes.extend_from_slice(&event);
     }
-    runtime.try_send_bytes(Bytes::from(bytes)).map_err(|_| ())
+    runtime
+        .try_send_bytes_with_activity(Bytes::from(bytes), false)
+        .map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -537,6 +539,7 @@ mod tests {
         let guard = rt.enter();
         let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(73, 5, 8);
         runtime.test_process_pty_bytes(&draw(&["first", "second", "third"], true));
+        runtime.restore_input_or_command_at(100);
         let started = Instant::now();
         let (mut pending, response_rx) = pending_read(&runtime, started, 8);
         pending.read.cols = Some(73);
@@ -549,6 +552,11 @@ mod tests {
                 )
                 .expect("read in progress");
             input_rx.try_recv().expect("scroll probe or restoration");
+            assert_eq!(
+                runtime.input_or_command_at(),
+                100,
+                "reading must preserve activity"
+            );
         }
         assert!(pending
             .poll(Some(&runtime), started + INITIAL_QUIET + STEP_TIMEOUT * 3)
@@ -561,6 +569,11 @@ mod tests {
         };
         assert_eq!(read.cols, Some(73));
         assert!(read.text.contains("second"));
+
+        runtime
+            .try_send_bytes(Bytes::from_static(b"operator input"))
+            .unwrap();
+        assert!(runtime.input_or_command_at() > 100);
 
         drop(runtime);
         drop(guard);

@@ -194,8 +194,14 @@ pub(super) fn apply_terminal_attach_input(
             .try_send_paste(text.to_owned())
             .map_err(|err| format!("terminal attach paste failed: {err}"))
     } else {
+        // A focus report only says the attached terminal was viewed. Preserve
+        // activity only when every byte belongs to a complete focus report.
+        let only_focus_reports = !data.is_empty()
+            && data
+                .chunks(3)
+                .all(|chunk| chunk == b"\x1b[I" || chunk == b"\x1b[O");
         runtime
-            .try_send_bytes(Bytes::from(data))
+            .try_send_bytes_with_activity(Bytes::from(data), !only_focus_reports)
             .map_err(|err| format!("terminal attach input failed: {err}"))
     }
 }
@@ -363,6 +369,32 @@ pub(super) fn apply_client_terminal_input_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_attach_bare_focus_reports_preserve_activity_but_other_bytes_count() {
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        for bytes in [b"\x1b[I".as_slice(), b"\x1b[O", b"\x1b[I\x1b[O"] {
+            runtime.restore_input_or_command_at(100);
+            apply_terminal_attach_input(&runtime, bytes.to_vec()).unwrap();
+            assert_eq!(input_rx.try_recv().unwrap().as_ref(), bytes);
+            assert_eq!(runtime.input_or_command_at(), 100);
+        }
+        for bytes in [
+            b"\x1b[Ix".as_slice(),
+            b"x\x1b[O",
+            b"\x1b[I\r\x1b[O",
+            b"\x1b[",
+            b"\x1b[200~\x1b[I\x1b[201~",
+        ] {
+            runtime.restore_input_or_command_at(100);
+            apply_terminal_attach_input(&runtime, bytes.to_vec()).unwrap();
+            assert!(!input_rx.try_recv().unwrap().is_empty());
+            assert!(
+                runtime.input_or_command_at() > 100,
+                "non-focus input {bytes:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn terminal_attach_stale_geometry_falls_back_to_the_canonical_cell() {

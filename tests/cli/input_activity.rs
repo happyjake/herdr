@@ -104,6 +104,90 @@ fn input_activity_typing_moves_the_stamp() {
 }
 
 #[test]
+fn input_activity_preserved_command_keeps_the_clock_across_foreground_changes() {
+    let session = Session::new();
+    thread::sleep(Duration::from_millis(1500));
+    let before = session.stamp();
+    session.request("pane.send_input", json!({
+        "text":"sleep 5; printf 'PRESERVED%s\\n' _DONE", "keys":["Enter"], "preserve_activity":true
+    }));
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(session.stamp(), before, "starting the preserved job");
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(50),
+        || { pane_read_recent_contains(&session.socket, &session.pane_id, "PRESERVED_DONE") }
+    ));
+    thread::sleep(Duration::from_millis(1000));
+    assert_eq!(session.stamp(), before, "returning to the shell");
+}
+
+#[test]
+fn input_activity_real_input_ends_foreground_suppression() {
+    let session = Session::new();
+    thread::sleep(Duration::from_millis(1500));
+    let before = session.stamp();
+    session.request(
+        "pane.send_input",
+        json!({
+            "text":"sleep 5; printf 'JOB%s\\n' _DONE", "keys":["Enter"], "preserve_activity":true
+        }),
+    );
+    thread::sleep(Duration::from_millis(1500));
+    session.request("pane.send_text", json!({"text":"operator input"}));
+    let typed = session.wait_for_stamp_after(before);
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(50),
+        || { pane_read_recent_contains(&session.socket, &session.pane_id, "JOB_DONE") }
+    ));
+    session.wait_for_stamp_after(typed);
+}
+
+#[test]
+fn input_activity_preserved_quit_keeps_the_clock_when_the_shell_returns() {
+    use std::os::unix::fs::PermissionsExt;
+    let session = Session::new();
+    let script = session.base.join("pi");
+    fs::write(&script, "#!/bin/sh\nwhile IFS= read -r line; do if [ \"$line\" = /quit ]; then printf 'EXIT%s\\n' _ACK; exit 0; fi; done\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    session.request(
+        "pane.send_input",
+        json!({"text":script.display().to_string(),"keys":["Enter"]}),
+    );
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || session.pane()["agent"] == "pi"
+    ));
+    session.request(
+        "pane.report_agent",
+        json!({"source":"custom:test","agent":"pi","state":"idle"}),
+    );
+    thread::sleep(Duration::from_millis(1500));
+    let before = session.stamp();
+    let response = send_request(
+        &session.socket,
+        &json!({
+            "id":"quit", "method":"agent.prompt", "params":{
+                "target":session.pane_id, "text":"/quit", "preserve_activity":true
+            }
+        })
+        .to_string(),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || {
+            pane_read_recent_contains(&session.socket, &session.pane_id, "EXIT_ACK")
+                && session.pane()["agent"].is_null()
+        }
+    ));
+    assert_eq!(session.stamp(), before);
+}
+
+#[test]
 fn input_activity_foreground_change_moves_the_stamp_without_more_input() {
     let session = Session::new();
     let fifo = session.base.join("command-gate");
@@ -143,6 +227,63 @@ fn input_activity_survives_cold_restart() {
     assert_eq!(session.stamp(), before);
     session.request("pane.send_text", json!({"text":"after restart"}));
     session.wait_for_stamp_after(before);
+}
+
+#[test]
+fn input_activity_survives_deferred_agent_resume_after_cold_restart() {
+    let mut session = Session::new();
+    let script = session.base.join("pi");
+    fs::write(&script, "printf 'RUN%s:%s\\n' _READY \"$1\"\nwhile IFS= read -r line; do printf 'PICKED:%s\\n' \"$line\"; done\n").unwrap();
+    session.request(
+        "pane.send_input",
+        json!({
+            "text":format!("sh '{}' initial", script.display()), "keys":["Enter"]
+        }),
+    );
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || { pane_read_recent_contains(&session.socket, &session.pane_id, "RUN_READY:initial") }
+    ));
+    session.request(
+        "pane.report_agent",
+        json!({
+            "source":"custom:test", "agent":"pi", "state":"idle",
+            "resume_argv":["sh", script.display().to_string(), "resumed"]
+        }),
+    );
+    thread::sleep(Duration::from_millis(1500));
+    let before = session.stamp();
+    session.stop();
+    thread::sleep(Duration::from_millis(1100));
+    session.start();
+    assert!(
+        wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
+            pane_read_recent_contains(&session.socket, &session.pane_id, "RUN_READY:resumed")
+        }),
+        "the deferred resume must launch a new agent"
+    );
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(session.stamp(), before);
+    session.stop();
+    let saved: Value = serde_json::from_slice(
+        &fs::read(
+            session
+                .base
+                .join("config")
+                .join(app_dir_name())
+                .join("session.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let pane = saved["workspaces"][0]["tabs"][0]["panes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(pane["input_or_command_at"], before);
 }
 
 #[test]

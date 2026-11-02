@@ -308,9 +308,12 @@ impl App {
             }
         };
 
+        if let Some(terminal) = self.state.terminals.get(&terminal_id) {
+            runtime.restore_input_or_command_at(terminal.input_or_command_at);
+        }
         let mut input = resume_command;
         input.push('\r');
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
+        if let Err(err) = runtime.try_send_bytes_with_activity(Bytes::from(input), false) {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,

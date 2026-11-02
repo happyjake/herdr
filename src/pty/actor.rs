@@ -7,14 +7,14 @@ pub(crate) type PtySubmissionGuard = Box<dyn FnMut() -> std::io::Result<()> + Se
 fn write_input_and_flush(
     writer: &mut impl std::io::Write,
     mut bytes: &[u8],
-    activity: Option<&crate::terminal::activity::InputActivity>,
+    activity: Option<(&crate::terminal::activity::InputActivity, bool)>,
 ) -> std::io::Result<()> {
     while !bytes.is_empty() {
         match writer.write(bytes) {
             Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
             Ok(written) => {
-                if let Some(activity) = activity {
-                    activity.record();
+                if let Some((activity, record_activity)) = activity {
+                    activity.input_delivered(record_activity);
                 }
                 bytes = &bytes[written..];
             }
@@ -32,17 +32,22 @@ mod activity_tests {
         let activity = crate::terminal::activity::InputActivity::default();
         activity.restore(100);
         let mut output = [0; 2];
-        let result =
-            super::write_input_and_flush(&mut output.as_mut_slice(), b"input", Some(&activity));
+        let result = super::write_input_and_flush(
+            &mut output.as_mut_slice(),
+            b"input",
+            Some((&activity, true)),
+        );
         assert_eq!(output, *b"in");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WriteZero);
         assert!(activity.get() > 100);
         activity.restore(100);
         let mut empty = [];
-        assert!(
-            super::write_input_and_flush(&mut empty.as_mut_slice(), b"input", Some(&activity))
-                .is_err()
-        );
+        assert!(super::write_input_and_flush(
+            &mut empty.as_mut_slice(),
+            b"input",
+            Some((&activity, true))
+        )
+        .is_err());
         assert_eq!(activity.get(), 100);
     }
 }
@@ -134,6 +139,7 @@ mod windows {
     enum PtyIoWriteCommand {
         Write(Bytes),
         WriteUserInput(Bytes),
+        WriteInputWithoutActivity(Bytes),
         SubmissionPart {
             prefix: Bytes,
             bytes: Bytes,
@@ -421,7 +427,10 @@ mod windows {
             let result = match command {
                 PtyIoWriteCommand::Write(bytes) => write_and_flush(writer, &bytes),
                 PtyIoWriteCommand::WriteUserInput(bytes) => {
-                    super::write_input_and_flush(writer, &bytes, Some(input_activity))
+                    super::write_input_and_flush(writer, &bytes, Some((input_activity, true)))
+                }
+                PtyIoWriteCommand::WriteInputWithoutActivity(bytes) => {
+                    super::write_input_and_flush(writer, &bytes, Some((input_activity, false)))
                 }
                 PtyIoWriteCommand::SubmissionPart {
                     prefix,
@@ -442,7 +451,7 @@ mod windows {
                             super::write_input_and_flush(
                                 writer,
                                 &bytes,
-                                record_activity.then_some(input_activity),
+                                Some((input_activity, record_activity)),
                             )
                         })
                     } else {
@@ -455,7 +464,7 @@ mod windows {
                             super::write_input_and_flush(
                                 writer,
                                 &bytes,
-                                record_activity.then_some(input_activity),
+                                Some((input_activity, record_activity)),
                             )
                         })
                     };
@@ -495,7 +504,10 @@ mod windows {
                     }
                 }
                 PtyIoDataCommand::WriteInputWithoutActivity(bytes) => {
-                    if write_tx.send(PtyIoWriteCommand::Write(bytes)).is_err() {
+                    if write_tx
+                        .send(PtyIoWriteCommand::WriteInputWithoutActivity(bytes))
+                        .is_err()
+                    {
                         break;
                     }
                 }

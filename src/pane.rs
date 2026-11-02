@@ -1044,7 +1044,7 @@ fn spawn_basic_detection_task(
             let foreground_pgid = (pid > 0)
                 .then(|| crate::detect::foreground_process_group_id(pid))
                 .flatten();
-            input_activity.observe_foreground(foreground_pgid);
+            input_activity.observe_foreground_at(foreground_pgid, now);
             observe_sampled_pane_cwd(
                 pane_id,
                 pid,
@@ -1556,7 +1556,7 @@ pub struct PaneRuntime {
 
 #[cfg(test)]
 struct TestChannelSubmission {
-    input_activity: Option<Arc<crate::terminal::activity::InputActivity>>,
+    input_activity: (Arc<crate::terminal::activity::InputActivity>, bool),
     prefix: Bytes,
     text: Bytes,
     enter: Bytes,
@@ -1703,7 +1703,7 @@ impl PaneRuntimeIo {
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
         guard: Option<crate::pty::actor::PtySubmissionGuard>,
-        input_activity: Option<Arc<crate::terminal::activity::InputActivity>>,
+        input_activity: (Arc<crate::terminal::activity::InputActivity>, bool),
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
@@ -1715,7 +1715,7 @@ impl PaneRuntimeIo {
                     delay,
                     deadline,
                     guard,
-                    input_activity.is_some(),
+                    input_activity.1,
                 );
                 #[cfg(unix)]
                 {
@@ -1726,7 +1726,7 @@ impl PaneRuntimeIo {
                         enter,
                         delay,
                         guard,
-                        input_activity.is_some(),
+                        input_activity.1,
                     )
                 }
             }
@@ -1755,12 +1755,16 @@ impl PaneRuntimeIo {
                                         continue;
                                     }
                                 }
+                                let has_text = !submission.text.is_empty();
                                 if let Err(err) = sender.try_send(submission.text) {
                                     let _ = submission.reply.send(Err(std::io::Error::other(err)));
                                     continue;
                                 }
-                                if let Some(activity) = &submission.input_activity {
-                                    activity.record();
+                                if has_text {
+                                    submission
+                                        .input_activity
+                                        .0
+                                        .input_delivered(submission.input_activity.1);
                                 }
                                 if let Some((held_tx, release_rx)) =
                                     state.hold_next_submission.lock().unwrap().take()
@@ -1770,9 +1774,16 @@ impl PaneRuntimeIo {
                                         release_rx.recv_timeout(std::time::Duration::from_secs(5));
                                 }
                                 std::thread::sleep(submission.delay);
+                                let has_enter = !submission.enter.is_empty();
                                 let result = sender
                                     .try_send(submission.enter)
                                     .map_err(std::io::Error::other);
+                                if result.is_ok() && has_enter {
+                                    submission
+                                        .input_activity
+                                        .0
+                                        .input_delivered(submission.input_activity.1);
+                                }
                                 let _ = submission.reply.send(result);
                             }
                         });
@@ -3269,7 +3280,7 @@ impl PaneRuntime {
                         last_observation = (now, (!retry).then_some(content_seq));
                     }
                     if foreground_observation_due {
-                        input_activity.observe_foreground(foreground_pgid);
+                        input_activity.observe_foreground_at(foreground_pgid, now);
                         observe_sampled_pane_cwd(
                             pane_id,
                             pid,
@@ -3985,13 +3996,12 @@ impl PaneRuntime {
         record_activity: bool,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         #[cfg(test)]
-        let record_test_input = record_activity
-            && !bytes.is_empty()
-            && matches!(self.io, PaneRuntimeIo::TestChannel { .. });
+        let record_test_input =
+            !bytes.is_empty() && matches!(self.io, PaneRuntimeIo::TestChannel { .. });
         self.io.try_send_bytes(bytes, record_activity)?;
         #[cfg(test)]
         if record_test_input {
-            self.input_activity.record();
+            self.input_activity.input_delivered(record_activity);
         }
         Ok(())
     }
@@ -4028,7 +4038,7 @@ impl PaneRuntime {
             delay,
             deadline,
             guard,
-            record_activity.then(|| self.input_activity.clone()),
+            (self.input_activity.clone(), record_activity),
         )
     }
 
