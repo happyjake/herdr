@@ -614,6 +614,70 @@ fn auto_close_preserves_main_checkout_and_worktree_group_refusals() {
 }
 
 #[test]
+fn auto_close_keeps_one_named_home_per_main_checkout() {
+    let session = Session::new(
+        "[auto_close]\nmode = 'report'\nplain_shell_age_secs = 0\npass_floor_secs = 1\n",
+    );
+    let repo = session.base.join("repo");
+    create_committed_repo(&repo);
+    let mut workspaces = Vec::new();
+    for _ in 0..3 {
+        let created = session.request("workspace.create", json!({"cwd":repo}));
+        workspaces.push((
+            created["root_pane"]["pane_id"].as_str().unwrap().to_owned(),
+            created["workspace"]["workspace_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        ));
+    }
+    thread::sleep(Duration::from_millis(1100));
+    session.request(
+        "pane.send_text",
+        json!({"pane_id":workspaces[1].0,"text":"recent activity"}),
+    );
+
+    let plan = session.plan();
+    let pane_ids = workspaces
+        .iter()
+        .map(|(pane_id, _)| pane_id.as_str())
+        .collect::<Vec<_>>();
+    let homes = plan["spared"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|pane| {
+            pane_ids.contains(&pane["pane_id"].as_str().unwrap())
+                && pane["exemption"] == "last-main-checkout-pane"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(homes.len(), 1, "{plan}");
+    assert_eq!(homes[0]["pane_id"].as_str(), Some(workspaces[1].0.as_str()));
+    let checkout = repo.canonicalize().unwrap().display().to_string();
+    assert_eq!(homes[0]["main_checkout"].as_str(), Some(checkout.as_str()));
+    assert_eq!(
+        homes[0]["main_checkout_home"].as_str(),
+        Some(workspaces[1].1.as_str())
+    );
+    for (pane_id, _) in workspaces
+        .iter()
+        .filter(|(pane_id, _)| pane_id != &workspaces[1].0)
+    {
+        let candidate = plan["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pane| pane["pane_id"].as_str() == Some(pane_id.as_str()))
+            .unwrap_or_else(|| panic!("missing sibling candidate {pane_id}: {plan}"));
+        assert_eq!(candidate["main_checkout"].as_str(), Some(checkout.as_str()));
+        assert_eq!(
+            candidate["main_checkout_home"].as_str(),
+            Some(workspaces[1].1.as_str())
+        );
+    }
+}
+
+#[test]
 fn auto_close_unresolved_agent_restore_is_exempt() {
     let config = "[auto_close]\nmode = 'report'\ndormant_age_secs = 0\nplain_shell_age_secs = 0\npass_floor_secs = 1\ndebrief = false\n";
     let mut session = Session::new(config);

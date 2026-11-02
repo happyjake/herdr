@@ -122,12 +122,20 @@ pub struct Candidate {
     pub action: Action,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_checkout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_checkout_home: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Spared {
     pub pane_id: String,
     pub exemption: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_checkout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_checkout_home: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -140,6 +148,7 @@ pub struct Plan {
 #[derive(Debug, Clone)]
 struct PaneSnapshot {
     pane_id: String,
+    workspace_id: String,
     agent: Option<String>,
     ended: bool,
     ended_at: Option<u64>,
@@ -151,7 +160,7 @@ struct PaneSnapshot {
     flagged: bool,
     desk_focused: bool,
     restore_until: Option<u64>,
-    last_main_pane: bool,
+    main_checkout: Option<String>,
     group_refusal: bool,
     bare_prompt: bool,
     starter: Option<String>,
@@ -202,6 +211,35 @@ impl AutoClose {
     }
 }
 
+fn main_checkout_home<'a>(
+    pane: &'a PaneSnapshot,
+    panes: &'a [PaneSnapshot],
+) -> Option<(&'a str, &'a PaneSnapshot)> {
+    let checkout = pane.main_checkout.as_deref()?;
+    let home = panes
+        .iter()
+        .chain(std::iter::once(pane))
+        .filter(|candidate| candidate.main_checkout.as_deref() == Some(checkout))
+        .min_by_key(|candidate| {
+            (
+                std::cmp::Reverse(candidate.status_at.max(candidate.input_at)),
+                crate::workspace::public_workspace_number(&candidate.workspace_id)
+                    .unwrap_or(usize::MAX),
+                &candidate.workspace_id,
+            )
+        })?;
+    Some((checkout, home))
+}
+
+fn main_checkout_fields(
+    pane: &PaneSnapshot,
+    panes: &[PaneSnapshot],
+) -> (Option<String>, Option<String>) {
+    main_checkout_home(pane, panes).map_or((None, None), |(checkout, home)| {
+        (Some(checkout.to_owned()), Some(home.workspace_id.clone()))
+    })
+}
+
 fn decide(
     pane: &PaneSnapshot,
     panes: &[PaneSnapshot],
@@ -228,7 +266,9 @@ fn decide(
     if pane.restore_until.is_some_and(|until| now < until) {
         return Err("restore-window");
     }
-    if pane.last_main_pane {
+    if main_checkout_home(pane, panes)
+        .is_some_and(|(_, home)| home.workspace_id == pane.workspace_id)
+    {
         return Err("last-main-checkout-pane");
     }
     if pane.group_refusal {
@@ -267,6 +307,7 @@ fn decide(
     if now < since || age_secs < threshold {
         return Err("too-young");
     }
+    let (main_checkout, main_checkout_home) = main_checkout_fields(pane, panes);
     Ok(Candidate {
         pane_id: pane.pane_id.clone(),
         kind,
@@ -274,6 +315,8 @@ fn decide(
         age_secs,
         action: Action::Close,
         wait_reason: None,
+        main_checkout,
+        main_checkout_home,
     })
 }
 
@@ -282,10 +325,15 @@ fn plan(panes: &[PaneSnapshot], config: &Config, now: u64) -> Plan {
     for pane in panes {
         match decide(pane, panes, config, now) {
             Ok(candidate) => result.candidates.push(candidate),
-            Err(exemption) => result.spared.push(Spared {
-                pane_id: pane.pane_id.clone(),
-                exemption: exemption.into(),
-            }),
+            Err(exemption) => {
+                let (main_checkout, main_checkout_home) = main_checkout_fields(pane, panes);
+                result.spared.push(Spared {
+                    pane_id: pane.pane_id.clone(),
+                    exemption: exemption.into(),
+                    main_checkout,
+                    main_checkout_home,
+                });
+            }
         }
     }
     result
@@ -537,12 +585,22 @@ impl App {
         let mut panes = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             let last = ws.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>() == 1;
-            let main = last
-                && (ws
-                    .worktree_space()
-                    .is_some_and(|space| !space.is_linked_worktree)
-                    || crate::workspace::git_space_metadata(&ws.identity_cwd)
-                        .is_some_and(|info| !info.is_linked_worktree));
+            let main_checkout = last
+                .then(|| {
+                    ws.worktree_space()
+                        .filter(|space| !space.is_linked_worktree)
+                        .map(|space| {
+                            crate::worktree::canonical_or_original(&space.checkout_path)
+                                .display()
+                                .to_string()
+                        })
+                        .or_else(|| {
+                            crate::workspace::git_space_metadata(&ws.identity_cwd)
+                                .filter(|info| !info.is_linked_worktree)
+                                .map(|info| info.checkout_key)
+                        })
+                })
+                .flatten();
             for tab in &ws.tabs {
                 for (&id, pane) in &tab.panes {
                     let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id)
@@ -571,6 +629,7 @@ impl App {
                             });
                     panes.push(PaneSnapshot {
                         pane_id,
+                        workspace_id: ws.id.clone(),
                         agent,
                         ended: terminal.ended_agent.is_some(),
                         ended_at: terminal.ended_at,
@@ -586,7 +645,7 @@ impl App {
                         flagged: terminal.flag.is_some(),
                         desk_focused: self.auto_close.focused.contains(&id),
                         restore_until: pane.agent_status_resolution_due_at(),
-                        last_main_pane: main,
+                        main_checkout: main_checkout.clone(),
                         group_refusal: last
                             && self
                                 .state
@@ -773,6 +832,7 @@ mod tests {
     fn shell() -> PaneSnapshot {
         PaneSnapshot {
             pane_id: "pane-1".into(),
+            workspace_id: "w1".into(),
             agent: None,
             ended: false,
             ended_at: None,
@@ -784,12 +844,22 @@ mod tests {
             flagged: false,
             desk_focused: false,
             restore_until: None,
-            last_main_pane: false,
+            main_checkout: None,
             group_refusal: false,
             bare_prompt: true,
             starter: None,
             session: None,
         }
+    }
+
+    fn main_checkout_shell(workspace_id: &str, status_at: u64, input_at: u64) -> PaneSnapshot {
+        let mut pane = shell();
+        pane.pane_id = format!("{workspace_id}:p1");
+        pane.workspace_id = workspace_id.into();
+        pane.status_at = status_at;
+        pane.input_at = input_at;
+        pane.main_checkout = Some("checkout".into());
+        pane
     }
 
     #[test]
@@ -865,7 +935,7 @@ mod tests {
         pane.flagged = true;
         pane.desk_focused = true;
         pane.restore_until = Some(200);
-        pane.last_main_pane = true;
+        pane.main_checkout = Some("checkout".into());
         pane.group_refusal = true;
         assert_eq!(decide(&pane, &[], &config, 150), Err("pinned"));
         pane.pinned = false;
@@ -887,7 +957,7 @@ mod tests {
             decide(&pane, &[], &config, 200),
             Err("last-main-checkout-pane")
         );
-        pane.last_main_pane = false;
+        pane.main_checkout = None;
         assert_eq!(decide(&pane, &[], &config, 200), Err("worktree-group"));
         pane.group_refusal = false;
         let mut kin = shell();
@@ -899,6 +969,73 @@ mod tests {
         pane.bare_prompt = false;
         assert_eq!(decide(&pane, &[], &config, 200), Err("not-bare-prompt"));
     }
+    #[test]
+    fn auto_close_main_checkout_keeps_only_the_most_recent_home() {
+        let config = Config {
+            plain_shell_age_secs: 0,
+            ..Config::default()
+        };
+        let only = main_checkout_shell("w1", 100, 100);
+        assert_eq!(
+            decide(&only, &[], &config, 200),
+            Err("last-main-checkout-pane")
+        );
+
+        let panes = [
+            main_checkout_shell("w1", 100, 140),
+            main_checkout_shell("w2", 150, 100),
+            main_checkout_shell("w3", 120, 130),
+        ];
+        let result = plan(&panes, &config, 200);
+        assert_eq!(result.candidates.len(), 2, "{result:?}");
+        assert_eq!(result.spared.len(), 1, "{result:?}");
+        assert_eq!(result.spared[0].pane_id, "w2:p1");
+        assert_eq!(result.spared[0].exemption, "last-main-checkout-pane");
+        assert_eq!(result.spared[0].main_checkout.as_deref(), Some("checkout"));
+        assert_eq!(result.spared[0].main_checkout_home.as_deref(), Some("w2"));
+        for candidate in &result.candidates {
+            assert!(matches!(candidate.pane_id.as_str(), "w1:p1" | "w3:p1"));
+            assert_eq!(candidate.main_checkout.as_deref(), Some("checkout"));
+            assert_eq!(candidate.main_checkout_home.as_deref(), Some("w2"));
+        }
+    }
+
+    #[test]
+    fn auto_close_main_checkout_ties_keep_the_oldest_workspace_id() {
+        let config = Config {
+            plain_shell_age_secs: 0,
+            ..Config::default()
+        };
+        let panes = [
+            main_checkout_shell("w10", 100, 100),
+            main_checkout_shell("w2", 100, 100),
+        ];
+        let result = plan(&panes, &config, 200);
+        assert_eq!(result.spared.len(), 1, "{result:?}");
+        assert_eq!(result.spared[0].pane_id, "w2:p1");
+        assert_eq!(result.candidates.len(), 1, "{result:?}");
+        assert_eq!(result.candidates[0].pane_id, "w10:p1");
+    }
+
+    #[test]
+    fn auto_close_linked_worktree_is_not_part_of_the_main_checkout_home() {
+        let config = Config {
+            plain_shell_age_secs: 0,
+            ..Config::default()
+        };
+        let main = main_checkout_shell("w1", 100, 100);
+        let mut linked = shell();
+        linked.pane_id = "w2:p1".into();
+        linked.workspace_id = "w2".into();
+        let result = plan(&[main, linked], &config, 200);
+        assert_eq!(result.spared.len(), 1, "{result:?}");
+        assert_eq!(result.spared[0].pane_id, "w1:p1");
+        assert_eq!(result.candidates.len(), 1, "{result:?}");
+        assert_eq!(result.candidates[0].pane_id, "w2:p1");
+        assert_eq!(result.candidates[0].main_checkout, None);
+        assert_eq!(result.candidates[0].main_checkout_home, None);
+    }
+
     #[test]
     fn auto_close_deadline_waits_for_the_next_age_but_never_beats_the_floor() {
         let mut config = Config {

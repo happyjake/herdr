@@ -8093,6 +8093,18 @@
             "kind": {
               "$ref": "#/schemas/success_response/$defs/Kind"
             },
+            "main_checkout": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "main_checkout_home": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
             },
@@ -13463,6 +13475,18 @@
           "properties": {
             "exemption": {
               "type": "string"
+            },
+            "main_checkout": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "main_checkout_home": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "pane_id": {
               "type": "string"
