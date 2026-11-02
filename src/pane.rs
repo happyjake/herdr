@@ -1549,9 +1549,20 @@ pub struct PaneRuntime {
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
+    submission_deadline: Arc<Mutex<Option<std::time::Instant>>>,
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
     detect_handle: Option<tokio::task::AbortHandle>,
+}
+
+/// Opt in only the submission queued synchronously within this scope. A failed
+/// validation must drop the scope before another caller can submit input.
+pub(crate) struct SubmissionDeadlineScope(Arc<Mutex<Option<std::time::Instant>>>);
+
+impl Drop for SubmissionDeadlineScope {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
 }
 
 #[cfg(test)]
@@ -1719,12 +1730,22 @@ impl PaneRuntimeIo {
                 );
                 #[cfg(unix)]
                 {
-                    let _ = deadline;
-                    actor.queue_input_submission(
+                    if deadline.is_none() {
+                        return actor.queue_input_submission(
+                            prefix,
+                            text,
+                            enter,
+                            delay,
+                            guard,
+                            input_activity.1,
+                        );
+                    }
+                    actor.queue_input_submission_with_deadline(
                         prefix,
                         text,
                         enter,
                         delay,
+                        deadline,
                         guard,
                         input_activity.1,
                     )
@@ -2544,6 +2565,7 @@ impl PaneRuntime {
             last_agent_state_change_seq: None,
             last_agent_completion_seq: None,
             sequence_baseline: None,
+            output_capture: self.terminal.output.snapshot(),
         }
     }
 
@@ -2781,6 +2803,7 @@ impl PaneRuntime {
             last_agent_state_change_seq: _,
             last_agent_completion_seq: _,
             sequence_baseline: _,
+            output_capture,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
@@ -2814,6 +2837,9 @@ impl PaneRuntime {
             pane_terminal.seed_history_ansi(ansi);
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
+        if let Some(capture) = output_capture {
+            terminal.output.restore(capture);
+        }
         let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let reported_cwd = Arc::new(Mutex::new(None));
@@ -2948,6 +2974,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
+            submission_deadline: Default::default(),
             compression,
             detect_handle: Some(detect_handle),
         };
@@ -3590,6 +3617,7 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
+            submission_deadline: Default::default(),
             compression,
             detect_handle,
         })
@@ -3990,6 +4018,25 @@ impl PaneRuntime {
         self.input_activity.restore(at);
     }
 
+    pub(crate) fn preserve_foreground_activity_for(&self, window: std::time::Duration) {
+        self.input_activity.preserve_for(window);
+    }
+
+    pub(crate) fn begin_output_capture(&self) -> crate::pty::output::OutputPosition {
+        self.terminal.output.begin()
+    }
+
+    pub(crate) fn read_output_after(
+        &self,
+        position: crate::pty::output::OutputPosition,
+    ) -> Option<crate::pty::output::OutputRead> {
+        self.terminal.output.read_after(position)
+    }
+
+    pub(crate) fn end_output_capture(&self) {
+        self.terminal.output.end();
+    }
+
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.try_send_bytes_with_activity(bytes, true)
     }
@@ -4035,6 +4082,18 @@ impl PaneRuntime {
         guard: Option<crate::pty::actor::PtySubmissionGuard>,
         record_activity: bool,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        let scoped = self
+            .submission_deadline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        #[cfg(unix)]
+        let deadline = {
+            let _ = deadline;
+            scoped
+        };
+        #[cfg(windows)]
+        let deadline = scoped.or(deadline);
         self.io.queue_user_input_submission(
             prefix,
             text,
@@ -4044,6 +4103,17 @@ impl PaneRuntime {
             guard,
             (self.input_activity.clone(), record_activity),
         )
+    }
+
+    pub(crate) fn scope_submission_deadline(
+        &self,
+        deadline: std::time::Instant,
+    ) -> SubmissionDeadlineScope {
+        *self
+            .submission_deadline
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(deadline);
+        SubmissionDeadlineScope(self.submission_deadline.clone())
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -4536,6 +4606,7 @@ impl PaneRuntime {
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
+                submission_deadline: Default::default(),
                 compression,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
             },
@@ -4548,6 +4619,57 @@ impl PaneRuntime {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn debrief_submission_scope_leaves_other_callers_deadline_behavior_unchanged() {
+        use std::io::Read;
+        use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let actor = PtyIoActor::spawn(PtyIoActorConfig {
+            input_activity: Default::default(),
+            pane_id: 1,
+            master_fd: unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) },
+            initially_quiesced: false,
+            on_read: Box::new(|_| PtyReadResult {
+                terminal_responses: Vec::new(),
+            }),
+            on_reader_exit: None,
+        })
+        .unwrap();
+        let runtime = PaneRuntime::test_with_actor(actor);
+        let expired = Instant::now() - Duration::from_secs(1);
+        drop(runtime.scope_submission_deadline(expired));
+        for (scoped, text) in [(false, "before"), (true, "cancelled"), (false, "after")] {
+            let scope = scoped.then(|| runtime.scope_submission_deadline(expired));
+            let receipt = runtime
+                .queue_input_submission(
+                    Bytes::new(),
+                    Bytes::copy_from_slice(text.as_bytes()),
+                    Bytes::from_static(b"\r"),
+                    Duration::ZERO,
+                    Some(expired),
+                    None,
+                    false,
+                )
+                .unwrap();
+            drop(scope);
+            let result = receipt.recv_timeout(Duration::from_secs(2)).unwrap();
+            if scoped {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+            } else {
+                result.unwrap();
+            }
+        }
+        let mut received = [0; 13];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"before\rafter\r");
+        runtime.shutdown();
+    }
 
     #[test]
     fn pane_cwd_sampling_does_not_walk_on_every_tick() {
@@ -6094,6 +6216,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            submission_deadline: Default::default(),
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };
@@ -6137,6 +6260,7 @@ mod tests {
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
+            submission_deadline: Default::default(),
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
         };

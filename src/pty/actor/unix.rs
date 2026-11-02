@@ -79,6 +79,7 @@ enum PtyIoDataCommand {
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+        deadline: Option<Instant>,
         guard: Option<super::PtySubmissionGuard>,
         record_activity: bool,
         reply: std_mpsc::Sender<std::io::Result<()>>,
@@ -184,6 +185,27 @@ impl PtyIoActorHandle {
         guard: Option<super::PtySubmissionGuard>,
         record_activity: bool,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_input_submission_with_deadline(
+            prefix,
+            text,
+            enter,
+            delay,
+            None,
+            guard,
+            record_activity,
+        )
+    }
+
+    pub(crate) fn queue_input_submission_with_deadline(
+        &self,
+        prefix: Bytes,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        deadline: Option<Instant>,
+        guard: Option<super::PtySubmissionGuard>,
+        record_activity: bool,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
             .lock()
@@ -201,6 +223,7 @@ impl PtyIoActorHandle {
                 text,
                 enter,
                 delay,
+                deadline,
                 guard,
                 record_activity,
                 reply: reply_tx,
@@ -482,6 +505,8 @@ struct PtyIoActorRunner {
 }
 
 struct ActiveSubmission {
+    deadline: Option<Instant>,
+    committed: bool,
     record_activity: bool,
     enter: Bytes,
     delay: Duration,
@@ -618,6 +643,8 @@ impl PtyIoActorRunner {
             let had_active_submission = self.active_submission.is_some();
 
             self.apply_pending_controls();
+
+            self.expire_uncommitted_submission();
 
             if self.start_pending_submission_delivery() == PendingSubmissionStart::Rejected {
                 continue;
@@ -773,12 +800,15 @@ impl PtyIoActorRunner {
                 text,
                 enter,
                 delay,
+                deadline,
                 guard,
                 record_activity,
                 reply,
             } => {
                 if self.state == ActorState::Running {
                     self.active_submission = Some(ActiveSubmission {
+                        deadline,
+                        committed: false,
                         record_activity,
                         enter,
                         delay,
@@ -1034,11 +1064,19 @@ impl PtyIoActorRunner {
     }
 
     fn poll_timeout_ms(&self) -> i32 {
-        let Some(ActiveSubmission {
-            phase: SubmissionPhase::WaitingUntil(deadline),
-            ..
-        }) = self.active_submission.as_ref()
-        else {
+        let Some(submission) = self.active_submission.as_ref() else {
+            return ACTOR_IDLE_POLL_MS;
+        };
+        let enter = if let SubmissionPhase::WaitingUntil(at) = submission.phase {
+            Some(at)
+        } else {
+            None
+        };
+        let deadline = enter
+            .into_iter()
+            .chain(submission.deadline.filter(|_| !submission.committed))
+            .min();
+        let Some(deadline) = deadline else {
             return ACTOR_IDLE_POLL_MS;
         };
         deadline
@@ -1055,6 +1093,9 @@ impl PtyIoActorRunner {
     }
 
     fn check_uncommitted_submission_guard(&mut self) -> bool {
+        if self.expire_uncommitted_submission() {
+            return false;
+        }
         let Some(ActiveSubmission {
             phase:
                 SubmissionPhase::WritingText {
@@ -1082,13 +1123,45 @@ impl PtyIoActorRunner {
     }
 
     fn commit_active_submission_write(&mut self) {
-        if let Some(ActiveSubmission {
-            phase: SubmissionPhase::WritingText { uncommitted_guard },
-            ..
-        }) = self.active_submission.as_mut()
-        {
-            *uncommitted_guard = None;
+        if let Some(submission) = self.active_submission.as_mut() {
+            match &mut submission.phase {
+                SubmissionPhase::WritingText { uncommitted_guard } => {
+                    submission.committed = true;
+                    *uncommitted_guard = None;
+                }
+                SubmissionPhase::WritingEnter => submission.committed = true,
+                _ => {}
+            }
         }
+    }
+
+    /// Cancellation is acknowledged only while no byte of this submission was
+    /// written. A committed submission retains its receipt until Enter is sent.
+    fn expire_uncommitted_submission(&mut self) -> bool {
+        let Some(submission) = self.active_submission.as_ref() else {
+            return false;
+        };
+        if submission.committed || submission.deadline.is_none_or(|at| Instant::now() < at) {
+            return false;
+        }
+        let boundary = match submission.phase {
+            SubmissionPhase::WritingText { .. } => Some(SubmissionBoundary::Text),
+            SubmissionPhase::WritingEnter => Some(SubmissionBoundary::Enter),
+            _ => None,
+        };
+        if let Some(boundary) = boundary {
+            while let Some(write) = self.pending_writes.pop_front() {
+                if write.boundary == Some(boundary) {
+                    break;
+                }
+            }
+            self.current_write_offset = 0;
+        }
+        self.fail_active_submission(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "prompt cancelled before delivery",
+        ));
+        true
     }
 
     fn close_input_queue(&mut self) {
@@ -1739,6 +1812,101 @@ mod tests {
         peer.read_exact(&mut after_drain)
             .expect("peer receives only sentinel submission");
         assert_eq!(&after_drain, b"sentinel\r");
+        handle.shutdown();
+    }
+
+    #[test]
+    fn debrief_deadline_cancels_a_backpressured_write_before_any_prompt_bytes() {
+        let (mut socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut prefilled = 0;
+        loop {
+            match socket.write(&[b'x'; 8192]) {
+                Ok(count) => prefilled += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert!(prefilled > 0);
+        let handle = PtyIoActor::spawn(PtyIoActorConfig {
+            input_activity: Default::default(),
+            pane_id: 1,
+            master_fd: unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) },
+            initially_quiesced: false,
+            on_read: Box::new(|_| PtyReadResult::empty()),
+            on_reader_exit: None,
+        })
+        .unwrap();
+        let cancelled = handle
+            .queue_input_submission_with_deadline(
+                Bytes::new(),
+                Bytes::from_static(b"cancelled"),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                Some(Instant::now() + Duration::from_millis(80)),
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            cancelled
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        let next = handle
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::from_static(b"next"),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
+            .unwrap();
+        let mut bytes = vec![0; prefilled + 5];
+        peer.read_exact(&mut bytes).unwrap();
+        next.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert!(bytes[..prefilled].iter().all(|byte| *byte == b'x'));
+        assert_eq!(&bytes[prefilled..], b"next\r");
+        handle.shutdown();
+    }
+
+    #[test]
+    fn debrief_committed_write_keeps_its_delivery_receipt_past_the_deadline() {
+        let (handle, mut peer, _) = actor_with_socket_pair(false);
+        let text = Bytes::from(vec![b'x'; 2 * 1024 * 1024]);
+        let receipt = handle
+            .queue_input_submission_with_deadline(
+                Bytes::new(),
+                text.clone(),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                Some(Instant::now() + Duration::from_millis(100)),
+                None,
+                false,
+            )
+            .unwrap();
+        let mut first = [0];
+        peer.read_exact(&mut first).unwrap();
+        assert_eq!(first, [b'x']);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(matches!(
+            receipt.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+        let mut remaining = vec![0; text.len()];
+        peer.read_exact(&mut remaining).unwrap();
+        assert!(remaining[..remaining.len() - 1]
+            .iter()
+            .all(|byte| *byte == b'x'));
+        assert_eq!(remaining.last(), Some(&b'\r'));
+        receipt
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
         handle.shutdown();
     }
 

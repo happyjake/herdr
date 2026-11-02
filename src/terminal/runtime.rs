@@ -29,6 +29,25 @@ impl TerminalRuntime {
         self.0.restore_input_or_command_at(at);
     }
 
+    pub(crate) fn preserve_foreground_activity_for(&self, window: std::time::Duration) {
+        self.0.preserve_foreground_activity_for(window);
+    }
+
+    pub(crate) fn begin_output_capture(&self) -> crate::pty::output::OutputPosition {
+        self.0.begin_output_capture()
+    }
+
+    pub(crate) fn read_output_after(
+        &self,
+        position: crate::pty::output::OutputPosition,
+    ) -> Option<crate::pty::output::OutputRead> {
+        self.0.read_output_after(position)
+    }
+
+    pub(crate) fn end_output_capture(&self) {
+        self.0.end_output_capture();
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }
@@ -519,6 +538,13 @@ impl TerminalRuntime {
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.0
             .queue_input_submission(prefix, text, enter, delay, deadline, guard, record_activity)
+    }
+
+    pub(crate) fn scope_submission_deadline(
+        &self,
+        deadline: std::time::Instant,
+    ) -> crate::pane::SubmissionDeadlineScope {
+        self.0.scope_submission_deadline(deadline)
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {

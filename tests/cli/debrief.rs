@@ -134,6 +134,28 @@ stty -echo
         fs::write(self.base.join("mode"), mode).unwrap();
     }
 
+    fn block_input(&self) {
+        self.request(
+            "agent.prompt",
+            json!({"target":self.pane,"text":"fixture:block","preserve_activity":true}),
+        );
+        crate::support::wait_for_file(&self.base.join("input-blocked"), Duration::from_secs(5));
+        for _ in 0..64 {
+            self.request(
+                "pane.send_text",
+                json!({"pane_id":self.pane,"text":"x".repeat(8192),"preserve_activity":true}),
+            );
+        }
+    }
+
+    fn unblock_input(&self) {
+        fs::write(self.base.join("unblock-input"), "go").unwrap();
+        self.request(
+            "pane.send_text",
+            json!({"pane_id":self.pane,"text":"\n","preserve_activity":true}),
+        );
+    }
+
     fn sent(&self) -> usize {
         self.logbook()
             .iter()
@@ -258,10 +280,28 @@ fn scripted_agent() {
         writeln!(file, "{response}").unwrap();
         assert!(response.get("error").is_none(), "{response}");
     };
+    println!("debrief v2: 3 memories saved");
+    std::io::stdout().flush().unwrap();
     report("idle");
     fs::write(base.join("ready"), "ready").unwrap();
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
+        let line = line.trim_start_matches('x');
+        if line.is_empty() {
+            continue;
+        }
+        if line == "fixture:block" {
+            assert!(Command::new("stty")
+                .args(["-icanon", "min", "1", "time", "0"])
+                .status()
+                .unwrap()
+                .success());
+            fs::write(base.join("input-blocked"), "ready").unwrap();
+            while !base.join("unblock-input").exists() {
+                thread::sleep(Duration::from_millis(20));
+            }
+            continue;
+        }
         let mut received = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -270,6 +310,13 @@ fn scripted_agent() {
         writeln!(received, "{line}").unwrap();
         let mode = fs::read_to_string(base.join("mode")).unwrap_or_default();
         if line == "/quit" {
+            if mode == "quit-working" {
+                report("working");
+                continue;
+            }
+            if mode == "slow-quit" {
+                thread::sleep(Duration::from_secs(11));
+            }
             if mode == "quit-ignore" {
                 continue;
             }
@@ -294,7 +341,14 @@ fn scripted_agent() {
             }
         }
         thread::sleep(Duration::from_secs(1));
-        println!("debrief v1: 99 memories saved\ndebrief v2: 3 memories saved\nNOT LANDED: topic — debrief");
+        if mode == "truncate" {
+            for _ in 0..5000 {
+                println!("reply output advances the terminal history");
+            }
+            println!("debrief v2: 3 memories saved\nNOT LANDED: topic — debrief");
+        } else {
+            println!("debrief v1: 99 memories saved\ndebrief v2: 3 memories saved\nNOT LANDED: topic — debrief");
+        }
         std::io::stdout().flush().unwrap();
         report("idle");
     }
@@ -609,8 +663,20 @@ fn debrief_waits_for_gates_and_skill_then_closes_when_both_are_available() {
             "gate_command = 'exit 0'",
             &format!("gate_command = '{command}'"),
         ));
-        let plan = session.request("auto_close.plan", json!({}));
-        assert_eq!(plan["plan"]["candidates"][0]["wait_reason"], reason);
+        let mut plan = Value::Null;
+        assert!(
+            wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                plan = session.request("auto_close.plan", json!({}));
+                plan["plan"]["candidates"]
+                    .as_array()
+                    .is_some_and(|candidates| !candidates.is_empty())
+            }),
+            "candidate did not become eligible: {plan}"
+        );
+        assert_eq!(
+            plan["plan"]["candidates"][0]["wait_reason"], reason,
+            "{plan}"
+        );
         thread::sleep(Duration::from_secs(2));
         assert_eq!(session.sent(), 0);
         assert!(!session.base.join("received").exists());
@@ -697,20 +763,249 @@ fn debrief_closes_after_quit_grace_when_the_agent_does_not_exit() {
 fn debrief_handoff_before_uptake_keeps_waiting_without_a_second_prompt() {
     let mut session = Session::new("pi");
     session.mode("no-uptake");
-    session.enable("pi", "");
+    session.configure(
+        &session
+            .config("pi", "")
+            .replace("limit_secs = 30", "limit_secs = 6"),
+    );
     assert!(wait_until(
         Duration::from_secs(10),
         Duration::from_millis(25),
         || session.base.join("received").exists()
     ));
     session.handoff();
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(9));
     assert_eq!(session.sent(), 1);
+    assert!(session
+        .logbook()
+        .iter()
+        .any(|line| line["state"]["phase"]["reason"] == "recovered-limit"));
     assert_eq!(session.pane().get("completion_seq"), Some(&Value::Null));
     assert!(!session
         .logbook()
         .iter()
         .any(|line| line["type"] == "pane_closed"));
+}
+
+#[test]
+fn debrief_quit_grace_never_closes_a_working_agent_or_repeats_the_skill() {
+    let session = Session::new("pi");
+    session.mode("quit-working");
+    session.enable("pi", "");
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || fs::read_to_string(session.base.join("received"))
+            .unwrap_or_default()
+            .contains("/quit")
+    ));
+    thread::sleep(Duration::from_secs(7));
+    assert_eq!(session.pane()["agent_status"], "working");
+    assert_eq!(session.sent(), 1);
+    assert!(!session
+        .logbook()
+        .iter()
+        .any(|line| line["type"] == "pane_closed"));
+    assert!(!session
+        .logbook()
+        .iter()
+        .any(|line| line["outcome"]["outcome"] == "abandoned"));
+}
+
+#[test]
+fn debrief_replay_rearms_the_kind_deadline_before_the_ordinary_pass() {
+    let mut session = Session::new("pi");
+    session.mode("hold");
+    let config = session
+        .config("pi", "")
+        .replace("limit_secs = 30", "limit_secs = 6");
+    session.configure(&config);
+    session.wait_status("working");
+    session.configure(&config.replace("pass_floor_secs = 1", "pass_floor_secs = 30"));
+    session.handoff();
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(50),
+        || session
+            .logbook()
+            .iter()
+            .any(|line| line["state"]["phase"]["reason"] == "limit")
+    ));
+    assert_eq!(session.sent(), 1);
+}
+
+#[test]
+fn debrief_records_a_fresh_identical_sentinel_after_history_truncation() {
+    let session = Session::new("pi");
+    session.mode("truncate");
+    session.enable("pi", "");
+    assert!(wait_until(
+        Duration::from_secs(15),
+        Duration::from_millis(50),
+        || session
+            .logbook()
+            .iter()
+            .any(|line| line["type"] == "pane_closed")
+    ));
+    let lines = session.logbook();
+    let close = lines
+        .iter()
+        .find(|line| line["type"] == "pane_closed")
+        .unwrap();
+    assert_eq!(
+        close["debrief"],
+        json!({"outcome":"finished","skill_version":"v2","memories":3})
+    );
+}
+
+#[test]
+fn debrief_slow_quit_preserves_activity_through_the_whole_grace() {
+    let session = Session::new("pi");
+    session.mode("slow-quit");
+    session.configure(
+        &session
+            .config("pi", "")
+            .replace("quit_grace_secs = 2", "quit_grace_secs = 20"),
+    );
+    assert!(wait_until(
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+        || session
+            .logbook()
+            .iter()
+            .any(|line| line["type"] == "pane_closed")
+    ));
+    assert_eq!(session.sent(), 1);
+}
+
+#[test]
+fn debrief_cancelled_backpressured_prompts_cannot_run_after_the_next_agent_starts() {
+    let session = Session::new("pi");
+    let second = session.another_agent();
+    fs::write(session.base.join("second/mode"), "hold").unwrap();
+    session.block_input();
+    session.enable("pi", "");
+    assert!(wait_until(
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+        || session.base.join("second/received").exists()
+    ));
+    assert_eq!(
+        session.request("pane.get", json!({"pane_id":second}))["pane"]["agent_status"],
+        "working"
+    );
+    assert_eq!(
+        session
+            .logbook()
+            .iter()
+            .filter(|line| line["type"] == "debrief_sent" && line["pane"] == session.pane)
+            .count(),
+        3
+    );
+    session.unblock_input();
+    // A marker after the blocked writes proves that the actor drained them.
+    session.request(
+        "agent.prompt",
+        json!({"target":session.pane,"text":"fixture:drained","preserve_activity":true}),
+    );
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || fs::read_to_string(session.base.join("received"))
+            .unwrap_or_default()
+            .contains("fixture:drained")
+    ));
+    assert!(!fs::read_to_string(session.base.join("received"))
+        .unwrap()
+        .contains("/skill:debrief"));
+}
+
+#[test]
+fn debrief_failed_quit_retries_only_quit_and_preserves_the_finished_result() {
+    let session = Session::new("claude");
+    session.configure(
+        &session
+            .config("claude", "")
+            .replace("settle_hold_secs = 2", "settle_hold_secs = 4"),
+    );
+    session.wait_status("working");
+    session.wait_status("done");
+    session.block_input();
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || session
+            .logbook()
+            .iter()
+            .any(|line| line["outcome"]["outcome"] == "finished")
+    ));
+    session.request("pane.report_agent", json!({"pane_id":session.pane,"source":"custom:debrief-test","agent":"claude","state":"working","seq":1000}));
+    session.unblock_input();
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || session
+            .logbook()
+            .iter()
+            .any(|line| line["state"]["phase"]["phase"] == "quit-retry")
+    ));
+    session.request("pane.report_agent", json!({"pane_id":session.pane,"source":"custom:debrief-test","agent":"claude","state":"idle","seq":1001}));
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || session
+            .logbook()
+            .iter()
+            .any(|line| line["type"] == "pane_closed")
+    ));
+    assert_eq!(session.sent(), 1);
+    let lines = session.logbook();
+    assert!(!lines
+        .iter()
+        .any(|line| line["outcome"]["outcome"] == "abandoned"));
+    let close = lines
+        .iter()
+        .find(|line| line["type"] == "pane_closed")
+        .unwrap();
+    assert_eq!(
+        close["debrief"],
+        json!({"outcome":"finished","skill_version":"v2","memories":3})
+    );
+}
+
+#[test]
+fn debrief_reply_boundary_survives_handoff_after_the_answer() {
+    let mut session = Session::new("pi");
+    session.mode("truncate");
+    session.configure(
+        &session
+            .config("pi", "")
+            .replace("settle_hold_secs = 2", "settle_hold_secs = 6"),
+    );
+    session.wait_status("working");
+    session.wait_status("done");
+    session.handoff();
+    assert!(
+        wait_until(Duration::from_secs(25), Duration::from_millis(50), || {
+            session
+                .logbook()
+                .iter()
+                .any(|line| line["type"] == "pane_closed")
+        }),
+        "pane: {}, logbook: {:?}",
+        session.pane(),
+        session.logbook()
+    );
+    let lines = session.logbook();
+    let close = lines
+        .iter()
+        .find(|line| line["type"] == "pane_closed")
+        .unwrap();
+    assert_eq!(
+        close["debrief"],
+        json!({"outcome":"finished","skill_version":"v2","memories":3})
+    );
+    assert_eq!(session.sent(), 1);
 }
 
 #[test]

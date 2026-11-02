@@ -400,11 +400,15 @@ pub(crate) struct GhosttyPaneCore {
 
 pub(crate) struct PaneTerminal {
     pub(crate) ghostty: GhosttyPaneTerminal,
+    pub(crate) output: crate::pty::output::OutputJournal,
 }
 
 impl PaneTerminal {
     pub(crate) fn new(ghostty: GhosttyPaneTerminal) -> Self {
-        Self { ghostty }
+        Self {
+            ghostty,
+            output: Default::default(),
+        }
     }
 
     pub fn process_pty_bytes(
@@ -414,6 +418,7 @@ impl PaneTerminal {
         bytes: &[u8],
         response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
+        self.output.record(bytes);
         self.ghostty
             .process_pty_bytes(pane_id, shell_pid, bytes, response_writer)
     }

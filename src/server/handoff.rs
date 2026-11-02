@@ -1251,6 +1251,7 @@ mod tests {
             last_agent_state_change_seq: None,
             last_agent_completion_seq: None,
             sequence_baseline: None,
+            output_capture: None,
         }
     }
 

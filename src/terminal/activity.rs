@@ -52,6 +52,10 @@ impl InputActivity {
         self.preserve_at(Instant::now());
     }
 
+    pub(crate) fn preserve_for(&self, window: Duration) {
+        self.preserve_for_at(Instant::now(), window);
+    }
+
     pub(crate) fn input_delivered(&self, record_activity: bool) {
         if record_activity {
             self.record();
@@ -61,11 +65,18 @@ impl InputActivity {
     }
 
     fn preserve_at(&self, now: Instant) {
+        self.preserve_for_at(now, PRESERVED_INPUT_FOREGROUND_GRACE);
+    }
+
+    fn preserve_for_at(&self, now: Instant, window: Duration) {
+        let Some(until) = now.checked_add(window) else {
+            return;
+        };
         let mut suppression = self
             .suppress_foreground_until
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        *suppression = Some(now + PRESERVED_INPUT_FOREGROUND_GRACE);
+        *suppression = Some(suppression.map_or(until, |current| current.max(until)));
     }
 
     #[cfg(test)]
@@ -98,6 +109,25 @@ impl InputActivity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_activity_caller_window_survives_default_writes_and_ends_on_real_input() {
+        let activity = InputActivity::default();
+        let now = Instant::now();
+        activity.restore(100);
+        activity.observe_foreground_at(Some(42), now);
+        activity.preserve_for_at(now, Duration::from_secs(60));
+        activity.preserve_at(now + Duration::from_secs(1));
+        activity.observe_foreground_at(Some(43), now + Duration::from_secs(11));
+        assert_eq!(activity.get(), 100);
+        activity.observe_foreground_at(Some(44), now + Duration::from_secs(60));
+        assert!(activity.get() > 100);
+        activity.preserve_for_at(now, Duration::from_secs(60));
+        activity.record();
+        activity.restore(100);
+        activity.observe_foreground_at(Some(45), now + Duration::from_secs(12));
+        assert!(activity.get() > 100);
+    }
 
     #[test]
     fn preserved_input_suppresses_foreground_changes_until_the_deadline() {

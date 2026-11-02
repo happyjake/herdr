@@ -12,6 +12,7 @@ pub(super) struct PendingDelivery {
 pub(super) struct PendingSubmission {
     pane: String,
     quitting: bool,
+    at: u64,
     response: std::sync::mpsc::Receiver<String>,
 }
 
@@ -23,8 +24,16 @@ pub(crate) struct Debrief {
     pub input_at: u64,
     pub attempt: u8,
     pub phase: Phase,
-    /// Prior sentinels distinguish this reply without retaining conversation text.
-    pub before: Vec<(String, u64)>,
+    #[serde(default)]
+    pub reply_start: Option<crate::pty::output::OutputPosition>,
+    #[serde(default)]
+    pub finished: Option<CloseDebrief>,
+    #[serde(default)]
+    pub quit_failures: u8,
+    #[serde(default)]
+    pub delivery_abort: Option<String>,
+    #[serde(default)]
+    pub recovered_delivery: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +44,7 @@ pub(crate) enum Phase {
     Running { at: u64 },
     Settling { at: u64, since: u64 },
     Quitting { at: u64, result: CloseDebrief },
+    QuitRetry { at: u64 },
     Retry { reason: String },
     Waiting { reason: String },
     Aborted { reason: String },
@@ -54,6 +64,7 @@ impl Debrief {
             Phase::Quitting { at, .. } => {
                 at.saturating_add(config.quit_grace_secs.saturating_mul(1000))
             }
+            Phase::QuitRetry { at } => at,
             _ => return None,
         })
     }
@@ -66,11 +77,12 @@ impl Debrief {
                 | Phase::Running { .. }
                 | Phase::Settling { .. }
                 | Phase::Quitting { .. }
-        )
+                | Phase::QuitRetry { .. }
+        ) || matches!(&self.phase, Phase::Waiting { reason } if reason == "delivery-pending")
     }
 
     pub(super) fn retry(&self, reason: &str) -> Phase {
-        if self.attempt >= 3 {
+        if self.recovered_delivery || self.attempt >= 3 {
             Phase::Waiting {
                 reason: reason.into(),
             }
@@ -87,6 +99,7 @@ enum Step {
     Wait,
     Change(Phase),
     Quit,
+    QuitFailed(&'static str),
     Close,
 }
 
@@ -95,8 +108,11 @@ fn elapsed(now: u64, at: u64, seconds: u64) -> bool {
 }
 
 pub(super) fn protected(pane: &PaneSnapshot, state: &Debrief) -> bool {
-    let quit_exit =
-        matches!(state.phase, Phase::Quitting { .. }) && pane.ended && pane.agent.is_none();
+    let quit_exit = matches!(
+        state.phase,
+        Phase::Quitting { .. } | Phase::QuitRetry { .. }
+    ) && pane.ended
+        && pane.agent.is_none();
     pane.pinned
         || pane.flagged
         || pane.desk_focused
@@ -129,7 +145,9 @@ fn step(state: &Debrief, status: AgentStatus, ended: bool, config: &Config, now:
         }
         Phase::Recovering { at } => {
             if elapsed(now, *at, limit) {
-                Step::Change(state.retry("limit"))
+                Step::Change(Phase::Waiting {
+                    reason: "recovered-limit".into(),
+                })
             } else if status == AgentStatus::Working {
                 Step::Change(Phase::Running { at: *at })
             } else {
@@ -160,7 +178,19 @@ fn step(state: &Debrief, status: AgentStatus, ended: bool, config: &Config, now:
             }
         }
         Phase::Quitting { at, .. } if ended || elapsed(now, *at, config.quit_grace_secs) => {
-            Step::Close
+            if status == AgentStatus::Working {
+                Step::QuitFailed("working-limit")
+            } else {
+                Step::Close
+            }
+        }
+        Phase::QuitRetry { .. } if ended => Step::Close,
+        Phase::QuitRetry { at } if now >= *at => {
+            if settled {
+                Step::Quit
+            } else {
+                Step::QuitFailed("working-limit")
+            }
         }
         _ => Step::Wait,
     }
@@ -190,18 +220,33 @@ fn sentinels(reply: &str) -> Vec<(String, u64)> {
         .collect()
 }
 
-fn finished(reply: &str, before: &[(String, u64)]) -> CloseDebrief {
+fn finished(reply: &str) -> CloseDebrief {
     let current = sentinels(reply);
-    let overlap = (0..=before.len().min(current.len()))
-        .rev()
-        .find(|length| before[before.len() - length..] == current[..*length])
-        .unwrap_or(0);
-    let sentinel = current[overlap..].last();
+    let sentinel = current.last();
     CloseDebrief {
         outcome: DebriefOutcome::Finished,
         memories: sentinel.as_ref().map(|(_, count)| *count),
         skill_version: sentinel.map(|(version, _)| version.clone()),
     }
+}
+
+fn reply_text(bytes: &[u8], rows: u16, cols: u16) -> String {
+    let cols = cols.max(1);
+    let Ok(mut terminal) = crate::ghostty::Terminal::new(cols, rows.max(1), 256 * 1024) else {
+        return String::new();
+    };
+    terminal.write(bytes);
+    let Some(last) = terminal
+        .total_rows()
+        .ok()
+        .and_then(|rows| rows.checked_sub(1))
+        .and_then(|last| u32::try_from(last).ok())
+    else {
+        return String::new();
+    };
+    terminal
+        .read_text_screen((0, 0), (cols - 1, last), false)
+        .unwrap_or_default()
 }
 
 impl App {
@@ -215,6 +260,35 @@ impl App {
         else {
             return;
         };
+        let unresolved = self
+            .parse_current_public_pane_id(pane)
+            .and_then(|(ws, id)| self.state.workspaces.get(ws)?.pane_state(id))
+            .and_then(|pane| pane.agent_status_resolution_due_at())
+            .is_some_and(|until| crate::pane::unix_now_secs() < until);
+        if unresolved && !matches!(status, AgentStatus::Working | AgentStatus::Blocked) {
+            return;
+        }
+        if let Some(submission) = self
+            .auto_close
+            .submission
+            .as_ref()
+            .filter(|submission| submission.pane == pane)
+        {
+            if status == AgentStatus::Blocked {
+                self.record_debrief_phase(
+                    pane,
+                    Phase::Aborted {
+                        reason: "blocked".into(),
+                    },
+                );
+            } else if !submission.quitting
+                && status == AgentStatus::Working
+                && state.delivery_abort.is_none()
+            {
+                self.record_debrief_phase(pane, Phase::Running { at: submission.at });
+            }
+            return;
+        }
         if let Step::Change(phase) = step(
             &state,
             status,
@@ -224,20 +298,40 @@ impl App {
         ) {
             self.record_debrief_phase(pane, phase);
         }
-        if matches!(state.phase, Phase::Quitting { .. }) && status == AgentStatus::Unknown {
+        if matches!(
+            state.phase,
+            Phase::Quitting { .. } | Phase::QuitRetry { .. }
+        ) && status == AgentStatus::Unknown
+        {
             self.auto_close.deadline = Some(Instant::now());
         }
     }
 
-    fn record_debrief_phase(&mut self, pane: &str, phase: Phase) {
+    fn record_debrief_phase(&mut self, pane: &str, mut phase: Phase) {
+        let pending = self
+            .auto_close
+            .submission
+            .as_ref()
+            .is_some_and(|submission| submission.pane == pane);
         let Some(state) = self.auto_close.debriefs.get_mut(pane) else {
             return;
         };
+        if pending {
+            if let Phase::Aborted { reason } = &phase {
+                state.delivery_abort = Some(reason.clone());
+                phase = Phase::Waiting {
+                    reason: "delivery-pending".into(),
+                };
+            }
+        }
         if state.phase == phase {
             return;
         }
+        if matches!(state.phase, Phase::Recovering { .. }) {
+            state.recovered_delivery = true;
+        }
         state.phase = phase;
-        let event = if state.active() {
+        let event = if state.active() && !matches!(state.phase, Phase::Waiting { .. }) {
             Event::DebriefProgress {
                 pane: pane.into(),
                 state: state.clone(),
@@ -247,16 +341,20 @@ impl App {
             Event::DebriefOutcome {
                 pane: pane.into(),
                 state: state.clone(),
-                outcome: CloseDebrief {
+                outcome: state.finished.clone().unwrap_or(CloseDebrief {
                     outcome: DebriefOutcome::Abandoned,
                     memories: None,
                     skill_version: None,
-                },
+                }),
                 at: logbook::now_ms(),
             }
         };
-        let quiet = state.active();
+        let quiet = state.active() && state.delivery_abort.is_none();
+        let retaining_output = state.active() && state.finished.is_none();
         self.set_debrief_quiet(pane, quiet);
+        if !retaining_output {
+            self.end_debrief_reply(pane);
+        }
         self.state.enqueue_logbook_events([event]);
         self.flush_logbook();
         self.schedule_debrief_tick(Instant::now());
@@ -279,13 +377,56 @@ impl App {
     }
 
     fn debrief_text(&self, pane: &str) -> String {
+        let Some(position) = self
+            .auto_close
+            .debriefs
+            .get(pane)
+            .and_then(|state| state.reply_start)
+        else {
+            return String::new();
+        };
+        let Some((runtime, _)) = self
+            .parse_current_public_pane_id(pane)
+            .and_then(|(ws, id)| self.lookup_runtime(ws, id))
+        else {
+            return String::new();
+        };
+        let Some(reply) = runtime.read_output_after(position) else {
+            return String::new();
+        };
+        let bytes = if reply.truncated {
+            reply
+                .bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&[][..], |index| &reply.bytes[index + 1..])
+        } else {
+            &reply.bytes
+        };
+        let (rows, cols) = runtime.current_size();
+        reply_text(bytes, rows, cols)
+    }
+
+    fn begin_debrief_reply(&self, pane: &str) -> Option<crate::pty::output::OutputPosition> {
         self.parse_current_public_pane_id(pane)
             .and_then(|(ws, id)| self.lookup_runtime(ws, id))
-            .map(|(runtime, _)| runtime.recent_unwrapped_text_snapshot(4000).text)
-            .unwrap_or_default()
+            .map(|(runtime, _)| runtime.begin_output_capture())
+    }
+
+    fn end_debrief_reply(&self, pane: &str) {
+        if let Some((runtime, _)) = self
+            .parse_current_public_pane_id(pane)
+            .and_then(|(ws, id)| self.lookup_runtime(ws, id))
+        {
+            runtime.end_output_capture();
+        }
     }
 
     pub(super) fn start_debrief(&mut self, pane: &PaneSnapshot, candidate: &Candidate) {
+        // A receipt still reserves the slot even if its pane has disappeared.
+        if self.auto_close.submission.is_some() || self.auto_close.delivery.is_some() {
+            return;
+        }
         let Some(agent) = pane.agent.as_deref() else {
             return;
         };
@@ -306,7 +447,11 @@ impl App {
             phase: Phase::Sent {
                 at: logbook::now_ms(),
             },
-            before: sentinels(&self.debrief_text(&pane.pane_id)),
+            reply_start: self.begin_debrief_reply(&pane.pane_id),
+            finished: None,
+            quit_failures: 0,
+            delivery_abort: None,
+            recovered_delivery: false,
         };
         self.set_debrief_quiet(&pane.pane_id, true);
         self.auto_close
@@ -349,6 +494,9 @@ impl App {
             return;
         };
         let quitting = text == "/quit";
+        if quitting {
+            self.preserve_debrief_quit_activity(pane, self.auto_close.config.quit_grace_secs);
+        }
         let delivery_limit = if quitting {
             self.auto_close.config.quit_grace_secs
         } else {
@@ -373,6 +521,13 @@ impl App {
             }),
         };
         let (sender, response) = std::sync::mpsc::channel();
+        let _deadline_scope = Instant::now()
+            .checked_add(Duration::from_secs(delivery_limit))
+            .and_then(|deadline| {
+                self.parse_current_public_pane_id(pane)
+                    .and_then(|(ws, id)| self.lookup_runtime(ws, id))
+                    .map(|(runtime, _)| runtime.scope_submission_deadline(deadline))
+            });
         self.handle_deferred_agent_api_request(
             Request {
                 id: "auto-close-debrief".into(),
@@ -383,6 +538,7 @@ impl App {
         self.auto_close.submission = Some(PendingSubmission {
             pane: pane.into(),
             quitting,
+            at: logbook::now_ms(),
             response,
         });
     }
@@ -450,15 +606,33 @@ impl App {
                         .cloned()
                         .filter(Debrief::active)
                     {
-                        if !accepted {
+                        if let Some(reason) = state.delivery_abort {
+                            self.record_debrief_phase(&submission.pane, Phase::Aborted { reason });
+                        } else if !accepted && submission.quitting {
+                            self.debrief_quit_failed(&submission.pane, "delivery");
+                        } else if matches!(&state.phase, Phase::Waiting { reason } if reason == "delivery-pending")
+                        {
+                            self.record_debrief_phase(
+                                &submission.pane,
+                                Phase::Waiting {
+                                    reason: "delivery-timeout".into(),
+                                },
+                            );
+                        } else if !accepted {
                             self.record_debrief_phase(&submission.pane, state.retry("no-uptake"));
                         } else if submission.quitting {
                             if let Phase::Quitting { result, .. } = state.phase {
+                                self.preserve_debrief_quit_activity(
+                                    &submission.pane,
+                                    self.auto_close.config.quit_grace_secs,
+                                );
                                 self.record_debrief_phase(
                                     &submission.pane,
                                     Phase::Quitting { at: now, result },
                                 );
                             }
+                        } else if matches!(state.phase, Phase::Sent { .. }) {
+                            self.record_debrief_phase(&submission.pane, Phase::Sent { at: now });
                         }
                     }
                 }
@@ -468,32 +642,38 @@ impl App {
                         .debriefs
                         .get(&submission.pane)
                         .filter(|state| state.active())
-                        .filter(|state| match state.phase {
-                            Phase::Sent { at } => {
-                                elapsed(now, at, self.auto_close.config.uptake_window_secs)
-                            }
-                            Phase::Quitting { at, .. } => {
-                                elapsed(now, at, self.auto_close.config.quit_grace_secs)
-                            }
-                            _ => false,
+                        .filter(|state| {
+                            kind_config_for(&self.auto_close.config, &state.agent)
+                                .is_some_and(|kind| elapsed(now, submission.at, kind.limit_secs))
                         })
                         .cloned();
-                    if let Some(state) = expired {
-                        self.record_debrief_phase(&submission.pane, state.retry("no-uptake"));
-                    } else {
-                        self.auto_close.submission = Some(submission);
-                        return;
+                    let pane = submission.pane.clone();
+                    self.auto_close.submission = Some(submission);
+                    if expired.is_some() {
+                        self.record_debrief_phase(
+                            &pane,
+                            Phase::Waiting {
+                                reason: "delivery-pending".into(),
+                            },
+                        );
                     }
+                    return;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    if let Some(state) = self
+                    if self
                         .auto_close
                         .debriefs
                         .get(&submission.pane)
-                        .cloned()
-                        .filter(Debrief::active)
+                        .is_some_and(Debrief::active)
                     {
-                        self.record_debrief_phase(&submission.pane, state.retry("no-uptake"));
+                        // Losing the receipt is not evidence that the write stopped.
+                        // Keep the slot until the pane goes away or a restart cancels its writer.
+                        self.record_debrief_phase(
+                            &submission.pane,
+                            Phase::Waiting {
+                                reason: "delivery-pending".into(),
+                            },
+                        );
                     }
                 }
             }
@@ -508,21 +688,32 @@ impl App {
             else {
                 continue;
             };
-            if pane.restore_until.is_some_and(|until| now / 1000 < until) {
-                continue;
-            }
+            let restoring = pane.restore_until.is_some_and(|until| now / 1000 < until);
             match step(
                 &state,
-                pane.status,
+                if restoring
+                    && !matches!(state.phase, Phase::Settling { .. } | Phase::Quitting { .. })
+                {
+                    AgentStatus::Unknown
+                } else {
+                    pane.status
+                },
                 pane.ended && pane.bare_prompt,
                 &self.auto_close.config,
                 now,
             ) {
                 Step::Wait => {}
                 Step::Change(phase) => self.record_debrief_phase(&pane.pane_id, phase),
+                Step::QuitFailed(reason) => self.debrief_quit_failed(&pane.pane_id, reason),
                 Step::Quit => {
+                    if restoring {
+                        continue;
+                    }
                     let text = self.debrief_text(&pane.pane_id);
-                    let result = finished(&text, &state.before);
+                    let result = state.finished.unwrap_or_else(|| finished(&text));
+                    if let Some(current) = self.auto_close.debriefs.get_mut(&pane.pane_id) {
+                        current.finished = Some(result.clone());
+                    }
                     self.record_debrief_phase(
                         &pane.pane_id,
                         Phase::Quitting {
@@ -542,11 +733,52 @@ impl App {
                     );
                 }
                 Step::Close => {
-                    if let Phase::Quitting { result, .. } = state.phase {
+                    if restoring {
+                        continue;
+                    }
+                    if let Some(result) = state.finished.or_else(|| {
+                        if let Phase::Quitting { result, .. } = state.phase {
+                            Some(result)
+                        } else {
+                            None
+                        }
+                    }) {
                         self.close_dormant_pane(&pane.pane_id, state.age_secs, result);
                     }
                 }
             }
+        }
+    }
+
+    fn debrief_quit_failed(&mut self, pane: &str, reason: &str) {
+        let Some(state) = self.auto_close.debriefs.get_mut(pane) else {
+            return;
+        };
+        state.quit_failures = state.quit_failures.saturating_add(1);
+        let phase = if state.quit_failures >= 3 {
+            Phase::Waiting {
+                reason: format!("quit-{reason}"),
+            }
+        } else {
+            Phase::QuitRetry {
+                at: logbook::now_ms().saturating_add(
+                    self.auto_close
+                        .config
+                        .pass_floor_secs
+                        .max(1)
+                        .saturating_mul(1000),
+                ),
+            }
+        };
+        self.record_debrief_phase(pane, phase);
+    }
+
+    fn preserve_debrief_quit_activity(&self, pane: &str, seconds: u64) {
+        if let Some((runtime, _)) = self
+            .parse_current_public_pane_id(pane)
+            .and_then(|(ws, id)| self.lookup_runtime(ws, id))
+        {
+            runtime.preserve_foreground_activity_for(Duration::from_secs(seconds));
         }
     }
 
@@ -616,12 +848,54 @@ impl App {
             .debriefs
             .retain(|pane, _| live.contains(pane));
         for (pane, state) in self.auto_close.debriefs.clone() {
+            if let Phase::Quitting { result, .. } = &state.phase {
+                if let Some(restored) = self.auto_close.debriefs.get_mut(&pane) {
+                    restored.finished.get_or_insert_with(|| result.clone());
+                }
+            }
+            if state.active() && state.finished.is_none() {
+                let retained = state.reply_start.is_some_and(|position| {
+                    self.parse_current_public_pane_id(&pane)
+                        .and_then(|(ws, id)| self.lookup_runtime(ws, id))
+                        .and_then(|(runtime, _)| runtime.read_output_after(position))
+                        .is_some()
+                });
+                if !retained {
+                    let position = self.begin_debrief_reply(&pane);
+                    if let Some(restored) = self.auto_close.debriefs.get_mut(&pane) {
+                        restored.reply_start = position;
+                    }
+                }
+            }
+            if let Phase::Quitting { at, .. } = state.phase {
+                let remaining = at
+                    .saturating_add(self.auto_close.config.quit_grace_secs.saturating_mul(1000))
+                    .saturating_sub(logbook::now_ms())
+                    .div_ceil(1000);
+                self.preserve_debrief_quit_activity(&pane, remaining);
+            }
             if let Phase::Sent { at } = state.phase {
                 if let Some(restored) = self.auto_close.debriefs.get_mut(&pane) {
                     restored.phase = Phase::Recovering { at };
+                    restored.recovered_delivery = true;
                 }
             }
-            self.set_debrief_quiet(&pane, state.active());
+            if matches!(&state.phase, Phase::Waiting { reason } if reason == "delivery-pending") {
+                if let Some(restored) = self.auto_close.debriefs.get_mut(&pane) {
+                    restored.phase = Phase::Waiting {
+                        reason: "delivery-interrupted".into(),
+                    };
+                }
+            }
+            let active = self
+                .auto_close
+                .debriefs
+                .get(&pane)
+                .is_some_and(Debrief::active);
+            self.set_debrief_quiet(&pane, active && state.delivery_abort.is_none());
+            if !active {
+                self.end_debrief_reply(&pane);
+            }
         }
         self.auto_close
             .status
@@ -634,6 +908,7 @@ impl App {
             .values()
             .filter(|state| matches!(state.phase, Phase::Waiting { .. }))
             .count() as u64;
+        self.schedule_debrief_tick(Instant::now());
     }
 }
 
@@ -649,7 +924,11 @@ mod tests {
             input_at: 100,
             attempt: 1,
             phase,
-            before: Vec::new(),
+            reply_start: None,
+            finished: None,
+            quit_failures: 0,
+            delivery_abort: None,
+            recovered_delivery: false,
         }
     }
 
@@ -725,14 +1004,30 @@ mod tests {
         let config = Config::default();
         let quitting = state(Phase::Quitting {
             at: 1000,
-            result: finished("", &[]),
+            result: finished(""),
         });
         assert_eq!(
             step(&quitting, AgentStatus::Working, false, &config, 60_999),
             Step::Wait
         );
+        assert_ne!(
+            step(&quitting, AgentStatus::Working, false, &config, 61_000),
+            Step::Close
+        );
         assert_eq!(
             step(&quitting, AgentStatus::Working, false, &config, 61_000),
+            Step::QuitFailed("working-limit")
+        );
+        assert_eq!(
+            step(&quitting, AgentStatus::Idle, false, &config, 61_000),
+            Step::Close
+        );
+        let retry = Debrief {
+            finished: Some(finished("debrief v1: 1 memories saved")),
+            ..state(Phase::QuitRetry { at: 10_000 })
+        };
+        assert_eq!(
+            step(&retry, AgentStatus::Unknown, true, &config, 1000),
             Step::Close
         );
         assert_eq!(
@@ -749,7 +1044,7 @@ mod tests {
 
     #[test]
     fn debrief_sentinel_uses_the_last_complete_line() {
-        let result = finished("debrief v1: 8 memories saved\ndebrief v12: 0 memories saved\nNOT LANDED: topic — debrief\n", &[]);
+        let result = finished("debrief v1: 8 memories saved\ndebrief v12: 0 memories saved\nNOT LANDED: topic — debrief\n");
         assert_eq!(result.skill_version.as_deref(), Some("v12"));
         assert_eq!(result.memories, Some(0));
         for text in [
@@ -758,31 +1053,31 @@ mod tests {
             "quoted debrief v2: 1 memories saved",
             "debrief v2: 1 memories saved extra",
         ] {
-            assert_eq!(finished(text, &[]).memories, None);
+            assert_eq!(finished(text).memories, None);
         }
-        let previous = sentinels("debrief v1: 8 memories saved");
         assert_eq!(
-            finished(
-                "debrief v1: 8 memories saved\nNo sentinel in this reply.",
-                &previous
-            )
-            .memories,
-            None
-        );
-        assert_eq!(
-            finished(
-                "debrief v1: 8 memories saved\ndebrief v1: 8 memories saved",
-                &previous
-            )
-            .memories,
+            finished("debrief v1: 8 memories saved\ndebrief v1: 8 memories saved").memories,
             Some(8)
         );
+    }
+
+    #[test]
+    fn debrief_reply_capture_interprets_cursor_addressing_and_styles() {
+        let text = reply_text(b"old line\x1b[2;1H\x1b[32mdebrief v2: 3 memories saved\x1b[0m\x1b[3;1HNOT LANDED: topic", 8, 80);
+        assert_eq!(finished(&text).memories, Some(3));
+        assert_eq!(finished(&text).skill_version.as_deref(), Some("v2"));
     }
 
     #[test]
     fn debrief_recovery_waits_without_mistaking_idle_for_an_answer() {
         let config = Config::default();
         let recovering = state(Phase::Recovering { at: 1000 });
+        assert_eq!(
+            step(&recovering, AgentStatus::Idle, false, &config, 601_000),
+            Step::Change(Phase::Waiting {
+                reason: "recovered-limit".into()
+            })
+        );
         assert_eq!(
             step(&recovering, AgentStatus::Done, false, &config, 120_000),
             Step::Wait
@@ -795,5 +1090,28 @@ mod tests {
             step(&recovering, AgentStatus::Working, false, &config, 120_000),
             Step::Change(Phase::Running { at: 1000 })
         );
+    }
+
+    #[test]
+    fn debrief_recovered_delivery_never_retries_the_skill_after_late_uptake() {
+        let config = Config::default();
+        let running = Debrief {
+            recovered_delivery: true,
+            ..state(Phase::Running { at: 1000 })
+        };
+        assert_eq!(
+            step(&running, AgentStatus::Working, false, &config, 601_000),
+            Step::Change(Phase::Waiting {
+                reason: "limit".into()
+            })
+        );
+        assert!(state(Phase::Waiting {
+            reason: "delivery-pending".into()
+        })
+        .active());
+        assert!(!state(Phase::Waiting {
+            reason: "limit".into()
+        })
+        .active());
     }
 }

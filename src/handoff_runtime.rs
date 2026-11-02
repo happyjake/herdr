@@ -36,6 +36,9 @@ pub(crate) struct HandoffRuntimeState {
     pub last_agent_completion_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequence_baseline: Option<crate::terminal::state::HandoffSequenceBaseline>,
+    /// Present only while a caller is reading output from a captured position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_capture: Option<crate::pty::output::OutputCapture>,
 }
 
 #[cfg(unix)]
