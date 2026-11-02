@@ -114,6 +114,22 @@ pub enum Event {
         child: SessionKey,
         parent: SessionKey,
     },
+    DebriefSent {
+        pane: String,
+        state: crate::app::auto_close::debrief::Debrief,
+        at: u64,
+    },
+    DebriefProgress {
+        pane: String,
+        state: crate::app::auto_close::debrief::Debrief,
+        at: u64,
+    },
+    DebriefOutcome {
+        pane: String,
+        state: crate::app::auto_close::debrief::Debrief,
+        outcome: CloseDebrief,
+        at: u64,
+    },
 }
 
 pub fn path() -> PathBuf {
@@ -265,7 +281,10 @@ impl Writer {
                 self.labels
                     .retain(|(recorded_pane, _), _| recorded_pane != pane);
             }
-            Event::WouldClose { .. } => {}
+            Event::WouldClose { .. }
+            | Event::DebriefSent { .. }
+            | Event::DebriefProgress { .. }
+            | Event::DebriefOutcome { .. } => {}
             Event::Parent { child, parent } => {
                 self.parents.insert((child.clone(), parent.clone()));
             }

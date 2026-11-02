@@ -2275,7 +2275,16 @@ impl AppState {
             }
             return None;
         };
-        let suppress_completion = preserve_handoff_sequences
+        let debrief_quiet = if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            if change.state == AgentState::Blocked {
+                terminal.debrief_quiet = false;
+            }
+            terminal.debrief_quiet
+        } else {
+            false
+        };
+        let suppress_completion = debrief_quiet
+            || preserve_handoff_sequences
             || force_suppress_completion
             || (change.state == AgentState::Idle && suppress_acquisition_completion);
         if change.previous_state != change.state && !preserve_handoff_sequences {
@@ -5201,6 +5210,52 @@ mod tests {
         let deadline = state.next_pending_agent_notification_deadline().unwrap();
         state.drain_due_agent_notifications(deadline);
         assert_eq!(state.toast.as_ref().unwrap().kind, ToastKind::Finished);
+    }
+
+    #[test]
+    fn debrief_suppresses_done_notifications_but_preserves_blocked_needs() {
+        for quiet in [false, true] {
+            for final_state in [AgentState::Idle, AgentState::Blocked] {
+                let mut state = app_with_workspaces(&["active", "background"]);
+                state.active = Some(0);
+                state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+                state.toast_config.delay_seconds = 0;
+                let pane_id = state.workspaces[1].tabs[0].root_pane;
+                detect_pi_process(&mut state, pane_id);
+                let terminal_id = state.terminal_id_for_pane(1, pane_id).unwrap();
+                state.terminals.get_mut(&terminal_id).unwrap().debrief_quiet = quiet;
+                for (seq, agent_state) in [(1, AgentState::Working), (2, final_state)] {
+                    state.handle_app_event(AppEvent::HookStateReported {
+                        pane_id,
+                        source: "herdr:pi".into(),
+                        agent_label: "pi".into(),
+                        state: agent_state,
+                        message: None,
+                        seq: Some(seq),
+                        session_ref: pi_session_ref(),
+                        cancelled: false,
+                    });
+                }
+                let expected = if final_state == AgentState::Blocked {
+                    Some(ToastKind::NeedsAttention)
+                } else if quiet {
+                    None
+                } else {
+                    Some(ToastKind::Finished)
+                };
+                assert_eq!(state.toast.as_ref().map(|toast| toast.kind), expected);
+                assert_eq!(
+                    state.terminals[&terminal_id]
+                        .last_agent_completion_seq
+                        .is_some(),
+                    !quiet && final_state == AgentState::Idle
+                );
+                assert_eq!(
+                    !state.workspaces[1].panes[&pane_id].seen,
+                    !quiet && final_state == AgentState::Idle
+                );
+            }
+        }
     }
 
     #[test]

@@ -299,13 +299,10 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        #[cfg(windows)]
         let submit_deadline = params
             .wait
             .as_ref()
             .and_then(|wait| wait.submission_deadline);
-        #[cfg(not(windows))]
-        let submit_deadline = None;
         let prefix = if expected_agent == crate::detect::Agent::GithubCopilot {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {

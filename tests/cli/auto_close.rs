@@ -1378,7 +1378,7 @@ fn auto_close_close_mode_keeps_dormant_agents_waiting_and_logs_confirmation_requ
         .join("config.toml");
     fs::write(
         &config_path,
-        "onboarding = false\n[auto_close]\nmode = 'close'\ndormant_age_secs = 0\nplain_shell_age_secs = 0\npass_floor_secs = 1\ndebrief = false\n",
+        "onboarding = false\n[auto_close]\nmode = 'close'\ndormant_age_secs = 0\nplain_shell_age_secs = 0\npass_floor_secs = 1\ndebrief_skill_path = ''\n",
     )
     .unwrap();
     session.request("server.reload_config", json!({}));

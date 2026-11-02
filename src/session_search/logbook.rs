@@ -16,7 +16,10 @@ pub(super) fn read(path: &Path) -> std::io::Result<BTreeMap<SearchSessionKey, Se
     let mut panes = HashMap::new();
     let mut labels = HashMap::new();
     logbook::for_each_event(path, |event| match event {
-        Event::WouldClose { .. } => {}
+        Event::WouldClose { .. }
+        | Event::DebriefSent { .. }
+        | Event::DebriefProgress { .. }
+        | Event::DebriefOutcome { .. } => {}
         Event::SessionReported {
             pane, key, cwd, at, ..
         } => {

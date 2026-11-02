@@ -834,6 +834,8 @@ impl App {
         };
         let workspace_id = self.public_workspace_id(update.ws_idx);
 
+        self.observe_debrief_status(&pane_id, update.reported_status);
+
         // Exit detection can first release an idle agent, then classify its
         // shell as Unknown. Publish the date of that final status as well.
         let ended_status_changed = update.previous_reported_status != update.reported_status

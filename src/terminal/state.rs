@@ -216,6 +216,8 @@ pub struct TerminalState {
     pub state: AgentState,
     pub last_agent_state_change_seq: Option<u64>,
     pub last_agent_completion_seq: Option<u64>,
+    /// Rebuilt from the Logbook before restored state is published.
+    pub debrief_quiet: bool,
     pending_handoff_sequence_baseline: Option<HandoffSequenceBaseline>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
@@ -283,6 +285,7 @@ impl TerminalState {
             state: AgentState::Unknown,
             last_agent_state_change_seq: None,
             last_agent_completion_seq: None,
+            debrief_quiet: false,
             pending_handoff_sequence_baseline: None,
             revision: 0,
             launch_argv: None,

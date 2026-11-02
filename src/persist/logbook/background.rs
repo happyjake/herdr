@@ -9,6 +9,7 @@ pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 enum Job {
     Append(Vec<Event>),
+    AppendConfirmed(Vec<Event>, Sender<bool>),
     Barrier(Sender<()>),
     #[cfg(test)]
     Pause {
@@ -41,6 +42,13 @@ impl BackgroundWriter {
 
     pub(crate) fn append(&self, events: Vec<Event>) {
         self.send(Job::Append(events));
+    }
+
+    /// Input delivery may proceed only after its recovery record was written.
+    pub(crate) fn append_confirmed(&self, events: Vec<Event>) -> Receiver<bool> {
+        let (sender, receiver) = mpsc::channel();
+        self.send(Job::AppendConfirmed(events, sender));
+        receiver
     }
 
     fn send(&self, job: Job) -> bool {
@@ -94,6 +102,21 @@ fn run(path: PathBuf, seed: Vec<Event>, live_panes: HashSet<String>, jobs: Recei
     let mut writer = open(&path, &seed, &live_panes);
     for job in jobs {
         match job {
+            Job::AppendConfirmed(events, done) => {
+                if writer.is_none() {
+                    writer = open(&path, &seed, &live_panes);
+                }
+                let success = writer.as_mut().is_some_and(|writer| {
+                    events.iter().all(|event| {
+                        if let Err(error) = writer.append(event) {
+                            tracing::warn!(%error, "failed to persist debrief input intent");
+                            return false;
+                        }
+                        true
+                    })
+                });
+                let _ = done.send(success);
+            }
             Job::Append(events) => {
                 if writer.is_none() {
                     writer = open(&path, &seed, &live_panes);

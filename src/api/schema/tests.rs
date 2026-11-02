@@ -1058,6 +1058,7 @@ fn completion_seq_is_nullable_and_legacy_payloads_remain_readable() {
         }
         let expected = completion_seq.unwrap_or(serde_json::Value::Null);
         let pane: PaneInfo = serde_json::from_value(json.clone()).unwrap();
+        let agent: AgentInfo = serde_json::from_value(json.clone()).unwrap();
         let subscription: PaneAgentStatusChangedEvent =
             serde_json::from_value(json.clone()).unwrap();
         json["type"] = serde_json::json!("pane_agent_status_changed");
@@ -1066,9 +1067,10 @@ fn completion_seq_is_nullable_and_legacy_payloads_remain_readable() {
         }))
         .unwrap();
         let pane = serde_json::to_value(pane).unwrap();
+        let agent = serde_json::to_value(agent).unwrap();
         let subscription = serde_json::to_value(subscription).unwrap();
         let event = serde_json::to_value(event).unwrap();
-        for payload in [&pane, &subscription, &event["data"]] {
+        for payload in [&pane, &agent, &subscription, &event["data"]] {
             assert_eq!(payload.get("completion_seq"), Some(&expected));
         }
     }

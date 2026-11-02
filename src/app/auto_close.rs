@@ -9,7 +9,12 @@ use super::App;
 use crate::api::schema::{AgentStatus, PaneStartedBy};
 use crate::persist::logbook::{self, CloseBy, CloseSession, Event};
 
-use crate::config::{AutoCloseConfig as Config, AutoCloseMode as Mode};
+use crate::config::{
+    AutoCloseConfig as Config, AutoCloseKindConfig as KindConfig, AutoCloseMode as Mode,
+};
+
+pub(crate) mod debrief;
+use debrief::{Debrief, Phase};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -168,6 +173,7 @@ struct PaneSnapshot {
     bare_prompt: bool,
     starter: Option<String>,
     session: Option<CloseSession>,
+    debrief: Option<Debrief>,
 }
 
 impl PaneSnapshot {
@@ -222,6 +228,10 @@ pub(crate) struct AutoClose {
     refused: HashMap<String, RefusalKey>,
     pending: Option<PendingPass>,
     last_pass: Option<Instant>,
+    pass_deadline: Option<Instant>,
+    debriefs: HashMap<String, Debrief>,
+    delivery: Option<debrief::PendingDelivery>,
+    submission: Option<debrief::PendingSubmission>,
 }
 
 struct PendingPass {
@@ -248,6 +258,10 @@ impl AutoClose {
             refused: HashMap::new(),
             pending: None,
             last_pass: None,
+            pass_deadline: None,
+            debriefs: HashMap::new(),
+            delivery: None,
+            submission: None,
         }
     }
 }
@@ -298,6 +312,46 @@ fn decide(
     }
     if pane.desk_focused {
         return Err("desk-focused");
+    }
+    if let Some(state) = &pane.debrief {
+        if debrief::protected(pane, state) {
+            return Err("debrief-pane-changed");
+        }
+        if matches!(state.phase, Phase::Retry { .. })
+            && pane.restore_until.is_some_and(|until| now < until)
+        {
+            return Err("restore-window");
+        }
+        if pane.status == AgentStatus::Blocked {
+            return Err("blocked");
+        }
+        let (action, reason) = match &state.phase {
+            Phase::Waiting { .. } | Phase::Retry { .. }
+                if !config.debrief
+                    && matches!(pane.status, AgentStatus::Idle | AgentStatus::Done) =>
+            {
+                (Action::Close, None)
+            }
+            Phase::Aborted { .. } => return Err("debrief-aborted"),
+            Phase::Waiting { reason } => (Action::Wait, Some(reason.clone())),
+            Phase::Retry { .. }
+                if !matches!(pane.status, AgentStatus::Idle | AgentStatus::Done) =>
+            {
+                (Action::Wait, Some("retry-working".into()))
+            }
+            Phase::Retry { .. } => (Action::Close, None),
+            _ => (Action::Wait, Some("debrief-in-progress".into())),
+        };
+        return Ok(Candidate {
+            pane_id: pane.pane_id.clone(),
+            kind: Kind::Dormant,
+            reason: "dormant".into(),
+            age_secs: state.age_secs,
+            action,
+            wait_reason: reason,
+            main_checkout: main_checkout_fields(pane, panes).0,
+            main_checkout_home: main_checkout_fields(pane, panes).1,
+        });
     }
     if pane.agent.is_some() {
         match pane.status {
@@ -394,6 +448,9 @@ fn debrief_waits(mut plan: Plan, panes: &[PaneSnapshot], config: &Config) -> Pla
     };
     let skill_present = path.is_some_and(|path| path.is_file());
     for candidate in &mut plan.candidates {
+        if candidate.action == Action::Wait {
+            continue;
+        }
         if candidate.kind != Kind::Dormant || !config.debrief {
             continue;
         }
@@ -474,16 +531,6 @@ async fn evaluate(panes: &[PaneSnapshot], config: &Config, now: u64) -> Plan {
                 candidate.wait_reason = None;
             }
             Err(reason) => candidate.wait_reason = Some(reason.into()),
-        }
-    }
-    if config.mode == Mode::Close {
-        for candidate in &mut result.candidates {
-            if candidate.kind == Kind::Dormant {
-                candidate.action = Action::Wait;
-                candidate
-                    .wait_reason
-                    .get_or_insert_with(|| "debrief-pending".into());
-            }
         }
     }
     result
@@ -602,6 +649,7 @@ impl App {
             return;
         }
         let mut reported = HashMap::new();
+        let mut debriefs = HashMap::new();
         let mut history = self
             .auto_close
             .status
@@ -612,6 +660,11 @@ impl App {
         history.closes.clear();
         let cutoff = logbook::now_ms().saturating_sub(86_400_000);
         if let Err(error) = logbook::for_each_event(&logbook::path(), |event| match event {
+            Event::DebriefSent { pane, state, .. }
+            | Event::DebriefProgress { pane, state, .. }
+            | Event::DebriefOutcome { pane, state, .. } => {
+                debriefs.insert(pane, state);
+            }
             Event::WouldClose {
                 pane,
                 reason,
@@ -641,18 +694,22 @@ impl App {
                 ..
             } => {
                 reported.remove(&pane);
+                debriefs.remove(&pane);
                 if at >= cutoff && matches!(reason.as_str(), "ended" | "dormant" | "plain-shell") {
                     history.closes.push_back(at);
                 }
             }
             Event::PaneClosed { pane, .. } => {
                 reported.remove(&pane);
+                debriefs.remove(&pane);
             }
             _ => {}
         }) {
             tracing::warn!(%error, "failed to read auto-close history");
         }
         self.auto_close.reported = reported;
+        drop(history);
+        self.restore_debriefs(debriefs);
     }
 
     pub(crate) fn wake_auto_close_for_changed_facts(&mut self, now: Instant) {
@@ -674,6 +731,11 @@ impl App {
                 .deadline
                 .map_or(floor, |deadline| deadline.min(floor)),
         );
+        self.auto_close.pass_deadline = Some(
+            self.auto_close
+                .pass_deadline
+                .map_or(floor, |deadline| deadline.min(floor)),
+        );
     }
     pub(crate) fn configure_auto_close(&mut self, config: Config) {
         if self.auto_close.config == config && self.auto_close.deadline.is_some() {
@@ -689,6 +751,7 @@ impl App {
                 ))
             })
             .flatten();
+        self.auto_close.pass_deadline = self.auto_close.deadline;
         let mut status = self
             .auto_close
             .status
@@ -696,10 +759,19 @@ impl App {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         status.mode = self.auto_close.config.mode;
-        status.waiting = 0;
+        status.waiting = self
+            .auto_close
+            .debriefs
+            .values()
+            .filter(|state| matches!(state.phase, Phase::Waiting { .. }))
+            .count() as u64;
     }
 
     fn auto_close_snapshot(&self, now: u64) -> Vec<PaneSnapshot> {
+        self.auto_close_snapshot_for(now, false)
+    }
+
+    fn auto_close_snapshot_for(&self, now: u64, active_only: bool) -> Vec<PaneSnapshot> {
         let mut panes = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             let single_pane_workspace =
@@ -754,6 +826,15 @@ impl App {
                     let Some(pane_id) = self.public_pane_id(ws_idx, id) else {
                         continue;
                     };
+                    if active_only
+                        && !self
+                            .auto_close
+                            .debriefs
+                            .get(&pane_id)
+                            .is_some_and(Debrief::active)
+                    {
+                        continue;
+                    }
                     let runtime = self.state.runtime_for_pane_in_workspace(
                         &self.terminal_runtimes,
                         ws_idx,
@@ -772,6 +853,7 @@ impl App {
                                     && crate::platform::session_processes(pid) == vec![pid]
                             });
                     panes.push(PaneSnapshot {
+                        debrief: self.auto_close.debriefs.get(&pane_id).cloned(),
                         pane_id,
                         workspace_id: ws.id.clone(),
                         agent,
@@ -834,11 +916,30 @@ impl App {
     }
 
     pub(crate) fn run_auto_close_pass(&mut self, monotonic: Instant) -> bool {
+        let sequence = self.event_hub.current_sequence();
+        let closed = self.advance_auto_close_pass(monotonic);
+        closed || self.event_hub.current_sequence() != sequence
+    }
+
+    fn advance_auto_close_pass(&mut self, monotonic: Instant) -> bool {
         if self
             .auto_close
             .deadline
             .is_none_or(|deadline| monotonic < deadline)
         {
+            return false;
+        }
+        if self.auto_close.config.mode == Mode::Close {
+            self.advance_debriefs();
+        }
+        if self.auto_close.pending.is_none()
+            && self
+                .auto_close
+                .pass_deadline
+                .is_some_and(|deadline| monotonic < deadline)
+        {
+            self.auto_close.deadline = self.auto_close.pass_deadline;
+            self.schedule_debrief_tick(monotonic);
             return false;
         }
         if let Some(pending) = self.auto_close.pending.as_ref() {
@@ -948,7 +1049,12 @@ impl App {
             current.candidates.iter().any(|fresh| {
                 fresh.pane_id == candidate.pane_id
                     && fresh.kind == candidate.kind
-                    && now.saturating_sub(fresh.age_secs) == at.saturating_sub(candidate.age_secs)
+                    && (panes
+                        .iter()
+                        .find(|pane| pane.pane_id == candidate.pane_id)
+                        .is_some_and(|pane| pane.debrief.is_some())
+                        || now.saturating_sub(fresh.age_secs)
+                            == at.saturating_sub(candidate.age_secs))
                     && panes
                         .iter()
                         .find(|pane| pane.pane_id == candidate.pane_id)
@@ -1039,28 +1145,23 @@ impl App {
                 .retain(|id, _| still_refused.contains(id));
             self.flush_logbook();
             panes = self.auto_close_snapshot(now);
-            self.auto_close
-                .status
-                .0
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .waiting = plan(&panes, &self.auto_close.config, now)
-                .candidates
-                .iter()
-                .filter(|candidate| candidate.kind == Kind::Dormant)
-                .count() as u64;
-        } else {
-            self.auto_close
-                .status
-                .0
-                .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .waiting = result
-                .candidates
-                .iter()
-                .filter(|candidate| candidate.action == Action::Wait)
-                .count() as u64;
         }
+        self.auto_close
+            .status
+            .0
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .waiting = result
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.action == Action::Wait
+                    && !matches!(
+                        candidate.wait_reason.as_deref(),
+                        Some("debrief-in-progress" | "retry-working")
+                    )
+            })
+            .count() as u64;
         if self.auto_close.config.mode == Mode::Report {
             for candidate in &result.candidates {
                 let Some(pane) = panes.iter().find(|pane| pane.pane_id == candidate.pane_id) else {
@@ -1098,6 +1199,32 @@ impl App {
                     .push_back(at);
             }
             self.flush_logbook();
+        } else if self.auto_close.config.mode == Mode::Close {
+            for candidate in &result.candidates {
+                if candidate.kind != Kind::Dormant {
+                    continue;
+                }
+                let Some(pane) = panes.iter().find(|pane| pane.pane_id == candidate.pane_id) else {
+                    continue;
+                };
+                match candidate.action {
+                    Action::Debrief if !self.auto_close.debriefs.values().any(Debrief::active) => {
+                        self.start_debrief(pane, candidate)
+                    }
+                    Action::Close if pane.debrief.is_none() || !self.auto_close.config.debrief => {
+                        self.close_dormant_pane(
+                            &pane.pane_id,
+                            candidate.age_secs,
+                            logbook::CloseDebrief {
+                                outcome: crate::api::schema::DebriefOutcome::Skipped,
+                                memories: None,
+                                skill_version: None,
+                            },
+                        )
+                    }
+                    _ => {}
+                }
+            }
         }
         {
             let mut history = self
@@ -1119,7 +1246,37 @@ impl App {
             &self.auto_close.config,
             now,
         )));
+        self.auto_close.pass_deadline = self.auto_close.deadline;
+        self.schedule_debrief_tick(monotonic);
         closed_any
+    }
+
+    fn schedule_debrief_tick(&mut self, now: Instant) {
+        if self.auto_close.config.mode == Mode::Close
+            && self.auto_close.debriefs.values().any(Debrief::active)
+        {
+            let delay =
+                if self.auto_close.delivery.is_some() || self.auto_close.submission.is_some() {
+                    25
+                } else {
+                    self.auto_close
+                        .debriefs
+                        .values()
+                        .filter_map(|state| state.deadline(&self.auto_close.config))
+                        .min()
+                        .unwrap_or(logbook::now_ms())
+                        .saturating_sub(logbook::now_ms())
+                        .max(100)
+                };
+            let Some(tick) = now.checked_add(Duration::from_millis(delay)) else {
+                return;
+            };
+            self.auto_close.deadline = Some(
+                self.auto_close
+                    .deadline
+                    .map_or(tick, |deadline| deadline.min(tick)),
+            );
+        }
     }
 }
 
@@ -1150,6 +1307,7 @@ mod tests {
             bare_prompt: true,
             starter: None,
             session: None,
+            debrief: None,
         }
     }
 
@@ -1437,7 +1595,8 @@ mod tests {
             ended_age_secs: 0,
             dormant_age_secs: 0,
             plain_shell_age_secs: 0,
-            debrief: false,
+            debrief: true,
+            debrief_skill_path: String::new(),
             ..Config::default()
         };
         let evaluated = evaluate(&panes, &config, 200).await;
@@ -1449,7 +1608,7 @@ mod tests {
         assert_eq!(evaluated.candidates[0].action, Action::Wait);
         assert_eq!(
             evaluated.candidates[0].wait_reason.as_deref(),
-            Some("debrief-pending")
+            Some("skill-missing")
         );
         assert_eq!(evaluated.candidates[1].kind, Kind::Ended);
         assert_eq!(evaluated.candidates[1].action, Action::Close);

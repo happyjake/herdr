@@ -2368,6 +2368,38 @@ impl App {
         params: &PaneCloseParams,
         age_secs: Option<u64>,
     ) -> Result<(), String> {
+        self.close_pane_with_details(id, params, age_secs, None)
+    }
+
+    pub(crate) fn close_pane_with_auto_close(
+        &mut self,
+        id: String,
+        params: &PaneCloseParams,
+        auto_close: Option<(
+            u64,
+            crate::persist::logbook::CloseDebrief,
+            Option<crate::persist::logbook::CloseSession>,
+        )>,
+    ) -> Result<(), String> {
+        self.close_pane_with_details(
+            id,
+            params,
+            auto_close.as_ref().map(|details| details.0),
+            auto_close,
+        )
+    }
+
+    fn close_pane_with_details(
+        &mut self,
+        id: String,
+        params: &PaneCloseParams,
+        age_secs: Option<u64>,
+        auto_close: Option<(
+            u64,
+            crate::persist::logbook::CloseDebrief,
+            Option<crate::persist::logbook::CloseSession>,
+        )>,
+    ) -> Result<(), String> {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return Err(pane_not_found(id, &params.pane_id));
         };
@@ -2421,6 +2453,7 @@ impl App {
                 params.reason.as_deref(),
                 age_secs,
             );
+            self.annotate_auto_close(&public_pane_id, auto_close);
             self.shutdown_detached_terminal_runtimes();
             self.schedule_session_save();
             self.emit_event(EventEnvelope {
@@ -2438,6 +2471,7 @@ impl App {
                 },
             });
         } else {
+            self.annotate_auto_close(&public_pane_id, auto_close);
             self.state.remove_unattached_terminal_ids(terminal_id);
             self.record_auto_close_pane_closed(
                 &public_pane_id,
