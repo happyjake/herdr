@@ -674,8 +674,7 @@ fn search_sessions_reports_latest_close_for_non_live_sessions_and_omits_when_liv
         "at_ms": 1790985605000_u64,
         "debrief": {
             "outcome": "finished",
-            "memories": 2,
-            "skill_version": "1"
+            "memories": 2
         }
     });
 
@@ -683,6 +682,9 @@ fn search_sessions_reports_latest_close_for_non_live_sessions_and_omits_when_liv
     let closed_row = by_key(&ended, "closed-session");
     assert_eq!(closed_row["state"], "ended");
     assert_eq!(closed_row["closed"], expected_closed);
+    assert!(closed_row["closed"]["debrief"]
+        .get("skill_version")
+        .is_none());
     assert_eq!(
         closed_row["resume"],
         json!({"command": "claude --resume closed-session", "cwd": cwd})
@@ -701,4 +703,107 @@ fn search_sessions_reports_latest_close_for_non_live_sessions_and_omits_when_liv
     let gone_row = by_key(&gone, "closed-session");
     assert_eq!(gone_row["state"], "record_gone");
     assert_eq!(gone_row["closed"], expected_closed);
+}
+
+#[test]
+fn search_sessions_attributes_close_by_session_key_across_pane_reuse_moves_and_out_of_order_appends(
+) {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    for id in ["session-a", "session-b", "session-moved", "session-ordered"] {
+        home.write(
+            &format!(".claude/projects/project/{id}.jsonl"),
+            &[claude_prompt(
+                id,
+                &cwd,
+                &format!("Prompt for {id}"),
+                "2026-10-03T00:00:00Z",
+            )],
+        );
+    }
+    home.write(
+        "logbook.jsonl",
+        &[
+            // Session A -> B -> A on one pane: third report for A is deduplicated by the writer,
+            // and the close carries session A.
+            reported("claude", "session-a", "w1:p1", &cwd, 1790985601000),
+            reported("claude", "session-b", "w1:p1", &cwd, 1790985602000),
+            json!({
+                "type": "pane_closed",
+                "pane": "w1:p1",
+                "by": "desk",
+                "session": {
+                    "agent": "claude",
+                    "id": "session-a"
+                },
+                "at": 1790985603000_u64
+            }),
+            // Pane moved from w1:p2 to w2:p1 before closing.
+            reported("claude", "session-moved", "w1:p2", &cwd, 1790985601000),
+            json!({
+                "type": "pane_closed",
+                "pane": "w2:p1",
+                "by": "phone",
+                "reason": "dormant",
+                "age_secs": 3600,
+                "session": {
+                    "agent": "claude",
+                    "id": "session-moved"
+                },
+                "at": 1790985604000_u64
+            }),
+            // Out-of-order appended closes: an older close from a delayed handoff drain is
+            // appended after a newer close; the latest by event time wins.
+            reported("claude", "session-ordered", "w3:p1", &cwd, 1790985601000),
+            json!({
+                "type": "pane_closed",
+                "pane": "w3:p1",
+                "by": "phone",
+                "reason": "ended",
+                "session": {
+                    "agent": "claude",
+                    "id": "session-ordered"
+                },
+                "at": 1790985608000_u64
+            }),
+            json!({
+                "type": "pane_closed",
+                "pane": "w3:p1",
+                "by": "desk",
+                "session": {
+                    "agent": "claude",
+                    "id": "session-ordered"
+                },
+                "at": 1790985605000_u64
+            }),
+        ],
+    );
+    home.catalog.refresh();
+
+    let result = home.search(json!({}), vec![]);
+    assert_eq!(
+        by_key(&result, "session-a")["closed"],
+        json!({
+            "by": "desk",
+            "at_ms": 1790985603000_u64
+        })
+    );
+    assert!(by_key(&result, "session-b").get("closed").is_none());
+    assert_eq!(
+        by_key(&result, "session-moved")["closed"],
+        json!({
+            "by": "phone",
+            "reason": "dormant",
+            "age_secs": 3600,
+            "at_ms": 1790985604000_u64
+        })
+    );
+    assert_eq!(
+        by_key(&result, "session-ordered")["closed"],
+        json!({
+            "by": "phone",
+            "reason": "ended",
+            "at_ms": 1790985608000_u64
+        })
+    );
 }

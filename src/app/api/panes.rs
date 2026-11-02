@@ -2380,9 +2380,7 @@ impl App {
                 ));
             }
         }
-        let by = params
-            .by
-            .unwrap_or_else(|| crate::app::logbook::close_by_for_request_id(&id));
+        let by = params.by.unwrap_or(crate::api::schema::PaneCloseBy::Api);
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         if !self.state.close_pane_would_close_workspace(ws_idx, pane_id) {

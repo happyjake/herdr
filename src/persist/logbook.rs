@@ -12,12 +12,27 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::api::schema::{CloseDebrief, PaneCloseBy as CloseBy};
+pub use crate::api::schema::{DebriefOutcome, PaneCloseBy as CloseBy};
 
 mod background;
 pub(crate) use background::BackgroundWriter;
 #[cfg(unix)]
 pub(crate) use background::DRAIN_TIMEOUT;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseDebrief {
+    pub outcome: DebriefOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memories: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CloseSession {
+    pub agent: String,
+    pub id: String,
+}
 
 /// Resume identity without the reporting hook's source or record-file hint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -80,6 +95,8 @@ pub enum Event {
         age_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         debrief: Option<CloseDebrief>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<CloseSession>,
         at: u64,
     },
     Parent {

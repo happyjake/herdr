@@ -356,7 +356,7 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
-        let by = crate::app::logbook::close_by_for_request_id(&id);
+        let by = crate::api::schema::PaneCloseBy::Api;
         self.state.selected = index;
         self.state
             .close_workspaces_with(close_indices, Some(by), None);

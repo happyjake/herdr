@@ -237,7 +237,7 @@ impl App {
             .map(|tab| tab.layout.pane_ids())
             .unwrap_or_default();
 
-        let by = crate::app::logbook::close_by_for_request_id(&id);
+        let by = crate::api::schema::PaneCloseBy::Api;
         if closes_workspace {
             if let Err(response) = self.require_restored_group_close_ready(
                 &id,

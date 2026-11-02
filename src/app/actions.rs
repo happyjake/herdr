@@ -1286,6 +1286,20 @@ impl AppState {
         }
 
         self.mark_session_dirty();
+        if let Some((ws_idx, pane_id)) = active.and_then(|i| {
+            self.workspaces
+                .get(i)
+                .and_then(|ws| ws.focused_pane_id().map(|pane_id| (i, pane_id)))
+        }) {
+            if !self.close_pane_would_close_workspace(ws_idx, pane_id) {
+                self.record_logbook_close_with(
+                    ws_idx,
+                    pane_id,
+                    Some(crate::api::schema::PaneCloseBy::Desk),
+                    None,
+                );
+            }
+        }
         let terminal_ids = active
             .and_then(|i| {
                 self.workspaces
@@ -1343,6 +1357,18 @@ impl AppState {
             return false;
         }
         if let Some(ws_idx) = self.active {
+            let logbook_events = self
+                .workspaces
+                .get(ws_idx)
+                .map(|ws| {
+                    self.logbook_tab_close_events(
+                        ws_idx,
+                        ws.active_tab,
+                        Some(crate::api::schema::PaneCloseBy::Desk),
+                    )
+                })
+                .unwrap_or_default();
+            self.enqueue_logbook_events(logbook_events);
             let terminal_ids = self
                 .workspaces
                 .get(ws_idx)

@@ -660,8 +660,6 @@ pub struct CloseDebrief {
     pub outcome: DebriefOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memories: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill_version: Option<String>,
 }
 
 crate::cli::projection::cli_params! {

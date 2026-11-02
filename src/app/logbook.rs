@@ -138,12 +138,21 @@ impl AppState {
         self.logbook_events.as_ref()?;
         let ws = self.workspaces.get(ws_idx)?;
         let number = ws.public_pane_number(pane_id)?;
+        let session = ws
+            .terminal_id(pane_id)
+            .and_then(|terminal_id| self.terminals.get(terminal_id))
+            .and_then(terminal_session_key)
+            .map(|key| logbook::CloseSession {
+                agent: key.agent,
+                id: key.value,
+            });
         Some(Event::PaneClosed {
             pane: crate::workspace::public_pane_id_for_number(&ws.id, number),
             by,
             reason,
             age_secs: None,
             debrief: None,
+            session,
             at: logbook::now_ms(),
         })
     }
@@ -230,16 +239,6 @@ impl App {
     pub(crate) fn shutdown_logbook(&mut self) {
         self.flush_logbook();
         drop(self.logbook_writer.take());
-    }
-}
-
-pub(crate) fn close_by_for_request_id(id: &str) -> logbook::CloseBy {
-    if id.starts_with("endpoint:") || id.starts_with("client-shell:") {
-        logbook::CloseBy::Desk
-    } else if id.starts_with("cli:") {
-        logbook::CloseBy::Cli
-    } else {
-        logbook::CloseBy::Api
     }
 }
 
@@ -652,7 +651,7 @@ mod tests {
                 json!({"type":"label_worn","key":first,"pane":pane,"label":"automatic label","source":"editor"}),
                 json!({"type":"session_reported","pane":pane,"terminal":terminal,"key":next,"cwd":"project"}),
                 json!({"type":"label_worn","key":next,"pane":pane,"label":"automatic label","source":"editor"}),
-                json!({"type":"pane_closed","pane":pane,"by":"api"}),
+                json!({"type":"pane_closed","pane":pane,"by":"api","session":{"agent":"claude","id":"next-session"}}),
             ]
         );
         let history = std::fs::read(root.path()).unwrap();
@@ -972,7 +971,7 @@ mod tests {
             vec![
                 json!({"type":"session_reported","pane":pane,"terminal":first_terminal,"key":key,"cwd":"project"}),
                 json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
-                json!({"type":"pane_closed","pane":pane,"by":"api"}),
+                json!({"type":"pane_closed","pane":pane,"by":"api","session":{"agent":"claude","id":"same-session"}}),
                 json!({"type":"session_reported","pane":pane,"terminal":next_terminal,"key":key,"cwd":"project"}),
                 json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
             ]
@@ -1059,7 +1058,7 @@ mod tests {
             vec![
                 json!({"type":"session_reported","pane":pane,"terminal":terminal,"key":key,"cwd":"project"}),
                 json!({"type":"label_worn","pane":pane,"key":key,"label":"queued label","source":"person"}),
-                json!({"type":"pane_closed","pane":pane,"by":"api"}),
+                json!({"type":"pane_closed","pane":pane,"by":"api","session":{"agent":"claude","id":"session"}}),
             ]
         );
     }
@@ -1117,7 +1116,7 @@ mod tests {
         let mut expected = vec![
             json!({"type":"session_reported","pane":pane,"terminal":old_terminal,"key":key,"cwd":"project"}),
             json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
-            json!({"type":"pane_closed","pane":pane,"by":"api"}),
+            json!({"type":"pane_closed","pane":pane,"by":"api","session":{"agent":"claude","id":"same-session"}}),
         ];
         assert_eq!(rows(&mut old, &root.path(), before), expected);
 
@@ -1157,7 +1156,7 @@ mod tests {
         let lines = [
             json!({"type":"pane_closed","pane":"w1:p1","at":1700000000000_u64}),
             json!({"type":"pane_closed","pane":"w1:p2","by":"desk","at":1700000001000_u64}),
-            json!({"type":"pane_closed","pane":"w1:p3","by":"phone","reason":"dormant","age_secs":7200,"debrief":{"outcome":"finished","memories":2,"skill_version":"1"},"at":1700000002000_u64}),
+            json!({"type":"pane_closed","pane":"w1:p3","by":"phone","reason":"dormant","age_secs":7200,"debrief":{"outcome":"finished","memories":2,"skill_version":"1"},"session":{"agent":"claude","id":"session-3"},"at":1700000002000_u64}),
             json!({"type":"pane_closed","pane":"w1:p4","by":"cli","reason":"ended","age_secs":180,"debrief":{"outcome":"skipped","skill_version":"1"},"at":1700000003000_u64}),
             json!({"type":"pane_closed","pane":"w1:p5","by":"api","reason":"plain-shell","debrief":{"outcome":"abandoned"},"at":1700000004000_u64}),
         ];
@@ -1174,6 +1173,7 @@ mod tests {
                 reason: None,
                 age_secs: None,
                 debrief: None,
+                session: None,
                 at: 1700000000000,
             }
         );
@@ -1188,7 +1188,7 @@ mod tests {
         let before = crate::pane::unix_now_secs() * 1000;
         let mut app = app();
         app.state.workspaces[0].id = "wclose".into();
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         }
         let tab2 = app.state.workspaces[0].test_add_tab(None);
@@ -1208,8 +1208,9 @@ mod tests {
         let p_desk = app.public_pane_id(0, tab1_panes[0]).unwrap();
         let p_cli = app.public_pane_id(0, tab1_panes[1]).unwrap();
         let p_phone = app.public_pane_id(0, tab1_panes[2]).unwrap();
-        let p_api = app.public_pane_id(0, tab1_panes[3]).unwrap();
-        let died_id = tab1_panes[4];
+        let p_api_endpoint_id = app.public_pane_id(0, tab1_panes[3]).unwrap();
+        let p_api_cli_id = app.public_pane_id(0, tab1_panes[4]).unwrap();
+        let died_id = tab1_panes[5];
         let p_died = app.public_pane_id(0, died_id).unwrap();
         let tab2_id = app.public_tab_id(0, tab2).unwrap();
         let tab2_panes: Vec<_> = app
@@ -1230,8 +1231,12 @@ mod tests {
 
         for request in [
             Request {
-                id: "endpoint:1".into(),
-                method: Method::PaneClose(PaneCloseParams::new(p_desk.clone())),
+                id: "desk-close".into(),
+                method: Method::PaneClose(PaneCloseParams {
+                    pane_id: p_desk.clone(),
+                    by: Some(PaneCloseBy::Desk),
+                    reason: None,
+                }),
             },
             Request {
                 id: "cli:pane:close".into(),
@@ -1250,8 +1255,12 @@ mod tests {
                 }),
             },
             Request {
-                id: "api-close".into(),
-                method: Method::PaneClose(PaneCloseParams::new(p_api.clone())),
+                id: "endpoint:example".into(),
+                method: Method::PaneClose(PaneCloseParams::new(p_api_endpoint_id.clone())),
+            },
+            Request {
+                id: "cli:example".into(),
+                method: Method::PaneClose(PaneCloseParams::new(p_api_cli_id.clone())),
             },
             Request {
                 id: "client-shell:tab".into(),
@@ -1291,20 +1300,101 @@ mod tests {
             json!({"type":"pane_closed","pane":p_desk,"by":"desk"}),
             json!({"type":"pane_closed","pane":p_cli,"by":"cli"}),
             json!({"type":"pane_closed","pane":p_phone,"by":"phone","reason":"dormant"}),
-            json!({"type":"pane_closed","pane":p_api,"by":"api"}),
+            json!({"type":"pane_closed","pane":p_api_endpoint_id,"by":"api"}),
+            json!({"type":"pane_closed","pane":p_api_cli_id,"by":"api"}),
         ];
         expected.extend(
             tab2_panes
                 .into_iter()
-                .map(|pane| json!({"type":"pane_closed","pane":pane,"by":"desk"})),
+                .map(|pane| json!({"type":"pane_closed","pane":pane,"by":"api"})),
         );
         expected.extend(
             ws2_panes
                 .into_iter()
-                .map(|pane| json!({"type":"pane_closed","pane":pane,"by":"cli"})),
+                .map(|pane| json!({"type":"pane_closed","pane":pane,"by":"api"})),
         );
         expected.push(json!({"type":"pane_closed","pane":p_last,"by":"phone","reason":"ended"}));
         expected.push(json!({"type":"pane_closed","pane":p_died}));
         assert_eq!(rows(&mut app, &root.path(), before), expected);
+    }
+
+    #[test]
+    fn logbook_close_records_hosting_session_after_deduplicated_return_and_after_pane_move() {
+        use crate::api::schema::{PaneCloseBy, PaneMoveDestination, PaneMoveParams};
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let root = ConfigRoot::new();
+        let before = crate::pane::unix_now_secs() * 1000;
+        let mut app = app();
+        app.state.workspaces[0].id = "w1".into();
+        let moved_pane_id =
+            app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let mut ws2 = Workspace::test_new("second");
+        ws2.id = "w2".into();
+        app.state.workspaces.push(ws2);
+        app.state.ensure_test_terminals();
+
+        let aba_pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let aba_pane = app.public_pane_id(0, aba_pane_id).unwrap();
+        let aba_terminal = app.state.terminal_id_for_pane(0, aba_pane_id).unwrap();
+        app.state.terminals.get_mut(&aba_terminal).unwrap().cwd = "project".into();
+        report(&mut app, aba_pane_id, "session-a", 1, "startup");
+        report(&mut app, aba_pane_id, "session-b", 2, "clear");
+        report(&mut app, aba_pane_id, "session-a", 3, "resume");
+
+        let moved_before = app.public_pane_id(0, moved_pane_id).unwrap();
+        let moved_terminal = app.state.terminal_id_for_pane(0, moved_pane_id).unwrap();
+        app.state.terminals.get_mut(&moved_terminal).unwrap().cwd = "project".into();
+        report(&mut app, moved_pane_id, "session-moved", 1, "startup");
+
+        let move_response = app.handle_api_request(Request {
+            id: "move".into(),
+            method: Method::PaneMove(PaneMoveParams {
+                pane_id: moved_before.clone(),
+                destination: PaneMoveDestination::NewTab {
+                    workspace_id: Some("w2".into()),
+                    label: None,
+                },
+                focus: false,
+            }),
+        });
+        let move_json: Value = serde_json::from_str(&move_response).unwrap();
+        assert!(move_json.get("error").is_none(), "{move_response}");
+        let moved_after = move_json["result"]["move_result"]["pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(moved_before, moved_after);
+
+        for (pane_id, reason) in [(&aba_pane, "ended"), (&moved_after, "dormant")] {
+            let response = app.handle_api_request(Request {
+                id: "close".into(),
+                method: Method::PaneClose(PaneCloseParams {
+                    pane_id: pane_id.clone(),
+                    by: Some(PaneCloseBy::Phone),
+                    reason: Some(reason.into()),
+                }),
+            });
+            assert!(
+                serde_json::from_str::<Value>(&response)
+                    .unwrap()
+                    .get("error")
+                    .is_none(),
+                "{response}"
+            );
+        }
+
+        let key_a = json!({"agent":"claude","kind":"id","value":"session-a"});
+        let key_b = json!({"agent":"claude","kind":"id","value":"session-b"});
+        let key_moved = json!({"agent":"claude","kind":"id","value":"session-moved"});
+        assert_eq!(
+            rows(&mut app, &root.path(), before),
+            vec![
+                json!({"type":"session_reported","pane":aba_pane,"terminal":aba_terminal,"key":key_a,"cwd":"project"}),
+                json!({"type":"session_reported","pane":aba_pane,"terminal":aba_terminal,"key":key_b,"cwd":"project"}),
+                json!({"type":"session_reported","pane":moved_before,"terminal":moved_terminal,"key":key_moved,"cwd":"project"}),
+                json!({"type":"pane_closed","pane":aba_pane,"by":"phone","reason":"ended","session":{"agent":"claude","id":"session-a"}}),
+                json!({"type":"pane_closed","pane":moved_after,"by":"phone","reason":"dormant","session":{"agent":"claude","id":"session-moved"}}),
+            ]
+        );
     }
 }

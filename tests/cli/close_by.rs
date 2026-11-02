@@ -157,7 +157,7 @@ fn pane_close_records_by_and_reason_in_logbook_and_surfaces_in_search_sessions()
     let api_close = send_request(
         &socket,
         &json!({
-            "id": "api-close",
+            "id": "endpoint:example",
             "method": "pane.close",
             "params": {
                 "pane_id": p3
@@ -192,15 +192,21 @@ fn pane_close_records_by_and_reason_in_logbook_and_surfaces_in_search_sessions()
     assert_eq!(closed_events[0]["pane"], p1);
     assert_eq!(closed_events[0]["by"], "phone");
     assert_eq!(closed_events[0]["reason"], "dormant");
+    assert_eq!(
+        closed_events[0]["session"],
+        json!({"agent": "claude", "id": "session-phone"})
+    );
     let closed_at = closed_events[0]["at"].as_u64().unwrap();
 
     assert_eq!(closed_events[1]["pane"], p2);
     assert_eq!(closed_events[1]["by"], "cli");
     assert!(closed_events[1].get("reason").is_none());
+    assert!(closed_events[1].get("session").is_none());
 
     assert_eq!(closed_events[2]["pane"], p3);
     assert_eq!(closed_events[2]["by"], "api");
     assert!(closed_events[2].get("reason").is_none());
+    assert!(closed_events[2].get("session").is_none());
 
     let search = send_request(
         &socket,

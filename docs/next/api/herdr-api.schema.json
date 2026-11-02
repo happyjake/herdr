@@ -8076,12 +8076,6 @@
             },
             "outcome": {
               "$ref": "#/schemas/success_response/$defs/DebriefOutcome"
-            },
-            "skill_version": {
-              "type": [
-                "string",
-                "null"
-              ]
             }
           },
           "required": [

@@ -607,7 +607,7 @@ impl App {
                         .cloned()
                         .map(|space| self.worktree_info_for_membership(&space, None));
                 }
-                let by = crate::app::logbook::close_by_for_request_id(&api.id);
+                let by = crate::api::schema::PaneCloseBy::Api;
                 self.close_removed_linked_worktree_workspace(ws_idx, Some(by));
                 self.shutdown_detached_terminal_runtimes();
                 self.emit_event(EventEnvelope {
