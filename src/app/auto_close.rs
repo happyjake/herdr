@@ -9,110 +9,7 @@ use super::App;
 use crate::api::schema::{AgentStatus, PaneStartedBy};
 use crate::persist::logbook::{self, CloseBy, CloseSession, Event};
 
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    #[default]
-    Off,
-    Report,
-    Close,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Config {
-    pub mode: Mode,
-    pub ended_age_secs: u64,
-    pub dormant_age_secs: u64,
-    pub plain_shell_age_secs: u64,
-    pub pass_floor_secs: u64,
-    pub debrief: bool,
-    pub debrief_skill_path: String,
-    pub uptake_window_secs: u64,
-    pub settle_hold_secs: u64,
-    pub quit_grace_secs: u64,
-    pub gate_timeout_secs: u64,
-    #[serde(deserialize_with = "claude_config")]
-    pub claude: KindConfig,
-    #[serde(deserialize_with = "codex_config")]
-    pub codex: KindConfig,
-    #[serde(deserialize_with = "pi_config")]
-    pub pi: KindConfig,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KindConfig {
-    pub gate_command: String,
-    pub invocation: String,
-    pub limit_secs: u64,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct KindOverrides {
-    gate_command: Option<String>,
-    invocation: Option<String>,
-    limit_secs: Option<u64>,
-}
-
-fn kind_config<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-    defaults: KindConfig,
-) -> Result<KindConfig, D::Error> {
-    let values = KindOverrides::deserialize(deserializer)?;
-    Ok(KindConfig {
-        gate_command: values.gate_command.unwrap_or(defaults.gate_command),
-        invocation: values.invocation.unwrap_or(defaults.invocation),
-        limit_secs: values.limit_secs.unwrap_or(defaults.limit_secs),
-    })
-}
-fn claude_config<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<KindConfig, D::Error> {
-    kind_config(deserializer, Config::default().claude)
-}
-fn codex_config<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<KindConfig, D::Error> {
-    kind_config(deserializer, Config::default().codex)
-}
-fn pi_config<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<KindConfig, D::Error> {
-    kind_config(deserializer, Config::default().pi)
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            mode: Mode::Off,
-            ended_age_secs: 24 * 3600,
-            dormant_age_secs: 72 * 3600,
-            plain_shell_age_secs: 7 * 24 * 3600,
-            pass_floor_secs: 600,
-            debrief: true,
-            debrief_skill_path: "~/.agents/skills/debrief/SKILL.md".into(),
-            uptake_window_secs: 60,
-            settle_hold_secs: 60,
-            quit_grace_secs: 60,
-            gate_timeout_secs: 10,
-            claude: KindConfig {
-                gate_command: "usage --debrief-gate claude".into(),
-                invocation: "/debrief".into(),
-                limit_secs: 600,
-            },
-            codex: KindConfig {
-                gate_command: "usage --debrief-gate codex".into(),
-                invocation: "$debrief".into(),
-                limit_secs: 900,
-            },
-            pi: KindConfig {
-                gate_command: "usage --debrief-gate pi".into(),
-                invocation: "/skill:debrief".into(),
-                limit_secs: 600,
-            },
-        }
-    }
-}
+use crate::config::{AutoCloseConfig as Config, AutoCloseMode as Mode};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -245,6 +142,7 @@ struct PaneSnapshot {
     pane_id: String,
     agent: Option<String>,
     ended: bool,
+    ended_at: Option<u64>,
     seen_agent: bool,
     status: AgentStatus,
     status_at: u64,
@@ -356,7 +254,11 @@ fn decide(
             return Err("not-bare-prompt");
         }
         if pane.ended {
-            (Kind::Ended, pane.status_at, config.ended_age_secs)
+            (
+                Kind::Ended,
+                pane.ended_at.ok_or("ended-time-unknown")?,
+                config.ended_age_secs,
+            )
         } else {
             (Kind::PlainShell, pane.input_at, config.plain_shell_age_secs)
         }
@@ -500,7 +402,7 @@ fn next_pass_delay(panes: &[PaneSnapshot], config: &Config, now: u64) -> u64 {
                     .max(pane.input_at)
                     .saturating_add(config.dormant_age_secs)
             } else if pane.ended {
-                pane.status_at.saturating_add(config.ended_age_secs)
+                pane.ended_at?.saturating_add(config.ended_age_secs)
             } else {
                 pane.input_at.saturating_add(config.plain_shell_age_secs)
             };
@@ -671,6 +573,7 @@ impl App {
                         pane_id,
                         agent,
                         ended: terminal.ended_agent.is_some(),
+                        ended_at: terminal.ended_at,
                         seen_agent: terminal.session_reported
                             || terminal.persisted_agent_session.is_some()
                             || terminal.agent_name.is_some(),
@@ -872,6 +775,7 @@ mod tests {
             pane_id: "pane-1".into(),
             agent: None,
             ended: false,
+            ended_at: None,
             seen_agent: false,
             status: AgentStatus::Unknown,
             status_at: 100,
@@ -903,6 +807,7 @@ mod tests {
             (Kind::Dormant, 125),
         ] {
             pane.ended = kind == Kind::Ended;
+            pane.ended_at = pane.ended.then_some(100);
             pane.agent = (kind == Kind::Dormant).then(|| "pi".into());
             pane.status = AgentStatus::Done;
             pane.input_at = if kind == Kind::Dormant { 105 } else { 100 };
@@ -924,6 +829,26 @@ mod tests {
         assert_eq!(decide(&pane, &[], &config, 159), Err("too-young"));
         assert!(decide(&pane, &[], &config, 160).is_ok());
         assert_eq!(decide(&pane, &[], &config, 99), Err("too-young"));
+    }
+
+    #[test]
+    fn auto_close_ended_age_requires_an_independent_exit_timestamp() {
+        let mut pane = shell();
+        pane.ended = true;
+        pane.status_at = 1;
+        let config = Config {
+            ended_age_secs: 10,
+            pass_floor_secs: 1,
+            ..Config::default()
+        };
+        assert_eq!(decide(&pane, &[], &config, 130), Err("ended-time-unknown"));
+        pane.ended_at = Some(120);
+        assert_eq!(decide(&pane, &[], &config, 129), Err("too-young"));
+        assert_eq!(next_pass_delay(&[pane.clone()], &config, 125), 5);
+        let candidate = decide(&pane, &[], &config, 130).unwrap();
+        assert_eq!(candidate.age_secs, 10);
+        pane.status_at = 1000;
+        assert_eq!(decide(&pane, &[], &config, 130).unwrap(), candidate);
     }
 
     #[test]

@@ -161,6 +161,8 @@ pub struct TerminalState {
     pub detected_agent: Option<Agent>,
     /// Last effective agent label after it leaves, until another agent takes over.
     pub ended_agent: Option<String>,
+    /// Unix seconds when the ended-agent fact was recorded, independent of status.
+    pub ended_at: Option<u64>,
     /// Restored activity clock for a terminal without a live runtime. A live
     /// runtime owns the current clock so PTY delivery can update it directly.
     pub input_or_command_at: u64,
@@ -245,6 +247,7 @@ impl TerminalState {
             cwd,
             detected_agent: None,
             ended_agent: None,
+            ended_at: None,
             input_or_command_at: crate::pane::unix_now_secs(),
             fallback_state: AgentState::Unknown,
             fallback_visible_blocker: false,
@@ -492,6 +495,7 @@ impl TerminalState {
             snapshot.authority.session_ref.as_ref(),
         );
         self.ended_agent = None;
+        self.ended_at = None;
         self.state = snapshot.authority.state;
         self.hook_authority = Some(snapshot.authority);
         self.agent_process_acquisition_pending = snapshot.acquisition_pending;
@@ -2759,6 +2763,7 @@ impl TerminalState {
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
         if let Some(agent) = self.effective_agent_label().map(str::to_string) {
             self.ended_agent = Some(agent);
+            self.ended_at = Some(crate::pane::unix_now_secs());
         }
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
@@ -2865,8 +2870,10 @@ impl TerminalState {
 
         if agent_label.is_some() {
             self.ended_agent = None;
+            self.ended_at = None;
         } else if previous_agent_label.is_some() {
             self.ended_agent = previous_agent_label.clone();
+            self.ended_at = Some(crate::pane::unix_now_secs());
         }
 
         if previous_agent_label == agent_label
@@ -6753,6 +6760,32 @@ mod tests {
     }
 
     #[test]
+    fn ended_at_records_identity_loss_even_when_status_does_not_change() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Unknown);
+        assert_eq!(terminal.state, AgentState::Unknown);
+        let before = crate::pane::unix_now_secs();
+        terminal.set_detected_state(None, AgentState::Unknown);
+        assert_eq!(terminal.state, AgentState::Unknown);
+        assert_eq!(terminal.ended_agent.as_deref(), Some("pi"));
+        assert!(terminal
+            .ended_at
+            .is_some_and(|at| at >= before && at <= crate::pane::unix_now_secs()));
+        terminal.ended_at = Some(1);
+        terminal.set_detected_state(None, AgentState::Unknown);
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert_eq!(
+            terminal.ended_at,
+            Some(1),
+            "later shell observations retain the exit date"
+        );
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Unknown);
+        assert!(terminal.ended_at.is_none());
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert!(terminal.ended_at.is_some_and(|at| at >= before));
+    }
+
+    #[test]
     fn respawn_cleanup_resets_restored_agent_status() {
         let mut terminal = test_terminal();
         terminal.respawn_shell_on_exit = true;
@@ -7160,12 +7193,14 @@ mod tests {
 
         let mut after = test_terminal();
         after.ended_agent = Some("pi".into());
+        after.ended_at = Some(1);
         after.restore_handoff_agent_state(snapshot);
         assert!(
             after.detected_agent.is_none(),
             "custom report restore must not invent process detection"
         );
         assert!(after.ended_agent.is_none());
+        assert!(after.ended_at.is_none());
         assert_eq!(after.effective_agent_label(), Some("pi"));
         assert_eq!(after.effective_known_agent(), Some(Agent::Pi));
         assert_eq!(after.state, AgentState::Working);

@@ -37,6 +37,137 @@
       ]
     },
     {
+      "id": "auto-close",
+      "title": "Auto-close",
+      "keys": [
+        {
+          "key": "auto_close.mode",
+          "type": "string",
+          "default": "\"off\"",
+          "description": "Per-server automatic planning mode. off disables scheduled passes. report writes would-close Logbook lines without closing or prompting panes. close is reserved and currently does not close panes. This section reloads without restarting the server.",
+          "values": [
+            "off",
+            "report",
+            "close"
+          ]
+        },
+        {
+          "key": "auto_close.ended_age_secs",
+          "type": "integer",
+          "default": "86400",
+          "description": "Minimum elapsed seconds since an agent ended before its pane qualifies. Panes restored without a recorded exit time remain spared until a later agent exit supplies one."
+        },
+        {
+          "key": "auto_close.dormant_age_secs",
+          "type": "integer",
+          "default": "259200",
+          "description": "Minimum elapsed seconds since both the last done or idle transition and the last input or command activity before a live agent qualifies."
+        },
+        {
+          "key": "auto_close.plain_shell_age_secs",
+          "type": "integer",
+          "default": "604800",
+          "description": "Minimum elapsed seconds since input or command activity before a plain shell qualifies. Output alone does not reset this age; another process in the shell session prevents eligibility."
+        },
+        {
+          "key": "auto_close.pass_floor_secs",
+          "type": "integer",
+          "default": "600",
+          "description": "Minimum interval between automatic passes, in seconds. Values below one are treated as one second. A pending age threshold may schedule a later pass."
+        },
+        {
+          "key": "auto_close.debrief",
+          "type": "boolean",
+          "default": "true",
+          "description": "Require a Debrief in the plan for supported dormant agents. When false, their planned action is close. Report mode never sends Debrief prompts or closes panes."
+        },
+        {
+          "key": "auto_close.debrief_skill_path",
+          "type": "string",
+          "default": "\"~/.agents/skills/debrief/SKILL.md\"",
+          "description": "Path to the Debrief skill file. A leading ~/ expands to the server process home directory. If the file is missing, agents that require a Debrief wait and the plan names skill-missing."
+        },
+        {
+          "key": "auto_close.uptake_window_secs",
+          "type": "integer",
+          "default": "60",
+          "description": "Configured time to wait for an agent to pick up a Debrief prompt, in whole seconds. Reserved for Debrief execution; report mode does not send prompts."
+        },
+        {
+          "key": "auto_close.settle_hold_secs",
+          "type": "integer",
+          "default": "60",
+          "description": "Configured hold after a Debrief answer, in whole seconds. Reserved for Debrief execution; unused by report passes."
+        },
+        {
+          "key": "auto_close.quit_grace_secs",
+          "type": "integer",
+          "default": "60",
+          "description": "Configured wait after an agent quit request, in whole seconds. Reserved for close execution; report mode does not send quit requests."
+        },
+        {
+          "key": "auto_close.gate_timeout_secs",
+          "type": "integer",
+          "default": "10",
+          "description": "Maximum time for each gate command, in whole seconds. Exit status zero before the timeout opens the gate. Failure, inability to start, or timeout leaves the candidate waiting."
+        },
+        {
+          "key": "auto_close.claude.gate_command",
+          "type": "string",
+          "default": "\"usage --debrief-gate claude\"",
+          "description": "Command that checks whether a claude Debrief may run. The server runs it asynchronously during planning, subject to gate_timeout_secs."
+        },
+        {
+          "key": "auto_close.claude.invocation",
+          "type": "string",
+          "default": "\"/debrief\"",
+          "description": "Configured skill invocation for a claude Debrief. Reserved for Debrief execution; report mode does not send it."
+        },
+        {
+          "key": "auto_close.claude.limit_secs",
+          "type": "integer",
+          "default": "600",
+          "description": "Configured maximum duration of a claude Debrief, in whole seconds. Reserved for Debrief execution; report mode does not run Debriefs."
+        },
+        {
+          "key": "auto_close.codex.gate_command",
+          "type": "string",
+          "default": "\"usage --debrief-gate codex\"",
+          "description": "Command that checks whether a codex Debrief may run. The server runs it asynchronously during planning, subject to gate_timeout_secs."
+        },
+        {
+          "key": "auto_close.codex.invocation",
+          "type": "string",
+          "default": "\"$debrief\"",
+          "description": "Configured skill invocation for a codex Debrief. Reserved for Debrief execution; report mode does not send it."
+        },
+        {
+          "key": "auto_close.codex.limit_secs",
+          "type": "integer",
+          "default": "900",
+          "description": "Configured maximum duration of a codex Debrief, in whole seconds. Reserved for Debrief execution; report mode does not run Debriefs."
+        },
+        {
+          "key": "auto_close.pi.gate_command",
+          "type": "string",
+          "default": "\"usage --debrief-gate pi\"",
+          "description": "Command that checks whether a pi Debrief may run. The server runs it asynchronously during planning, subject to gate_timeout_secs."
+        },
+        {
+          "key": "auto_close.pi.invocation",
+          "type": "string",
+          "default": "\"/skill:debrief\"",
+          "description": "Configured skill invocation for a pi Debrief. Reserved for Debrief execution; report mode does not send it."
+        },
+        {
+          "key": "auto_close.pi.limit_secs",
+          "type": "integer",
+          "default": "600",
+          "description": "Configured maximum duration of a pi Debrief, in whole seconds. Reserved for Debrief execution; report mode does not run Debriefs."
+        }
+      ]
+    },
+    {
       "id": "theme",
       "title": "Theme",
       "keys": [

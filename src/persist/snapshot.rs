@@ -165,6 +165,9 @@ pub struct PaneSnapshot {
     // Omitting an absent ended agent preserves legacy history fingerprints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_agent: Option<String>,
+    /// Unix seconds when the agent ended. Missing legacy dates stay unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<u64>,
     // Keep legacy layout fingerprints stable when the pane has no starter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_by: Option<crate::api::schema::PaneStartedBy>,
@@ -532,6 +535,7 @@ fn capture_tab(
                     .map(|runtime| runtime.input_or_command_at())
                     .or_else(|| terminal.map(|terminal| terminal.input_or_command_at)),
                 ended_agent: terminal.and_then(|terminal| terminal.ended_agent.clone()),
+                ended_at: terminal.and_then(|terminal| terminal.ended_at),
                 started_by: terminal.and_then(|terminal| terminal.started_by.clone()),
                 session_reported: terminal.is_some_and(|terminal| terminal.session_reported),
                 starter_label: terminal.and_then(|terminal| terminal.starter_label.clone()),
@@ -854,6 +858,43 @@ mod tests {
         let active_pane = &active.workspaces[0].tabs[0].panes[&root.raw()];
         assert_eq!(active_pane.agent_name.as_deref(), Some("reviewer"));
         assert_eq!(active_pane.managed_agent_kind.as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn ended_at_snapshot_roundtrip_preserves_the_date_and_legacy_fingerprint() {
+        let mut state = state_with_workspaces(&["snapshot"]);
+        let terminal = state.terminals.values_mut().next().unwrap();
+        terminal.ended_agent = Some("pi".into());
+        terminal.ended_at = Some(123);
+        let snapshot = capture_from_state(&state);
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        let pane = json["workspaces"][0]["tabs"][0]["panes"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        assert_eq!(pane["ended_at"], 123);
+        let captured: PaneSnapshot = serde_json::from_value(pane.clone()).unwrap();
+        assert_eq!(captured.ended_at, Some(123));
+        pane.as_object_mut().unwrap().remove("ended_at");
+        let legacy: SessionSnapshot = serde_json::from_value(json.clone()).unwrap();
+        assert!(legacy.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .ended_at
+            .is_none());
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), json);
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            layout_fingerprint(&legacy),
+            Some(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&json).unwrap())
+            ))
+        );
     }
 
     #[test]
@@ -1272,6 +1313,7 @@ mod tests {
             0,
             PaneSnapshot {
                 ended_agent: None,
+                ended_at: None,
                 input_or_command_at: None,
                 started_by: None,
                 session_reported: false,
@@ -1301,6 +1343,7 @@ mod tests {
             1,
             PaneSnapshot {
                 ended_agent: None,
+                ended_at: None,
                 input_or_command_at: None,
                 started_by: None,
                 session_reported: false,
@@ -2070,6 +2113,7 @@ mod tests {
             0,
             PaneSnapshot {
                 ended_agent: None,
+                ended_at: None,
                 input_or_command_at: None,
                 started_by: None,
                 session_reported: false,
@@ -2099,6 +2143,7 @@ mod tests {
             1,
             PaneSnapshot {
                 ended_agent: None,
+                ended_at: None,
                 input_or_command_at: None,
                 started_by: None,
                 session_reported: false,

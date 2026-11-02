@@ -311,7 +311,7 @@ pub fn validated_sidebar_bounds(min: u16, max: u16) -> Option<(u16, u16)> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub auto_close: crate::app::auto_close::Config,
+    pub auto_close: AutoCloseConfig,
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
@@ -325,6 +325,115 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
     pub websocket_api: WebSocketApiConfig,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoCloseMode {
+    #[default]
+    Off,
+    Report,
+    Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoCloseConfig {
+    pub mode: AutoCloseMode,
+    pub ended_age_secs: u64,
+    pub dormant_age_secs: u64,
+    pub plain_shell_age_secs: u64,
+    pub pass_floor_secs: u64,
+    pub debrief: bool,
+    pub debrief_skill_path: String,
+    pub uptake_window_secs: u64,
+    pub settle_hold_secs: u64,
+    pub quit_grace_secs: u64,
+    pub gate_timeout_secs: u64,
+    #[serde(deserialize_with = "auto_close_claude_config")]
+    pub claude: AutoCloseKindConfig,
+    #[serde(deserialize_with = "auto_close_codex_config")]
+    pub codex: AutoCloseKindConfig,
+    #[serde(deserialize_with = "auto_close_pi_config")]
+    pub pi: AutoCloseKindConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoCloseKindConfig {
+    pub gate_command: String,
+    pub invocation: String,
+    pub limit_secs: u64,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AutoCloseKindOverrides {
+    gate_command: Option<String>,
+    invocation: Option<String>,
+    limit_secs: Option<u64>,
+}
+
+fn auto_close_kind_config<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    defaults: AutoCloseKindConfig,
+) -> Result<AutoCloseKindConfig, D::Error> {
+    let values = AutoCloseKindOverrides::deserialize(deserializer)?;
+    Ok(AutoCloseKindConfig {
+        gate_command: values.gate_command.unwrap_or(defaults.gate_command),
+        invocation: values.invocation.unwrap_or(defaults.invocation),
+        limit_secs: values.limit_secs.unwrap_or(defaults.limit_secs),
+    })
+}
+fn auto_close_claude_config<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AutoCloseKindConfig, D::Error> {
+    auto_close_kind_config(deserializer, AutoCloseConfig::default().claude)
+}
+fn auto_close_codex_config<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AutoCloseKindConfig, D::Error> {
+    auto_close_kind_config(deserializer, AutoCloseConfig::default().codex)
+}
+fn auto_close_pi_config<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<AutoCloseKindConfig, D::Error> {
+    auto_close_kind_config(deserializer, AutoCloseConfig::default().pi)
+}
+
+impl Default for AutoCloseConfig {
+    fn default() -> Self {
+        Self {
+            mode: AutoCloseMode::Off,
+            ended_age_secs: 24 * 3600,
+            dormant_age_secs: 72 * 3600,
+            plain_shell_age_secs: 7 * 24 * 3600,
+            pass_floor_secs: 600,
+            debrief: true,
+            debrief_skill_path: "~/.agents/skills/debrief/SKILL.md".into(),
+            uptake_window_secs: 60,
+            settle_hold_secs: 60,
+            quit_grace_secs: 60,
+            gate_timeout_secs: 10,
+            claude: AutoCloseKindConfig {
+                gate_command: "usage --debrief-gate claude".into(),
+                invocation: "/debrief".into(),
+                limit_secs: 600,
+            },
+            codex: AutoCloseKindConfig {
+                gate_command: "usage --debrief-gate codex".into(),
+                invocation: "$debrief".into(),
+                limit_secs: 900,
+            },
+            pi: AutoCloseKindConfig {
+                gate_command: "usage --debrief-gate pi".into(),
+                invocation: "/skill:debrief".into(),
+                limit_secs: 600,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]

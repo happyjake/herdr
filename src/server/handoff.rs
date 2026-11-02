@@ -1262,6 +1262,7 @@ mod tests {
                     *pane_id,
                     crate::persist::PaneSnapshot {
                         ended_agent: None,
+                        ended_at: None,
                         input_or_command_at: None,
                         started_by: None,
                         session_reported: false,

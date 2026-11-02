@@ -725,3 +725,178 @@ fn auto_close_gate_keeps_runtime_responsive_and_rechecks_exemptions() {
     assert_eq!(session.plan()["spared"][0]["exemption"], "pinned");
     agent.stop();
 }
+
+#[test]
+fn auto_close_unknown_agent_exit_starts_a_fresh_ended_age() {
+    let session =
+        Session::new("[auto_close]\nmode = 'report'\nended_age_secs = 3\npass_floor_secs = 1\n");
+    let reporter =
+        crate::support::InPaneReporter::write(&session.base, "custom-runner", &session.socket);
+    assert!(run_cli(
+        &session.socket,
+        &["pane", "run", &session.pane, &reporter.command()]
+    )
+    .status
+    .success());
+    reporter.wait_until_started(Duration::from_secs(5));
+    session.request("pane.report_agent", json!({"pane_id":session.pane,"source":"custom:test","agent":"custom-kind","state":"unknown"}));
+    let active = session.request("pane.get", json!({"pane_id":session.pane}))["pane"].clone();
+    assert_eq!(active["agent"], "custom-kind");
+    assert_eq!(active["agent_status"], "unknown");
+    thread::sleep(Duration::from_secs(4));
+    let exiting_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    reporter.stop();
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || {
+            let pane = session.request("pane.get", json!({"pane_id":session.pane}))["pane"].clone();
+            pane["agent"].is_null() && pane["ended_agent"] == "custom-kind"
+        }
+    ));
+    let ended = session.request("pane.get", json!({"pane_id":session.pane}))["pane"].clone();
+    assert_eq!(
+        ended["agent_status_changed_at"],
+        active["agent_status_changed_at"]
+    );
+    let plan = session.plan();
+    assert_eq!(plan["spared"][0]["exemption"], "too-young", "{plan}");
+    assert!(session.reports().is_empty());
+    assert!(wait_until(
+        Duration::from_secs(6),
+        Duration::from_millis(50),
+        || session.plan()["candidates"][0]["kind"] == "ended"
+    ));
+    assert!(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            >= exiting_at + 3
+    );
+}
+
+impl Session {
+    fn saved_pane(&self) -> Value {
+        let snapshot: Value = serde_json::from_slice(
+            &fs::read(
+                self.base
+                    .join("config")
+                    .join(app_dir_name())
+                    .join("session.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        snapshot["workspaces"][0]["tabs"][0]["panes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone()
+    }
+
+    fn wait_for_ended(&self, kind: &str) {
+        assert!(wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+            || {
+                let pane = self.request("pane.get", json!({"pane_id":self.pane}))["pane"].clone();
+                pane["agent"].is_null() && pane["ended_agent"] == kind
+            }
+        ));
+    }
+}
+
+#[test]
+fn auto_close_ended_age_survives_restart_without_restarting_its_clock() {
+    let config = "[auto_close]\nmode = 'report'\nended_age_secs = 6\npass_floor_secs = 1\n";
+    let mut session = Session::new(config);
+    let agent = session.agent("pi");
+    let before_exit = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    agent.stop();
+    session.wait_for_ended("pi");
+    session.stop();
+    let ended_at = session.saved_pane()["ended_at"]
+        .as_u64()
+        .expect("persisted exit time");
+    assert!(ended_at >= before_exit);
+    session.start(config);
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || session.plan()["spared"][0]["exemption"] == "too-young"
+    ));
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(50),
+        || session.plan()["candidates"][0]["kind"] == "ended"
+    ));
+    let before_plan = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let age = session.plan()["candidates"][0]["age_secs"]
+        .as_u64()
+        .unwrap();
+    let after_plan = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!((before_plan - ended_at..=after_plan - ended_at).contains(&age));
+    session.stop();
+    assert_eq!(session.saved_pane()["ended_at"], ended_at);
+}
+
+#[test]
+fn auto_close_legacy_ended_pane_waits_for_a_known_exit_time() {
+    let config = "[auto_close]\nmode = 'report'\nended_age_secs = 0\npass_floor_secs = 1\n";
+    let mut session = Session::new(config);
+    let agent = session.agent("pi");
+    agent.stop();
+    session.wait_for_ended("pi");
+    session.stop();
+    let reports_before = session.reports().len();
+    let path = session
+        .base
+        .join("config")
+        .join(app_dir_name())
+        .join("session.json");
+    let mut snapshot: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for pane in snapshot["workspaces"][0]["tabs"][0]["panes"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+    {
+        assert!(pane.as_object_mut().unwrap().remove("ended_at").is_some());
+    }
+    fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    session.start(config);
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || session.plan()["spared"][0]["exemption"] == "ended-time-unknown"
+    ));
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(session.reports().len(), reports_before);
+    session.stop();
+    assert!(session.saved_pane().get("ended_at").is_none());
+    session.start(config);
+    let next = session.agent("codex");
+    next.stop();
+    session.wait_for_ended("codex");
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || session.plan()["candidates"][0]["kind"] == "ended"
+    ));
+    session.stop();
+    assert!(session.saved_pane()["ended_at"].as_u64().is_some());
+}
