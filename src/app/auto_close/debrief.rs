@@ -534,7 +534,7 @@ impl App {
                     .and_then(|(ws, id)| self.lookup_runtime(ws, id))
                     .map(|(runtime, _)| runtime.scope_submission_deadline(deadline))
             });
-        self.handle_deferred_agent_api_request(
+        self.handle_internal_agent_prompt(
             Request {
                 id: "auto-close-debrief".into(),
                 method: Method::AgentPrompt(params),
@@ -559,7 +559,10 @@ impl App {
             .collect();
         for pane in missing {
             self.auto_close.debriefs.remove(&pane);
+            self.auto_close.close_probe_after.remove(&pane);
         }
+        if !self.auto_close.debriefs.values().any(Debrief::active)
+            && self.auto_close.delivery.is_none() && self.auto_close.submission.is_none() { return; }
         let now = logbook::now_ms();
         let panes = self.auto_close_snapshot_for(now / 1000, true);
         for pane in &panes {
@@ -795,7 +798,17 @@ impl App {
         debrief: CloseDebrief,
     ) {
         let now = crate::pane::unix_now_secs();
-        let fresh = self.auto_close_snapshot(now);
+        let mut fresh = self.auto_close_snapshot(now);
+        if observed.debrief.is_some() {
+            let after = *self
+                .auto_close
+                .close_probe_after
+                .entry(observed.pane_id.clone())
+                .or_insert_with(Instant::now);
+            if !self.auto_close.probes.refresh(&mut fresh, after) {
+                return;
+            }
+        }
         let Ok(candidate) = decide(observed, &fresh, &self.auto_close.config, now) else {
             return;
         };
@@ -831,6 +844,7 @@ impl App {
             return;
         }
         self.auto_close.debriefs.remove(pane);
+        self.auto_close.close_probe_after.remove(pane);
         self.flush_logbook();
     }
 
@@ -867,11 +881,14 @@ impl App {
 
     pub(super) fn restore_debriefs(&mut self, states: HashMap<String, Debrief>) {
         self.auto_close.debriefs = states;
-        let live: HashSet<_> = self
-            .auto_close_snapshot(crate::pane::unix_now_secs())
-            .into_iter()
-            .map(|pane| pane.pane_id)
-            .collect();
+        let mut live = HashSet::new();
+        for (ws_idx, workspace) in self.state.workspaces.iter().enumerate() {
+            for pane_id in workspace.tabs.iter().flat_map(|tab| tab.panes.keys()) {
+                if let Some(id) = self.public_pane_id(ws_idx, *pane_id) {
+                    live.insert(id);
+                }
+            }
+        }
         self.auto_close
             .debriefs
             .retain(|pane, _| live.contains(pane));

@@ -2422,7 +2422,17 @@ impl App {
             }
         }
         let by = params.by.unwrap_or(crate::api::schema::PaneCloseBy::Api);
-        let workspace_snapshot = self.workspace_info(ws_idx);
+        let workspace_snapshot = if age_secs.is_some() {
+            let label =
+                self.state.workspaces[ws_idx].display_name_from_terminals(&self.state.terminals);
+            self.workspace_info_with_label(
+                ws_idx,
+                crate::pane::AgentStatusProjection::Reported,
+                label,
+            )
+        } else {
+            self.workspace_info(ws_idx)
+        };
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         if !self.state.close_pane_would_close_workspace(ws_idx, pane_id) {
             self.state.record_logbook_close_with_age(
@@ -2454,7 +2464,11 @@ impl App {
                 age_secs,
             );
             self.annotate_auto_close(&public_pane_id, auto_close);
-            self.shutdown_detached_terminal_runtimes();
+            if age_secs.is_some() {
+                self.shutdown_auto_closed_runtimes();
+            } else {
+                self.shutdown_detached_terminal_runtimes();
+            }
             self.schedule_session_save();
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,
@@ -2479,7 +2493,11 @@ impl App {
                 params.reason.as_deref(),
                 age_secs,
             );
-            self.shutdown_detached_terminal_runtimes();
+            if age_secs.is_some() {
+                self.shutdown_auto_closed_runtimes();
+            } else {
+                self.shutdown_detached_terminal_runtimes();
+            }
             self.schedule_session_save();
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,

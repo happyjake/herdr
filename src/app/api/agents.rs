@@ -84,10 +84,29 @@ impl App {
         request: crate::api::schema::Request,
         respond_to: std::sync::mpsc::Sender<String>,
     ) -> bool {
+        self.handle_agent_prompt_request(request, respond_to, true)
+    }
+
+    /// Internal automation needs only a receipt. Its process guard runs on the
+    /// PTY worker; constructing public CWD metadata must not block the runtime.
+    pub(crate) fn handle_internal_agent_prompt(
+        &mut self,
+        request: crate::api::schema::Request,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) -> bool {
+        self.handle_agent_prompt_request(request, respond_to, false)
+    }
+
+    fn handle_agent_prompt_request(
+        &mut self,
+        request: crate::api::schema::Request,
+        respond_to: std::sync::mpsc::Sender<String>,
+        probe_now: bool,
+    ) -> bool {
         let crate::api::schema::Method::AgentPrompt(params) = request.method else {
             return false;
         };
-        let validated = match self.validate_agent_prompt(request.id, &params) {
+        let validated = match self.validate_agent_prompt(request.id, &params, probe_now) {
             Ok(validated) => validated,
             Err(response) => {
                 let _ = respond_to.send(response);
@@ -98,7 +117,7 @@ impl App {
         // fails the request while nothing has been sent yet.
         let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<(
             String,
-            crate::api::schema::AgentInfo,
+            Option<crate::api::schema::AgentInfo>,
             std::sync::mpsc::Receiver<std::io::Result<()>>,
         )>();
         let waiter_respond_to = respond_to.clone();
@@ -107,7 +126,12 @@ impl App {
                 return;
             };
             let response = match completion.recv() {
-                Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                Ok(Ok(())) => encode_success(
+                    id,
+                    agent.map_or(ResponseResult::Ok {}, |agent| {
+                        ResponseResult::AgentPrompted { agent }
+                    }),
+                ),
                 Ok(Err(err)) => {
                     if let Some(rejected) = crate::pty::actor::submission_rejected_response(&err) {
                         rejected.to_owned()
@@ -146,6 +170,7 @@ impl App {
         &self,
         id: String,
         params: &AgentPromptParams,
+        probe_now: bool,
     ) -> Result<ValidatedAgentPrompt, String> {
         if params.text.is_empty() {
             return Err(encode_error(
@@ -165,6 +190,9 @@ impl App {
             ));
         }
         let target_is_pane_id = self.parse_current_public_pane_id(&params.target).is_some();
+        if !probe_now && !target_is_pane_id {
+            return Err(agent_not_found(id, &params.target));
+        }
         let resolved = match self
             .resolve_agent_prompt_target(&params.target, params.expect_terminal.as_deref())
         {
@@ -204,6 +232,7 @@ impl App {
                     pane_snapshot.as_ref(),
                     terminal_snapshot.as_ref(),
                     &dummy_pid,
+                    probe_now,
                     #[cfg(test)]
                     None,
                 )?;
@@ -227,12 +256,18 @@ impl App {
                 pane_snapshot.as_ref(),
                 terminal_snapshot.as_ref(),
                 &child_pid_handle,
+                probe_now,
                 #[cfg(test)]
                 test_foreground_agent.as_ref(),
             )?
         };
-        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
-            return Err(agent_not_found(id, &params.target));
+        let agent = if probe_now {
+            Some(
+                self.agent_info(resolved.ws_idx, resolved.pane_id)
+                    .ok_or_else(|| agent_not_found(id.clone(), &params.target))?,
+            )
+        } else {
+            None
         };
         let guard_id = id.clone();
         let guard_params: AgentPromptParams = params.clone();
@@ -260,6 +295,7 @@ impl App {
                 pane_snapshot.as_ref(),
                 terminal_snapshot.as_ref(),
                 &child_pid_handle,
+                true,
                 #[cfg(test)]
                 test_foreground_agent.as_ref(),
             )
@@ -283,7 +319,7 @@ impl App {
     ) -> Result<
         (
             String,
-            crate::api::schema::AgentInfo,
+            Option<crate::api::schema::AgentInfo>,
             std::sync::mpsc::Receiver<std::io::Result<()>>,
         ),
         String,
@@ -510,7 +546,7 @@ struct ValidatedAgentPrompt {
     ws_idx: usize,
     pane_id: crate::layout::PaneId,
     expected_agent: crate::detect::Agent,
-    agent: crate::api::schema::AgentInfo,
+    agent: Option<crate::api::schema::AgentInfo>,
     guard: crate::pty::actor::PtySubmissionGuard,
 }
 
@@ -522,6 +558,7 @@ fn validate_agent_prompt_delivery(
     pane_snapshot: Option<&crate::pane::PaneDeliverySnapshot>,
     terminal_snapshot: Option<&crate::terminal::state::TerminalDeliverySnapshot>,
     child_pid_handle: &std::sync::atomic::AtomicU32,
+    probe_process: bool,
     #[cfg(test)] test_foreground_agent: Option<
         &std::sync::Arc<std::sync::Mutex<Option<Option<crate::detect::Agent>>>>,
     >,
@@ -642,12 +679,14 @@ fn validate_agent_prompt_delivery(
     if terminal_snapshot.managed_agent_launch_pending {
         return Err(agent_not_ready(id.to_string(), &params.target));
     }
-    if !super::super::agents::runtime_handles_host_agent(
-        child_pid_handle,
-        #[cfg(test)]
-        test_foreground_agent,
-        expected_agent,
-    ) {
+    if probe_process
+        && !super::super::agents::runtime_handles_host_agent(
+            child_pid_handle,
+            #[cfg(test)]
+            test_foreground_agent,
+            expected_agent,
+        )
+    {
         let code = if has_identity_expectations {
             "agent_mismatch"
         } else {

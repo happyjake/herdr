@@ -14,6 +14,7 @@ use crate::config::{
 };
 
 pub(crate) mod debrief;
+mod probes;
 use debrief::{Debrief, Phase};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -152,6 +153,8 @@ pub struct Plan {
 /// Facts are captured once; eligibility itself reads no process, filesystem or clock.
 #[derive(Debug, Clone)]
 struct PaneSnapshot {
+    probe: Option<probes::Request>,
+    probe_ready: bool,
     pane_id: String,
     workspace_id: String,
     agent: Option<String>,
@@ -178,7 +181,11 @@ struct PaneSnapshot {
 
 impl PaneSnapshot {
     fn same_close_facts(&self, other: &Self) -> bool {
-        self.input_at == other.input_at
+        self.probe_ready
+            && other.probe_ready
+            && self.probe.as_ref().map(|request| &request.key)
+                == other.probe.as_ref().map(|request| &request.key)
+            && self.input_at == other.input_at
             && self.input_seq == other.input_seq
             && self.status == other.status
             && self.status_at == other.status_at
@@ -220,6 +227,9 @@ struct RefusalKey {
 }
 
 pub(crate) struct AutoClose {
+    probes: probes::Probes,
+    close_probe_after: HashMap<String, Instant>,
+    shutdowns: Option<std::sync::mpsc::Sender<crate::terminal::TerminalRuntime>>,
     pub(crate) config: Config,
     pub(crate) deadline: Option<Instant>,
     pub(crate) focused: HashSet<crate::layout::PaneId>,
@@ -235,9 +245,8 @@ pub(crate) struct AutoClose {
 }
 
 struct PendingPass {
-    receiver: std::sync::mpsc::Receiver<Plan>,
+    receiver: std::sync::mpsc::Receiver<(Plan, Vec<PaneSnapshot>)>,
     task: tokio::task::JoinHandle<()>,
-    panes: Vec<PaneSnapshot>,
     at: u64,
 }
 
@@ -250,6 +259,9 @@ impl Drop for PendingPass {
 impl AutoClose {
     pub(crate) fn new(config: Config) -> Self {
         Self {
+            probes: probes::Probes::default(),
+            close_probe_after: HashMap::new(),
+            shutdowns: None,
             config,
             deadline: None,
             focused: HashSet::new(),
@@ -331,6 +343,9 @@ fn decide(
     }
     if pane.debrief.is_some() && pane.status == AgentStatus::Blocked {
         return Err("blocked");
+    }
+    if !pane.probe_ready {
+        return Err("probe-pending");
     }
     if pane.single_pane_workspace
         && main_checkout_home(pane, panes)
@@ -454,13 +469,12 @@ fn plan(panes: &[PaneSnapshot], config: &Config, now: u64) -> Plan {
     result
 }
 
-fn debrief_waits(mut plan: Plan, panes: &[PaneSnapshot], config: &Config) -> Plan {
-    let path = if let Some(relative) = config.debrief_skill_path.strip_prefix("~/") {
-        std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(relative))
-    } else {
-        Some(std::path::PathBuf::from(&config.debrief_skill_path))
-    };
-    let skill_present = path.is_some_and(|path| path.is_file());
+fn debrief_waits(
+    mut plan: Plan,
+    panes: &[PaneSnapshot],
+    config: &Config,
+    skill_present: bool,
+) -> Plan {
     for candidate in &mut plan.candidates {
         if candidate.action == Action::Wait {
             continue;
@@ -519,8 +533,30 @@ async fn gate(command: &str, timeout_secs: u64) -> Result<(), &'static str> {
     }
 }
 
-async fn evaluate(panes: &[PaneSnapshot], config: &Config, now: u64) -> Plan {
-    let mut result = debrief_waits(plan(panes, config, now), panes, config);
+async fn evaluate(
+    panes: &[PaneSnapshot],
+    config: &Config,
+    now: u64,
+    probes: &probes::Probes,
+) -> Plan {
+    let planned = plan(panes, config, now);
+    let needs_skill = config.debrief
+        && planned.candidates.iter().any(|candidate| {
+            candidate.kind == Kind::Dormant
+                && candidate.action != Action::Wait
+                && panes
+                    .iter()
+                    .find(|pane| pane.pane_id == candidate.pane_id)
+                    .is_some_and(|pane| {
+                        matches!(pane.agent.as_deref(), Some("claude" | "codex" | "pi"))
+                            && pane
+                                .debrief
+                                .as_ref()
+                                .is_none_or(|state| matches!(state.phase, Phase::Retry { .. }))
+                    })
+        });
+    let skill_present = needs_skill && probes.skill(&config.debrief_skill_path).await;
+    let mut result = debrief_waits(planned, panes, config, skill_present);
     let mut gates = HashMap::new();
     for candidate in &mut result.candidates {
         if candidate.wait_reason.as_deref() != Some("gate-pending") {
@@ -655,6 +691,41 @@ fn candidate_ready_to_close(
 }
 
 impl App {
+    pub(crate) fn shutdown_auto_closed_runtimes(&mut self) {
+        if self.auto_close.shutdowns.is_none() {
+            let (sender, receiver) = std::sync::mpsc::channel::<crate::terminal::TerminalRuntime>();
+            if let Err(error) =
+                crate::thread_spawn::spawn_named("herdr-auto-close-stop", move || {
+                    for runtime in receiver {
+                        runtime.shutdown();
+                    }
+                })
+            {
+                tracing::warn!(%error, "failed to start auto-close shutdown worker");
+                return;
+            }
+            self.auto_close.shutdowns = Some(sender);
+        }
+        self.flush_logbook();
+        let ids = std::mem::take(&mut self.state.terminal_runtime_shutdowns);
+        for id in ids {
+            if let Some(runtime) = self.terminal_runtimes.remove(&id) {
+                if let Some(sender) = &self.auto_close.shutdowns {
+                    if let Err(error) = sender.send(runtime) {
+                        self.terminal_runtimes.insert(id.clone(), error.0);
+                        self.state.terminal_runtime_shutdowns.push(id);
+                        self.auto_close.shutdowns = None;
+                    }
+                } else {
+                    self.terminal_runtimes.insert(id.clone(), runtime);
+                    self.state.terminal_runtime_shutdowns.push(id);
+                }
+            }
+        }
+        self.sync_flag_deadline();
+        self.prune_emitted_pane_and_workspace_facts();
+    }
+
     pub(crate) fn attach_auto_close_status(&mut self, shared: SharedStatus) {
         *shared.0.write().unwrap_or_else(|error| error.into_inner()) = self
             .auto_close
@@ -794,6 +865,15 @@ impl App {
     }
 
     fn auto_close_snapshot_for(&self, now: u64, active_only: bool) -> Vec<PaneSnapshot> {
+        let terminals = self
+            .state
+            .terminals
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        self.auto_close
+            .probes
+            .retain(&terminals, &self.auto_close.config.debrief_skill_path);
         let mut panes = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             let single_pane_workspace =
@@ -867,14 +947,21 @@ impl App {
                         super::api_helpers::pane_agent_status(terminal.state, pane.seen),
                         now,
                     );
-                    let bare_prompt = agent.is_none()
-                        && runtime
-                            .and_then(|runtime| runtime.child_pid())
-                            .is_some_and(|pid| {
-                                crate::detect::pane_shell_is_idle(pid)
-                                    && crate::platform::session_processes(pid) == vec![pid]
-                            });
+                    let probe = probes::Request {
+                        key: probes::Key {
+                            terminal: terminal.id.to_string(),
+                            pid: runtime.and_then(|runtime| runtime.child_pid()),
+                            input_seq: runtime.map_or(0, |runtime| runtime.input_or_command_seq()),
+                            status_at,
+                            agent: agent.clone(),
+                            cwd: terminal.cwd.clone(),
+                        },
+                        process: runtime.map(|runtime| runtime.process_probe()),
+                    };
+                    let facts = self.auto_close.probes.pane(&probe, None);
                     panes.push(PaneSnapshot {
+                        probe: Some(probe),
+                        probe_ready: facts.is_some(),
                         debrief: self.auto_close.debriefs.get(&pane_id).cloned(),
                         pane_id,
                         workspace_id: ws.id.clone(),
@@ -895,17 +982,10 @@ impl App {
                         desk_focused: self.auto_close.focused.contains(&id),
                         restore_until: pane.agent_status_resolution_due_at(),
                         single_pane_workspace,
-                        main_checkout: tab
-                            .foreground_cwd_for_pane(id, &self.terminal_runtimes)
-                            .or_else(|| {
-                                tab.cwd_for_pane(id, &self.state.terminals, &self.terminal_runtimes)
-                            })
-                            .and_then(|cwd| crate::workspace::git_space_metadata(&cwd))
-                            .filter(|info| !info.is_linked_worktree)
-                            .map(|info| info.checkout_key),
+                        main_checkout: facts.as_ref().and_then(|facts| facts.main_checkout.clone()),
                         group_refusal,
                         group_members: group_members.clone(),
-                        bare_prompt,
+                        bare_prompt: facts.is_some_and(|facts| facts.bare_prompt),
                         starter: terminal.started_by.as_ref().and_then(live_starter),
                         session: self.state.logbook_key(id).map(|key| CloseSession {
                             agent: key.agent,
@@ -925,10 +1005,13 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
         let now = crate::pane::unix_now_secs();
+        let after = Instant::now();
         let panes = self.auto_close_snapshot(now);
         let config = self.auto_close.config.clone();
+        let probes = self.auto_close.probes.clone();
         tokio::spawn(async move {
-            let plan = evaluate(&panes, &config, now).await;
+            let panes = probes.resolve(panes, after).await;
+            let plan = evaluate(&panes, &config, now, &probes).await;
             let response = super::api::responses::encode_success(
                 id,
                 crate::api::schema::ResponseResult::AutoClosePlan { plan },
@@ -966,14 +1049,9 @@ impl App {
         }
         if let Some(pending) = self.auto_close.pending.as_ref() {
             match pending.receiver.try_recv() {
-                Ok(result) => {
+                Ok((result, panes)) => {
                     if let Some(pending) = self.auto_close.pending.take() {
-                        return self.finish_auto_close_pass(
-                            result,
-                            &pending.panes,
-                            pending.at,
-                            monotonic,
-                        );
+                        return self.finish_auto_close_pass(result, &panes, pending.at, monotonic);
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -990,17 +1068,22 @@ impl App {
             return false;
         }
         let now = crate::pane::unix_now_secs();
+        let after = Instant::now();
         let panes = self.auto_close_snapshot(now);
         let config = self.auto_close.config.clone();
-        let input = panes.clone();
+        let probes = self.auto_close.probes.clone();
         let (sender, receiver) = std::sync::mpsc::channel();
         let task = tokio::spawn(async move {
-            let _ = sender.send(evaluate(&input, &config, now).await);
+            let panes = probes.resolve(panes, after).await;
+            let result = evaluate(&panes, &config, now, &probes).await;
+            // Gates can take seconds. Refresh external facts off-loop before
+            // the runtime checks current input, status and layout at each close.
+            probes.resolve(panes.clone(), Instant::now()).await;
+            let _ = sender.send((result, panes));
         });
         self.auto_close.pending = Some(PendingPass {
             receiver,
             task,
-            panes,
             at: now,
         });
         self.auto_close.deadline = monotonic.checked_add(Duration::from_millis(25));
@@ -1308,6 +1391,8 @@ mod tests {
 
     fn shell() -> PaneSnapshot {
         PaneSnapshot {
+            probe: None,
+            probe_ready: true,
             pane_id: "pane-1".into(),
             workspace_id: "w1".into(),
             agent: None,
@@ -1570,7 +1655,8 @@ mod tests {
             debrief_waits(
                 plan(&[pane.clone()], &config, 200),
                 &[pane.clone()],
-                &config
+                &config,
+                false
             )
             .candidates[0]
                 .action,
@@ -1581,7 +1667,8 @@ mod tests {
             debrief_waits(
                 plan(&[pane.clone()], &config, 200),
                 &[pane.clone()],
-                &config
+                &config,
+                false
             )
             .candidates[0]
                 .wait_reason
@@ -1590,8 +1677,9 @@ mod tests {
         );
         config.debrief = false;
         assert_eq!(
-            debrief_waits(plan(&[pane.clone()], &config, 200), &[pane], &config).candidates[0]
-                .action,
+            debrief_waits(plan(&[pane.clone()], &config, 200), &[pane], &config, false).candidates
+                [0]
+            .action,
             Action::Close
         );
     }
@@ -1621,7 +1709,7 @@ mod tests {
             debrief_skill_path: String::new(),
             ..Config::default()
         };
-        let evaluated = evaluate(&panes, &config, 200).await;
+        let evaluated = evaluate(&panes, &config, 200, &probes::Probes::default()).await;
         assert_eq!(evaluated.candidates.len(), 3);
         assert_eq!(evaluated.spared.len(), 1);
         assert_eq!(evaluated.spared[0].pane_id, "pane-legacy-ended");
@@ -1753,7 +1841,21 @@ mod tests {
             120,
         ));
 
-        let mutations: [fn(&mut PaneSnapshot); 12] = [
+        let mutations: [fn(&mut PaneSnapshot); 14] = [
+            |pane| pane.probe_ready = false,
+            |pane| {
+                pane.probe = Some(probes::Request {
+                    key: probes::Key {
+                        terminal: "replacement".into(),
+                        pid: None,
+                        input_seq: 0,
+                        status_at: 100,
+                        agent: None,
+                        cwd: "checkout".into(),
+                    },
+                    process: None,
+                })
+            },
             |pane| pane.input_at = 105,
             |pane| pane.input_seq = 4,
             |pane| pane.status = AgentStatus::Working,

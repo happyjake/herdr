@@ -1595,6 +1595,51 @@ enum PaneRuntimeIo {
     },
 }
 
+/// Owned inputs for process/CWD inspection on a background worker.
+#[derive(Clone)]
+pub(crate) struct PaneProcessProbe {
+    pid: u32,
+    reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
+}
+
+impl std::fmt::Debug for PaneProcessProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaneProcessProbe")
+            .field("pid", &self.pid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PaneProcessProbe {
+    pub(crate) fn inspect(&self, check_shell: bool) -> (Option<std::path::PathBuf>, bool) {
+        if self.pid == 0 {
+            return (None, false);
+        }
+        let foreground = crate::platform::foreground_process_group_id(self.pid);
+        let cwd = process_foreground_cwd(self.pid, foreground)
+            .or_else(|| resolve_pane_cwd(&self.reported_cwd, self.pid, || foreground));
+        let bare = check_shell
+            && crate::detect::pane_shell_is_idle(self.pid)
+            && crate::platform::session_processes(self.pid) == vec![self.pid];
+        (cwd, bare)
+    }
+}
+
+fn process_foreground_cwd(pid: u32, foreground_pgid: Option<u32>) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        let shell_cwd = absolute_process_cwd(pid);
+        foreground_pgid
+            .and_then(absolute_process_cwd)
+            .or_else(|| foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, foreground_pgid);
+        None
+    }
+}
+
 impl PaneRuntimeIo {
     fn shutdown(&self) {
         match self {
@@ -4301,6 +4346,13 @@ impl PaneRuntime {
         (pid > 0).then_some(pid)
     }
 
+    pub(crate) fn process_probe(&self) -> PaneProcessProbe {
+        PaneProcessProbe {
+            pid: self.child_pid.load(Ordering::Acquire),
+            reported_cwd: self.reported_cwd.clone(),
+        }
+    }
+
     pub(crate) fn child_pid_handle(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.child_pid)
     }
@@ -4326,21 +4378,12 @@ impl PaneRuntime {
         #[cfg(unix)]
         {
             let pid = self.child_pid.load(Ordering::Acquire);
-            let shell_cwd = absolute_process_cwd(pid);
-            let foreground_pgid = self
+            let foreground = self
                 .io
                 .foreground_process_group_id()
                 .or_else(|| crate::platform::foreground_process_group_id(pid));
-            let leader_cwd = foreground_pgid.and_then(absolute_process_cwd);
-
-            // The group leader's cwd is authoritative (issue #3270): a helper
-            // process that chdirs elsewhere inside the same foreground group
-            // must not override it. Scan other members only when the leader's
-            // cwd cannot be read at all.
-            leader_cwd
-                .or_else(|| foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref()))
+            process_foreground_cwd(pid, foreground)
         }
-
         #[cfg(not(unix))]
         {
             None

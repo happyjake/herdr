@@ -55,6 +55,34 @@ fn restore_request_with_params(
 
 #[test]
 fn server_restores_while_git_metadata_is_blocked() {
+    assert_restore_responsive("", false);
+}
+
+#[test]
+fn auto_close_report_stays_responsive_with_blocked_git_metadata() {
+    assert_restore_responsive(
+        "[auto_close]\nmode = 'report'\npass_floor_secs = 1\nplain_shell_age_secs = 0\n",
+        false,
+    );
+}
+
+#[test]
+fn auto_close_close_stays_responsive_with_blocked_git_metadata() {
+    assert_restore_responsive(
+        "[auto_close]\nmode = 'close'\npass_floor_secs = 1\nplain_shell_age_secs = 0\n",
+        false,
+    );
+}
+
+#[test]
+fn debrief_replay_deadline_does_not_wait_for_blocked_git_metadata() {
+    assert_restore_responsive(
+        "[auto_close]\nmode = 'close'\npass_floor_secs = 30\n[auto_close.pi]\nlimit_secs = 1\n",
+        true,
+    );
+}
+
+fn assert_restore_responsive(auto_close: &str, replay_debrief: bool) {
     use std::os::unix::fs::OpenOptionsExt;
 
     for saved_membership in [false, true] {
@@ -108,7 +136,7 @@ fn server_restores_while_git_metadata_is_blocked() {
             "key": healthy.join(".git"), "label": "healthy", "repo_root": healthy,
             "checkout_path": healthy, "is_linked_worktree": false
         });
-        let snapshot = serde_json::json!({
+        let mut snapshot = serde_json::json!({
             "version": 3, "active": 0, "selected": 0,
             "workspaces": [{
                 "id": "w1", "custom_name": "restored", "identity_cwd": repo,
@@ -123,9 +151,21 @@ fn server_restores_while_git_metadata_is_blocked() {
                           "zoomed": false, "focused": 9, "root_pane": 9}]
             }]
         });
+        if replay_debrief {
+            snapshot["workspaces"][0]["tabs"][0]["panes"]["7"]["input_or_command_at"] =
+                serde_json::json!(100);
+        }
         fs::write(data_dir.join("session.json"), snapshot.to_string()).unwrap();
         fs::write(data_dir.join("config.toml"),
-            "onboarding = false\n[terminal]\ndefault_shell = \"/bin/sh\"\n[ui.sidebar.spaces]\nrows = [[\"workspace\"]]\n").unwrap();
+            format!("onboarding = false\n[terminal]\ndefault_shell = \"/bin/sh\"\n[ui.sidebar.spaces]\nrows = [[\"workspace\"]]\n{auto_close}")).unwrap();
+        if replay_debrief {
+            let at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let sent = serde_json::json!({"type":"debrief_sent","pane":"w1:p3","at":at,"state":{"agent":"pi","session":null,"age_secs":259200,"input_at":100,"attempt":1,"phase":{"phase":"sent","at":at}}});
+            fs::write(data_dir.join("logbook.jsonl"), format!("{sent}\n")).unwrap();
+        }
         support::register_runtime_dir(&runtime_dir);
         let child = Command::new(env!("CARGO_BIN_EXE_herdr"))
             .arg("server")
@@ -145,6 +185,21 @@ fn server_restores_while_git_metadata_is_blocked() {
         support::register_spawned_herdr_pid(Some(child.id()));
         let mut herdr = RestoredServer { child, base };
         support::wait_for_socket(&socket_path, Duration::from_secs(5));
+
+        let mut pending_plan = None;
+        if !auto_close.is_empty() {
+            let mut stream = UnixStream::connect(&socket_path).unwrap();
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({"id":"plan","method":"auto_close.plan","params":{}})
+            )
+            .unwrap();
+            pending_plan = Some(stream);
+            // The plan and the scheduled pass now overlap the blocked metadata
+            // read. Other API requests and shutdown must remain available.
+            std::thread::sleep(Duration::from_millis(1200));
+        }
 
         let workspaces = restore_request(&socket_path, "workspace.list");
         let restored = &workspaces["result"]["workspaces"][0];
@@ -198,6 +253,16 @@ fn server_restores_while_git_metadata_is_blocked() {
         }
         restore_request(&socket_path, "session.snapshot");
         restore_request(&socket_path, "agent.list");
+        if replay_debrief {
+            assert!(
+                support::wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                    fs::read_to_string(data_dir.join("logbook.jsonl"))
+                        .unwrap_or_default()
+                        .contains("recovered-limit")
+                }),
+                "the replayed Debrief deadline did not advance while metadata was blocked"
+            );
+        }
         restore_request(&socket_path, "server.stop");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -222,5 +287,6 @@ fn server_restores_while_git_metadata_is_blocked() {
             snapshot["workspaces"][0]["worktree_space"]
         );
         drop(herdr);
+        drop(pending_plan);
     }
 }

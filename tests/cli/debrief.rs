@@ -1164,3 +1164,46 @@ fn debrief_finished_close_preserves_a_new_main_checkout_home() {
         1
     );
 }
+
+#[test]
+fn debrief_disabled_waits_for_metadata_without_blocking_requests() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let session = Session::new("pi");
+    create_committed_repo(&session.base);
+    let config = session.base.join(".git/config");
+    fs::remove_file(&config).unwrap();
+    assert!(Command::new("mkfifo")
+        .arg(&config)
+        .status()
+        .unwrap()
+        .success());
+    let blocked = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&config)
+        .unwrap();
+    session.enable("pi", "debrief = false");
+    let mut pending_plan = UnixStream::connect(&session.socket).unwrap();
+    writeln!(
+        pending_plan,
+        "{}",
+        json!({"id":"pending","method":"auto_close.plan","params":{}})
+    )
+    .unwrap();
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(session.pane()["agent"], "pi");
+    assert_eq!(
+        session.request("workspace.list", json!({}))["workspaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(session
+        .logbook()
+        .iter()
+        .all(|line| line["type"] != "pane_closed"));
+    drop(session);
+    drop(blocked);
+}

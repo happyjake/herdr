@@ -674,6 +674,10 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    pub(crate) fn process_probe(&self) -> crate::pane::PaneProcessProbe {
+        self.0.process_probe()
+    }
+
     pub(crate) fn child_pid_handle(&self) -> Arc<std::sync::atomic::AtomicU32> {
         self.0.child_pid_handle()
     }
