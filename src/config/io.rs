@@ -5,6 +5,7 @@ use tracing::warn;
 use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
+    "auto_close",
     "advanced",
     "experimental",
     "keys",
@@ -288,6 +289,14 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         }
     }
 
+    load_live_section(
+        table,
+        "auto_close",
+        "auto-close config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.auto_close = section,
+    );
     load_live_section(
         table,
         "theme",

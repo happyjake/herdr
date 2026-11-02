@@ -121,6 +121,17 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
             };
             exit_code
         }
+        "auto-close" => {
+            if args[2..] != ["plan"] {
+                eprintln!("usage: herdr auto-close plan");
+                2
+            } else {
+                print_response(&send_request(&Request {
+                    id: "cli:auto-close:plan".into(),
+                    method: Method::AutoClosePlan(Default::default()),
+                })?)?
+            }
+        }
         "api" => api::run_api_command(&args[2..])?,
         "status" => status::run_status_command(&args[2..])?,
         "completion" | "completions" => completion::run_completion_command(&args[2..])?,

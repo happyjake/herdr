@@ -417,6 +417,36 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
 
+# Auto-close planning is off by default. Report mode writes would-close
+# Logbook lines and never closes or prompts a pane. All durations are seconds.
+[auto_close]
+mode = "off"                         # off | report | close (reserved)
+ended_age_secs = 86400
+dormant_age_secs = 259200
+plain_shell_age_secs = 604800
+pass_floor_secs = 600                 # at least one second
+debrief = true
+debrief_skill_path = "~/.agents/skills/debrief/SKILL.md"
+uptake_window_secs = 60
+settle_hold_secs = 60
+quit_grace_secs = 60
+gate_timeout_secs = 10
+
+[auto_close.claude]
+gate_command = "usage --debrief-gate claude"
+invocation = "/debrief"
+limit_secs = 600
+
+[auto_close.codex]
+gate_command = "usage --debrief-gate codex"
+invocation = "$debrief"
+limit_secs = 900
+
+[auto_close.pi]
+gate_command = "usage --debrief-gate pi"
+invocation = "/skill:debrief"
+limit_secs = 600
+
 [websocket_api]
 # Optional WebSocket transport for the JSON API, for non-terminal clients.
 # Off by default: with no bind address, no network port is opened.

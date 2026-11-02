@@ -283,6 +283,24 @@ pub(super) fn spawn_herdr_with_config(
     path_override: Option<&Path>,
     config_toml: &str,
 ) -> SpawnedHerdr {
+    spawn_herdr_with_config_and_home(
+        config_home,
+        runtime_dir,
+        socket_path,
+        path_override,
+        config_toml,
+        None,
+    )
+}
+
+pub(super) fn spawn_herdr_with_config_and_home(
+    config_home: &Path,
+    runtime_dir: &Path,
+    socket_path: &Path,
+    path_override: Option<&Path>,
+    config_toml: &str,
+    home: Option<&Path>,
+) -> SpawnedHerdr {
     fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
@@ -310,6 +328,12 @@ pub(super) fn spawn_herdr_with_config(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    if let Some(home) = home {
+        fs::create_dir_all(home).unwrap();
+        cmd.env("HOME", home);
+        cmd.env("XDG_CACHE_HOME", home.join("cache"));
+        cmd.env("XDG_STATE_HOME", home.join("state"));
+    }
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }

@@ -99,6 +99,17 @@ pub enum Event {
         session: Option<CloseSession>,
         at: u64,
     },
+    WouldClose {
+        pane: String,
+        by: CloseBy,
+        reason: String,
+        age_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        debrief: Option<CloseDebrief>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<CloseSession>,
+        at: u64,
+    },
     Parent {
         child: SessionKey,
         parent: SessionKey,
@@ -254,6 +265,7 @@ impl Writer {
                 self.labels
                     .retain(|(recorded_pane, _), _| recorded_pane != pane);
             }
+            Event::WouldClose { .. } => {}
             Event::Parent { child, parent } => {
                 self.parents.insert((child.clone(), parent.clone()));
             }

@@ -125,6 +125,7 @@ pub(crate) fn start_server_with_stop_control(
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
     advertised_endpoint: crate::api::SharedAdvertisedEndpoint,
+    auto_close: crate::app::auto_close::SharedStatus,
 ) -> std::io::Result<ServerHandle> {
     start_server_inner(
         api_tx,
@@ -135,6 +136,7 @@ pub(crate) fn start_server_with_stop_control(
         server_name,
         server_reach,
         advertised_endpoint,
+        auto_close,
     )
 }
 
@@ -147,6 +149,7 @@ fn start_server_inner(
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
     advertised_endpoint: crate::api::SharedAdvertisedEndpoint,
+    auto_close: crate::app::auto_close::SharedStatus,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -197,6 +200,7 @@ fn start_server_inner(
                 let server_name = server_name.clone();
                 let server_reach = server_reach.clone();
                 let advertised_endpoint = advertised_endpoint.clone();
+                let auto_close = auto_close.clone();
                 // Local socket ownership grants managing authority unless the
                 // request explicitly selects a registry credential.
                 let credentials =
@@ -217,6 +221,7 @@ fn start_server_inner(
                         &server_name,
                         &server_reach,
                         &advertised_endpoint,
+                        &auto_close,
                         &credentials,
                     ) {
                         warn!(err = %err, "api connection failed");
@@ -403,6 +408,7 @@ fn handle_connection(
         &crate::api::SharedAdvertisedEndpoint::from_config(
             &crate::config::WebSocketApiConfig::default(),
         ),
+        &crate::app::auto_close::SharedStatus::default(),
         &crate::api::credentials::CredentialContext::local_socket(
             crate::api::credentials::SharedCredentialRegistry::open(
                 crate::api::credentials::test_registry_path("socket"),
@@ -423,6 +429,7 @@ fn handle_connection_with_stop(
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
     advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
+    auto_close: &crate::app::auto_close::SharedStatus,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -460,6 +467,7 @@ fn handle_connection_with_stop(
             server_name,
             server_reach,
             advertised_endpoint,
+            auto_close,
             credentials,
         ),
     }
@@ -578,6 +586,9 @@ pub(super) fn parse_api_request<T: ApiTransport>(
     }
 }
 
+// Both transports pass their shared declaration slots explicitly so hello
+// metadata uses the same live values on ordinary and multiplexed requests.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_parsed_request<T: ApiTransport>(
     request: Request,
     transport: &mut T,
@@ -589,6 +600,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
     advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
+    auto_close: &crate::app::auto_close::SharedStatus,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
@@ -704,6 +716,7 @@ pub(super) fn handle_parsed_request<T: ApiTransport>(
             server_name,
             server_reach,
             advertised_endpoint,
+            auto_close,
             credentials,
         ),
     }
@@ -749,6 +762,7 @@ fn serve_simple_request<T: ApiTransport>(
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
     advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
+    auto_close: &crate::app::auto_close::SharedStatus,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let request_id = request.id.clone();
@@ -768,6 +782,7 @@ fn serve_simple_request<T: ApiTransport>(
         server_name,
         server_reach,
         advertised_endpoint,
+        auto_close,
         credentials,
     );
     let result = write_and_log_response(transport, &response, &request_id, method, changes_ui);
@@ -791,6 +806,7 @@ pub(super) fn serve_interleaved_request<T: ApiTransport>(
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
     advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
+    auto_close: &crate::app::auto_close::SharedStatus,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> std::io::Result<()> {
     let Some(request) = parse_api_request(transport, text)? else {
@@ -834,6 +850,7 @@ pub(super) fn serve_interleaved_request<T: ApiTransport>(
         server_name,
         server_reach,
         advertised_endpoint,
+        auto_close,
         credentials,
     )
 }
@@ -890,6 +907,7 @@ fn handle_request(
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
     advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
+    auto_close: &crate::app::auto_close::SharedStatus,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> String {
     // Declarations and runtime facts are read per request, so config
@@ -906,6 +924,7 @@ fn handle_request(
                 advertised_endpoint: advertised_endpoint.current(),
                 session: crate::session::active_name_for_api_socket(),
                 exe: crate::api::server_executable::path_for_pong(),
+                auto_close: auto_close.current(),
             },
         })
         .unwrap_or_else(|_| {
@@ -1576,6 +1595,7 @@ mod tests {
                     &crate::config::WebSocketApiConfig::default(),
                 ),
                 &undeclared_advertised_endpoint(),
+                &crate::app::auto_close::SharedStatus::default(),
                 &test_credentials(),
             )
             .unwrap();
@@ -1766,6 +1786,7 @@ mod tests {
             crate::api::SharedServerName::new("test".into()),
             undeclared_server_reach(),
             undeclared_advertised_endpoint(),
+            crate::app::auto_close::SharedStatus::default(),
         );
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
 
@@ -1978,6 +1999,7 @@ mod tests {
             &crate::api::SharedServerName::new("test-server".to_string()),
             &undeclared_server_reach(),
             &undeclared_advertised_endpoint(),
+            &crate::app::auto_close::SharedStatus::default(),
             &test_credentials(),
         );
 
@@ -2009,6 +2031,7 @@ mod tests {
                 &server_name,
                 &server_reach,
                 &advertised_endpoint,
+                &crate::app::auto_close::SharedStatus::default(),
                 &test_credentials(),
             )
         };
@@ -2046,6 +2069,7 @@ mod tests {
             &server_name,
             &server_reach,
             &advertised_endpoint,
+            &crate::app::auto_close::SharedStatus::default(),
             &credentials,
         );
 
@@ -2073,6 +2097,7 @@ mod tests {
             &server_name,
             &server_reach,
             &advertised_endpoint,
+            &crate::app::auto_close::SharedStatus::default(),
             &credentials,
         );
         let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
@@ -2100,6 +2125,7 @@ mod tests {
                 &server_name,
                 &server_reach,
                 &advertised_endpoint,
+                &crate::app::auto_close::SharedStatus::default(),
                 &test_credentials(),
             )
         };
@@ -2175,6 +2201,7 @@ mod tests {
                 &server_name,
                 &server_reach,
                 &advertised_endpoint,
+                &crate::app::auto_close::SharedStatus::default(),
                 &test_credentials(),
             )
         };
@@ -2239,6 +2266,7 @@ mod tests {
                 &crate::api::SharedServerName::new("test".to_string()),
                 &undeclared_server_reach(),
                 &undeclared_advertised_endpoint(),
+                &crate::app::auto_close::SharedStatus::default(),
                 &test_credentials(),
             )
         });

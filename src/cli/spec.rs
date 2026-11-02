@@ -36,6 +36,11 @@ pub(super) fn command() -> Command {
         .subcommand(channel_command())
         .subcommand(machine::command())
         .subcommand(server_command())
+        .subcommand(
+            Command::new("auto-close")
+                .about("Inspect automatic pane close decisions")
+                .subcommand(Command::new("plan").about("List candidates and spared panes")),
+        )
         .subcommand(api_command())
         .subcommand(workspace_command())
         .subcommand(worktree_command())

@@ -185,6 +185,7 @@ impl App {
             self.config_diagnostic_deadline,
             self.toast_deadline,
             self.flag_deadline,
+            self.auto_close.deadline,
             self.state.next_pending_agent_notification_deadline(),
             self.state.next_managed_agent_deadline(),
             self.state.next_agent_status_resolution_deadline(now),

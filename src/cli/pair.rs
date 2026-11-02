@@ -2581,6 +2581,7 @@ mod tests {
             crate::api::SharedServerName::from_config(&config),
             crate::api::SharedServerReach::from_config(&config),
             crate::api::SharedAdvertisedEndpoint::from_config(&config),
+            crate::app::auto_close::SharedStatus::default(),
         )
         .expect("the listener starts")
         .expect("bind is configured, so it binds");

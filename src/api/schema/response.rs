@@ -84,6 +84,11 @@ pub enum ResponseResult {
         /// clients do not depend on a remote shell's PATH or a stale config.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exe: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_close: Option<crate::app::auto_close::Status>,
+    },
+    AutoClosePlan {
+        plan: crate::app::auto_close::Plan,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,

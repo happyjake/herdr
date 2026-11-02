@@ -167,6 +167,7 @@ operations::define_operations! {
     PaneSetFlag(PaneSetFlagParams) => "pane.set_flag", false, false;
     PaneClearFlag(PaneTarget) => "pane.clear_flag", false, false;
     ServerAgentSettings(EmptyParams) => "server.agent_settings", false, false;
+    AutoClosePlan(EmptyParams) => "auto_close.plan", false, false;
     @internal {
         // In-process only; absent from wire schemas and advertised operations.
         InternalActiveSessions { deadline: std::time::Instant } => "internal.active_sessions";

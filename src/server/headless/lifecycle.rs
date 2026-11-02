@@ -387,6 +387,7 @@ impl HeadlessServer {
             server_name.clone(),
             server_reach.clone(),
             advertised_endpoint.clone(),
+            self.app.auto_close.status.clone(),
         )?;
         let websocket_server = api::start_websocket_server(
             &self.websocket_api_config,
@@ -395,6 +396,7 @@ impl HeadlessServer {
             server_name,
             server_reach,
             advertised_endpoint,
+            self.app.auto_close.status.clone(),
         )?;
 
         let client_path = client_socket_path();

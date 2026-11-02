@@ -47,6 +47,9 @@ pub fn run_server() -> io::Result<()> {
     let advertised_endpoint =
         api::SharedAdvertisedEndpoint::from_config(&loaded_config.config.websocket_api);
 
+    let auto_close =
+        crate::app::auto_close::SharedStatus::from_config(&loaded_config.config.auto_close);
+
     // Start the JSON API socket server.
     let _api_server = match api::start_server_with_stop_control(
         api_tx.clone(),
@@ -55,6 +58,7 @@ pub fn run_server() -> io::Result<()> {
         server_name.clone(),
         server_reach.clone(),
         advertised_endpoint.clone(),
+        auto_close.clone(),
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -74,6 +78,7 @@ pub fn run_server() -> io::Result<()> {
         server_name.clone(),
         server_reach.clone(),
         advertised_endpoint.clone(),
+        auto_close.clone(),
     ) {
         Ok(server) => server,
         Err(err) => {
@@ -96,6 +101,7 @@ pub fn run_server() -> io::Result<()> {
             api_rx,
             event_hub,
         )?;
+        app.attach_auto_close_status(auto_close.clone());
         app.set_server_name(Some(server_name));
         app.set_server_reach(Some(server_reach));
         app.set_advertised_endpoint(Some(advertised_endpoint));
@@ -215,6 +221,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         let server_reach = api::SharedServerReach::from_config(&loaded_config.config.websocket_api);
         let advertised_endpoint =
             api::SharedAdvertisedEndpoint::from_config(&loaded_config.config.websocket_api);
+        let auto_close = app.auto_close.status.clone();
         app.set_server_name(Some(server_name.clone()));
         app.set_server_reach(Some(server_reach.clone()));
         app.set_advertised_endpoint(Some(advertised_endpoint.clone()));
@@ -225,6 +232,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             server_name.clone(),
             server_reach.clone(),
             advertised_endpoint.clone(),
+            auto_close.clone(),
         )?;
         // The old server released the websocket port with its socket files;
         // bind it here so a committed handoff keeps the listener alive.
@@ -236,6 +244,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             server_name,
             server_reach,
             advertised_endpoint,
+            auto_close.clone(),
         )?;
         let mut server = HeadlessServer::new(
             app,

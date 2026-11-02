@@ -1707,6 +1707,7 @@ fn success_response_round_trips() {
             advertised_endpoint: Some("wss://a-host.example.net:8443".into()),
             session: Some("mobile".into()),
             exe: Some("/opt/herdr".into()),
+            auto_close: None,
         },
     };
 

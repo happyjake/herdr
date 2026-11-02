@@ -15,6 +15,7 @@ mod api;
 pub(crate) use api::test_support::exiting_test_command;
 pub(crate) mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
+pub(crate) mod auto_close;
 mod creation;
 mod custom_commands;
 mod fact_updates;
@@ -120,6 +121,7 @@ pub struct App {
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) flag_deadline: Option<Instant>,
+    pub(crate) auto_close: auto_close::AutoClose,
     pub(crate) flag_due_at: Option<u64>,
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
@@ -663,6 +665,7 @@ impl App {
             toast_deadline: None,
             flag_deadline: None,
             flag_due_at: None,
+            auto_close: auto_close::AutoClose::new(config.auto_close.clone()),
             last_api_notification_at: None,
             state,
             pixel_mouse_available: false,
@@ -738,6 +741,8 @@ impl App {
         app.refresh_restored_workspace_git_metadata();
         app.initialize_logbook();
         app.sync_flag_deadline();
+        app.configure_auto_close(config.auto_close.clone());
+        app.initialize_auto_close_history();
         app.seed_emitted_pane_and_workspace_facts();
         Ok(app)
     }
@@ -811,6 +816,8 @@ impl App {
         app.policy = AppPolicy::HANDOFF_REPLACEMENT;
         app.initialize_logbook();
         app.sync_flag_deadline();
+        app.configure_auto_close(config.auto_close.clone());
+        app.initialize_auto_close_history();
         app.seed_emitted_pane_and_workspace_facts();
         Ok(app)
     }
@@ -977,6 +984,10 @@ impl App {
                     );
                 }
             }
+        }
+
+        if !invalid_section("auto_close") {
+            self.configure_auto_close(config.auto_close.clone());
         }
 
         if !invalid_section("ui") {

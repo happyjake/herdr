@@ -495,6 +495,9 @@ impl HeadlessServer {
             }
 
             self.app.sync_focus_events();
+            if self.app.state.session_dirty {
+                self.app.wake_auto_close_for_changed_facts(Instant::now());
+            }
             self.app.sync_session_save_schedule();
 
             // 4. Accept new client connections.
@@ -2902,6 +2905,14 @@ impl HeadlessServer {
         }
     }
 
+    fn sync_auto_close_focus(&mut self) {
+        self.app.auto_close.focused = self
+            .shell_focus_targets()
+            .into_iter()
+            .filter_map(|(_, target)| target.map(|target| target.pane_id))
+            .collect();
+    }
+
     fn reject_api_request_for_shutdown(msg: api::ApiRequestMessage) {
         let response = serde_json::to_string(&api::schema::ErrorResponse {
             id: msg.request.id,
@@ -2926,6 +2937,13 @@ impl HeadlessServer {
         if self.shutting_down || self.host_shutdown_requested() {
             // During shutdown, respond with server_unavailable.
             Self::reject_api_request_for_shutdown(msg);
+            return false;
+        }
+
+        if matches!(msg.request.method, api::schema::Method::AutoClosePlan(_)) {
+            self.sync_auto_close_focus();
+            self.app
+                .request_auto_close_plan(msg.request.id, msg.respond_to);
             return false;
         }
 
@@ -3322,6 +3340,16 @@ impl HeadlessServer {
             self.app.toast_deadline = None;
             self.app.state.toast = None;
             changed = true;
+        }
+
+        if self
+            .app
+            .auto_close
+            .deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.sync_auto_close_focus();
+            self.app.run_auto_close_pass(now);
         }
 
         // Flags publish runtime metadata only; they do not request a TUI render.

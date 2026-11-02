@@ -346,6 +346,7 @@ pub fn start_websocket_server(
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
     advertised_endpoint: crate::api::SharedAdvertisedEndpoint,
+    auto_close: crate::app::auto_close::SharedStatus,
 ) -> io::Result<Option<WebSocketServerHandle>> {
     start_websocket_server_with_capabilities(
         config,
@@ -356,6 +357,7 @@ pub fn start_websocket_server(
         server_name,
         server_reach,
         advertised_endpoint,
+        auto_close,
     )
 }
 
@@ -372,6 +374,7 @@ pub fn start_websocket_server_with_capabilities(
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
     advertised_endpoint: crate::api::SharedAdvertisedEndpoint,
+    auto_close: crate::app::auto_close::SharedStatus,
 ) -> io::Result<Option<WebSocketServerHandle>> {
     let Some(spec) = websocket_api_spec(config)? else {
         return Ok(None);
@@ -403,6 +406,7 @@ pub fn start_websocket_server_with_capabilities(
                 let server_name = server_name.clone();
                 let server_reach = server_reach.clone();
                 let advertised_endpoint = advertised_endpoint.clone();
+                let auto_close = auto_close.clone();
                 let connection_running = Arc::clone(&listener_running);
                 let credentials = credentials.clone();
                 crate::thread_spawn::spawn_named("herdr-ws-conn", move || {
@@ -416,6 +420,7 @@ pub fn start_websocket_server_with_capabilities(
                         &server_name,
                         &server_reach,
                         &advertised_endpoint,
+                        &auto_close,
                     ) {
                         warn!(peer = %peer, err = %err, "websocket api connection failed");
                     }
@@ -553,6 +558,7 @@ fn handle_ws_connection(
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
     advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
+    auto_close: &crate::app::auto_close::SharedStatus,
 ) -> io::Result<()> {
     configure_accepted_ws_stream(&stream)?;
     let peer = stream.peer_addr().ok();
@@ -624,6 +630,7 @@ fn handle_ws_connection(
             server_name: server_name.clone(),
             server_reach: server_reach.clone(),
             advertised_endpoint: advertised_endpoint.clone(),
+            auto_close: auto_close.clone(),
             credentials: credential_context.clone(),
         }),
     );
@@ -638,6 +645,7 @@ fn handle_ws_connection(
         server_name,
         server_reach,
         advertised_endpoint,
+        auto_close,
         &credential_context,
     );
 
@@ -856,6 +864,7 @@ fn ws_request_loop(
     server_name: &crate::api::SharedServerName,
     server_reach: &crate::api::SharedServerReach,
     advertised_endpoint: &crate::api::SharedAdvertisedEndpoint,
+    auto_close: &crate::app::auto_close::SharedStatus,
     credentials: &crate::api::credentials::CredentialContext,
 ) -> io::Result<()> {
     // Parity with the Unix socket: a client that completes the handshake
@@ -890,6 +899,7 @@ fn ws_request_loop(
                     server_name,
                     server_reach,
                     advertised_endpoint,
+                    auto_close,
                     credentials,
                 )?;
                 if revoked {
@@ -1097,6 +1107,7 @@ struct WsDispatch {
     server_name: crate::api::SharedServerName,
     server_reach: crate::api::SharedServerReach,
     advertised_endpoint: crate::api::SharedAdvertisedEndpoint,
+    auto_close: crate::app::auto_close::SharedStatus,
     credentials: crate::api::credentials::CredentialContext,
 }
 
@@ -1362,6 +1373,7 @@ impl ApiTransport for WsTransport {
                         &dispatch.server_name,
                         &dispatch.server_reach,
                         &dispatch.advertised_endpoint,
+                        &dispatch.auto_close,
                         &dispatch.credentials,
                     )?;
                 }
@@ -1438,6 +1450,7 @@ mod tests {
             server_name: crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string()),
             server_reach: crate::api::SharedServerReach::from_config(&config),
             advertised_endpoint: crate::api::SharedAdvertisedEndpoint::from_config(&config),
+            auto_close: crate::app::auto_close::SharedStatus::default(),
             credentials: crate::api::credentials::CredentialContext::local_socket(test_registry()),
         });
         (dispatch, api_rx)
@@ -2018,6 +2031,7 @@ mod tests {
             crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string()),
             crate::api::SharedServerReach::from_config(&config),
             crate::api::SharedAdvertisedEndpoint::from_config(&config),
+            crate::app::auto_close::SharedStatus::default(),
         );
         let Err(error) = result else {
             panic!("injected spawn failure must be returned")
@@ -2039,6 +2053,7 @@ mod tests {
             crate::api::SharedServerName::new(TEST_SERVER_NAME.to_string()),
             crate::api::SharedServerReach::from_config(&WebSocketApiConfig::default()),
             crate::api::SharedAdvertisedEndpoint::from_config(&WebSocketApiConfig::default()),
+            crate::app::auto_close::SharedStatus::default(),
         )
         .unwrap();
         assert!(handle.is_none());
@@ -2071,6 +2086,7 @@ mod tests {
             server_name.clone(),
             crate::api::SharedServerReach::from_config(&config),
             crate::api::SharedAdvertisedEndpoint::from_config(&config),
+            crate::app::auto_close::SharedStatus::default(),
         )
         .unwrap()
         .expect("listener should start when configured");

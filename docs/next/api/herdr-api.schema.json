@@ -7391,6 +7391,22 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "auto_close.plan",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -7754,6 +7770,14 @@
     },
     "success_response": {
       "$defs": {
+        "Action": {
+          "enum": [
+            "close",
+            "debrief",
+            "wait"
+          ],
+          "type": "string"
+        },
         "AgentDefault": {
           "description": "User-level defaults only; absent fields remain explicit nulls.",
           "properties": {
@@ -8056,6 +8080,41 @@
           ],
           "type": "string"
         },
+        "Candidate": {
+          "properties": {
+            "action": {
+              "$ref": "#/schemas/success_response/$defs/Action"
+            },
+            "age_secs": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/Kind"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "wait_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id",
+            "kind",
+            "reason",
+            "age_secs",
+            "action"
+          ],
+          "type": "object"
+        },
         "ClientWindowTitleReason": {
           "enum": [
             "set",
@@ -8169,6 +8228,13 @@
             "finished",
             "skipped",
             "abandoned"
+          ],
+          "type": "string"
+        },
+        "EnabledMode": {
+          "enum": [
+            "report",
+            "close"
           ],
           "type": "string"
         },
@@ -9177,6 +9243,14 @@
             "messages"
           ],
           "type": "object"
+        },
+        "Kind": {
+          "enum": [
+            "ended",
+            "dormant",
+            "plain-shell"
+          ],
+          "type": "string"
         },
         "LabelSource": {
           "description": "Who wrote a pane's label, when it was not a person.\n\nKept beside the label rather than derived, and never shown: it is there\nso a client that names panes by itself can tell its own names from the\nones people and skills gave, and leave those alone.",
@@ -10403,6 +10477,27 @@
             }
           ]
         },
+        "Plan": {
+          "properties": {
+            "candidates": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/Candidate"
+              },
+              "type": "array"
+            },
+            "spared": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/Spared"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "candidates",
+            "spared"
+          ],
+          "type": "object"
+        },
         "PluginActionContext": {
           "enum": [
             "global",
@@ -11194,6 +11289,16 @@
                     "null"
                   ]
                 },
+                "auto_close": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/Status"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "capabilities": {
                   "anyOf": [
                     {
@@ -11250,6 +11355,22 @@
                 "type",
                 "version",
                 "protocol"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "plan": {
+                  "$ref": "#/schemas/success_response/$defs/Plan"
+                },
+                "type": {
+                  "const": "auto_close_plan",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "plan"
               ],
               "type": "object"
             },
@@ -13338,12 +13459,50 @@
           ],
           "type": "string"
         },
+        "Spared": {
+          "properties": {
+            "exemption": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "exemption"
+          ],
+          "type": "object"
+        },
         "SplitDirection": {
           "enum": [
             "right",
             "down"
           ],
           "type": "string"
+        },
+        "Status": {
+          "properties": {
+            "closed_24h": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mode": {
+              "$ref": "#/schemas/success_response/$defs/EnabledMode"
+            },
+            "waiting": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "mode",
+            "waiting",
+            "closed_24h"
+          ],
+          "type": "object"
         },
         "TabInfo": {
           "properties": {
