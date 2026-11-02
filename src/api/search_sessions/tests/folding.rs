@@ -604,3 +604,101 @@ fn descendant_matches_reach_ancestors_with_the_best_score_and_source_explanation
     let own = home.search(json!({"terms": ["needle"]}), vec![]);
     assert_eq!(by_key(&own, "root")["why"]["line"], "needle root");
 }
+
+#[test]
+fn search_sessions_reports_latest_close_for_non_live_sessions_and_omits_when_live_or_unknown() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    for id in ["closed-session", "legacy-close", "never-closed"] {
+        home.write(
+            &format!(".claude/projects/project/{id}.jsonl"),
+            &[claude_prompt(
+                id,
+                &cwd,
+                &format!("Prompt for {id}"),
+                "2026-10-03T00:00:00Z",
+            )],
+        );
+    }
+    let closed_record = home
+        .root
+        .join(".claude/projects/project/closed-session.jsonl");
+    home.write(
+        ".claude/history.jsonl",
+        &[json!({
+            "sessionId": "closed-session",
+            "project": cwd,
+            "display": "Prompt for closed-session",
+            "timestamp": 1790985600000_u64
+        })],
+    );
+    home.write(
+        "logbook.jsonl",
+        &[
+            reported("claude", "closed-session", "w1:p1", &cwd, 1790985600000),
+            json!({
+                "type": "pane_closed",
+                "pane": "w1:p1",
+                "by": "desk",
+                "at": 1790985601000_u64
+            }),
+            reported("claude", "closed-session", "w1:p2", &cwd, 1790985602000),
+            json!({
+                "type": "pane_closed",
+                "pane": "w1:p2",
+                "by": "phone",
+                "reason": "dormant",
+                "age_secs": 7200,
+                "debrief": {
+                    "outcome": "finished",
+                    "memories": 2,
+                    "skill_version": "1"
+                },
+                "at": 1790985605000_u64
+            }),
+            reported("claude", "legacy-close", "w2:p1", &cwd, 1790985600000),
+            json!({
+                "type": "pane_closed",
+                "pane": "w2:p1",
+                "at": 1790985606000_u64
+            }),
+            reported("claude", "never-closed", "w3:p1", &cwd, 1790985600000),
+        ],
+    );
+    home.catalog.refresh();
+
+    let expected_closed = json!({
+        "by": "phone",
+        "reason": "dormant",
+        "age_secs": 7200,
+        "at_ms": 1790985605000_u64,
+        "debrief": {
+            "outcome": "finished",
+            "memories": 2,
+            "skill_version": "1"
+        }
+    });
+
+    let ended = home.search(json!({}), vec![]);
+    let closed_row = by_key(&ended, "closed-session");
+    assert_eq!(closed_row["state"], "ended");
+    assert_eq!(closed_row["closed"], expected_closed);
+    assert_eq!(
+        closed_row["resume"],
+        json!({"command": "claude --resume closed-session", "cwd": cwd})
+    );
+    assert!(by_key(&ended, "legacy-close").get("closed").is_none());
+    assert!(by_key(&ended, "never-closed").get("closed").is_none());
+
+    let live = home.search(json!({}), vec![live_pane("claude", "id", "closed-session")]);
+    let live_row = by_key(&live, "closed-session");
+    assert_eq!(live_row["state"], "live");
+    assert!(live_row.get("closed").is_none());
+
+    std::fs::remove_file(closed_record).unwrap();
+    home.catalog.refresh();
+    let gone = home.search(json!({}), vec![]);
+    let gone_row = by_key(&gone, "closed-session");
+    assert_eq!(gone_row["state"], "record_gone");
+    assert_eq!(gone_row["closed"], expected_closed);
+}

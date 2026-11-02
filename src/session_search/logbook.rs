@@ -6,7 +6,7 @@ use std::path::Path;
 use super::records::Session;
 use crate::agent_resume::AgentSessionRefKind;
 use crate::api::schema::{
-    SearchSessionKey, SearchSessionKeyKind, SessionLabel, SessionLabelSource,
+    SearchSessionKey, SearchSessionKeyKind, SessionClosed, SessionLabel, SessionLabelSource,
 };
 use crate::persist::logbook::{self, Event, LabelSource, SessionKey};
 
@@ -60,11 +60,25 @@ pub(super) fn read(path: &Path) -> std::io::Result<BTreeMap<SearchSessionKey, Se
                 });
             }
         }
-        Event::PaneClosed { pane, at } => {
+        Event::PaneClosed {
+            pane,
+            by,
+            reason,
+            age_secs,
+            debrief,
+            at,
+        } => {
             close_label(&pane, at, &mut labels, &mut sessions);
             if let Some(key) = panes.remove(&pane) {
                 if let Some(session) = sessions.get_mut(&key) {
                     session.at(at);
+                    session.closed = by.map(|by| SessionClosed {
+                        by,
+                        reason,
+                        age_secs,
+                        at_ms: at,
+                        debrief,
+                    });
                 }
             }
         }

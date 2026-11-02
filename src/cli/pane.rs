@@ -413,7 +413,7 @@ mod tests {
                 vec!["pane"],
                 "cli:pane:close",
                 "pane.close",
-                json!({"pane_id": "pane"}),
+                json!({"pane_id": "pane", "by": "cli"}),
             ),
             (
                 "send-text",

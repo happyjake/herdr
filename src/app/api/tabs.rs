@@ -237,6 +237,7 @@ impl App {
             .map(|tab| tab.layout.pane_ids())
             .unwrap_or_default();
 
+        let by = crate::app::logbook::close_by_for_request_id(&id);
         if closes_workspace {
             if let Err(response) = self.require_restored_group_close_ready(
                 &id,
@@ -253,7 +254,7 @@ impl App {
             }
             let workspace = self.workspace_info(ws_idx);
             self.state.selected = ws_idx;
-            self.state.close_selected_workspace();
+            self.state.close_selected_workspace_with(Some(by), None);
             self.state.remove_plugin_pane_records(pane_ids);
             self.shutdown_detached_terminal_runtimes();
             self.emit_event(EventEnvelope {
@@ -273,7 +274,9 @@ impl App {
             return encode_success(id, ResponseResult::Ok {});
         }
 
-        let logbook_events = self.state.logbook_tab_close_events(ws_idx, tab_idx);
+        let logbook_events = self
+            .state
+            .logbook_tab_close_events(ws_idx, tab_idx, Some(by));
         let closing_starters = self
             .state
             .closing_starters(ws_idx, pane_ids.iter().copied());

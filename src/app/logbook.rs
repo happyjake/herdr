@@ -113,28 +113,53 @@ impl AppState {
     }
 
     pub(crate) fn record_logbook_close(&mut self, ws_idx: usize, pane_id: PaneId) {
-        if let Some(event) = self.logbook_close_event(ws_idx, pane_id) {
+        self.record_logbook_close_with(ws_idx, pane_id, None, None);
+    }
+
+    pub(crate) fn record_logbook_close_with(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        by: Option<logbook::CloseBy>,
+        reason: Option<String>,
+    ) {
+        if let Some(event) = self.logbook_close_event(ws_idx, pane_id, by, reason) {
             self.push_logbook_event(event);
         }
     }
 
-    fn logbook_close_event(&self, ws_idx: usize, pane_id: PaneId) -> Option<Event> {
+    fn logbook_close_event(
+        &self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        by: Option<logbook::CloseBy>,
+        reason: Option<String>,
+    ) -> Option<Event> {
         self.logbook_events.as_ref()?;
         let ws = self.workspaces.get(ws_idx)?;
         let number = ws.public_pane_number(pane_id)?;
         Some(Event::PaneClosed {
             pane: crate::workspace::public_pane_id_for_number(&ws.id, number),
+            by,
+            reason,
+            age_secs: None,
+            debrief: None,
             at: logbook::now_ms(),
         })
     }
 
-    pub(crate) fn logbook_tab_close_events(&self, ws_idx: usize, tab_idx: usize) -> Vec<Event> {
+    pub(crate) fn logbook_tab_close_events(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        by: Option<logbook::CloseBy>,
+    ) -> Vec<Event> {
         if self.logbook_events.is_none() {
             return Vec::new();
         }
         self.pane_ids_for_tab(ws_idx, tab_idx)
             .into_iter()
-            .filter_map(|pane_id| self.logbook_close_event(ws_idx, pane_id))
+            .filter_map(|pane_id| self.logbook_close_event(ws_idx, pane_id, by, None))
             .collect()
     }
 
@@ -208,9 +233,19 @@ impl App {
     }
 }
 
+pub(crate) fn close_by_for_request_id(id: &str) -> logbook::CloseBy {
+    if id.starts_with("endpoint:") || id.starts_with("client-shell:") {
+        logbook::CloseBy::Desk
+    } else if id.starts_with("cli:") {
+        logbook::CloseBy::Cli
+    } else {
+        logbook::CloseBy::Api
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::api::schema::{LabelSource, Method, PaneRenameParams, PaneTarget, Request};
+    use crate::api::schema::{LabelSource, Method, PaneCloseParams, PaneRenameParams, Request};
     use crate::app::{App, AppPolicy};
     use crate::events::AppEvent;
     use crate::workspace::Workspace;
@@ -598,9 +633,7 @@ mod tests {
         report(&mut app, pane_id, "next-session", 3, "clear");
         let response = app.handle_api_request(Request {
             id: "close".into(),
-            method: Method::PaneClose(PaneTarget {
-                pane_id: pane.clone(),
-            }),
+            method: Method::PaneClose(PaneCloseParams::new(pane.clone())),
         });
         assert!(serde_json::from_str::<Value>(&response)
             .unwrap()
@@ -619,7 +652,7 @@ mod tests {
                 json!({"type":"label_worn","key":first,"pane":pane,"label":"automatic label","source":"editor"}),
                 json!({"type":"session_reported","pane":pane,"terminal":terminal,"key":next,"cwd":"project"}),
                 json!({"type":"label_worn","key":next,"pane":pane,"label":"automatic label","source":"editor"}),
-                json!({"type":"pane_closed","pane":pane}),
+                json!({"type":"pane_closed","pane":pane,"by":"api"}),
             ]
         );
         let history = std::fs::read(root.path()).unwrap();
@@ -660,7 +693,7 @@ mod tests {
         );
         let mut expected: Vec<_> = closing
             .into_iter()
-            .map(|pane| json!({"type":"pane_closed","pane":pane}))
+            .map(|pane| json!({"type":"pane_closed","pane":pane,"by":"api"}))
             .collect();
         assert_eq!(rows(&mut app, &root.path(), before), expected);
         let response = app.handle_api_request(Request {
@@ -677,7 +710,7 @@ mod tests {
                 .is_none(),
             "{response}"
         );
-        expected.push(json!({"type":"pane_closed","pane":first_public}));
+        expected.push(json!({"type":"pane_closed","pane":first_public,"by":"api"}));
         app.handle_internal_event(AppEvent::PaneDied {
             pane_id: first,
             exit_reason: crate::platform::ChildExitReason::Exited,
@@ -724,7 +757,7 @@ mod tests {
             assert_eq!(state.label_source, Some(LabelSource::Editor));
             let response = app.handle_api_request(Request {
                 id: "close".into(),
-                method: Method::PaneClose(PaneTarget { pane_id: pane }),
+                method: Method::PaneClose(PaneCloseParams::new(pane)),
             });
             assert!(
                 serde_json::from_str::<Value>(&response)
@@ -900,9 +933,7 @@ mod tests {
         report(&mut app, first_id, "same-session", 1, "startup");
         let response = app.handle_api_request(Request {
             id: "close".into(),
-            method: Method::PaneClose(PaneTarget {
-                pane_id: pane.clone(),
-            }),
+            method: Method::PaneClose(PaneCloseParams::new(pane.clone())),
         });
         assert!(
             serde_json::from_str::<Value>(&response)
@@ -941,7 +972,7 @@ mod tests {
             vec![
                 json!({"type":"session_reported","pane":pane,"terminal":first_terminal,"key":key,"cwd":"project"}),
                 json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
-                json!({"type":"pane_closed","pane":pane}),
+                json!({"type":"pane_closed","pane":pane,"by":"api"}),
                 json!({"type":"session_reported","pane":pane,"terminal":next_terminal,"key":key,"cwd":"project"}),
                 json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
             ]
@@ -998,9 +1029,7 @@ mod tests {
             });
             let closed = app.handle_api_request(Request {
                 id: "close".into(),
-                method: Method::PaneClose(PaneTarget {
-                    pane_id: action_pane,
-                }),
+                method: Method::PaneClose(PaneCloseParams::new(action_pane)),
             });
             done_tx.send((app, renamed, closed)).unwrap();
         });
@@ -1030,7 +1059,7 @@ mod tests {
             vec![
                 json!({"type":"session_reported","pane":pane,"terminal":terminal,"key":key,"cwd":"project"}),
                 json!({"type":"label_worn","pane":pane,"key":key,"label":"queued label","source":"person"}),
-                json!({"type":"pane_closed","pane":pane}),
+                json!({"type":"pane_closed","pane":pane,"by":"api"}),
             ]
         );
     }
@@ -1054,9 +1083,7 @@ mod tests {
         let paused = old.logbook_writer.as_ref().unwrap().pause_for_test();
         let response = old.handle_api_request(Request {
             id: "close".into(),
-            method: Method::PaneClose(PaneTarget {
-                pane_id: pane.clone(),
-            }),
+            method: Method::PaneClose(PaneCloseParams::new(pane.clone())),
         });
         assert!(
             serde_json::from_str::<Value>(&response)
@@ -1090,7 +1117,7 @@ mod tests {
         let mut expected = vec![
             json!({"type":"session_reported","pane":pane,"terminal":old_terminal,"key":key,"cwd":"project"}),
             json!({"type":"label_worn","pane":pane,"key":key,"label":"same label","source":"person"}),
-            json!({"type":"pane_closed","pane":pane}),
+            json!({"type":"pane_closed","pane":pane,"by":"api"}),
         ];
         assert_eq!(rows(&mut old, &root.path(), before), expected);
 
@@ -1120,5 +1147,164 @@ mod tests {
         ]);
         assert_eq!(rows(&mut replacement, &root.path(), before), expected);
         assert!(std::fs::read(root.path()).unwrap().starts_with(&persisted));
+    }
+
+    #[test]
+    fn logbook_pane_closed_parses_legacy_lines_and_round_trips_close_metadata() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let root = ConfigRoot::new();
+        std::fs::create_dir_all(root.path().parent().unwrap()).unwrap();
+        let lines = [
+            json!({"type":"pane_closed","pane":"w1:p1","at":1700000000000_u64}),
+            json!({"type":"pane_closed","pane":"w1:p2","by":"desk","at":1700000001000_u64}),
+            json!({"type":"pane_closed","pane":"w1:p3","by":"phone","reason":"dormant","age_secs":7200,"debrief":{"outcome":"finished","memories":2,"skill_version":"1"},"at":1700000002000_u64}),
+            json!({"type":"pane_closed","pane":"w1:p4","by":"cli","reason":"ended","age_secs":180,"debrief":{"outcome":"skipped","skill_version":"1"},"at":1700000003000_u64}),
+            json!({"type":"pane_closed","pane":"w1:p5","by":"api","reason":"plain-shell","debrief":{"outcome":"abandoned"},"at":1700000004000_u64}),
+        ];
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(root.path(), text).unwrap();
+
+        let events = crate::persist::logbook::read(&root.path()).unwrap();
+        assert_eq!(events.len(), lines.len());
+        assert_eq!(
+            events[0],
+            crate::persist::logbook::Event::PaneClosed {
+                pane: "w1:p1".into(),
+                by: None,
+                reason: None,
+                age_secs: None,
+                debrief: None,
+                at: 1700000000000,
+            }
+        );
+        assert_eq!(serde_json::to_value(&events).unwrap(), json!(lines));
+    }
+
+    #[test]
+    fn logbook_records_close_by_and_reason_across_desk_cli_phone_api_and_cascades() {
+        use crate::api::schema::PaneCloseBy;
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let root = ConfigRoot::new();
+        let before = crate::pane::unix_now_secs() * 1000;
+        let mut app = app();
+        app.state.workspaces[0].id = "wclose".into();
+        for _ in 0..4 {
+            app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        }
+        let tab2 = app.state.workspaces[0].test_add_tab(None);
+        app.state.workspaces[0].active_tab = tab2;
+        app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces[0].active_tab = 0;
+        let mut ws2 = Workspace::test_new("cascade");
+        ws2.id = "wcascade".into();
+        ws2.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces.push(ws2);
+        let mut ws3 = Workspace::test_new("last-pane");
+        ws3.id = "wlast".into();
+        app.state.workspaces.push(ws3);
+        app.state.ensure_test_terminals();
+
+        let tab1_panes = app.state.pane_ids_for_tab(0, 0);
+        let p_desk = app.public_pane_id(0, tab1_panes[0]).unwrap();
+        let p_cli = app.public_pane_id(0, tab1_panes[1]).unwrap();
+        let p_phone = app.public_pane_id(0, tab1_panes[2]).unwrap();
+        let p_api = app.public_pane_id(0, tab1_panes[3]).unwrap();
+        let died_id = tab1_panes[4];
+        let p_died = app.public_pane_id(0, died_id).unwrap();
+        let tab2_id = app.public_tab_id(0, tab2).unwrap();
+        let tab2_panes: Vec<_> = app
+            .state
+            .pane_ids_for_tab(0, tab2)
+            .into_iter()
+            .map(|id| app.public_pane_id(0, id).unwrap())
+            .collect();
+        let ws2_panes: Vec<_> = app
+            .state
+            .pane_ids_for_workspace(1)
+            .into_iter()
+            .map(|id| app.public_pane_id(1, id).unwrap())
+            .collect();
+        let p_last = app
+            .public_pane_id(2, app.state.pane_ids_for_workspace(2)[0])
+            .unwrap();
+
+        for request in [
+            Request {
+                id: "endpoint:1".into(),
+                method: Method::PaneClose(PaneCloseParams::new(p_desk.clone())),
+            },
+            Request {
+                id: "cli:pane:close".into(),
+                method: Method::PaneClose(PaneCloseParams {
+                    pane_id: p_cli.clone(),
+                    by: Some(PaneCloseBy::Cli),
+                    reason: None,
+                }),
+            },
+            Request {
+                id: "phone-close".into(),
+                method: Method::PaneClose(PaneCloseParams {
+                    pane_id: p_phone.clone(),
+                    by: Some(PaneCloseBy::Phone),
+                    reason: Some("dormant".into()),
+                }),
+            },
+            Request {
+                id: "api-close".into(),
+                method: Method::PaneClose(PaneCloseParams::new(p_api.clone())),
+            },
+            Request {
+                id: "client-shell:tab".into(),
+                method: Method::TabClose(crate::api::schema::TabTarget { tab_id: tab2_id }),
+            },
+            Request {
+                id: "cli:workspace:close".into(),
+                method: Method::WorkspaceClose(crate::api::schema::WorkspaceCloseParams {
+                    workspace_id: "wcascade".into(),
+                    close_group: false,
+                }),
+            },
+            Request {
+                id: "phone-last-pane".into(),
+                method: Method::PaneClose(PaneCloseParams {
+                    pane_id: p_last.clone(),
+                    by: Some(PaneCloseBy::Phone),
+                    reason: Some("ended".into()),
+                }),
+            },
+        ] {
+            let response = app.handle_api_request(request);
+            assert!(
+                serde_json::from_str::<Value>(&response)
+                    .unwrap()
+                    .get("error")
+                    .is_none(),
+                "{response}"
+            );
+        }
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id: died_id,
+            exit_reason: crate::platform::ChildExitReason::Exited,
+        });
+
+        let mut expected = vec![
+            json!({"type":"pane_closed","pane":p_desk,"by":"desk"}),
+            json!({"type":"pane_closed","pane":p_cli,"by":"cli"}),
+            json!({"type":"pane_closed","pane":p_phone,"by":"phone","reason":"dormant"}),
+            json!({"type":"pane_closed","pane":p_api,"by":"api"}),
+        ];
+        expected.extend(
+            tab2_panes
+                .into_iter()
+                .map(|pane| json!({"type":"pane_closed","pane":pane,"by":"desk"})),
+        );
+        expected.extend(
+            ws2_panes
+                .into_iter()
+                .map(|pane| json!({"type":"pane_closed","pane":pane,"by":"cli"})),
+        );
+        expected.push(json!({"type":"pane_closed","pane":p_last,"by":"phone","reason":"ended"}));
+        expected.push(json!({"type":"pane_closed","pane":p_died}));
+        assert_eq!(rows(&mut app, &root.path(), before), expected);
     }
 }

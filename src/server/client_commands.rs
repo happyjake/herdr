@@ -270,6 +270,13 @@ mod tests {
             actual.remove("pane.edit_scrollback").as_deref(),
             Some("f2ca0584d190a3716ecb8eb41c7032039f80952a6d2beb670ca8477152a55c95")
         );
+        // pane.close carries optional `by` and `reason` provenance; a v1
+        // client omits both and the server attributes the close to the desk.
+        expected.remove("pane.close");
+        assert_eq!(
+            actual.remove("pane.close").as_deref(),
+            Some("5d023c2b2773d1e45c33c8d92724cff39f2e044c08572a9ed740155efaa66d83")
+        );
 
         assert_eq!(
             actual, expected,

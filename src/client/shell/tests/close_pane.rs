@@ -76,9 +76,13 @@ fn assert_pane_close(outcome: &ClientShellInput) {
         })
         .filter(|method| !matches!(method, Method::TabFocus(_) | Method::PaneFocus(_)))
         .collect::<Vec<_>>();
-    assert!(
-        matches!(methods.as_slice(), [Method::PaneClose(target)] if target.pane_id == "pane_1")
-    );
+    assert!(matches!(
+        methods.as_slice(),
+        [Method::PaneClose(target)]
+            if target.pane_id == "pane_1"
+                && target.by == Some(crate::api::schema::PaneCloseBy::Desk)
+                && target.reason.is_none()
+    ));
 }
 
 #[test]

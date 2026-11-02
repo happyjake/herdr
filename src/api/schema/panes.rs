@@ -638,6 +638,53 @@ crate::cli::projection::cli_params! {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneCloseBy {
+    Desk,
+    Phone,
+    Cli,
+    Api,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DebriefOutcome {
+    Finished,
+    Skipped,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CloseDebrief {
+    pub outcome: DebriefOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memories: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_version: Option<String>,
+}
+
+crate::cli::projection::cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct PaneCloseParams => PaneCloseProjection {
+        pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub by: Option<PaneCloseBy> => Field::new(Some(PaneCloseBy::Cli)),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String> => Field::new(None::<String>),
+    }
+}
+
+impl PaneCloseParams {
+    pub fn new(pane_id: impl Into<String>) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            by: None,
+            reason: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
     /// Unix seconds of the last delivered input or observed foreground-job change.

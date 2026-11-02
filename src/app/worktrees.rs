@@ -7,7 +7,11 @@ impl App {
         force || cfg!(windows)
     }
 
-    pub(crate) fn close_removed_linked_worktree_workspace(&mut self, ws_idx: usize) {
+    pub(crate) fn close_removed_linked_worktree_workspace(
+        &mut self,
+        ws_idx: usize,
+        by: Option<crate::api::schema::PaneCloseBy>,
+    ) {
         let removed_workspace_was_active = self.state.active == Some(ws_idx);
         let parent_key = self
             .state
@@ -18,7 +22,7 @@ impl App {
             .map(|space| space.key.clone());
 
         self.state.selected = ws_idx;
-        self.state.close_selected_workspace();
+        self.state.close_selected_workspace_with(by, None);
 
         if !removed_workspace_was_active {
             return;

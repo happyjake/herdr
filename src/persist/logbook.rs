@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::api::schema::{CloseDebrief, PaneCloseBy as CloseBy};
+
 mod background;
 pub(crate) use background::BackgroundWriter;
 #[cfg(unix)]
@@ -70,6 +72,14 @@ pub enum Event {
     },
     PaneClosed {
         pane: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<CloseBy>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        age_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        debrief: Option<CloseDebrief>,
         at: u64,
     },
     Parent {

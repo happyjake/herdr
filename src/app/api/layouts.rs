@@ -171,9 +171,11 @@ impl App {
                 .state
                 .terminal_ids_for_tab(target_ws_idx, target_tab_idx);
             let plugin_pane_ids = self.state.pane_ids_for_tab(target_ws_idx, target_tab_idx);
-            let logbook_events = self
-                .state
-                .logbook_tab_close_events(target_ws_idx, target_tab_idx);
+            let logbook_events = self.state.logbook_tab_close_events(
+                target_ws_idx,
+                target_tab_idx,
+                Some(crate::api::schema::PaneCloseBy::Api),
+            );
             let closing_starters = self
                 .state
                 .closing_starters(target_ws_idx, plugin_pane_ids.iter().copied());
@@ -523,7 +525,11 @@ impl App {
         };
         let terminal_ids = self.state.terminal_ids_for_tab(ws_idx, tab_idx);
         let plugin_pane_ids = self.state.pane_ids_for_tab(ws_idx, tab_idx);
-        let logbook_events = self.state.logbook_tab_close_events(ws_idx, tab_idx);
+        let logbook_events = self.state.logbook_tab_close_events(
+            ws_idx,
+            tab_idx,
+            Some(crate::api::schema::PaneCloseBy::Api),
+        );
         let closing_starters = self
             .state
             .closing_starters(ws_idx, plugin_pane_ids.iter().copied());

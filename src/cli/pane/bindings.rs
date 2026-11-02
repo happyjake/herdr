@@ -733,7 +733,7 @@ pub(super) const LEAVES: &[Leaf] = &[
         "Close a pane",
         "cli:pane:close",
         Json,
-        PaneTargetProjection,
+        PaneCloseProjection,
         PaneClose
     ),
     leaf!(

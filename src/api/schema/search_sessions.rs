@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::panes::{CloseDebrief, PaneCloseBy};
+
 /// Resume identity without the reporting source. Paths identify pi sessions;
 /// old Claude history without session ids uses a project-day key.
 #[derive(
@@ -55,6 +57,8 @@ pub struct SessionHit {
     pub live_pane_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside: Option<SessionOutside>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<SessionClosed>,
     #[serde(deserialize_with = "required_nullable")]
     #[schemars(schema_with = "nullable_schema::<SessionResume>")]
     pub resume: Option<SessionResume>,
@@ -120,6 +124,18 @@ pub struct SessionResume {
 pub struct SessionOutside {
     pub pid: u32,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionClosed {
+    pub by: PaneCloseBy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<u64>,
+    pub at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debrief: Option<CloseDebrief>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

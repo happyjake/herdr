@@ -964,12 +964,26 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     pub fn close_selected_workspace(&mut self) {
-        let close_indices = self.workspace_close_indices(self.selected);
-        self.close_workspaces(close_indices);
+        self.close_selected_workspace_with(Some(crate::api::schema::PaneCloseBy::Desk), None);
     }
 
-    pub(crate) fn close_workspaces(&mut self, close_indices: Vec<usize>) {
+    pub(crate) fn close_selected_workspace_with(
+        &mut self,
+        by: Option<crate::api::schema::PaneCloseBy>,
+        reason_pane: Option<(PaneId, Option<String>)>,
+    ) {
+        let close_indices = self.workspace_close_indices(self.selected);
+        self.close_workspaces_with(close_indices, by, reason_pane);
+    }
+
+    pub(crate) fn close_workspaces_with(
+        &mut self,
+        close_indices: Vec<usize>,
+        by: Option<crate::api::schema::PaneCloseBy>,
+        reason_pane: Option<(PaneId, Option<String>)>,
+    ) {
         if self.workspaces.is_empty() {
             return;
         }
@@ -980,7 +994,13 @@ impl AppState {
         let mut closing_starters = Vec::new();
         for idx in &close_indices {
             for pane_id in self.pane_ids_for_workspace(*idx) {
-                self.record_logbook_close(*idx, pane_id);
+                let reason = reason_pane
+                    .as_ref()
+                    .and_then(|(target_pane, reason)| {
+                        (*target_pane == pane_id).then(|| reason.clone())
+                    })
+                    .flatten();
+                self.record_logbook_close_with(*idx, pane_id, by, reason);
             }
             closing_starters.extend(self.closing_starters(*idx, self.pane_ids_for_workspace(*idx)));
             terminal_ids.extend(self.terminal_ids_for_workspace(*idx));

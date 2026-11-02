@@ -130,7 +130,7 @@ operations::define_operations! {
     PaneReportMetadata(PaneReportMetadataParams) => "pane.report_metadata", true, false;
     PaneClearAgentAuthority(PaneClearAgentAuthorityParams) => "pane.clear_agent_authority", true, false;
     PaneReleaseAgent(PaneReleaseAgentParams) => "pane.release_agent", true, false;
-    PaneClose(PaneTarget) => "pane.close", true, true;
+    PaneClose(PaneCloseParams) => "pane.close", true, true;
     PopupClose(EmptyParams) => "popup.close", true, false;
     EventsSubscribe(EventsSubscribeParams) => "events.subscribe", false, false;
     EventsWait(EventsWaitParams) => "events.wait", false, false;

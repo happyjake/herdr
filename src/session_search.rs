@@ -277,6 +277,9 @@ fn hit(
         state,
         live_pane_id: live_pane_id.cloned(),
         outside: outside.filter(|_| state == SessionState::Outside),
+        closed: (state != SessionState::Live)
+            .then(|| session.closed.clone())
+            .flatten(),
         resume,
         resume_blocked,
         headless: false,

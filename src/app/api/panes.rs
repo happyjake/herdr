@@ -1,9 +1,9 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCopyMotion,
-    PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
-    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneEditScrollbackParams,
+    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCloseParams,
+    PaneCopyMotion, PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams,
+    PaneCurrentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneEditScrollbackParams,
     PaneFocusDirectionParams, PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo,
     PaneInputSetParams, PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot,
     PaneLayoutSplit, PaneListParams, PaneMouseRouting, PaneMoveDestination, PaneMoveParams,
@@ -2346,20 +2346,24 @@ impl App {
         )
     }
 
-    pub(super) fn handle_pane_close(&mut self, id: String, target: PaneTarget) -> String {
-        match self.close_pane(id.clone(), &target) {
+    pub(super) fn handle_pane_close(&mut self, id: String, params: PaneCloseParams) -> String {
+        match self.close_pane(id.clone(), &params) {
             Ok(()) => encode_success(id, ResponseResult::Ok {}),
             Err(response) => response,
         }
     }
 
     /// Close a pane; `Err` carries the encoded error response.
-    pub(super) fn close_pane(&mut self, id: String, target: &PaneTarget) -> Result<(), String> {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
-            return Err(pane_not_found(id, &target.pane_id));
+    pub(super) fn close_pane(
+        &mut self,
+        id: String,
+        params: &PaneCloseParams,
+    ) -> Result<(), String> {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return Err(pane_not_found(id, &params.pane_id));
         };
         let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
-            return Err(pane_not_found(id, &target.pane_id));
+            return Err(pane_not_found(id, &params.pane_id));
         };
         let workspace_id = self.public_workspace_id(ws_idx);
         let layout_update_target = self.layout_update_target_after_pane_removal(ws_idx, pane_id);
@@ -2376,22 +2380,27 @@ impl App {
                 ));
             }
         }
+        let by = params
+            .by
+            .unwrap_or_else(|| crate::app::logbook::close_by_for_request_id(&id));
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         if !self.state.close_pane_would_close_workspace(ws_idx, pane_id) {
-            self.state.record_logbook_close(ws_idx, pane_id);
+            self.state
+                .record_logbook_close_with(ws_idx, pane_id, Some(by), params.reason.clone());
             self.state.retire_starter(ws_idx, pane_id);
         }
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
-                return Err(pane_not_found(id, &target.pane_id));
+                return Err(pane_not_found(id, &params.pane_id));
             };
             ws.close_pane(pane_id)
         };
         self.state.remove_plugin_pane_records([pane_id]);
         if should_close_workspace {
             self.state.selected = ws_idx;
-            self.state.close_selected_workspace();
+            self.state
+                .close_selected_workspace_with(Some(by), Some((pane_id, params.reason.clone())));
             self.shutdown_detached_terminal_runtimes();
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,
@@ -5916,12 +5925,8 @@ mod tests {
         app.state
             .insert_test_runtime(survivor_pane, survivor_runtime);
 
-        let close_response = app.handle_pane_close(
-            "close".into(),
-            PaneTarget {
-                pane_id: closed_pane_id,
-            },
-        );
+        let close_response =
+            app.handle_pane_close("close".into(), PaneCloseParams::new(closed_pane_id));
         assert_ok_response(&close_response, "close");
 
         let read_response = app.handle_api_request(crate::api::schema::Request {
@@ -6281,12 +6286,7 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
 
-        let response = app.handle_pane_close(
-            "req".into(),
-            PaneTarget {
-                pane_id: public_pane_id,
-            },
-        );
+        let response = app.handle_pane_close("req".into(), PaneCloseParams::new(public_pane_id));
 
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(success.id, "req");

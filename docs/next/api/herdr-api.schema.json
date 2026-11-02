@@ -2935,6 +2935,42 @@
           ],
           "type": "object"
         },
+        "PaneCloseBy": {
+          "enum": [
+            "desk",
+            "phone",
+            "cli",
+            "api"
+          ],
+          "type": "string"
+        },
+        "PaneCloseParams": {
+          "properties": {
+            "by": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/PaneCloseBy"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneCopyMotion": {
           "enum": [
             "line_end",
@@ -6771,7 +6807,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
+              "$ref": "#/schemas/request/$defs/PaneCloseParams"
             }
           },
           "required": [
@@ -8028,6 +8064,31 @@
           ],
           "type": "string"
         },
+        "CloseDebrief": {
+          "properties": {
+            "memories": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "outcome": {
+              "$ref": "#/schemas/success_response/$defs/DebriefOutcome"
+            },
+            "skill_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "outcome"
+          ],
+          "type": "object"
+        },
         "ClosedPaneStarter": {
           "properties": {
             "label": {
@@ -8108,6 +8169,14 @@
               "type": "string"
             }
           ]
+        },
+        "DebriefOutcome": {
+          "enum": [
+            "finished",
+            "skipped",
+            "abandoned"
+          ],
+          "type": "string"
         },
         "EventData": {
           "oneOf": [
@@ -9237,6 +9306,15 @@
             "rate_limited",
             "no_foreground_client",
             "busy"
+          ],
+          "type": "string"
+        },
+        "PaneCloseBy": {
+          "enum": [
+            "desk",
+            "phone",
+            "cli",
+            "api"
           ],
           "type": "string"
         },
@@ -12863,6 +12941,47 @@
           ],
           "type": "object"
         },
+        "SessionClosed": {
+          "properties": {
+            "age_secs": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "at_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "by": {
+              "$ref": "#/schemas/success_response/$defs/PaneCloseBy"
+            },
+            "debrief": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/CloseDebrief"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "by",
+            "at_ms"
+          ],
+          "type": "object"
+        },
         "SessionHit": {
           "properties": {
             "agent": {
@@ -12872,6 +12991,16 @@
               "type": [
                 "string",
                 "null"
+              ]
+            },
+            "closed": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/SessionClosed"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
             "cwd": {

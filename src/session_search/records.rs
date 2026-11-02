@@ -8,7 +8,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::agent_resume::AgentSessionRef;
-use crate::api::schema::{PromptTrailAgent, SearchSessionKey, SearchSessionKeyKind, SessionLabel};
+use crate::api::schema::{
+    PromptTrailAgent, SearchSessionKey, SearchSessionKeyKind, SessionClosed, SessionLabel,
+};
 use crate::prompt_trail::{self, LineRead};
 
 #[derive(Clone, Copy)]
@@ -61,6 +63,7 @@ pub(super) struct Session {
     pub last_active_at_ms: u64,
     pub record_path: Option<PathBuf>,
     pub labels: Vec<SessionLabel>,
+    pub closed: Option<SessionClosed>,
     pub parent: Option<SearchSessionKey>,
     pub reported: bool,
     pub non_interactive: bool,
@@ -80,6 +83,7 @@ impl Session {
             last_active_at_ms: 0,
             record_path,
             labels: Vec::new(),
+            closed: None,
             parent: None,
             reported: false,
             non_interactive: false,

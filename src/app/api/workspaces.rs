@@ -356,8 +356,10 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
+        let by = crate::app::logbook::close_by_for_request_id(&id);
         self.state.selected = index;
-        self.state.close_workspaces(close_indices);
+        self.state
+            .close_workspaces_with(close_indices, Some(by), None);
         self.shutdown_detached_terminal_runtimes();
         for (workspace_id, workspace) in closed_workspaces {
             self.emit_event(EventEnvelope {
@@ -1482,8 +1484,11 @@ mod tests {
                 });
             } else {
                 let pane_id = app.public_pane_id(0, root).unwrap();
-                app.close_pane("close".into(), &crate::api::schema::PaneTarget { pane_id })
-                    .unwrap();
+                app.close_pane(
+                    "close".into(),
+                    &crate::api::schema::PaneCloseParams::new(pane_id),
+                )
+                .unwrap();
             }
             assert_eq!(app.state.workspaces[0].tabs[0].root_pane, survivor);
             assert!(app.pending_pane_cwd_updates.is_empty());

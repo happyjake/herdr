@@ -94,6 +94,46 @@ fn workspace_close_group_intent_defaults_false_and_round_trips() {
 }
 
 #[test]
+fn pane_close_request_defaults_optional_by_and_reason_and_round_trips() {
+    let legacy: Request = serde_json::from_value(serde_json::json!({
+        "id": "close",
+        "method": "pane.close",
+        "params": { "pane_id": "w1:p1" }
+    }))
+    .unwrap();
+    assert_eq!(
+        legacy.method,
+        Method::PaneClose(PaneCloseParams::new("w1:p1"))
+    );
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    assert_eq!(
+        legacy_json["params"],
+        serde_json::json!({"pane_id": "w1:p1"})
+    );
+
+    for (by, by_name, reason) in [
+        (PaneCloseBy::Desk, "desk", None),
+        (PaneCloseBy::Phone, "phone", Some("dormant")),
+        (PaneCloseBy::Cli, "cli", Some("ended")),
+        (PaneCloseBy::Api, "api", Some("plain-shell")),
+    ] {
+        let explicit = Request {
+            id: "close-explicit".into(),
+            method: Method::PaneClose(PaneCloseParams {
+                pane_id: "w1:p1".into(),
+                by: Some(by),
+                reason: reason.map(str::to_owned),
+            }),
+        };
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(json["params"]["pane_id"], "w1:p1");
+        assert_eq!(json["params"]["by"], by_name);
+        assert_eq!(json["params"]["reason"].as_str(), reason);
+        assert_eq!(serde_json::from_value::<Request>(json).unwrap(), explicit);
+    }
+}
+
+#[test]
 fn pane_set_pinned_request_names_both_directions_with_one_method() {
     for pinned in [true, false] {
         let request: Request = serde_json::from_value(serde_json::json!({
