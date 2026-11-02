@@ -438,7 +438,7 @@ pub(super) fn wait_until(
 pub(super) fn pane_read_recent_contains(socket_path: &Path, pane_id: &str, expected: &str) -> bool {
     let output = run_cli(
         socket_path,
-        &["pane", "read", pane_id, "--source", "recent"],
+        &["pane", "read", pane_id, "--source", "recent-unwrapped"],
     );
     if !output.status.success() {
         return false;
