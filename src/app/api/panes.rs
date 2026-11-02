@@ -2359,6 +2359,15 @@ impl App {
         id: String,
         params: &PaneCloseParams,
     ) -> Result<(), String> {
+        self.close_pane_with_age(id, params, None)
+    }
+
+    pub(crate) fn close_pane_with_age(
+        &mut self,
+        id: String,
+        params: &PaneCloseParams,
+        age_secs: Option<u64>,
+    ) -> Result<(), String> {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return Err(pane_not_found(id, &params.pane_id));
         };
@@ -2384,8 +2393,13 @@ impl App {
         let workspace_snapshot = self.workspace_info(ws_idx);
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
         if !self.state.close_pane_would_close_workspace(ws_idx, pane_id) {
-            self.state
-                .record_logbook_close_with(ws_idx, pane_id, Some(by), params.reason.clone());
+            self.state.record_logbook_close_with_age(
+                ws_idx,
+                pane_id,
+                Some(by),
+                params.reason.clone(),
+                age_secs,
+            );
             self.state.retire_starter(ws_idx, pane_id);
         }
         let should_close_workspace = {
@@ -2397,9 +2411,18 @@ impl App {
         self.state.remove_plugin_pane_records([pane_id]);
         if should_close_workspace {
             self.state.selected = ws_idx;
-            self.state
-                .close_selected_workspace_with(Some(by), Some((pane_id, params.reason.clone())));
+            self.state.close_selected_workspace_with_age(
+                Some(by),
+                Some((pane_id, params.reason.clone(), age_secs)),
+            );
+            self.record_auto_close_pane_closed(
+                &public_pane_id,
+                by,
+                params.reason.as_deref(),
+                age_secs,
+            );
             self.shutdown_detached_terminal_runtimes();
+            self.schedule_session_save();
             self.emit_event(EventEnvelope {
                 event: EventKind::PaneClosed,
                 data: EventData::PaneClosed {
@@ -2416,6 +2439,12 @@ impl App {
             });
         } else {
             self.state.remove_unattached_terminal_ids(terminal_id);
+            self.record_auto_close_pane_closed(
+                &public_pane_id,
+                by,
+                params.reason.as_deref(),
+                age_secs,
+            );
             self.shutdown_detached_terminal_runtimes();
             self.schedule_session_save();
             self.emit_event(EventEnvelope {

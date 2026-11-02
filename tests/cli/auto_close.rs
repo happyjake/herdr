@@ -19,7 +19,9 @@ struct Session {
 
 impl Session {
     fn new(config: &str) -> Self {
-        let base = unique_test_dir();
+        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = PathBuf::from(format!("{}-{id}", unique_test_dir().display()));
         let socket = base.join("runtime/herdr.sock");
         let server = spawn_isolated(&base, &socket, config);
         wait_for_socket(&socket, Duration::from_secs(10));
@@ -62,6 +64,20 @@ impl Session {
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|line| line["type"] == "would_close")
+        .collect()
+    }
+
+    fn closes(&self) -> Vec<Value> {
+        fs::read_to_string(
+            self.base
+                .join("config")
+                .join(app_dir_name())
+                .join("logbook.jsonl"),
+        )
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["type"] == "pane_closed")
         .collect()
     }
 }
@@ -179,7 +195,14 @@ impl Session {
             Duration::from_millis(50),
             || {
                 let pane = self.request("pane.get", json!({"pane_id":self.pane}));
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
                 matches!(pane["pane"]["agent_status"].as_str(), Some("done" | "idle"))
+                    && pane["pane"]["agent_status_changed_at"]
+                        .as_u64()
+                        .is_some_and(|at| at <= now)
             }
         ));
         agent
@@ -1080,4 +1103,372 @@ fn auto_close_legacy_ended_pane_waits_for_a_known_exit_time() {
     ));
     session.stop();
     assert!(session.saved_pane()["ended_at"].as_u64().is_some());
+}
+
+#[test]
+fn auto_close_close_mode_closes_ended_pane_and_plain_shell_and_preserves_resumable_session_search()
+{
+    let config =
+        "[auto_close]\nmode = 'close'\nended_age_secs = 2\nplain_shell_age_secs = 5\npass_floor_secs = 1\n";
+    let mut session = Session::new("[auto_close]\nmode = 'off'\n");
+    let legacy = session.agent("pi");
+    legacy.stop();
+    session.wait_for_ended("pi");
+    session.stop();
+    let snapshot_path = session
+        .base
+        .join("config")
+        .join(app_dir_name())
+        .join("session.json");
+    let mut snapshot: Value = serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+    for pane in snapshot["workspaces"][0]["tabs"][0]["panes"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+    {
+        assert!(pane.as_object_mut().unwrap().remove("ended_at").is_some());
+    }
+    fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    session.start(config);
+    assert!(wait_until(
+        Duration::from_secs(3),
+        Duration::from_millis(25),
+        || session.plan()["spared"][0]["exemption"] == "ended-time-unknown"
+    ));
+    thread::sleep(Duration::from_millis(1200));
+    assert!(session.closes().is_empty());
+
+    let claude_record = session
+        .base
+        .join("home/.claude/projects/project/session-ended.jsonl");
+    fs::create_dir_all(claude_record.parent().unwrap()).unwrap();
+    fs::write(
+        &claude_record,
+        format!(
+            "{}\n",
+            json!({
+                "type": "user",
+                "sessionId": "session-ended",
+                "cwd": session.base,
+                "gitBranch": "main",
+                "timestamp": "2026-10-03T00:00:00Z",
+                "message": {"role": "user", "content": "Resumable ended conversation"}
+            })
+        ),
+    )
+    .unwrap();
+
+    let agent = session.agent("claude");
+    agent.ok(&[
+        "pane",
+        "report-agent-session",
+        &session.pane,
+        "--source=herdr:claude",
+        "--agent=claude",
+        "--seq=2",
+        "--agent-session-id=session-ended",
+        "--session-start-source=startup",
+    ]);
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || {
+            session.request("pane.get", json!({"pane_id":session.pane}))["pane"]["agent_session"]
+                ["value"]
+                == "session-ended"
+        }
+    ));
+    let split = run_cli_json(
+        &session.socket,
+        &["pane", "split", &session.pane, "--direction", "right"],
+    );
+    let shell_pane = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let exiting_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    agent.stop();
+    session.wait_for_ended("claude");
+
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        || session
+            .closes()
+            .iter()
+            .any(|line| line["pane"] == session.pane)
+    ));
+    let ended_close = session
+        .closes()
+        .into_iter()
+        .find(|line| line["pane"] == session.pane)
+        .unwrap();
+    assert_eq!(ended_close["by"], "desk");
+    assert_eq!(ended_close["reason"], "ended");
+    assert!(ended_close["age_secs"].as_u64().unwrap() >= 2);
+    assert!(ended_close["at"].as_u64().unwrap() / 1000 >= exiting_at + 2);
+    let missing = send_request(
+        &session.socket,
+        &json!({"id":"gone","method":"pane.get","params":{"pane_id":session.pane}}).to_string(),
+    );
+    assert_eq!(missing["error"]["code"], "pane_not_found", "{missing}");
+
+    let search = session.request("server.search_sessions", json!({"terms": ["Resumable"]}));
+    let hits = search["sessions"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{search}");
+    assert_eq!(hits[0]["key"]["value"], "session-ended");
+    assert_eq!(hits[0]["state"], "ended");
+    assert_eq!(hits[0]["closed"]["by"], "desk");
+    assert_eq!(hits[0]["closed"]["reason"], "ended");
+    assert_eq!(hits[0]["closed"]["age_secs"], ended_close["age_secs"]);
+    assert_eq!(hits[0]["closed"]["at_ms"], ended_close["at"]);
+    assert_eq!(
+        hits[0]["resume"],
+        json!({
+            "command": "claude --resume session-ended",
+            "cwd": session.base
+        })
+    );
+
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        || session
+            .closes()
+            .iter()
+            .any(|line| line["pane"] == shell_pane)
+    ));
+    let shell_close = session
+        .closes()
+        .into_iter()
+        .find(|line| line["pane"] == shell_pane)
+        .unwrap();
+    assert_eq!(shell_close["by"], "desk");
+    assert_eq!(shell_close["reason"], "plain-shell");
+    assert!(shell_close["age_secs"].as_u64().unwrap() >= 5);
+    assert!(session.reports().is_empty());
+    assert_eq!(
+        session.request("ping", json!({}))["auto_close"],
+        json!({"mode":"close","waiting":0,"closed_24h":2})
+    );
+}
+
+#[test]
+fn auto_close_close_mode_closes_ended_kin_before_ended_starter() {
+    let session = Session::new(
+        "[auto_close]\nmode = 'close'\nended_age_secs = 2\ndormant_age_secs = 100\nplain_shell_age_secs = 100\npass_floor_secs = 1\n",
+    );
+    let starter = session.agent("pi");
+    let created: Value = serde_json::from_str(&starter.ok(&["tab", "create"])).unwrap();
+    let kin = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let dir = session.base.join("kin-agent");
+    fs::create_dir_all(&dir).unwrap();
+    let child = crate::support::InPaneReporter::write(&dir, "pi", &session.socket);
+    assert!(
+        run_cli(&session.socket, &["pane", "run", &kin, &child.command()])
+            .status
+            .success()
+    );
+    child.wait_until_started(Duration::from_secs(10));
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || session.request("pane.get", json!({"pane_id":kin}))["pane"]["agent"] == "pi"
+    ));
+
+    // Stop the starter first; while its kin is still open, the starter must wait on open-kin.
+    starter.stop();
+    session.wait_for_ended("pi");
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        session.closes().is_empty(),
+        "starter must not close while kin is still open: {:?}",
+        session.closes()
+    );
+    assert_eq!(
+        session.request("pane.get", json!({"pane_id":session.pane}))["pane"]["pane_id"],
+        session.pane
+    );
+
+    child.stop();
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || session.request("pane.get", json!({"pane_id":kin}))["pane"]["ended_agent"] == "pi"
+    ));
+
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        || session.closes().len() == 2
+    ));
+    let closes = session.closes();
+    assert_eq!(closes[0]["pane"], kin, "{closes:?}");
+    assert_eq!(closes[0]["by"], "desk");
+    assert_eq!(closes[0]["reason"], "ended");
+    assert_eq!(closes[1]["pane"], session.pane, "{closes:?}");
+    assert_eq!(closes[1]["by"], "desk");
+    assert_eq!(closes[1]["reason"], "ended");
+    assert_eq!(
+        session.request("ping", json!({}))["auto_close"]["closed_24h"],
+        2
+    );
+}
+
+#[test]
+fn auto_close_close_mode_keeps_dormant_agents_waiting_and_logs_confirmation_required_refusal() {
+    let session = Session::new("[auto_close]\nmode = 'off'\n");
+    let agent = session.agent("pi");
+
+    let repo = session.base.join("repo");
+    create_committed_repo(&repo);
+    let root = session.request("workspace.create", json!({"cwd":repo}));
+    let root_id = root["root_pane"]["pane_id"].as_str().unwrap().to_string();
+    let workspace = root["workspace"]["workspace_id"].as_str().unwrap();
+    let created = run_cli_json(
+        &session.socket,
+        &[
+            "worktree",
+            "create",
+            "--workspace",
+            workspace,
+            "--branch",
+            "group-child",
+        ],
+    );
+    let child_pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    session.request(
+        "pane.set_pinned",
+        json!({"pane_id":child_pane,"pinned":true}),
+    );
+
+    let config_path = session
+        .base
+        .join("config")
+        .join(app_dir_name())
+        .join("config.toml");
+    fs::write(
+        &config_path,
+        "onboarding = false\n[auto_close]\nmode = 'close'\ndormant_age_secs = 0\nplain_shell_age_secs = 0\npass_floor_secs = 1\ndebrief = false\n",
+    )
+    .unwrap();
+    session.request("server.reload_config", json!({}));
+
+    let refusal = send_request(
+        &session.socket,
+        &json!({"id":"refusal","method":"pane.close","params":{"pane_id":root_id}}).to_string(),
+    );
+    assert_eq!(
+        refusal["error"]["code"], "confirmation_required",
+        "{refusal}"
+    );
+
+    let plan = session.plan();
+    let dormant = plan["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["pane_id"] == session.pane)
+        .unwrap();
+    assert_eq!(dormant["kind"], "dormant", "{plan}");
+    assert_eq!(dormant["action"], "wait", "{plan}");
+
+    let log_path = session
+        .base
+        .join("config")
+        .join(app_dir_name())
+        .join("herdr-server.log");
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+        || {
+            session.request("ping", json!({}))["auto_close"]["waiting"] == 1
+                && fs::read_to_string(&log_path).is_ok_and(|log| {
+                    log.contains("confirmation_required") && log.contains(&root_id)
+                })
+        }
+    ));
+    assert!(session.closes().is_empty());
+    assert_eq!(
+        session.request("pane.get", json!({"pane_id":session.pane}))["pane"]["agent"],
+        "pi"
+    );
+    assert_eq!(
+        session.request("pane.get", json!({"pane_id":root_id}))["pane"]["pane_id"],
+        root_id
+    );
+    agent.stop();
+}
+
+#[test]
+fn auto_close_switching_close_to_report_stops_closing_on_the_next_pass() {
+    let session = Session::new("[auto_close]\nmode = 'off'\n");
+    let split = run_cli_json(
+        &session.socket,
+        &["pane", "split", &session.pane, "--direction", "right"],
+    );
+    let second = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    session.request("pane.set_pinned", json!({"pane_id":second,"pinned":true}));
+
+    let config_path = session
+        .base
+        .join("config")
+        .join(app_dir_name())
+        .join("config.toml");
+    fs::write(
+        &config_path,
+        "onboarding = false\n[auto_close]\nmode = 'close'\nplain_shell_age_secs = 2\npass_floor_secs = 1\n",
+    )
+    .unwrap();
+    session.request("server.reload_config", json!({}));
+
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        || session.closes().len() == 1
+    ));
+    assert_eq!(session.closes()[0]["pane"], session.pane);
+    assert_eq!(
+        session.request("ping", json!({}))["auto_close"],
+        json!({"mode":"close","waiting":0,"closed_24h":1})
+    );
+
+    fs::write(
+        &config_path,
+        "onboarding = false\n[auto_close]\nmode = 'report'\nplain_shell_age_secs = 2\npass_floor_secs = 1\n",
+    )
+    .unwrap();
+    session.request("server.reload_config", json!({}));
+    session.request("pane.set_pinned", json!({"pane_id":second,"pinned":false}));
+
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        || session.reports().len() == 1
+    ));
+    assert_eq!(session.reports()[0]["pane"], second);
+    assert_eq!(session.reports()[0]["by"], "desk");
+    assert_eq!(session.reports()[0]["reason"], "plain-shell");
+    assert_eq!(session.closes().len(), 1);
+    assert_eq!(
+        session.request("pane.get", json!({"pane_id":second}))["pane"]["pane_id"],
+        second
+    );
+    assert_eq!(
+        session.request("ping", json!({}))["auto_close"],
+        json!({"mode":"report","waiting":0,"closed_24h":1})
+    );
 }

@@ -3349,7 +3349,7 @@ impl HeadlessServer {
             .is_some_and(|deadline| now >= deadline)
         {
             self.sync_auto_close_focus();
-            self.app.run_auto_close_pass(now);
+            changed |= self.app.run_auto_close_pass(now);
         }
 
         // Flags publish runtime metadata only; they do not request a TUI render.

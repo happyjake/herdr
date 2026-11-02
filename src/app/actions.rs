@@ -974,8 +974,19 @@ impl AppState {
         by: Option<crate::api::schema::PaneCloseBy>,
         reason_pane: Option<(PaneId, Option<String>)>,
     ) {
+        self.close_selected_workspace_with_age(
+            by,
+            reason_pane.map(|(pane_id, reason)| (pane_id, reason, None)),
+        );
+    }
+
+    pub(crate) fn close_selected_workspace_with_age(
+        &mut self,
+        by: Option<crate::api::schema::PaneCloseBy>,
+        close_pane: Option<(PaneId, Option<String>, Option<u64>)>,
+    ) {
         let close_indices = self.workspace_close_indices(self.selected);
-        self.close_workspaces_with(close_indices, by, reason_pane);
+        self.close_workspaces_with_age(close_indices, by, close_pane);
     }
 
     pub(crate) fn close_workspaces_with(
@@ -983,6 +994,19 @@ impl AppState {
         close_indices: Vec<usize>,
         by: Option<crate::api::schema::PaneCloseBy>,
         reason_pane: Option<(PaneId, Option<String>)>,
+    ) {
+        self.close_workspaces_with_age(
+            close_indices,
+            by,
+            reason_pane.map(|(pane_id, reason)| (pane_id, reason, None)),
+        );
+    }
+
+    pub(crate) fn close_workspaces_with_age(
+        &mut self,
+        close_indices: Vec<usize>,
+        by: Option<crate::api::schema::PaneCloseBy>,
+        close_pane: Option<(PaneId, Option<String>, Option<u64>)>,
     ) {
         if self.workspaces.is_empty() {
             return;
@@ -994,13 +1018,13 @@ impl AppState {
         let mut closing_starters = Vec::new();
         for idx in &close_indices {
             for pane_id in self.pane_ids_for_workspace(*idx) {
-                let reason = reason_pane
+                let (reason, age_secs) = close_pane
                     .as_ref()
-                    .and_then(|(target_pane, reason)| {
-                        (*target_pane == pane_id).then(|| reason.clone())
+                    .and_then(|(target_pane, reason, age_secs)| {
+                        (*target_pane == pane_id).then(|| (reason.clone(), *age_secs))
                     })
-                    .flatten();
-                self.record_logbook_close_with(*idx, pane_id, by, reason);
+                    .unwrap_or((None, None));
+                self.record_logbook_close_with_age(*idx, pane_id, by, reason, age_secs);
             }
             closing_starters.extend(self.closing_starters(*idx, self.pane_ids_for_workspace(*idx)));
             terminal_ids.extend(self.terminal_ids_for_workspace(*idx));

@@ -434,6 +434,16 @@ async fn evaluate(panes: &[PaneSnapshot], config: &Config, now: u64) -> Plan {
             Err(reason) => candidate.wait_reason = Some(reason.into()),
         }
     }
+    if config.mode == Mode::Close {
+        for candidate in &mut result.candidates {
+            if candidate.kind == Kind::Dormant {
+                candidate.action = Action::Wait;
+                candidate
+                    .wait_reason
+                    .get_or_insert_with(|| "debrief-pending".into());
+            }
+        }
+    }
     result
 }
 
@@ -680,19 +690,24 @@ impl App {
         });
     }
 
-    pub(crate) fn run_auto_close_pass(&mut self, monotonic: Instant) {
+    pub(crate) fn run_auto_close_pass(&mut self, monotonic: Instant) -> bool {
         if self
             .auto_close
             .deadline
             .is_none_or(|deadline| monotonic < deadline)
         {
-            return;
+            return false;
         }
         if let Some(pending) = self.auto_close.pending.as_ref() {
             match pending.receiver.try_recv() {
                 Ok(result) => {
                     if let Some(pending) = self.auto_close.pending.take() {
-                        self.finish_auto_close_pass(result, &pending.panes, pending.at, monotonic);
+                        return self.finish_auto_close_pass(
+                            result,
+                            &pending.panes,
+                            pending.at,
+                            monotonic,
+                        );
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -706,7 +721,7 @@ impl App {
                     tracing::warn!("auto-close planning task stopped before producing a plan");
                 }
             }
-            return;
+            return false;
         }
         let now = crate::pane::unix_now_secs();
         let panes = self.auto_close_snapshot(now);
@@ -723,6 +738,54 @@ impl App {
             at: now,
         });
         self.auto_close.deadline = monotonic.checked_add(Duration::from_millis(25));
+        false
+    }
+
+    pub(crate) fn record_auto_close_pane_closed(
+        &mut self,
+        pane_id: &str,
+        by: CloseBy,
+        reason: Option<&str>,
+        age_secs: Option<u64>,
+    ) {
+        self.auto_close.reported.remove(pane_id);
+        if by == CloseBy::Desk
+            && age_secs.is_some()
+            && reason.is_some_and(|reason| matches!(reason, "ended" | "dormant" | "plain-shell"))
+        {
+            self.auto_close
+                .status
+                .0
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .closes
+                .push_back(logbook::now_ms());
+        }
+    }
+
+    pub(crate) fn close_auto_close_pane(
+        &mut self,
+        pane_id: &str,
+        reason: &str,
+        age_secs: u64,
+    ) -> bool {
+        let params = crate::api::schema::PaneCloseParams {
+            pane_id: pane_id.to_owned(),
+            by: Some(CloseBy::Desk),
+            reason: Some(reason.to_owned()),
+        };
+        match self.close_pane_with_age("auto-close".into(), &params, Some(age_secs)) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    pane_id = %pane_id,
+                    reason = %reason,
+                    %error,
+                    "auto-close refused to close pane"
+                );
+                false
+            }
+        }
     }
 
     fn finish_auto_close_pass(
@@ -731,11 +794,11 @@ impl App {
         previous: &[PaneSnapshot],
         at: u64,
         monotonic: Instant,
-    ) {
+    ) -> bool {
         let now = crate::pane::unix_now_secs();
         // Gate execution may take seconds. Re-check protections and activity
         // before reporting a result about the still-live pane.
-        let panes = self.auto_close_snapshot(now);
+        let mut panes = self.auto_close_snapshot(now);
         let current = plan(&panes, &self.auto_close.config, now);
         result.candidates.retain(|candidate| {
             current.candidates.iter().any(|fresh| {
@@ -752,16 +815,83 @@ impl App {
                             .map(|pane| &pane.session)
             })
         });
-        self.auto_close
-            .status
-            .0
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .waiting = result
-            .candidates
-            .iter()
-            .filter(|candidate| candidate.action == Action::Wait)
-            .count() as u64;
+        let mut closed_any = false;
+        if self.auto_close.config.mode == Mode::Close {
+            let mut attempted = HashSet::new();
+            loop {
+                panes = self.auto_close_snapshot(now);
+                for pane in &panes {
+                    if !pane.group_refusal || !attempted.insert(format!("refusal:{}", pane.pane_id))
+                    {
+                        continue;
+                    }
+                    let mut probe = pane.clone();
+                    probe.last_main_pane = false;
+                    probe.group_refusal = false;
+                    if let Ok(candidate) = decide(&probe, &panes, &self.auto_close.config, now) {
+                        if matches!(candidate.kind, Kind::Ended | Kind::PlainShell) {
+                            tracing::warn!(
+                                pane_id = %pane.pane_id,
+                                reason = %candidate.reason,
+                                code = "confirmation_required",
+                                "auto-close refused to close pane that would close a worktree group"
+                            );
+                        }
+                    }
+                }
+                let current = plan(&panes, &self.auto_close.config, now);
+                let next = current.candidates.into_iter().find(|candidate| {
+                    matches!(candidate.kind, Kind::Ended | Kind::PlainShell)
+                        && candidate.action == Action::Close
+                        && !attempted.contains(&candidate.pane_id)
+                        && previous.iter().any(|prev| {
+                            prev.pane_id == candidate.pane_id
+                                && panes
+                                    .iter()
+                                    .find(|pane| pane.pane_id == candidate.pane_id)
+                                    .is_some_and(|pane| {
+                                        pane.session == prev.session
+                                            && pane.ended == prev.ended
+                                            && pane.agent == prev.agent
+                                    })
+                        })
+                });
+                let Some(candidate) = next else {
+                    break;
+                };
+                attempted.insert(candidate.pane_id.clone());
+                if self.close_auto_close_pane(
+                    &candidate.pane_id,
+                    &candidate.reason,
+                    candidate.age_secs,
+                ) {
+                    closed_any = true;
+                }
+            }
+            self.flush_logbook();
+            panes = self.auto_close_snapshot(now);
+            self.auto_close
+                .status
+                .0
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .waiting = plan(&panes, &self.auto_close.config, now)
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.kind == Kind::Dormant)
+                .count() as u64;
+        } else {
+            self.auto_close
+                .status
+                .0
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .waiting = result
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.action == Action::Wait)
+                .count() as u64;
+        }
         if self.auto_close.config.mode == Mode::Report {
             for candidate in &result.candidates {
                 let Some(pane) = panes.iter().find(|pane| pane.pane_id == candidate.pane_id) else {
@@ -820,6 +950,7 @@ impl App {
             &self.auto_close.config,
             now,
         )));
+        closed_any
     }
 }
 
@@ -1106,6 +1237,136 @@ mod tests {
                 .action,
             Action::Close
         );
+    }
+
+    #[tokio::test]
+    async fn auto_close_close_mode_waits_for_dormant_agents_while_closing_shells_and_ended_panes() {
+        let mut dormant = shell();
+        dormant.pane_id = "pane-dormant".into();
+        dormant.agent = Some("pi".into());
+        dormant.status = AgentStatus::Idle;
+        let mut ended = shell();
+        ended.pane_id = "pane-ended".into();
+        ended.ended = true;
+        ended.ended_at = Some(100);
+        let mut legacy_ended = shell();
+        legacy_ended.pane_id = "pane-legacy-ended".into();
+        legacy_ended.ended = true;
+        let mut plain = shell();
+        plain.pane_id = "pane-shell".into();
+        let panes = vec![dormant, ended, legacy_ended, plain];
+        let config = Config {
+            mode: Mode::Close,
+            ended_age_secs: 0,
+            dormant_age_secs: 0,
+            plain_shell_age_secs: 0,
+            debrief: false,
+            ..Config::default()
+        };
+        let evaluated = evaluate(&panes, &config, 200).await;
+        assert_eq!(evaluated.candidates.len(), 3);
+        assert_eq!(evaluated.spared.len(), 1);
+        assert_eq!(evaluated.spared[0].pane_id, "pane-legacy-ended");
+        assert_eq!(evaluated.spared[0].exemption, "ended-time-unknown");
+        assert_eq!(evaluated.candidates[0].kind, Kind::Dormant);
+        assert_eq!(evaluated.candidates[0].action, Action::Wait);
+        assert_eq!(
+            evaluated.candidates[0].wait_reason.as_deref(),
+            Some("debrief-pending")
+        );
+        assert_eq!(evaluated.candidates[1].kind, Kind::Ended);
+        assert_eq!(evaluated.candidates[1].action, Action::Close);
+        assert_eq!(evaluated.candidates[2].kind, Kind::PlainShell);
+        assert_eq!(evaluated.candidates[2].action, Action::Close);
+    }
+
+    #[test]
+    fn auto_close_close_pane_records_desk_provenance_and_refuses_confirmation_required_group() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-auto-close-unit-{}-{}.jsonl",
+            std::process::id(),
+            logbook::now_ms()
+        ));
+        let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.logbook_events = Some(Vec::new());
+        app.logbook_writer = Some(
+            logbook::BackgroundWriter::start(path.clone(), Vec::new(), HashSet::new()).unwrap(),
+        );
+        app.state.confirm_close = true;
+        let mut parent = crate::workspace::Workspace::test_new("parent");
+        parent.id = "wparent".into();
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "/tmp/repo/.git".into(),
+            label: "repo".into(),
+            repo_root: "/tmp/repo".into(),
+            checkout_path: "/tmp/repo".into(),
+            is_linked_worktree: false,
+        });
+        parent.test_add_tab(None);
+        let mut child = crate::workspace::Workspace::test_new("child");
+        child.id = "wchild".into();
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "/tmp/repo/.git".into(),
+            label: "repo".into(),
+            repo_root: "/tmp/repo".into(),
+            checkout_path: "/tmp/repo-child".into(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces = vec![parent, child];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+
+        let pane_ids = app.state.pane_ids_for_workspace(0);
+        let first = app.public_pane_id(0, pane_ids[0]).unwrap();
+        let second = app.public_pane_id(0, pane_ids[1]).unwrap();
+
+        assert!(app.close_auto_close_pane(&second, "ended", 42));
+        app.drain_logbook();
+        assert_eq!(
+            app.auto_close.status.0.read().unwrap().closes.len(),
+            1,
+            "first close should increment closes history"
+        );
+        let mut events = Vec::new();
+        logbook::for_each_event(&path, |event| events.push(event)).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::PaneClosed {
+                pane,
+                by,
+                reason,
+                age_secs,
+                ..
+            } => {
+                assert_eq!(pane, &second);
+                assert_eq!(*by, Some(CloseBy::Desk));
+                assert_eq!(reason.as_deref(), Some("ended"));
+                assert_eq!(*age_secs, Some(42));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // Now `first` is the last pane in the parent workspace of a worktree group;
+        // `close_auto_close_pane` must refuse with `confirmation_required` and never force.
+        assert!(!app.close_auto_close_pane(&first, "plain-shell", 99));
+        app.drain_logbook();
+        assert_eq!(app.auto_close.status.0.read().unwrap().closes.len(), 1);
+        let mut after_refusal = Vec::new();
+        logbook::for_each_event(&path, |event| after_refusal.push(event)).unwrap();
+        assert_eq!(after_refusal.len(), 1);
+        assert_eq!(
+            app.public_pane_id(0, pane_ids[0]).as_deref(),
+            Some(first.as_str())
+        );
+        app.shutdown_logbook();
+        let _ = std::fs::remove_file(&path);
     }
 }
 

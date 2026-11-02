@@ -123,7 +123,18 @@ impl AppState {
         by: Option<logbook::CloseBy>,
         reason: Option<String>,
     ) {
-        if let Some(event) = self.logbook_close_event(ws_idx, pane_id, by, reason) {
+        self.record_logbook_close_with_age(ws_idx, pane_id, by, reason, None);
+    }
+
+    pub(crate) fn record_logbook_close_with_age(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        by: Option<logbook::CloseBy>,
+        reason: Option<String>,
+        age_secs: Option<u64>,
+    ) {
+        if let Some(event) = self.logbook_close_event(ws_idx, pane_id, by, reason, age_secs) {
             self.push_logbook_event(event);
         }
     }
@@ -134,6 +145,7 @@ impl AppState {
         pane_id: PaneId,
         by: Option<logbook::CloseBy>,
         reason: Option<String>,
+        age_secs: Option<u64>,
     ) -> Option<Event> {
         self.logbook_events.as_ref()?;
         let ws = self.workspaces.get(ws_idx)?;
@@ -150,7 +162,7 @@ impl AppState {
             pane: crate::workspace::public_pane_id_for_number(&ws.id, number),
             by,
             reason,
-            age_secs: None,
+            age_secs,
             debrief: None,
             session,
             at: logbook::now_ms(),
@@ -168,7 +180,7 @@ impl AppState {
         }
         self.pane_ids_for_tab(ws_idx, tab_idx)
             .into_iter()
-            .filter_map(|pane_id| self.logbook_close_event(ws_idx, pane_id, by, None))
+            .filter_map(|pane_id| self.logbook_close_event(ws_idx, pane_id, by, None, None))
             .collect()
     }
 
