@@ -3982,6 +3982,10 @@ impl PaneRuntime {
         self.input_activity.get()
     }
 
+    pub(crate) fn input_or_command_seq(&self) -> u64 {
+        self.input_activity.seq()
+    }
+
     pub(crate) fn restore_input_or_command_at(&self, at: u64) {
         self.input_activity.restore(at);
     }

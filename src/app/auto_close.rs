@@ -156,6 +156,7 @@ struct PaneSnapshot {
     status: AgentStatus,
     status_at: u64,
     input_at: u64,
+    input_seq: u64,
     pinned: bool,
     flagged: bool,
     desk_focused: bool,
@@ -163,9 +164,37 @@ struct PaneSnapshot {
     single_pane_workspace: bool,
     main_checkout: Option<String>,
     group_refusal: bool,
+    group_members: Vec<String>,
     bare_prompt: bool,
     starter: Option<String>,
     session: Option<CloseSession>,
+}
+
+impl PaneSnapshot {
+    fn same_close_facts(&self, other: &Self) -> bool {
+        self.input_at == other.input_at
+            && self.input_seq == other.input_seq
+            && self.status == other.status
+            && self.status_at == other.status_at
+            && self.agent == other.agent
+            && self.ended == other.ended
+            && self.ended_at == other.ended_at
+            && self.pinned == other.pinned
+            && self.flagged == other.flagged
+            && self.desk_focused == other.desk_focused
+            && self.main_checkout == other.main_checkout
+            && self.session == other.session
+    }
+
+    fn refusal_key(&self, reason: &str, now: u64, age_secs: u64) -> RefusalKey {
+        RefusalKey {
+            reason: reason.to_owned(),
+            since: now.saturating_sub(age_secs),
+            input_seq: self.input_seq,
+            session: self.session.clone(),
+            group_members: self.group_members.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,12 +204,22 @@ struct ReportKey {
     session: Option<CloseSession>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefusalKey {
+    reason: String,
+    since: u64,
+    input_seq: u64,
+    session: Option<CloseSession>,
+    group_members: Vec<String>,
+}
+
 pub(crate) struct AutoClose {
     pub(crate) config: Config,
     pub(crate) deadline: Option<Instant>,
     pub(crate) focused: HashSet<crate::layout::PaneId>,
     pub(crate) status: SharedStatus,
     reported: HashMap<String, ReportKey>,
+    refused: HashMap<String, RefusalKey>,
     pending: Option<PendingPass>,
     last_pass: Option<Instant>,
 }
@@ -206,6 +245,7 @@ impl AutoClose {
             focused: HashSet::new(),
             status: SharedStatus::default(),
             reported: HashMap::new(),
+            refused: HashMap::new(),
             pending: None,
             last_pass: None,
         }
@@ -301,7 +341,9 @@ fn decide(
         if pane.ended {
             (
                 Kind::Ended,
-                pane.ended_at.ok_or("ended-time-unknown")?,
+                pane.ended_at
+                    .ok_or("ended-time-unknown")?
+                    .max(pane.input_at),
                 config.ended_age_secs,
             )
         } else {
@@ -465,7 +507,9 @@ fn next_pass_delay(panes: &[PaneSnapshot], config: &Config, now: u64) -> u64 {
                     .max(pane.input_at)
                     .saturating_add(config.dormant_age_secs)
             } else if pane.ended {
-                pane.ended_at?.saturating_add(config.ended_age_secs)
+                pane.ended_at?
+                    .max(pane.input_at)
+                    .saturating_add(config.ended_age_secs)
             } else {
                 pane.input_at.saturating_add(config.plain_shell_age_secs)
             };
@@ -481,6 +525,64 @@ fn live_starter(link: &PaneStartedBy) -> Option<String> {
         PaneStartedBy::Pane { pane_id } => Some(pane_id.clone()),
         PaneStartedBy::Closed { closed } => closed.started_by.as_ref().and_then(live_starter),
     }
+}
+
+fn record_group_refusal(
+    refused: &mut HashMap<String, RefusalKey>,
+    still_refused: &mut HashSet<String>,
+    pane: &PaneSnapshot,
+    panes: &[PaneSnapshot],
+    config: &Config,
+    now: u64,
+) -> Option<Candidate> {
+    if !pane.group_refusal {
+        return None;
+    }
+    let mut probe = pane.clone();
+    probe.main_checkout = None;
+    probe.group_refusal = false;
+    let candidate = decide(&probe, panes, config, now).ok()?;
+    if !matches!(candidate.kind, Kind::Ended | Kind::PlainShell) {
+        return None;
+    }
+    let key = pane.refusal_key(&candidate.reason, now, candidate.age_secs);
+    still_refused.insert(pane.pane_id.clone());
+    if refused.get(&pane.pane_id) == Some(&key) {
+        return None;
+    }
+    refused.insert(pane.pane_id.clone(), key);
+    Some(candidate)
+}
+
+fn candidate_ready_to_close(
+    candidate: &Candidate,
+    previous: &[PaneSnapshot],
+    fresh_panes: &[PaneSnapshot],
+    refused: &HashMap<String, RefusalKey>,
+    still_refused: &mut HashSet<String>,
+    config: &Config,
+    now: u64,
+) -> bool {
+    let Some((prev, fresh)) = previous
+        .iter()
+        .find(|prev| prev.pane_id == candidate.pane_id)
+        .zip(
+            fresh_panes
+                .iter()
+                .find(|pane| pane.pane_id == candidate.pane_id),
+        )
+    else {
+        return false;
+    };
+    let key = fresh.refusal_key(&candidate.reason, now, candidate.age_secs);
+    if refused.get(&fresh.pane_id) == Some(&key) {
+        still_refused.insert(fresh.pane_id.clone());
+        return false;
+    }
+    fresh.same_close_facts(prev)
+        && decide(fresh, fresh_panes, config, now).is_ok_and(|fresh_candidate| {
+            fresh_candidate.kind == candidate.kind && fresh_candidate.action == Action::Close
+        })
 }
 
 impl App {
@@ -578,6 +680,7 @@ impl App {
             return;
         }
         self.auto_close.pending = None;
+        self.auto_close.refused.clear();
         self.auto_close.config = config;
         self.auto_close.deadline = (self.auto_close.config.mode != Mode::Off)
             .then(|| {
@@ -601,6 +704,47 @@ impl App {
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             let single_pane_workspace =
                 ws.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>() == 1;
+            let group_refusal = single_pane_workspace
+                && self
+                    .state
+                    .workspace_close_would_close_worktree_group(ws_idx);
+            let group_members = ws.worktree_space().map_or_else(Vec::new, |space| {
+                let mut members = Vec::new();
+                for (other_idx, other_ws) in self.state.workspaces.iter().enumerate() {
+                    if other_ws
+                        .worktree_space()
+                        .is_none_or(|other_space| other_space.key != space.key)
+                    {
+                        continue;
+                    }
+                    members.push(format!("ws:{}", other_ws.id));
+                    for other_tab in &other_ws.tabs {
+                        for (&other_id, other_pane) in &other_tab.panes {
+                            let Some(other_pane_id) = self.public_pane_id(other_idx, other_id)
+                            else {
+                                continue;
+                            };
+                            let (pinned, flagged, ended, agent) = self
+                                .state
+                                .terminals
+                                .get(&other_pane.attached_terminal_id)
+                                .map_or((false, false, false, ""), |term| {
+                                    (
+                                        term.pinned,
+                                        term.flag.is_some(),
+                                        term.ended_agent.is_some(),
+                                        term.effective_agent_label().unwrap_or(""),
+                                    )
+                                });
+                            members.push(format!(
+                                "pane:{other_pane_id}:{pinned}:{flagged}:{ended}:{agent}"
+                            ));
+                        }
+                    }
+                }
+                members.sort();
+                members
+            });
             for tab in &ws.tabs {
                 for (&id, pane) in &tab.panes {
                     let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id)
@@ -641,6 +785,7 @@ impl App {
                         input_at: runtime.map_or(terminal.input_or_command_at, |runtime| {
                             runtime.input_or_command_at()
                         }),
+                        input_seq: runtime.map_or(0, |runtime| runtime.input_or_command_seq()),
                         pinned: terminal.pinned,
                         flagged: terminal.flag.is_some(),
                         desk_focused: self.auto_close.focused.contains(&id),
@@ -654,10 +799,8 @@ impl App {
                             .and_then(|cwd| crate::workspace::git_space_metadata(&cwd))
                             .filter(|info| !info.is_linked_worktree)
                             .map(|info| info.checkout_key),
-                        group_refusal: single_pane_workspace
-                            && self
-                                .state
-                                .workspace_close_would_close_worktree_group(ws_idx),
+                        group_refusal,
+                        group_members: group_members.clone(),
                         bare_prompt,
                         starter: terminal.started_by.as_ref().and_then(live_starter),
                         session: self.state.logbook_key(id).map(|key| CloseSession {
@@ -749,6 +892,7 @@ impl App {
         age_secs: Option<u64>,
     ) {
         self.auto_close.reported.remove(pane_id);
+        self.auto_close.refused.remove(pane_id);
         if by == CloseBy::Desk
             && age_secs.is_some()
             && reason.is_some_and(|reason| matches!(reason, "ended" | "dormant" | "plain-shell"))
@@ -808,66 +952,91 @@ impl App {
                     && panes
                         .iter()
                         .find(|pane| pane.pane_id == candidate.pane_id)
-                        .map(|pane| &pane.session)
-                        == previous
-                            .iter()
-                            .find(|pane| pane.pane_id == candidate.pane_id)
-                            .map(|pane| &pane.session)
+                        .zip(
+                            previous
+                                .iter()
+                                .find(|pane| pane.pane_id == candidate.pane_id),
+                        )
+                        .is_some_and(|(pane, prev)| pane.same_close_facts(prev))
             })
         });
         let mut closed_any = false;
         if self.auto_close.config.mode == Mode::Close {
             let mut attempted = HashSet::new();
+            let mut still_refused = HashSet::new();
             loop {
-                panes = self.auto_close_snapshot(now);
+                let step_now = crate::pane::unix_now_secs().max(now);
+                panes = self.auto_close_snapshot(step_now);
                 for pane in &panes {
-                    if !pane.group_refusal || !attempted.insert(format!("refusal:{}", pane.pane_id))
-                    {
+                    if !attempted.insert(format!("refusal:{}", pane.pane_id)) {
                         continue;
                     }
-                    let mut probe = pane.clone();
-                    probe.last_main_pane = false;
-                    probe.group_refusal = false;
-                    if let Ok(candidate) = decide(&probe, &panes, &self.auto_close.config, now) {
-                        if matches!(candidate.kind, Kind::Ended | Kind::PlainShell) {
-                            tracing::warn!(
-                                pane_id = %pane.pane_id,
-                                reason = %candidate.reason,
-                                code = "confirmation_required",
-                                "auto-close refused to close pane that would close a worktree group"
-                            );
-                        }
+                    if let Some(candidate) = record_group_refusal(
+                        &mut self.auto_close.refused,
+                        &mut still_refused,
+                        pane,
+                        &panes,
+                        &self.auto_close.config,
+                        step_now,
+                    ) {
+                        tracing::warn!(
+                            pane_id = %pane.pane_id,
+                            reason = %candidate.reason,
+                            code = "confirmation_required",
+                            "auto-close refused to close pane that would close a worktree group"
+                        );
                     }
                 }
-                let current = plan(&panes, &self.auto_close.config, now);
+                let current = plan(&panes, &self.auto_close.config, step_now);
                 let next = current.candidates.into_iter().find(|candidate| {
                     matches!(candidate.kind, Kind::Ended | Kind::PlainShell)
                         && candidate.action == Action::Close
                         && !attempted.contains(&candidate.pane_id)
-                        && previous.iter().any(|prev| {
-                            prev.pane_id == candidate.pane_id
-                                && panes
-                                    .iter()
-                                    .find(|pane| pane.pane_id == candidate.pane_id)
-                                    .is_some_and(|pane| {
-                                        pane.session == prev.session
-                                            && pane.ended == prev.ended
-                                            && pane.agent == prev.agent
-                                    })
-                        })
+                        && candidate_ready_to_close(
+                            candidate,
+                            previous,
+                            &panes,
+                            &self.auto_close.refused,
+                            &mut still_refused,
+                            &self.auto_close.config,
+                            step_now,
+                        )
                 });
                 let Some(candidate) = next else {
                     break;
                 };
                 attempted.insert(candidate.pane_id.clone());
+                let check_now = crate::pane::unix_now_secs().max(step_now);
+                let fresh_panes = self.auto_close_snapshot(check_now);
+                if !candidate_ready_to_close(
+                    &candidate,
+                    previous,
+                    &fresh_panes,
+                    &self.auto_close.refused,
+                    &mut still_refused,
+                    &self.auto_close.config,
+                    check_now,
+                ) {
+                    continue;
+                }
                 if self.close_auto_close_pane(
                     &candidate.pane_id,
                     &candidate.reason,
                     candidate.age_secs,
                 ) {
                     closed_any = true;
+                } else if let Some(pane) = fresh_panes
+                    .iter()
+                    .find(|pane| pane.pane_id == candidate.pane_id)
+                {
+                    let key = pane.refusal_key(&candidate.reason, check_now, candidate.age_secs);
+                    still_refused.insert(pane.pane_id.clone());
+                    self.auto_close.refused.insert(pane.pane_id.clone(), key);
                 }
             }
+            self.auto_close
+                .refused
+                .retain(|id, _| still_refused.contains(id));
             self.flush_logbook();
             panes = self.auto_close_snapshot(now);
             self.auto_close
@@ -969,6 +1138,7 @@ mod tests {
             status: AgentStatus::Unknown,
             status_at: 100,
             input_at: 100,
+            input_seq: 0,
             pinned: false,
             flagged: false,
             desk_focused: false,
@@ -976,6 +1146,7 @@ mod tests {
             single_pane_workspace: true,
             main_checkout: None,
             group_refusal: false,
+            group_members: Vec::new(),
             bare_prompt: true,
             starter: None,
             session: None,
@@ -1049,6 +1220,12 @@ mod tests {
         assert_eq!(candidate.age_secs, 10);
         pane.status_at = 1000;
         assert_eq!(decide(&pane, &[], &config, 130).unwrap(), candidate);
+        pane.input_at = 125;
+        assert_eq!(decide(&pane, &[], &config, 134), Err("too-young"));
+        assert_eq!(next_pass_delay(&[pane.clone()], &config, 130), 5);
+        let candidate = decide(&pane, &[], &config, 135).unwrap();
+        assert_eq!(candidate.kind, Kind::Ended);
+        assert_eq!(candidate.age_secs, 10);
     }
 
     #[test]
@@ -1367,6 +1544,165 @@ mod tests {
         );
         app.shutdown_logbook();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn auto_close_pre_close_recheck_aborts_on_any_changed_pane_fact() {
+        let config = Config {
+            mode: Mode::Close,
+            ended_age_secs: 10,
+            plain_shell_age_secs: 10,
+            ..Config::default()
+        };
+        let mut base = shell();
+        base.ended = true;
+        base.ended_at = Some(100);
+        base.input_at = 100;
+        base.input_seq = 3;
+        let candidate = decide(&base, std::slice::from_ref(&base), &config, 120).unwrap();
+        let refused = HashMap::new();
+        let mut still_refused = HashSet::new();
+        assert!(candidate_ready_to_close(
+            &candidate,
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&base),
+            &refused,
+            &mut still_refused,
+            &config,
+            120,
+        ));
+
+        let mutations: [fn(&mut PaneSnapshot); 12] = [
+            |pane| pane.input_at = 105,
+            |pane| pane.input_seq = 4,
+            |pane| pane.status = AgentStatus::Working,
+            |pane| pane.status_at = 105,
+            |pane| pane.agent = Some("pi".into()),
+            |pane| pane.ended = false,
+            |pane| pane.ended_at = Some(101),
+            |pane| pane.pinned = true,
+            |pane| pane.flagged = true,
+            |pane| pane.desk_focused = true,
+            |pane| pane.main_checkout = Some("checkout".into()),
+            |pane| {
+                pane.session = Some(CloseSession {
+                    agent: "pi".into(),
+                    id: "session-2".into(),
+                })
+            },
+        ];
+        for mutate in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert!(!candidate_ready_to_close(
+                &candidate,
+                std::slice::from_ref(&base),
+                std::slice::from_ref(&changed),
+                &refused,
+                &mut still_refused,
+                &config,
+                120,
+            ));
+        }
+
+        // Re-evaluating the main-checkout home exemption on the live workspace state
+        // immediately before each close ensures closing one sibling never takes the
+        // last pane of a checkout in the same pass.
+        let mut first = main_checkout_shell("w1", 100, 100);
+        first.single_pane_workspace = false;
+        let mut second = main_checkout_shell("w1", 100, 100);
+        second.pane_id = "w1:p2".into();
+        second.single_pane_workspace = false;
+        let initial_panes = [first.clone(), second.clone()];
+        let second_candidate = decide(&second, &initial_panes, &config, 120).unwrap();
+        let mut live_second = second.clone();
+        live_second.single_pane_workspace = true;
+        assert!(!candidate_ready_to_close(
+            &second_candidate,
+            &initial_panes,
+            std::slice::from_ref(&live_second),
+            &refused,
+            &mut still_refused,
+            &config,
+            120,
+        ));
+    }
+
+    #[test]
+    fn auto_close_deduplicates_unchanged_group_refusals_until_group_or_pane_facts_change() {
+        let config = Config {
+            mode: Mode::Close,
+            plain_shell_age_secs: 10,
+            ..Config::default()
+        };
+        let mut root = shell();
+        root.pane_id = "pane-root".into();
+        root.main_checkout = Some("checkout".into());
+        root.group_refusal = true;
+        root.group_members = vec![
+            "pane:pane-root:false:false:false:".into(),
+            "pane:pane-child-1:true:false:false:".into(),
+            "pane:pane-child-2:true:false:false:".into(),
+        ];
+        let mut refused = HashMap::new();
+
+        // Pass 1 logs the refusal once.
+        let mut still_refused = HashSet::new();
+        assert!(record_group_refusal(
+            &mut refused,
+            &mut still_refused,
+            &root,
+            std::slice::from_ref(&root),
+            &config,
+            200,
+        )
+        .is_some());
+        refused.retain(|id, _| still_refused.contains(id));
+
+        // Subsequent passes with unchanged pane and group facts do not re-log.
+        for now in [201, 205] {
+            let mut still_refused = HashSet::new();
+            assert!(record_group_refusal(
+                &mut refused,
+                &mut still_refused,
+                &root,
+                std::slice::from_ref(&root),
+                &config,
+                now,
+            )
+            .is_none());
+            refused.retain(|id, _| still_refused.contains(id));
+            assert!(refused.contains_key("pane-root"));
+        }
+
+        // Changing the group (e.g. a pinned child closes) lets the refusal be reconsidered.
+        root.group_members.pop();
+        let mut still_refused = HashSet::new();
+        assert!(record_group_refusal(
+            &mut refused,
+            &mut still_refused,
+            &root,
+            std::slice::from_ref(&root),
+            &config,
+            210,
+        )
+        .is_some());
+        refused.retain(|id, _| still_refused.contains(id));
+
+        // When the last child closes so `group_refusal` clears, the refusal entry is dropped.
+        root.group_refusal = false;
+        let mut still_refused = HashSet::new();
+        assert!(record_group_refusal(
+            &mut refused,
+            &mut still_refused,
+            &root,
+            std::slice::from_ref(&root),
+            &config,
+            215,
+        )
+        .is_none());
+        refused.retain(|id, _| still_refused.contains(id));
+        assert!(refused.is_empty());
     }
 }
 

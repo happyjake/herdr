@@ -21,6 +21,10 @@ impl TerminalRuntime {
         self.0.input_or_command_at()
     }
 
+    pub(crate) fn input_or_command_seq(&self) -> u64 {
+        self.0.input_or_command_seq()
+    }
+
     pub(crate) fn restore_input_or_command_at(&self, at: u64) {
         self.0.restore_input_or_command_at(at);
     }

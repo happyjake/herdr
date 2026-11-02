@@ -1332,7 +1332,7 @@ fn auto_close_close_mode_keeps_dormant_agents_waiting_and_logs_confirmation_requ
     let root = session.request("workspace.create", json!({"cwd":repo}));
     let root_id = root["root_pane"]["pane_id"].as_str().unwrap().to_string();
     let workspace = root["workspace"]["workspace_id"].as_str().unwrap();
-    let created = run_cli_json(
+    let created_1 = run_cli_json(
         &session.socket,
         &[
             "worktree",
@@ -1340,16 +1340,35 @@ fn auto_close_close_mode_keeps_dormant_agents_waiting_and_logs_confirmation_requ
             "--workspace",
             workspace,
             "--branch",
-            "group-child",
+            "group-child-1",
         ],
     );
-    let child_pane = created["result"]["root_pane"]["pane_id"]
+    let child_pane_1 = created_1["result"]["root_pane"]["pane_id"]
         .as_str()
         .unwrap()
         .to_string();
     session.request(
         "pane.set_pinned",
-        json!({"pane_id":child_pane,"pinned":true}),
+        json!({"pane_id":child_pane_1,"pinned":true}),
+    );
+    let created_2 = run_cli_json(
+        &session.socket,
+        &[
+            "worktree",
+            "create",
+            "--workspace",
+            workspace,
+            "--branch",
+            "group-child-2",
+        ],
+    );
+    let child_pane_2 = created_2["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    session.request(
+        "pane.set_pinned",
+        json!({"pane_id":child_pane_2,"pinned":true}),
     );
 
     let config_path = session
@@ -1388,17 +1407,40 @@ fn auto_close_close_mode_keeps_dormant_agents_waiting_and_logs_confirmation_requ
         .join("config")
         .join(app_dir_name())
         .join("herdr-server.log");
+    let refusal_log_count = || {
+        fs::read_to_string(&log_path).map_or(0, |log| {
+            log.lines()
+                .filter(|line| {
+                    line.contains(
+                        "auto-close refused to close pane that would close a worktree group",
+                    ) && line.contains(&root_id)
+                })
+                .count()
+        })
+    };
     assert!(wait_until(
         Duration::from_secs(5),
         Duration::from_millis(100),
         || {
             session.request("ping", json!({}))["auto_close"]["waiting"] == 1
-                && fs::read_to_string(&log_path).is_ok_and(|log| {
-                    log.contains("confirmation_required") && log.contains(&root_id)
-                })
+                && refusal_log_count() == 1
         }
     ));
+    // Several passes with an unchanged refusal must not log it again.
+    thread::sleep(Duration::from_millis(2300));
+    assert_eq!(refusal_log_count(), 1);
     assert!(session.closes().is_empty());
+
+    // Changing the worktree group (closing a pinned child) lets the refusal be reconsidered.
+    session.request("pane.close", json!({"pane_id":child_pane_1}));
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+        || refusal_log_count() == 2
+    ));
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(refusal_log_count(), 2);
+
     assert_eq!(
         session.request("pane.get", json!({"pane_id":session.pane}))["pane"]["agent"],
         "pi"
@@ -1408,6 +1450,129 @@ fn auto_close_close_mode_keeps_dormant_agents_waiting_and_logs_confirmation_requ
         root_id
     );
     agent.stop();
+}
+
+#[test]
+fn auto_close_close_mode_rejects_pending_close_after_new_input_to_ended_pane() {
+    let session = Session::new("[auto_close]\nmode = 'off'\n");
+    let split = run_cli_json(
+        &session.socket,
+        &["pane", "split", &session.pane, "--direction", "right"],
+    );
+    let ended_pane = split["result"]["pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Start an agent in the first pane that stays dormant, and an agent in the second pane that exits.
+    let dormant_agent = session.agent("pi");
+    let ended_dir = session.base.join("ended-agent");
+    fs::create_dir_all(&ended_dir).unwrap();
+    let ended_agent = crate::support::InPaneReporter::write(&ended_dir, "claude", &session.socket);
+    assert!(run_cli(
+        &session.socket,
+        &["pane", "run", &ended_pane, &ended_agent.command()]
+    )
+    .status
+    .success());
+    ended_agent.wait_until_started(Duration::from_secs(10));
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || session.request("pane.get", json!({"pane_id":ended_pane}))["pane"]["agent"] == "claude"
+    ));
+    ended_agent.stop();
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || {
+            let pane = session.request("pane.get", json!({"pane_id":ended_pane}))["pane"].clone();
+            pane["agent"].is_null() && pane["ended_agent"] == "claude"
+        }
+    ));
+    // Age the ended pane past ended_age_secs = 2 before starting the pass.
+    thread::sleep(Duration::from_millis(2300));
+
+    let skill = session.base.join("debrief.md");
+    fs::write(&skill, "Record lessons.").unwrap();
+    let started = session.base.join("gate-started");
+    let released = session.base.join("gate-released");
+    let finished = session.base.join("gate-finished");
+    let command = format!(
+        "printf ready > '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; printf done > '{}'",
+        started.display(),
+        released.display(),
+        finished.display()
+    );
+    let config_path = session
+        .base
+        .join("config")
+        .join(app_dir_name())
+        .join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "onboarding = false\n[auto_close]\nmode = 'close'\nended_age_secs = 2\ndormant_age_secs = 0\nplain_shell_age_secs = 100\npass_floor_secs = 1\ndebrief_skill_path = '{}'\ngate_timeout_secs = 5\n[auto_close.pi]\ngate_command = {}\n",
+            skill.display(),
+            toml::Value::String(command)
+        ),
+    )
+    .unwrap();
+    session.request("server.reload_config", json!({}));
+    crate::support::wait_for_file(&started, Duration::from_secs(10));
+
+    // While asynchronous planning is blocked in the dormant pane's gate, type text without Enter
+    // into the eligible ended pane.
+    session.request(
+        "pane.send_text",
+        json!({"pane_id":ended_pane,"text":"ECHO_DRAFT_INPUT"}),
+    );
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || pane_read_recent_contains(&session.socket, &ended_pane, "ECHO_DRAFT_INPUT")
+    ));
+
+    // Release the gate; the pass finishes now and must reject closing `ended_pane`
+    // and reset its ended age from the new input.
+    fs::write(&released, "go").unwrap();
+    crate::support::wait_for_file(&finished, Duration::from_secs(2));
+    thread::sleep(Duration::from_millis(400));
+
+    assert!(
+        session.closes().is_empty(),
+        "ended pane with fresh input must not close when the pending pass finishes: {:?}",
+        session.closes()
+    );
+    assert_eq!(
+        session.request("pane.get", json!({"pane_id":ended_pane}))["pane"]["pane_id"],
+        ended_pane
+    );
+    assert!(pane_read_recent_contains(
+        &session.socket,
+        &ended_pane,
+        "ECHO_DRAFT_INPUT"
+    ));
+    let plan = session.plan();
+    assert!(
+        plan["spared"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pane| pane["pane_id"] == ended_pane && pane["exemption"] == "too-young"),
+        "{plan}"
+    );
+
+    // Once `ended_age_secs` elapses from the new input, the ended pane becomes eligible again and closes.
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        || session
+            .closes()
+            .iter()
+            .any(|line| line["pane"] == ended_pane)
+    ));
+    dormant_agent.stop();
 }
 
 #[test]

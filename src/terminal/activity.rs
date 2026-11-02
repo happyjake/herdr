@@ -8,6 +8,7 @@ const PRESERVED_INPUT_FOREGROUND_GRACE: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 pub(crate) struct InputActivity {
     at: AtomicU64,
+    seq: AtomicU64,
     foreground: AtomicU32,
     suppress_foreground_until: Mutex<Option<Instant>>,
 }
@@ -16,6 +17,7 @@ impl Default for InputActivity {
     fn default() -> Self {
         Self {
             at: AtomicU64::new(crate::pane::unix_now_secs()),
+            seq: AtomicU64::new(0),
             foreground: AtomicU32::new(0),
             suppress_foreground_until: Mutex::new(None),
         }
@@ -25,6 +27,10 @@ impl Default for InputActivity {
 impl InputActivity {
     pub(crate) fn get(&self) -> u64 {
         self.at.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
     }
 
     pub(crate) fn restore(&self, at: u64) {
@@ -39,6 +45,7 @@ impl InputActivity {
         *suppression = None;
         self.at
             .fetch_max(crate::pane::unix_now_secs(), Ordering::AcqRel);
+        self.seq.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn preserve(&self) {
@@ -83,6 +90,7 @@ impl InputActivity {
             *suppression = None;
             self.at
                 .fetch_max(crate::pane::unix_now_secs(), Ordering::AcqRel);
+            self.seq.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
