@@ -59,6 +59,7 @@ pub fn server_capabilities() -> crate::api::schema::ServerCapabilities {
         // Only a unix socket whose agent registry opened can offer it; that
         // listener raises it for itself.
         ssh_agent_registration: false,
+        input_activity: true,
         send_affirm: true,
         stream_multiplex: true,
         credential_registry: true,
@@ -135,6 +136,7 @@ mod tests {
 
         assert!(capabilities.credential_registry);
         assert!(capabilities.send_affirm);
+        assert!(capabilities.input_activity);
         assert!(capabilities.stream_multiplex);
         assert!(capabilities.agent_report_cancelled);
         assert!(capabilities.agent_prompt_expectations);

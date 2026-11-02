@@ -161,6 +161,9 @@ pub struct TerminalState {
     pub detected_agent: Option<Agent>,
     /// Last effective agent label after it leaves, until another agent takes over.
     pub ended_agent: Option<String>,
+    /// Restored activity clock for a terminal without a live runtime. A live
+    /// runtime owns the current clock so PTY delivery can update it directly.
+    pub input_or_command_at: u64,
     pub fallback_state: AgentState,
     fallback_visible_blocker: bool,
     fallback_observed_at: Option<Instant>,
@@ -242,6 +245,7 @@ impl TerminalState {
             cwd,
             detected_agent: None,
             ended_agent: None,
+            input_or_command_at: crate::pane::unix_now_secs(),
             fallback_state: AgentState::Unknown,
             fallback_visible_blocker: false,
             fallback_observed_at: None,

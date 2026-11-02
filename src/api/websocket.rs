@@ -2246,6 +2246,7 @@ mod tests {
             surface_interest: false,
             health_check: false,
             ssh_agent_registration: false,
+            input_activity: true,
             send_affirm: true,
             stream_multiplex: true,
             credential_registry: true,

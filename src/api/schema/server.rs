@@ -216,6 +216,10 @@ pub struct FileAttachmentsCapability {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
+    /// Pane input timestamps and `preserve_activity` on agent.prompt, pane.send_text
+    /// and pane.send_input. Clients must omit the flag without this capability.
+    #[serde(default)]
+    pub input_activity: bool,
     pub live_handoff: bool,
     #[serde(default)]
     pub detached_server_daemon: bool,

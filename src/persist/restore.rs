@@ -456,6 +456,9 @@ fn unavailable_restored_terminal(
             .filter(|_| terminal.manual_label.is_some());
         terminal.restore_flag(pane.flag.clone(), pane.flag_set_through);
         terminal.ended_agent = pane.ended_agent.clone();
+        terminal.input_or_command_at = pane
+            .input_or_command_at
+            .unwrap_or(terminal.input_or_command_at);
         terminal.started_by = pane.started_by.clone();
         terminal.session_reported = pane.session_reported;
         terminal.starter_label = pane.starter_label.clone();
@@ -689,6 +692,9 @@ fn restore_tab(
             terminal.set_pinned(saved_pinned);
             terminal.restore_flag(saved_flag, saved_flag_set_through);
             terminal.ended_agent = saved_pane.and_then(|pane| pane.ended_agent.clone());
+            terminal.input_or_command_at = saved_pane
+                .and_then(|pane| pane.input_or_command_at)
+                .unwrap_or(terminal.input_or_command_at);
             terminal.started_by = saved_pane.and_then(|pane| pane.started_by.clone());
             terminal.session_reported = saved_pane.is_some_and(|pane| pane.session_reported);
             terminal.starter_label = saved_pane.and_then(|pane| pane.starter_label.clone());
@@ -782,6 +788,9 @@ fn restore_tab(
 
         match runtime_result {
             Ok(runtime) => {
+                if let Some(at) = saved_pane.and_then(|pane| pane.input_or_command_at) {
+                    runtime.restore_input_or_command_at(at);
+                }
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
                 if was_imported {
@@ -796,6 +805,9 @@ fn restore_tab(
                 terminal.set_pinned(saved_pinned);
                 terminal.restore_flag(saved_flag, saved_flag_set_through);
                 terminal.ended_agent = saved_pane.and_then(|pane| pane.ended_agent.clone());
+                terminal.input_or_command_at = saved_pane
+                    .and_then(|pane| pane.input_or_command_at)
+                    .unwrap_or(terminal.input_or_command_at);
                 terminal.started_by = saved_pane.and_then(|pane| pane.started_by.clone());
                 terminal.session_reported = saved_pane.is_some_and(|pane| pane.session_reported);
                 terminal.starter_label = saved_pane.and_then(|pane| pane.starter_label.clone());
@@ -1729,6 +1741,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -1898,6 +1911,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -2115,6 +2129,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -2243,6 +2258,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -2341,6 +2357,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -2473,6 +2490,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -2610,6 +2628,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -2713,6 +2732,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -2804,6 +2824,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -2900,6 +2921,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -2984,6 +3006,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -3082,6 +3105,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -3177,6 +3201,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -3272,6 +3297,7 @@ mod tests {
                             10,
                             super::super::snapshot::PaneSnapshot {
                                 ended_agent: None,
+                                input_or_command_at: None,
                                 started_by: None,
                                 session_reported: false,
                                 starter_label: None,
@@ -3300,6 +3326,7 @@ mod tests {
                             20,
                             super::super::snapshot::PaneSnapshot {
                                 ended_agent: None,
+                                input_or_command_at: None,
                                 started_by: None,
                                 session_reported: false,
                                 starter_label: None,
@@ -3370,6 +3397,7 @@ mod tests {
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
                     ended_agent: None,
+                    input_or_command_at: None,
                     started_by: None,
                     session_reported: false,
                     starter_label: None,
@@ -3397,6 +3425,7 @@ mod tests {
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
             ended_agent: None,
+            input_or_command_at: None,
             started_by: None,
             session_reported: false,
             starter_label: None,
@@ -3566,6 +3595,7 @@ mod tests {
                         0,
                         super::super::snapshot::PaneSnapshot {
                             ended_agent: None,
+                            input_or_command_at: None,
                             started_by: None,
                             session_reported: false,
                             starter_label: None,
@@ -4332,6 +4362,7 @@ mod tests {
             0,
             super::super::snapshot::PaneSnapshot {
                 ended_agent: None,
+                input_or_command_at: None,
                 started_by: None,
                 session_reported: false,
                 starter_label: None,

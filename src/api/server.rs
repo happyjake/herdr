@@ -1456,6 +1456,7 @@ fn caller_timeout_dispatch_uses_timeout_error() {
         Request {
             id: "prompt-timeout".into(),
             method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                preserve_activity: false,
                 target: "reviewer".into(),
                 text: "review this".into(),
                 expect_terminal: None,
@@ -1636,6 +1637,7 @@ mod tests {
     ) -> crate::api::schema::PaneInfo {
         crate::api::schema::PaneInfo {
             ended_agent: None,
+            input_or_command_at: None,
             started_by: None,
             pane_id: pane_id.into(),
             terminal_id: "term_1".into(),
@@ -1950,6 +1952,7 @@ mod tests {
             },
             &tx,
             Some(ServerCapabilities {
+                input_activity: false,
                 live_handoff: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: Some(

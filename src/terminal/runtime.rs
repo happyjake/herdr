@@ -17,6 +17,14 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    pub(crate) fn input_or_command_at(&self) -> u64 {
+        self.0.input_or_command_at()
+    }
+
+    pub(crate) fn restore_input_or_command_at(&self, at: u64) {
+        self.0.restore_input_or_command_at(at);
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }
@@ -487,15 +495,15 @@ impl TerminalRuntime {
         self.0.encode_terminal_key(key)
     }
 
-    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.0.try_send_bytes(bytes)
+    pub(crate) fn try_send_bytes_with_activity(
+        &self,
+        bytes: Bytes,
+        record_activity: bool,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.try_send_bytes_with_activity(bytes, record_activity)
     }
 
-    pub(crate) fn validate_input_submission(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.0.validate_input_submission(bytes)
-    }
-
-    pub fn queue_user_input_submission(
+    pub(crate) fn queue_input_submission(
         &self,
         prefix: Bytes,
         text: Bytes,
@@ -503,9 +511,18 @@ impl TerminalRuntime {
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
         guard: Option<crate::pty::actor::PtySubmissionGuard>,
+        record_activity: bool,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         self.0
-            .queue_user_input_submission(prefix, text, enter, delay, deadline, guard)
+            .queue_input_submission(prefix, text, enter, delay, deadline, guard, record_activity)
+    }
+
+    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.try_send_bytes(bytes)
+    }
+
+    pub(crate) fn validate_input_submission(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.validate_input_submission(bytes)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {

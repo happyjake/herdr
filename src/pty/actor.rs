@@ -2,6 +2,51 @@ use std::fmt;
 
 pub(crate) type PtySubmissionGuard = Box<dyn FnMut() -> std::io::Result<()> + Send + 'static>;
 
+/// Record even a partial input write before a later write or flush fails.
+#[cfg(any(windows, test))]
+fn write_input_and_flush(
+    writer: &mut impl std::io::Write,
+    mut bytes: &[u8],
+    activity: Option<&crate::terminal::activity::InputActivity>,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => {
+                if let Some(activity) = activity {
+                    activity.record();
+                }
+                bytes = &bytes[written..];
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    writer.flush()
+}
+
+#[cfg(test)]
+mod activity_tests {
+    #[test]
+    fn input_activity_counts_partial_delivery_before_a_write_failure() {
+        let activity = crate::terminal::activity::InputActivity::default();
+        activity.restore(100);
+        let mut output = [0; 2];
+        let result =
+            super::write_input_and_flush(&mut output.as_mut_slice(), b"input", Some(&activity));
+        assert_eq!(output, *b"in");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WriteZero);
+        assert!(activity.get() > 100);
+        activity.restore(100);
+        let mut empty = [];
+        assert!(
+            super::write_input_and_flush(&mut empty.as_mut_slice(), b"input", Some(&activity))
+                .is_err()
+        );
+        assert_eq!(activity.get(), 100);
+    }
+}
+
 #[derive(Debug)]
 struct SubmissionRejected(String);
 
@@ -64,6 +109,7 @@ mod windows {
 
     pub(crate) struct PtyIoActorConfig {
         pub pane_id: u32,
+        pub input_activity: Arc<crate::terminal::activity::InputActivity>,
         pub master: Box<dyn MasterPty + Send>,
         pub initially_quiesced: bool,
         pub on_read: ReadCallback,
@@ -72,6 +118,7 @@ mod windows {
 
     enum PtyIoDataCommand {
         WriteUserInput(Bytes),
+        WriteInputWithoutActivity(Bytes),
         SubmitUserInput {
             prefix: Bytes,
             text: Bytes,
@@ -79,12 +126,14 @@ mod windows {
             delay: Duration,
             deadline: Option<Instant>,
             guard: Option<PtySubmissionGuard>,
+            record_activity: bool,
             reply: std_mpsc::Sender<std::io::Result<()>>,
         },
     }
 
     enum PtyIoWriteCommand {
         Write(Bytes),
+        WriteUserInput(Bytes),
         SubmissionPart {
             prefix: Bytes,
             bytes: Bytes,
@@ -92,6 +141,7 @@ mod windows {
             deadline: Option<Instant>,
             reply: oneshot::Sender<std::io::Result<()>>,
             enter_completion: Option<std_mpsc::Sender<()>>,
+            record_activity: bool,
         },
     }
 
@@ -115,9 +165,10 @@ mod windows {
     }
 
     impl PtyIoActorHandle {
-        pub(crate) fn try_write_user_input(
+        pub(crate) fn try_write_input(
             &self,
             bytes: Bytes,
+            record_activity: bool,
         ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
             if !self
                 .accepting
@@ -128,16 +179,24 @@ mod windows {
                 return Err(mpsc::error::TrySendError::Closed(bytes));
             }
             self.data_tx
-                .try_send(PtyIoDataCommand::WriteUserInput(bytes))
+                .try_send(if record_activity {
+                    PtyIoDataCommand::WriteUserInput(bytes)
+                } else {
+                    PtyIoDataCommand::WriteInputWithoutActivity(bytes)
+                })
                 .map_err(|err| match err {
                     mpsc::error::TrySendError::Full(command) => {
-                        let PtyIoDataCommand::WriteUserInput(bytes) = command else {
+                        let (PtyIoDataCommand::WriteUserInput(bytes)
+                        | PtyIoDataCommand::WriteInputWithoutActivity(bytes)) = command
+                        else {
                             unreachable!("queued write returned another command")
                         };
                         mpsc::error::TrySendError::Full(bytes)
                     }
                     mpsc::error::TrySendError::Closed(command) => {
-                        let PtyIoDataCommand::WriteUserInput(bytes) = command else {
+                        let (PtyIoDataCommand::WriteUserInput(bytes)
+                        | PtyIoDataCommand::WriteInputWithoutActivity(bytes)) = command
+                        else {
                             unreachable!("queued write returned another command")
                         };
                         mpsc::error::TrySendError::Closed(bytes)
@@ -145,7 +204,7 @@ mod windows {
                 })
         }
 
-        pub(crate) fn queue_user_input_submission(
+        pub(crate) fn queue_input_submission(
             &self,
             prefix: Bytes,
             text: Bytes,
@@ -153,6 +212,7 @@ mod windows {
             delay: Duration,
             deadline: Option<Instant>,
             guard: Option<PtySubmissionGuard>,
+            record_activity: bool,
         ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
             let accepting = self
                 .accepting
@@ -173,6 +233,7 @@ mod windows {
                     delay,
                     deadline,
                     guard,
+                    record_activity,
                     reply: reply_tx,
                 })
                 .map_err(|err| match err {
@@ -240,6 +301,7 @@ mod windows {
         pub(crate) fn spawn(config: PtyIoActorConfig) -> std::io::Result<PtyIoActorHandle> {
             let PtyIoActorConfig {
                 pane_id,
+                input_activity,
                 master,
                 initially_quiesced,
                 mut on_read,
@@ -262,7 +324,7 @@ mod windows {
             }));
 
             crate::thread_spawn::spawn_named("herdr-pty-writer", move || {
-                run_writer(&mut writer, write_rx);
+                run_writer_with_activity(&mut writer, write_rx, &input_activity);
                 debug!(pane_id, "windows pty writer thread exiting");
             })?;
 
@@ -345,10 +407,22 @@ mod windows {
         }
     }
 
+    #[cfg(test)]
     fn run_writer(writer: &mut impl Write, write_rx: std_mpsc::Receiver<PtyIoWriteCommand>) {
+        run_writer_with_activity(writer, write_rx, &Default::default());
+    }
+
+    fn run_writer_with_activity(
+        writer: &mut impl Write,
+        write_rx: std_mpsc::Receiver<PtyIoWriteCommand>,
+        input_activity: &crate::terminal::activity::InputActivity,
+    ) {
         for command in write_rx {
             let result = match command {
                 PtyIoWriteCommand::Write(bytes) => write_and_flush(writer, &bytes),
+                PtyIoWriteCommand::WriteUserInput(bytes) => {
+                    super::write_input_and_flush(writer, &bytes, Some(input_activity))
+                }
                 PtyIoWriteCommand::SubmissionPart {
                     prefix,
                     bytes,
@@ -356,6 +430,7 @@ mod windows {
                     deadline,
                     reply,
                     enter_completion,
+                    record_activity,
                 } => {
                     let result = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         Err(input_submission_timed_out())
@@ -364,7 +439,11 @@ mod windows {
                             if !prefix.is_empty() {
                                 write_and_flush(writer, &prefix)?;
                             }
-                            write_and_flush(writer, &bytes)
+                            super::write_input_and_flush(
+                                writer,
+                                &bytes,
+                                record_activity.then_some(input_activity),
+                            )
                         })
                     } else {
                         let prefix_result = if prefix.is_empty() {
@@ -372,7 +451,13 @@ mod windows {
                         } else {
                             write_and_flush(writer, &prefix)
                         };
-                        prefix_result.and_then(|()| write_and_flush(writer, &bytes))
+                        prefix_result.and_then(|()| {
+                            super::write_input_and_flush(
+                                writer,
+                                &bytes,
+                                record_activity.then_some(input_activity),
+                            )
+                        })
                     };
                     let failed = result.as_ref().is_err_and(|err| {
                         err.kind() != std::io::ErrorKind::TimedOut
@@ -402,6 +487,14 @@ mod windows {
         while let Some(command) = data_rx.recv().await {
             match command {
                 PtyIoDataCommand::WriteUserInput(bytes) => {
+                    if write_tx
+                        .send(PtyIoWriteCommand::WriteUserInput(bytes))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                PtyIoDataCommand::WriteInputWithoutActivity(bytes) => {
                     if write_tx.send(PtyIoWriteCommand::Write(bytes)).is_err() {
                         break;
                     }
@@ -413,6 +506,7 @@ mod windows {
                     delay,
                     deadline,
                     guard,
+                    record_activity,
                     reply,
                 } => {
                     let result = if deadline.is_some_and(|deadline| {
@@ -423,13 +517,14 @@ mod windows {
                         let text_deadline =
                             deadline.and_then(|deadline| deadline.checked_sub(delay));
                         async {
-                            write_submission_part(
+                            write_submission_part_with_activity(
                                 &write_tx,
                                 prefix,
                                 text,
                                 guard,
                                 text_deadline,
                                 None,
+                                record_activity,
                             )
                             .await?;
                             // A started text write is committed. Finish Enter even if the caller
@@ -437,13 +532,14 @@ mod windows {
                             if !delay.is_zero() {
                                 tokio::time::sleep(delay).await;
                             }
-                            write_submission_part(
+                            write_submission_part_with_activity(
                                 &write_tx,
                                 Bytes::new(),
                                 enter,
                                 None,
                                 None,
                                 Some(&accepting),
+                                record_activity,
                             )
                             .await
                         }
@@ -462,6 +558,7 @@ mod windows {
         }
     }
 
+    #[cfg(test)]
     async fn write_submission_part(
         write_tx: &std_mpsc::Sender<PtyIoWriteCommand>,
         prefix: Bytes,
@@ -469,6 +566,21 @@ mod windows {
         guard: Option<PtySubmissionGuard>,
         deadline: Option<Instant>,
         accepting: Option<&Arc<Mutex<InputAcceptance>>>,
+    ) -> std::io::Result<()> {
+        write_submission_part_with_activity(
+            write_tx, prefix, bytes, guard, deadline, accepting, true,
+        )
+        .await
+    }
+
+    async fn write_submission_part_with_activity(
+        write_tx: &std_mpsc::Sender<PtyIoWriteCommand>,
+        prefix: Bytes,
+        bytes: Bytes,
+        guard: Option<PtySubmissionGuard>,
+        deadline: Option<Instant>,
+        accepting: Option<&Arc<Mutex<InputAcceptance>>>,
+        record_activity: bool,
     ) -> std::io::Result<()> {
         let completion = {
             let (reply, completion) = oneshot::channel();
@@ -495,6 +607,7 @@ mod windows {
                     deadline,
                     reply,
                     enter_completion,
+                    record_activity,
                 })
                 .map_err(|_| pty_actor_closed())?;
             completion
@@ -601,6 +714,7 @@ mod windows {
             let accepting = input_acceptance(true);
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    record_activity: true,
                     prefix: Bytes::new(),
                     text: Bytes::from_static(b"prompt"),
                     enter: Bytes::from_static(b"\r"),
@@ -694,6 +808,7 @@ mod windows {
             let accepting = input_acceptance(true);
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    record_activity: true,
                     prefix: Bytes::new(),
                     text: Bytes::from_static(b"first"),
                     enter: Bytes::from_static(b"\r"),
@@ -705,6 +820,7 @@ mod windows {
                 .unwrap();
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    record_activity: true,
                     prefix: Bytes::new(),
                     text: Bytes::from_static(b"expired"),
                     enter: Bytes::from_static(b"\r"),
@@ -750,6 +866,9 @@ mod windows {
             let deadline = Instant::now() + Duration::from_millis(50);
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    record_activity: true,
+                    prefix: Bytes::new(),
+                    guard: None,
                     text: Bytes::from_static(b"committed"),
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::from_millis(20),
@@ -786,6 +905,7 @@ mod windows {
                 deadline,
                 reply,
                 enter_completion,
+                ..
             } = next_write_command(&write_rx).await
             else {
                 panic!("queued user input cannot overtake Enter");
@@ -804,7 +924,7 @@ mod windows {
             drop(enter_completion);
             reply.send(Ok(())).unwrap();
             forwarder.await.unwrap();
-            let PtyIoWriteCommand::Write(bytes) = write_rx.try_recv().unwrap() else {
+            let PtyIoWriteCommand::WriteUserInput(bytes) = write_rx.try_recv().unwrap() else {
                 panic!("ordinary user input follows Enter");
             };
             assert_eq!(bytes, b"after".as_slice());

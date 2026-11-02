@@ -940,6 +940,7 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 // Handoff detection needs both the write-bracketed text revision and detection epoch.
 #[allow(clippy::too_many_arguments)]
 fn spawn_basic_detection_task(
+    input_activity: Arc<crate::terminal::activity::InputActivity>,
     pane_id: PaneId,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
@@ -1043,6 +1044,7 @@ fn spawn_basic_detection_task(
             let foreground_pgid = (pid > 0)
                 .then(|| crate::detect::foreground_process_group_id(pid))
                 .flatten();
+            input_activity.observe_foreground(foreground_pgid);
             observe_sampled_pane_cwd(
                 pane_id,
                 pid,
@@ -1530,6 +1532,7 @@ pub struct PaneRuntime {
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
+    input_activity: Arc<crate::terminal::activity::InputActivity>,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
@@ -1553,6 +1556,7 @@ pub struct PaneRuntime {
 
 #[cfg(test)]
 struct TestChannelSubmission {
+    input_activity: Option<Arc<crate::terminal::activity::InputActivity>>,
     prefix: Bytes,
     text: Bytes,
     enter: Bytes,
@@ -1667,9 +1671,13 @@ impl PaneRuntimeIo {
         }
     }
 
-    fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    fn try_send_bytes(
+        &self,
+        bytes: Bytes,
+        record_activity: bool,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         match self {
-            PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
+            PaneRuntimeIo::Actor(actor) => actor.try_write_input(bytes, record_activity),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
         }
@@ -1695,16 +1703,31 @@ impl PaneRuntimeIo {
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
         guard: Option<crate::pty::actor::PtySubmissionGuard>,
+        input_activity: Option<Arc<crate::terminal::activity::InputActivity>>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 #[cfg(windows)]
-                return actor
-                    .queue_user_input_submission(prefix, text, enter, delay, deadline, guard);
+                return actor.queue_input_submission(
+                    prefix,
+                    text,
+                    enter,
+                    delay,
+                    deadline,
+                    guard,
+                    input_activity.is_some(),
+                );
                 #[cfg(unix)]
                 {
                     let _ = deadline;
-                    actor.queue_user_input_submission(prefix, text, enter, delay, guard)
+                    actor.queue_input_submission(
+                        prefix,
+                        text,
+                        enter,
+                        delay,
+                        guard,
+                        input_activity.is_some(),
+                    )
                 }
             }
             #[cfg(test)]
@@ -1736,6 +1759,9 @@ impl PaneRuntimeIo {
                                     let _ = submission.reply.send(Err(std::io::Error::other(err)));
                                     continue;
                                 }
+                                if let Some(activity) = &submission.input_activity {
+                                    activity.record();
+                                }
                                 if let Some((held_tx, release_rx)) =
                                     state.hold_next_submission.lock().unwrap().take()
                                 {
@@ -1756,6 +1782,7 @@ impl PaneRuntimeIo {
                 drop(worker_guard);
                 submission_tx
                     .send(TestChannelSubmission {
+                        input_activity,
                         prefix,
                         text,
                         enter,
@@ -2785,6 +2812,7 @@ impl PaneRuntime {
         let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
 
+        let input_activity = Arc::new(crate::terminal::activity::InputActivity::default());
         let io = {
             let terminal = terminal.clone();
             let response_writer = response_tx.clone();
@@ -2858,6 +2886,7 @@ impl PaneRuntime {
                 debug!(pane = pane_id.raw(), "handoff PTY actor exiting");
             });
             PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
+                input_activity: input_activity.clone(),
                 pane_id: pane_id.raw(),
                 master_fd,
                 initially_quiesced: true,
@@ -2874,6 +2903,7 @@ impl PaneRuntime {
             .flatten();
         let last_observed_cwd = Arc::new(Mutex::new(CwdObservation::seeded(initial_observed_cwd)));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
+            input_activity.clone(),
             pane_id,
             child_pid.clone(),
             reported_cwd.clone(),
@@ -2890,6 +2920,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            input_activity,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
@@ -2998,6 +3029,7 @@ impl PaneRuntime {
             });
         }
 
+        let input_activity = Arc::new(crate::terminal::activity::InputActivity::default());
         let io = {
             let terminal = terminal.clone();
             let response_writer = response_tx.clone();
@@ -3060,6 +3092,7 @@ impl PaneRuntime {
                 }
             });
             PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
+                input_activity: input_activity.clone(),
                 pane_id: pane_id.raw(),
                 #[cfg(unix)]
                 master_fd: spawned.master_fd,
@@ -3094,6 +3127,7 @@ impl PaneRuntime {
             let state_events = events.clone();
             let text_content_seq = content_seq.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let input_activity = input_activity.clone();
             let full_lifecycle_authority_active_for_task = full_lifecycle_authority_active.clone();
             let self_reported_agent_active_for_task = self_reported_agent_active.clone();
             let render_notify = render_notify.clone();
@@ -3235,6 +3269,7 @@ impl PaneRuntime {
                         last_observation = (now, (!retry).then_some(content_seq));
                     }
                     if foreground_observation_due {
+                        input_activity.observe_foreground(foreground_pgid);
                         observe_sampled_pane_cwd(
                             pane_id,
                             pid,
@@ -3527,6 +3562,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            input_activity,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
@@ -3931,8 +3967,33 @@ impl PaneRuntime {
         self.terminal.encode_terminal_key(key)
     }
 
+    pub(crate) fn input_or_command_at(&self) -> u64 {
+        self.input_activity.get()
+    }
+
+    pub(crate) fn restore_input_or_command_at(&self, at: u64) {
+        self.input_activity.restore(at);
+    }
+
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.io.try_send_bytes(bytes)
+        self.try_send_bytes_with_activity(bytes, true)
+    }
+
+    pub(crate) fn try_send_bytes_with_activity(
+        &self,
+        bytes: Bytes,
+        record_activity: bool,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        #[cfg(test)]
+        let record_test_input = record_activity
+            && !bytes.is_empty()
+            && matches!(self.io, PaneRuntimeIo::TestChannel { .. });
+        self.io.try_send_bytes(bytes, record_activity)?;
+        #[cfg(test)]
+        if record_test_input {
+            self.input_activity.record();
+        }
+        Ok(())
     }
 
     /// Preflight a complete API command without changing input queue semantics.
@@ -3950,7 +4011,7 @@ impl PaneRuntime {
         }
     }
 
-    pub fn queue_user_input_submission(
+    pub(crate) fn queue_input_submission(
         &self,
         prefix: Bytes,
         text: Bytes,
@@ -3958,9 +4019,17 @@ impl PaneRuntime {
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
         guard: Option<crate::pty::actor::PtySubmissionGuard>,
+        record_activity: bool,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
-        self.io
-            .queue_user_input_submission(prefix, text, enter, delay, deadline, guard)
+        self.io.queue_user_input_submission(
+            prefix,
+            text,
+            enter,
+            delay,
+            deadline,
+            guard,
+            record_activity.then(|| self.input_activity.clone()),
+        )
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -3986,7 +4055,7 @@ impl PaneRuntime {
         let Ok(bytes) = crate::ghostty::encode_focus(event) else {
             return false;
         };
-        if let Err(err) = self.try_send_bytes(Bytes::from(bytes)) {
+        if let Err(err) = self.try_send_bytes_with_activity(Bytes::from(bytes), false) {
             warn!(err = %err, ?event, "failed to forward pane focus event");
         }
         true
@@ -4290,6 +4359,7 @@ impl PaneRuntime {
         }
         let (events, receiver) = mpsc::channel(8);
         let (handle, reset, release) = spawn_basic_detection_task(
+            self.input_activity.clone(),
             self.pane_id,
             self.child_pid.clone(),
             self.reported_cwd.clone(),
@@ -4430,6 +4500,7 @@ impl PaneRuntime {
             Self {
                 pane_id,
                 terminal,
+                input_activity: Default::default(),
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
@@ -5990,6 +6061,7 @@ mod tests {
             persistence_cwd: Mutex::new(None),
             pane_id,
             terminal,
+            input_activity: Default::default(),
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
@@ -6032,6 +6104,7 @@ mod tests {
             persistence_cwd: Mutex::new(None),
             pane_id,
             terminal,
+            input_activity: Default::default(),
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,

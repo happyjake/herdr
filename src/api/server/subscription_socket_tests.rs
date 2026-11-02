@@ -225,6 +225,7 @@ fn reply_to_probe_with_flag(
         Method::PaneGet(_) => ResponseResult::PaneInfo {
             pane: PaneInfo {
                 ended_agent: None,
+                input_or_command_at: None,
                 started_by: None,
                 pane_id: "pane_1".into(),
                 terminal_id: "term_1".into(),

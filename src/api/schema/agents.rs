@@ -204,6 +204,10 @@ cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct AgentPromptParams => AgentPromptProjection {
+        /// Deliver synthetic input without advancing the input activity clock.
+        /// Send only when the server advertises `input_activity`.
+        #[serde(default, skip_serializing_if = "super::is_false")]
+        pub preserve_activity: bool => Field::new(false),
         pub target: String => Field::new(String::new()).input(bindings::target()),
         pub text: String => Field::new(String::new()).input(bindings::text_position("text", "TEXT", 1).verbatim()),
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -101,6 +101,7 @@ fn pane_request(pane_id: &str, text: &str) -> Request {
     Request {
         id: "input".into(),
         method: Method::PaneSendInput(PaneSendInputParams {
+            preserve_activity: false,
             pane_id: pane_id.into(),
             text: text.into(),
             keys: vec!["enter".into()],
@@ -117,6 +118,7 @@ async fn canonical_api_rejection_writes_nothing_and_allows_same_name_retry() {
         let limit = unsafe { libc::fpathconf(slave.as_raw_fd(), libc::_PC_MAX_CANON) } as usize;
         assert_eq!(limit, 1024);
         let handle = PtyIoActor::spawn(PtyIoActorConfig {
+            input_activity: Default::default(),
             pane_id: 1,
             master_fd: master,
             initially_quiesced: false,
@@ -199,6 +201,7 @@ async fn input_admission_does_not_wait_for_actor_and_raw_input_stays_intact() {
     let (resume_tx, resume_rx) = mpsc::channel();
     let mut barrier = Some((entered_tx, resume_rx));
     let handle = PtyIoActor::spawn(PtyIoActorConfig {
+        input_activity: Default::default(),
         pane_id: 1,
         master_fd: master,
         initially_quiesced: false,
@@ -269,6 +272,7 @@ fn canonical_multiline_submission_preserves_each_line() {
             0
         );
         let handle = PtyIoActor::spawn(PtyIoActorConfig {
+            input_activity: Default::default(),
             pane_id: 1,
             master_fd: master,
             initially_quiesced: false,

@@ -99,6 +99,9 @@ pub struct TabSnapshot {
 
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
+    /// Last delivered input or foreground-job change, in Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_or_command_at: Option<u64>,
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -524,6 +527,10 @@ fn capture_tab(
                 agent_status_reported_through,
                 agent_status_captured_pair_reported,
                 pinned,
+                input_or_command_at: terminal_id
+                    .and_then(|id| terminal_runtimes.get(id))
+                    .map(|runtime| runtime.input_or_command_at())
+                    .or_else(|| terminal.map(|terminal| terminal.input_or_command_at)),
                 ended_agent: terminal.and_then(|terminal| terminal.ended_agent.clone()),
                 started_by: terminal.and_then(|terminal| terminal.started_by.clone()),
                 session_reported: terminal.is_some_and(|terminal| terminal.session_reported),
@@ -1265,6 +1272,7 @@ mod tests {
             0,
             PaneSnapshot {
                 ended_agent: None,
+                input_or_command_at: None,
                 started_by: None,
                 session_reported: false,
                 starter_label: None,
@@ -1293,6 +1301,7 @@ mod tests {
             1,
             PaneSnapshot {
                 ended_agent: None,
+                input_or_command_at: None,
                 started_by: None,
                 session_reported: false,
                 starter_label: None,
@@ -2061,6 +2070,7 @@ mod tests {
             0,
             PaneSnapshot {
                 ended_agent: None,
+                input_or_command_at: None,
                 started_by: None,
                 session_reported: false,
                 starter_label: None,
@@ -2089,6 +2099,7 @@ mod tests {
             1,
             PaneSnapshot {
                 ended_agent: None,
+                input_or_command_at: None,
                 started_by: None,
                 session_reported: false,
                 starter_label: None,

@@ -329,13 +329,14 @@ impl App {
             text
         };
         let completion = runtime
-            .queue_user_input_submission(
+            .queue_input_submission(
                 prefix,
                 Bytes::from(text),
                 Bytes::from(enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
                 submit_deadline,
                 Some(guard),
+                !params.preserve_activity,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
         Ok((id, agent, completion))
@@ -759,6 +760,7 @@ mod tests {
 
     fn prompt_params(target: impl Into<String>, text: impl Into<String>) -> AgentPromptParams {
         AgentPromptParams {
+            preserve_activity: false,
             target: target.into(),
             text: text.into(),
             expect_terminal: None,
@@ -936,6 +938,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                preserve_activity: false,
                 target: "reviewer".into(),
                 text: "hello".into(),
                 wait: None,
@@ -974,6 +977,7 @@ mod tests {
                 &mut app,
                 "req",
                 AgentPromptParams {
+                    preserve_activity: false,
                     target: target.into(),
                     text: text.into(),
                     wait: None,

@@ -100,6 +100,7 @@ fn send_input_segments(
 fn write_send_input_segments(
     runtime: &crate::terminal::TerminalRuntime,
     segments: Vec<SendInputSegment>,
+    preserve_activity: bool,
 ) -> Result<(), String> {
     // Admit the exact encoded bytes before any segment can reach the terminal.
     {
@@ -116,25 +117,26 @@ fn write_send_input_segments(
         if segment.delay_before.is_zero() {
             if let Some(bytes) = held.replace(segment.bytes) {
                 runtime
-                    .try_send_bytes(bytes)
+                    .try_send_bytes_with_activity(bytes, !preserve_activity)
                     .map_err(|err| err.to_string())?;
             }
         } else {
             runtime
-                .queue_user_input_submission(
+                .queue_input_submission(
                     Bytes::new(),
                     held.take().unwrap_or_default(),
                     segment.bytes,
                     segment.delay_before,
                     None,
                     None,
+                    !preserve_activity,
                 )
                 .map_err(|err| err.to_string())?;
         }
     }
     if let Some(bytes) = held {
         runtime
-            .try_send_bytes(bytes)
+            .try_send_bytes_with_activity(bytes, !preserve_activity)
             .map_err(|err| err.to_string())?;
     }
     Ok(())
@@ -2223,7 +2225,9 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+        if let Err(err) = runtime
+            .try_send_bytes_with_activity(Bytes::from(params.text), !params.preserve_activity)
+        {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
 
@@ -2261,7 +2265,9 @@ impl App {
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
             for bytes in encoded_keys {
-                if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+                if let Err(err) = runtime
+                    .try_send_bytes_with_activity(Bytes::from(bytes), !params.preserve_activity)
+                {
                     return encode_error(id, "pane_send_failed", err.to_string());
                 }
             }
@@ -2270,7 +2276,8 @@ impl App {
                 .into_iter()
                 .map(|chunk| (encode_api_text(runtime, chunk.text), chunk.is_image_paths));
             let segments = send_input_segments(chunks, encoded_keys);
-            if let Err(err) = write_send_input_segments(runtime, segments) {
+            if let Err(err) = write_send_input_segments(runtime, segments, params.preserve_activity)
+            {
                 return encode_error(id, "pane_send_failed", err);
             }
         }
@@ -5584,6 +5591,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id,
                 text: "A != B".into(),
                 keys: vec!["Enter".into()],
@@ -5617,6 +5625,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id,
                 text: String::new(),
                 keys: vec!["ctrl+j".into()],
@@ -5644,6 +5653,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id,
                 text: "hello".into(),
                 keys: Vec::new(),
@@ -5666,6 +5676,7 @@ mod tests {
         let request = |req_id: &str| crate::api::schema::Request {
             id: req_id.into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id: pane_id.clone(),
                 text: "kick off".into(),
                 keys: Vec::new(),
@@ -5694,6 +5705,7 @@ mod tests {
         let request = |req_id: &str, send_id: Option<&str>| crate::api::schema::Request {
             id: req_id.into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id: pane_id.clone(),
                 text: "again".into(),
                 keys: Vec::new(),
@@ -5730,6 +5742,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id: terminal_id,
                 text: "echo safe".into(),
                 keys: vec!["Enter".into()],
@@ -5772,6 +5785,7 @@ mod tests {
         let send_response = app.handle_api_request(crate::api::schema::Request {
             id: "send".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id: unknown_terminal_id.into(),
                 text: "do not send".into(),
                 keys: vec!["Enter".into()],
@@ -5815,6 +5829,7 @@ mod tests {
         let send_response = app.handle_api_request(crate::api::schema::Request {
             id: "send".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id: stale_terminal_id.into(),
                 text: "do not send".into(),
                 keys: vec!["Enter".into()],
@@ -5863,6 +5878,7 @@ mod tests {
         let send_response = app.handle_api_request(crate::api::schema::Request {
             id: "send".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id: "worker".into(),
                 text: "do not send".into(),
                 keys: vec!["Enter".into()],
@@ -5920,6 +5936,7 @@ mod tests {
         let send_response = app.handle_api_request(crate::api::schema::Request {
             id: "send".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id: closed_terminal_id,
                 text: "do not send".into(),
                 keys: vec!["Enter".into()],
@@ -5942,6 +5959,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id,
                 text: "hello".into(),
                 keys: vec!["Enter".into()],
@@ -5975,6 +5993,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id,
                 text: String::new(),
                 keys: vec!["Escape".into(), "Enter".into()],
@@ -6149,6 +6168,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id,
                 text: text.into(),
                 keys: vec!["Enter".into()],
@@ -6202,6 +6222,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req".into(),
             method: crate::api::schema::Method::PaneSendInput(PaneSendInputParams {
+                preserve_activity: false,
                 pane_id,
                 text: "hello".into(),
                 keys: vec!["ctrl+h".into(), raw_key.clone()],

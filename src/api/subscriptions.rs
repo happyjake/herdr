@@ -841,6 +841,7 @@ mod tests {
     fn pane_info_with_scroll(scroll: Option<PaneScrollInfo>) -> PaneInfo {
         PaneInfo {
             ended_agent: None,
+            input_or_command_at: None,
             started_by: None,
             pane_id: "pane_1".into(),
             terminal_id: "terminal_1".into(),

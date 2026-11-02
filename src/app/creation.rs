@@ -383,6 +383,13 @@ impl App {
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),
             ended_agent: terminal.ended_agent.clone(),
+            input_or_command_at: Some(
+                self.terminal_runtimes
+                    .get(&terminal.id)
+                    .map_or(terminal.input_or_command_at, |runtime| {
+                        runtime.input_or_command_at()
+                    }),
+            ),
             title: presentation.title,
             terminal_title: terminal.terminal_title.clone(),
             terminal_title_stripped: terminal.terminal_title_stripped(),

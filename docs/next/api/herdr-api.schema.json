@@ -1004,6 +1004,15 @@
                 "null"
               ]
             },
+            "input_or_command_at": {
+              "description": "Unix seconds of the last delivered input or observed foreground-job change.\nOutput and terminal-generated responses do not advance this clock.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "label": {
               "type": [
                 "string",
@@ -1538,6 +1547,10 @@
                 "$ref": "#/schemas/request/$defs/AgentStatus"
               },
               "type": "array"
+            },
+            "preserve_activity": {
+              "description": "Deliver synthetic input without advancing the input activity clock.\nSend only when the server advertises `input_activity`.",
+              "type": "boolean"
             },
             "target": {
               "type": "string"
@@ -3727,6 +3740,10 @@
             "pane_id": {
               "type": "string"
             },
+            "preserve_activity": {
+              "description": "Deliver synthetic input without advancing the input activity clock.\nSend only when the server advertises `input_activity`.",
+              "type": "boolean"
+            },
             "send_id": {
               "description": "Client-generated identity of this logical send. When present, an id\nthe server already applied is acknowledged without writing again —\nthe re-affirmation contract behind the `send_affirm` capability.",
               "type": [
@@ -3802,6 +3819,10 @@
           "properties": {
             "pane_id": {
               "type": "string"
+            },
+            "preserve_activity": {
+              "description": "Deliver synthetic input without advancing the input activity clock.\nSend only when the server advertises `input_activity`.",
+              "type": "boolean"
             },
             "text": {
               "type": "string"
@@ -9422,6 +9443,15 @@
                 "null"
               ]
             },
+            "input_or_command_at": {
+              "description": "Unix seconds of the last delivered input or observed foreground-job change.\nOutput and terminal-generated responses do not advance this clock.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "label": {
               "type": [
                 "string",
@@ -12782,6 +12812,11 @@
             "health_check": {
               "default": false,
               "description": "Whether this server supports endpoint health probes.",
+              "type": "boolean"
+            },
+            "input_activity": {
+              "default": false,
+              "description": "Pane input timestamps and `preserve_activity` on agent.prompt, pane.send_text\nand pane.send_input. Clients must omit the flag without this capability.",
               "type": "boolean"
             },
             "live_handoff": {

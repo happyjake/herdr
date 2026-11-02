@@ -117,6 +117,27 @@ fn pane_set_pinned_request_names_both_directions_with_one_method() {
 }
 
 #[test]
+fn input_activity_is_optional_in_legacy_pane_info() {
+    let mut json = serde_json::json!({
+        "pane_id":"w1:p1", "terminal_id":"term_1", "workspace_id":"w1",
+        "tab_id":"w1:t1", "focused":false, "agent_status":"unknown", "revision":0
+    });
+    let legacy: PaneInfo = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(legacy.input_or_command_at, None);
+    assert!(serde_json::to_value(legacy)
+        .unwrap()
+        .get("input_or_command_at")
+        .is_none());
+    json["input_or_command_at"] = 1_700_000_000_u64.into();
+    let current: PaneInfo = serde_json::from_value(json).unwrap();
+    assert_eq!(current.input_or_command_at, Some(1_700_000_000));
+    assert_eq!(
+        serde_json::to_value(current).unwrap()["input_or_command_at"],
+        1_700_000_000_u64
+    );
+}
+
+#[test]
 fn pane_info_defaults_a_missing_pin_to_unpinned() {
     let pane: PaneInfo = serde_json::from_value(serde_json::json!({
         "pane_id": "pane_1",
@@ -189,6 +210,7 @@ fn agent_start_and_prompt_requests_round_trip() {
     let prompt = Request {
         id: "prompt".into(),
         method: Method::AgentPrompt(AgentPromptParams {
+            preserve_activity: false,
             target: "reviewer".into(),
             text: "review this".into(),
             expect_terminal: None,
@@ -212,6 +234,7 @@ fn agent_start_and_prompt_requests_round_trip() {
     let prompt_and_wait = Request {
         id: "prompt-and-wait".into(),
         method: Method::AgentPrompt(AgentPromptParams {
+            preserve_activity: false,
             target: "reviewer".into(),
             text: "review this".into(),
             expect_terminal: Some("term_1".into()),
@@ -1618,6 +1641,7 @@ fn success_response_round_trips() {
             version: "0.1.2".into(),
             protocol: 6,
             capabilities: Some(ServerCapabilities {
+                input_activity: false,
                 live_handoff: true,
                 detached_server_daemon: true,
                 endpoint_protocol_generation: Some(1),
@@ -1760,6 +1784,7 @@ fn worktree_request_and_response_round_trip() {
             },
             root_pane: PaneInfo {
                 ended_agent: None,
+                input_or_command_at: None,
                 started_by: None,
                 pane_id: "w_1-1".into(),
                 terminal_id: "term_1".into(),
@@ -2202,6 +2227,7 @@ fn create_response_round_trips_with_root_pane() {
             },
             root_pane: PaneInfo {
                 ended_agent: None,
+                input_or_command_at: None,
                 started_by: None,
                 pane_id: "w_1-3".into(),
                 terminal_id: "term_example".into(),

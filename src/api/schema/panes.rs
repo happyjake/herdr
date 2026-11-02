@@ -433,6 +433,10 @@ crate::cli::projection::cli_params! {
 crate::cli::projection::cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
     pub struct PaneSendTextParams => PaneSendTextProjection {
+        /// Deliver synthetic input without advancing the input activity clock.
+        /// Send only when the server advertises `input_activity`.
+        #[serde(default, skip_serializing_if = "super::is_false")]
+        pub preserve_activity: bool => Field::new(false),
         pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
         pub text: String => Field::new(String::new()).input(binding::joined("text", "TEXT")),
     }
@@ -449,6 +453,10 @@ crate::cli::projection::cli_params! {
 crate::cli::projection::cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
     pub struct PaneSendInputParams => PaneRunProjection {
+        /// Deliver synthetic input without advancing the input activity clock.
+        /// Send only when the server advertises `input_activity`.
+        #[serde(default, skip_serializing_if = "super::is_false")]
+        pub preserve_activity: bool => Field::new(false),
         pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
         #[serde(default, skip_serializing_if = "String::is_empty")]
         pub text: String => Field::new(String::new()).input(binding::joined("command", "COMMAND")),
@@ -632,6 +640,10 @@ crate::cli::projection::cli_params! {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
+    /// Unix seconds of the last delivered input or observed foreground-job change.
+    /// Output and terminal-generated responses do not advance this clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_or_command_at: Option<u64>,
     /// Always serialized: the last agent's kind after exit, or null until an agent ends.
     #[serde(default)]
     pub ended_agent: Option<String>,
