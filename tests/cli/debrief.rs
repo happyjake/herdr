@@ -1041,3 +1041,126 @@ fn debrief_runs_one_at_a_time_and_releases_the_slot_after_close() {
         0
     );
 }
+
+#[test]
+fn debrief_disabled_revalidates_the_main_checkout_home_between_closes() {
+    let session = Session::new("pi");
+    create_committed_repo(&session.base);
+    let second = session.another_agent();
+    let config = session.config("pi", "debrief = false");
+    session.configure(&config.replace("mode = 'close'", "mode = 'report'"));
+    let mut plan = Value::Null;
+    assert!(
+        wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            plan = session.request("auto_close.plan", json!({}))["plan"].clone();
+            plan["candidates"].as_array().is_some_and(|candidates| {
+                candidates
+                    .iter()
+                    .filter(|candidate| {
+                        (candidate["pane_id"] == session.pane || candidate["pane_id"] == second)
+                            && candidate["kind"] == "dormant"
+                            && candidate["action"] == "close"
+                    })
+                    .count()
+                    == 2
+            })
+        }),
+        "{plan}"
+    );
+    let checkout = session.base.canonicalize().unwrap().display().to_string();
+    assert!(plan["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|candidate| candidate["main_checkout"] == checkout));
+    session.configure(&config);
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(50),
+        || session
+            .logbook()
+            .iter()
+            .any(|line| line["type"] == "pane_closed")
+    ));
+    thread::sleep(Duration::from_secs(2));
+    let lines = session.logbook();
+    let closes: Vec<_> = lines
+        .iter()
+        .filter(|line| line["type"] == "pane_closed")
+        .collect();
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!(closes[0]["debrief"]["outcome"], "skipped");
+    let live = session.request("pane.list", json!({}));
+    assert_eq!(live["panes"].as_array().unwrap().len(), 1);
+    let survivor = &live["panes"][0];
+    assert_eq!(survivor["agent"], "pi");
+    assert_ne!(survivor["pane_id"], closes[0]["pane"]);
+    let plan = session.request("auto_close.plan", json!({}))["plan"].clone();
+    assert_eq!(plan["spared"][0]["pane_id"], survivor["pane_id"]);
+    assert_eq!(plan["spared"][0]["exemption"], "last-main-checkout-pane");
+    assert_eq!(plan["spared"][0]["main_checkout"], checkout);
+    assert_eq!(
+        plan["spared"][0]["main_checkout_home"],
+        survivor["workspace_id"]
+    );
+    assert_eq!(
+        session.request("ping", json!({}))["auto_close"]["closed_24h"],
+        1
+    );
+}
+
+#[test]
+fn debrief_finished_close_preserves_a_new_main_checkout_home() {
+    let session = Session::new("pi");
+    create_committed_repo(&session.base);
+    let second = session.another_agent();
+    session.mode("hold");
+    session.enable("pi", "");
+    session.wait_status("working");
+    session.request("pane.close", json!({"pane_id":second}));
+    fs::write(session.base.join("release"), "go").unwrap();
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || fs::read_to_string(session.base.join("received"))
+            .unwrap_or_default()
+            .contains("/quit")
+    ));
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(session.pane()["pane_id"], session.pane);
+    assert_eq!(
+        session.request("auto_close.plan", json!({}))["plan"]["spared"][0]["exemption"],
+        "last-main-checkout-pane"
+    );
+    assert!(session
+        .logbook()
+        .iter()
+        .all(|line| line["type"] != "pane_closed" || line["pane"] != session.pane));
+    // Another pane makes the completed pane closable again. Its saved outcome
+    // goes through the same close-time decision, without another skill prompt.
+    session.another_agent();
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || session
+            .logbook()
+            .iter()
+            .any(|line| line["type"] == "pane_closed" && line["pane"] == session.pane)
+    ));
+    let lines = session.logbook();
+    let close = lines
+        .iter()
+        .find(|line| line["type"] == "pane_closed" && line["pane"] == session.pane)
+        .unwrap();
+    assert_eq!(
+        close["debrief"],
+        json!({"outcome":"finished","memories":3,"skill_version":"v2"})
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line["type"] == "debrief_sent" && line["pane"] == session.pane)
+            .count(),
+        1
+    );
+}

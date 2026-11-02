@@ -313,19 +313,55 @@ fn decide(
     if pane.desk_focused {
         return Err("desk-focused");
     }
+    if pane.agent.is_some() && pane.debrief.is_none() {
+        match pane.status {
+            AgentStatus::Working => return Err("working"),
+            AgentStatus::Blocked => return Err("blocked"),
+            AgentStatus::Unknown => return Err("unknown"),
+            AgentStatus::Done | AgentStatus::Idle => {}
+        }
+    }
+    if pane.restore_until.is_some_and(|until| now < until)
+        && pane
+            .debrief
+            .as_ref()
+            .is_none_or(|state| matches!(state.phase, Phase::Retry { .. }))
+    {
+        return Err("restore-window");
+    }
+    if pane.debrief.is_some() && pane.status == AgentStatus::Blocked {
+        return Err("blocked");
+    }
+    if pane.single_pane_workspace
+        && main_checkout_home(pane, panes)
+            .is_some_and(|home| home.workspace_id == pane.workspace_id)
+    {
+        return Err("last-main-checkout-pane");
+    }
+    if pane.group_refusal {
+        return Err("worktree-group");
+    }
+    if panes
+        .iter()
+        .any(|kin| kin.starter.as_deref() == Some(&pane.pane_id))
+    {
+        return Err("open-kin");
+    }
     if let Some(state) = &pane.debrief {
         if debrief::protected(pane, state) {
             return Err("debrief-pane-changed");
         }
-        if matches!(state.phase, Phase::Retry { .. })
-            && pane.restore_until.is_some_and(|until| now < until)
-        {
-            return Err("restore-window");
-        }
-        if pane.status == AgentStatus::Blocked {
-            return Err("blocked");
-        }
         let (action, reason) = match &state.phase {
+            _ if debrief::step(
+                state,
+                pane.status,
+                pane.ended && pane.bare_prompt,
+                config,
+                now.saturating_mul(1000),
+            ) == debrief::Step::Close =>
+            {
+                (Action::Close, None)
+            }
             Phase::Waiting { .. } | Phase::Retry { .. }
                 if !config.debrief
                     && matches!(pane.status, AgentStatus::Idle | AgentStatus::Done) =>
@@ -342,6 +378,10 @@ fn decide(
             Phase::Retry { .. } => (Action::Close, None),
             _ => (Action::Wait, Some("debrief-in-progress".into())),
         };
+        if action == Action::Close && pane.agent.is_some() && pane.status == AgentStatus::Unknown {
+            return Err("unknown");
+        }
+        let (main_checkout, main_checkout_home) = main_checkout_fields(pane, panes);
         return Ok(Candidate {
             pane_id: pane.pane_id.clone(),
             kind: Kind::Dormant,
@@ -349,35 +389,9 @@ fn decide(
             age_secs: state.age_secs,
             action,
             wait_reason: reason,
-            main_checkout: main_checkout_fields(pane, panes).0,
-            main_checkout_home: main_checkout_fields(pane, panes).1,
+            main_checkout,
+            main_checkout_home,
         });
-    }
-    if pane.agent.is_some() {
-        match pane.status {
-            AgentStatus::Working => return Err("working"),
-            AgentStatus::Blocked => return Err("blocked"),
-            AgentStatus::Unknown => return Err("unknown"),
-            AgentStatus::Done | AgentStatus::Idle => {}
-        }
-    }
-    if pane.restore_until.is_some_and(|until| now < until) {
-        return Err("restore-window");
-    }
-    if pane.single_pane_workspace
-        && main_checkout_home(pane, panes)
-            .is_some_and(|home| home.workspace_id == pane.workspace_id)
-    {
-        return Err("last-main-checkout-pane");
-    }
-    if pane.group_refusal {
-        return Err("worktree-group");
-    }
-    if panes
-        .iter()
-        .any(|kin| kin.starter.as_deref() == Some(&pane.pane_id))
-    {
-        return Err("open-kin");
     }
     let (kind, since, threshold) = if pane.agent.is_some() {
         (
@@ -449,6 +463,14 @@ fn debrief_waits(mut plan: Plan, panes: &[PaneSnapshot], config: &Config) -> Pla
     let skill_present = path.is_some_and(|path| path.is_file());
     for candidate in &mut plan.candidates {
         if candidate.action == Action::Wait {
+            continue;
+        }
+        if panes
+            .iter()
+            .find(|pane| pane.pane_id == candidate.pane_id)
+            .and_then(|pane| pane.debrief.as_ref())
+            .is_some_and(|state| !matches!(state.phase, Phase::Retry { .. }))
+        {
             continue;
         }
         if candidate.kind != Kind::Dormant || !config.debrief {
@@ -1213,7 +1235,7 @@ impl App {
                     }
                     Action::Close if pane.debrief.is_none() || !self.auto_close.config.debrief => {
                         self.close_dormant_pane(
-                            &pane.pane_id,
+                            pane,
                             candidate.age_secs,
                             logbook::CloseDebrief {
                                 outcome: crate::api::schema::DebriefOutcome::Skipped,

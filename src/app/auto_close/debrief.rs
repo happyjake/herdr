@@ -95,7 +95,7 @@ impl Debrief {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Step {
+pub(super) enum Step {
     Wait,
     Change(Phase),
     Quit,
@@ -125,7 +125,13 @@ pub(super) fn protected(pane: &PaneSnapshot, state: &Debrief) -> bool {
         || (pane.session != state.session && !(quit_exit && pane.session.is_none()))
 }
 
-fn step(state: &Debrief, status: AgentStatus, ended: bool, config: &Config, now: u64) -> Step {
+pub(super) fn step(
+    state: &Debrief,
+    status: AgentStatus,
+    ended: bool,
+    config: &Config,
+    now: u64,
+) -> Step {
     if status == AgentStatus::Blocked {
         return Step::Change(Phase::Aborted {
             reason: "blocked".into(),
@@ -743,7 +749,7 @@ impl App {
                             None
                         }
                     }) {
-                        self.close_dormant_pane(&pane.pane_id, state.age_secs, result);
+                        self.close_dormant_pane(&pane, state.age_secs, result);
                     }
                 }
             }
@@ -782,7 +788,29 @@ impl App {
         }
     }
 
-    pub(super) fn close_dormant_pane(&mut self, pane: &str, age: u64, debrief: CloseDebrief) {
+    pub(super) fn close_dormant_pane(
+        &mut self,
+        observed: &PaneSnapshot,
+        age: u64,
+        debrief: CloseDebrief,
+    ) {
+        let now = crate::pane::unix_now_secs();
+        let fresh = self.auto_close_snapshot(now);
+        let Ok(candidate) = decide(observed, &fresh, &self.auto_close.config, now) else {
+            return;
+        };
+        if !candidate_ready_to_close(
+            &candidate,
+            std::slice::from_ref(observed),
+            &fresh,
+            &self.auto_close.refused,
+            &mut HashSet::new(),
+            &self.auto_close.config,
+            now,
+        ) {
+            return;
+        }
+        let pane = observed.pane_id.as_str();
         let session = self
             .auto_close
             .debriefs
