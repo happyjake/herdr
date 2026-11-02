@@ -160,6 +160,7 @@ struct PaneSnapshot {
     flagged: bool,
     desk_focused: bool,
     restore_until: Option<u64>,
+    single_pane_workspace: bool,
     main_checkout: Option<String>,
     group_refusal: bool,
     bare_prompt: bool,
@@ -214,12 +215,14 @@ impl AutoClose {
 fn main_checkout_home<'a>(
     pane: &'a PaneSnapshot,
     panes: &'a [PaneSnapshot],
-) -> Option<(&'a str, &'a PaneSnapshot)> {
+) -> Option<&'a PaneSnapshot> {
     let checkout = pane.main_checkout.as_deref()?;
-    let home = panes
+    panes
         .iter()
         .chain(std::iter::once(pane))
-        .filter(|candidate| candidate.main_checkout.as_deref() == Some(checkout))
+        .filter(|candidate| {
+            candidate.single_pane_workspace && candidate.main_checkout.as_deref() == Some(checkout)
+        })
         .min_by_key(|candidate| {
             (
                 std::cmp::Reverse(candidate.status_at.max(candidate.input_at)),
@@ -227,17 +230,18 @@ fn main_checkout_home<'a>(
                     .unwrap_or(usize::MAX),
                 &candidate.workspace_id,
             )
-        })?;
-    Some((checkout, home))
+        })
 }
 
 fn main_checkout_fields(
     pane: &PaneSnapshot,
     panes: &[PaneSnapshot],
 ) -> (Option<String>, Option<String>) {
-    main_checkout_home(pane, panes).map_or((None, None), |(checkout, home)| {
-        (Some(checkout.to_owned()), Some(home.workspace_id.clone()))
-    })
+    let home = main_checkout_home(pane, panes);
+    (
+        pane.main_checkout.clone(),
+        home.map(|home| home.workspace_id.clone()),
+    )
 }
 
 fn decide(
@@ -266,8 +270,9 @@ fn decide(
     if pane.restore_until.is_some_and(|until| now < until) {
         return Err("restore-window");
     }
-    if main_checkout_home(pane, panes)
-        .is_some_and(|(_, home)| home.workspace_id == pane.workspace_id)
+    if pane.single_pane_workspace
+        && main_checkout_home(pane, panes)
+            .is_some_and(|home| home.workspace_id == pane.workspace_id)
     {
         return Err("last-main-checkout-pane");
     }
@@ -584,23 +589,8 @@ impl App {
     fn auto_close_snapshot(&self, now: u64) -> Vec<PaneSnapshot> {
         let mut panes = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
-            let last = ws.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>() == 1;
-            let main_checkout = last
-                .then(|| {
-                    ws.worktree_space()
-                        .filter(|space| !space.is_linked_worktree)
-                        .map(|space| {
-                            crate::worktree::canonical_or_original(&space.checkout_path)
-                                .display()
-                                .to_string()
-                        })
-                        .or_else(|| {
-                            crate::workspace::git_space_metadata(&ws.identity_cwd)
-                                .filter(|info| !info.is_linked_worktree)
-                                .map(|info| info.checkout_key)
-                        })
-                })
-                .flatten();
+            let single_pane_workspace =
+                ws.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>() == 1;
             for tab in &ws.tabs {
                 for (&id, pane) in &tab.panes {
                     let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id)
@@ -645,8 +635,16 @@ impl App {
                         flagged: terminal.flag.is_some(),
                         desk_focused: self.auto_close.focused.contains(&id),
                         restore_until: pane.agent_status_resolution_due_at(),
-                        main_checkout: main_checkout.clone(),
-                        group_refusal: last
+                        single_pane_workspace,
+                        main_checkout: tab
+                            .foreground_cwd_for_pane(id, &self.terminal_runtimes)
+                            .or_else(|| {
+                                tab.cwd_for_pane(id, &self.state.terminals, &self.terminal_runtimes)
+                            })
+                            .and_then(|cwd| crate::workspace::git_space_metadata(&cwd))
+                            .filter(|info| !info.is_linked_worktree)
+                            .map(|info| info.checkout_key),
+                        group_refusal: single_pane_workspace
                             && self
                                 .state
                                 .workspace_close_would_close_worktree_group(ws_idx),
@@ -844,6 +842,7 @@ mod tests {
             flagged: false,
             desk_focused: false,
             restore_until: None,
+            single_pane_workspace: true,
             main_checkout: None,
             group_refusal: false,
             bare_prompt: true,

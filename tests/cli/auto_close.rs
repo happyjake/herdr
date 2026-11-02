@@ -678,6 +678,123 @@ fn auto_close_keeps_one_named_home_per_main_checkout() {
 }
 
 #[test]
+fn auto_close_live_pane_checkout_survives_restart() {
+    let config = "[auto_close]\nmode = 'report'\nplain_shell_age_secs = 0\npass_floor_secs = 1\n";
+    let mut session = Session::new(config);
+    let repo_a = session.base.join("repo-a");
+    let repo_b = session.base.join("repo-b");
+    create_committed_repo(&repo_a);
+    create_committed_repo(&repo_b);
+    let first = session.request("workspace.create", json!({"cwd":repo_a}));
+    let moved = session.request("workspace.create", json!({"cwd":repo_a}));
+    let first_pane = first["root_pane"]["pane_id"].as_str().unwrap().to_owned();
+    let first_workspace = first["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let moved_pane = moved["root_pane"]["pane_id"].as_str().unwrap().to_owned();
+    let moved_workspace = moved["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let checkout_a = repo_a.canonicalize().unwrap().display().to_string();
+    let checkout_b = repo_b.canonicalize().unwrap().display().to_string();
+    thread::sleep(Duration::from_millis(1100));
+    session.request(
+        "pane.send_input",
+        json!({"pane_id":moved_pane,"text":format!("cd '{}'", repo_b.display()),"keys":["Enter"]}),
+    );
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || session.request("pane.get", json!({"pane_id":moved_pane}))["pane"]["cwd"].as_str()
+            == Some(checkout_b.as_str())
+    ));
+
+    let assert_homes = |session: &Session| {
+        let plan = session.plan();
+        for (pane_id, checkout, workspace_id) in [
+            (&first_pane, &checkout_a, &first_workspace),
+            (&moved_pane, &checkout_b, &moved_workspace),
+        ] {
+            let spared = plan["spared"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|pane| pane["pane_id"].as_str() == Some(pane_id.as_str()))
+                .unwrap_or_else(|| panic!("missing spared pane {pane_id}: {plan}"));
+            assert_eq!(spared["exemption"], "last-main-checkout-pane", "{plan}");
+            assert_eq!(spared["main_checkout"].as_str(), Some(checkout.as_str()));
+            assert_eq!(
+                spared["main_checkout_home"].as_str(),
+                Some(workspace_id.as_str())
+            );
+        }
+    };
+    assert_homes(&session);
+
+    session.stop();
+    session.start(config);
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || session.request("pane.get", json!({"pane_id":moved_pane}))["pane"]["cwd"].as_str()
+            == Some(checkout_b.as_str())
+    ));
+    assert_homes(&session);
+}
+
+#[test]
+fn auto_close_split_workspace_siblings_name_the_single_pane_home() {
+    let session = Session::new(
+        "[auto_close]\nmode = 'report'\nplain_shell_age_secs = 0\npass_floor_secs = 1\n",
+    );
+    let repo = session.base.join("repo");
+    create_committed_repo(&repo);
+    let home = session.request("workspace.create", json!({"cwd":repo}));
+    let sibling = session.request("workspace.create", json!({"cwd":repo}));
+    let home_pane = home["root_pane"]["pane_id"].as_str().unwrap().to_owned();
+    let home_workspace = home["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sibling_pane = sibling["root_pane"]["pane_id"].as_str().unwrap().to_owned();
+    let split = session.request(
+        "pane.split",
+        json!({"target_pane_id":sibling_pane,"direction":"right","focus":false}),
+    );
+    let split_pane = split["pane"]["pane_id"].as_str().unwrap().to_owned();
+    thread::sleep(Duration::from_millis(1100));
+    session.request(
+        "pane.send_text",
+        json!({"pane_id":split_pane,"text":"recent activity"}),
+    );
+
+    let plan = session.plan();
+    let spared = plan["spared"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pane| pane["pane_id"].as_str() == Some(home_pane.as_str()))
+        .unwrap_or_else(|| panic!("missing single-pane home: {plan}"));
+    assert_eq!(spared["exemption"], "last-main-checkout-pane", "{plan}");
+    let checkout = repo.canonicalize().unwrap().display().to_string();
+    for pane_id in [&sibling_pane, &split_pane] {
+        let candidate = plan["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pane| pane["pane_id"].as_str() == Some(pane_id.as_str()))
+            .unwrap_or_else(|| panic!("missing split sibling {pane_id}: {plan}"));
+        assert_eq!(candidate["main_checkout"].as_str(), Some(checkout.as_str()));
+        assert_eq!(
+            candidate["main_checkout_home"].as_str(),
+            Some(home_workspace.as_str())
+        );
+    }
+}
+
+#[test]
 fn auto_close_unresolved_agent_restore_is_exempt() {
     let config = "[auto_close]\nmode = 'report'\ndormant_age_secs = 0\nplain_shell_age_secs = 0\npass_floor_secs = 1\ndebrief = false\n";
     let mut session = Session::new(config);
