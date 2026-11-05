@@ -302,8 +302,16 @@ fn main_checkout_home<'a>(
             candidate.single_pane_workspace && candidate.main_checkout.as_deref() == Some(checkout)
         })
         .min_by_key(|candidate| {
+            // A Debrief's own working and done transitions move status_at; ranking
+            // on them would make the pane being debriefed its checkout's home and
+            // strand its close. Its input stamp is one the Debrief never moves.
+            let recency = if candidate.debrief.is_some() {
+                candidate.input_at
+            } else {
+                candidate.status_at.max(candidate.input_at)
+            };
             (
-                std::cmp::Reverse(candidate.status_at.max(candidate.input_at)),
+                std::cmp::Reverse(recency),
                 crate::workspace::public_workspace_number(&candidate.workspace_id)
                     .unwrap_or(usize::MAX),
                 &candidate.workspace_id,
@@ -1638,6 +1646,60 @@ mod tests {
             assert_eq!(candidate.main_checkout.as_deref(), Some("checkout"));
             assert_eq!(candidate.main_checkout_home.as_deref(), Some("w2"));
         }
+    }
+
+    #[test]
+    fn auto_close_a_debriefs_own_status_changes_never_make_its_pane_the_home() {
+        let config = Config {
+            dormant_age_secs: 50,
+            ..Config::default()
+        };
+        let mut home = main_checkout_shell("w1", 100, 100);
+        home.agent = Some("codex".into());
+        home.status = AgentStatus::Idle;
+        let mut debriefing = main_checkout_shell("w2", 100, 100);
+        debriefing.agent = Some("claude".into());
+        debriefing.status = AgentStatus::Idle;
+        let panes = [home.clone(), debriefing.clone()];
+        assert_eq!(decide(&home, &panes, &config, 200), Err("last-main-checkout-pane"));
+        assert!(decide(&debriefing, &panes, &config, 200).is_ok());
+
+        // The Debrief ran: its working and done transitions restamped status_at.
+        debriefing.status_at = 190;
+        debriefing.debrief = Some(Debrief {
+            agent: "claude".into(),
+            session: None,
+            age_secs: 100,
+            input_at: 100,
+            attempt: 1,
+            phase: debrief::Phase::Quitting {
+                at: 195_000,
+                result: crate::persist::logbook::CloseDebrief {
+                    outcome: crate::api::schema::DebriefOutcome::Finished,
+                    memories: Some(3),
+                    skill_version: Some("v1".into()),
+                },
+            },
+            reply_start: None,
+            finished: None,
+            quit_failures: 0,
+            delivery_abort: None,
+            recovered_delivery: false,
+        });
+        let panes = [home.clone(), debriefing.clone()];
+        assert_ne!(
+            decide(&debriefing, &panes, &config, 200),
+            Err("last-main-checkout-pane")
+        );
+        assert_eq!(decide(&home, &panes, &config, 200), Err("last-main-checkout-pane"));
+
+        // Without a Debrief, the same status change would move the home as before.
+        debriefing.debrief = None;
+        let panes = [home.clone(), debriefing.clone()];
+        assert_eq!(
+            decide(&debriefing, &panes, &config, 200),
+            Err("last-main-checkout-pane")
+        );
     }
 
     #[test]
