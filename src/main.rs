@@ -444,7 +444,7 @@ limit_secs = 900
 
 [auto_close.pi]
 gate_command = "usage --debrief-gate pi"
-invocation = "/skill:debrief"
+invocation = "/skill:debrief If the debrief skill is not loaded in this session, read ~/.agents/skills/debrief/SKILL.md and follow it now."
 limit_secs = 600
 
 [websocket_api]

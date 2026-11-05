@@ -429,7 +429,10 @@ impl Default for AutoCloseConfig {
             },
             pi: AutoCloseKindConfig {
                 gate_command: "usage --debrief-gate pi".into(),
-                invocation: "/skill:debrief".into(),
+                // pi passes `/skill:<name>` through as bare text when its session
+                // started before the skill was installed; the sentence that follows
+                // points such a session at the skill file.
+                invocation: "/skill:debrief If the debrief skill is not loaded in this session, read ~/.agents/skills/debrief/SKILL.md and follow it now.".into(),
                 limit_secs: 600,
             },
         }

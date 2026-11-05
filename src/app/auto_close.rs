@@ -2191,7 +2191,13 @@ mod contract_tests {
         assert_eq!(config.codex.limit_secs, 900);
         assert_eq!(config.codex.invocation, "$debrief");
         assert_eq!(config.claude.invocation, "/debrief");
-        assert_eq!(config.pi.invocation, "/skill:debrief");
+        assert_eq!(
+            config.pi.invocation,
+            "/skill:debrief If the debrief skill is not loaded in this session, read ~/.agents/skills/debrief/SKILL.md and follow it now."
+        );
+        // pi passes `/skill:<name>` through as bare text when the session started
+        // before the skill existed, so the invocation names the skill file itself.
+        assert!(config.pi.invocation.contains(&config.debrief_skill_path));
         assert_eq!(config.uptake_window_secs, 60);
         assert_eq!(config.settle_hold_secs, 60);
         assert_eq!(config.quit_grace_secs, 60);
