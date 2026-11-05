@@ -13,6 +13,7 @@ use crate::config::{
     AutoCloseConfig as Config, AutoCloseKindConfig as KindConfig, AutoCloseMode as Mode,
 };
 
+mod composer;
 pub(crate) mod debrief;
 mod probes;
 use debrief::{Debrief, Phase};
@@ -150,6 +151,16 @@ pub struct Plan {
     pub spared: Vec<Spared>,
 }
 
+/// What the agent's composer held when the snapshot was taken. Read only for
+/// agent panes old enough to be dormant, or with a Debrief in flight.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum Composer {
+    #[default]
+    NotRead,
+    Unreadable,
+    Text(String),
+}
+
 /// Facts are captured once; eligibility itself reads no process, filesystem or clock.
 #[derive(Debug, Clone)]
 struct PaneSnapshot {
@@ -177,6 +188,7 @@ struct PaneSnapshot {
     starter: Option<String>,
     session: Option<CloseSession>,
     debrief: Option<Debrief>,
+    composer: Composer,
 }
 
 impl PaneSnapshot {
@@ -469,6 +481,29 @@ fn plan(panes: &[PaneSnapshot], config: &Config, now: u64) -> Plan {
     result
 }
 
+/// A Debrief types into the composer, so it waits unless the composer is empty.
+/// Text the desk typed itself in an earlier, untaken attempt is cleared first.
+fn composer_wait(pane: &PaneSnapshot, config: &Config) -> Option<&'static str> {
+    match &pane.composer {
+        Composer::NotRead => None,
+        Composer::Unreadable => Some("composer-unreadable"),
+        Composer::Text(text) if text.is_empty() => None,
+        Composer::Text(_) if own_draft(pane, config).is_some() => Some("clearing-own-draft"),
+        Composer::Text(_) => Some("draft-present"),
+    }
+}
+
+/// The length of the composer's text when it is only this pane's own earlier
+/// invocation, typed by a Debrief that was never taken up.
+fn own_draft(pane: &PaneSnapshot, config: &Config) -> Option<usize> {
+    let Composer::Text(text) = &pane.composer else {
+        return None;
+    };
+    let kind = debrief::kind_config_for(config, pane.agent.as_deref()?)?;
+    (pane.debrief.is_some() && composer::is_own(text, &kind.invocation))
+        .then(|| text.chars().count())
+}
+
 fn debrief_waits(
     mut plan: Plan,
     panes: &[PaneSnapshot],
@@ -497,12 +532,17 @@ fn debrief_waits(
         if agent == Some("agy") {
             continue;
         }
+        let pane = panes
+            .iter()
+            .find(|pane| pane.pane_id == candidate.pane_id);
         candidate.action = Action::Wait;
         candidate.wait_reason = Some(
             if !matches!(agent, Some("claude" | "codex" | "pi")) {
                 "unsupported-agent"
             } else if !skill_present {
                 "skill-missing"
+            } else if let Some(reason) = pane.and_then(|pane| composer_wait(pane, config)) {
+                reason
             } else {
                 "gate-pending"
             }
@@ -959,10 +999,27 @@ impl App {
                         process: runtime.map(|runtime| runtime.process_probe()),
                     };
                     let facts = self.auto_close.probes.pane(&probe, None);
+                    let input_at = runtime.map_or(terminal.input_or_command_at, |runtime| {
+                        runtime.input_or_command_at()
+                    });
+                    let debrief = self.auto_close.debriefs.get(&pane_id).cloned();
+                    let composer = match (agent.as_deref(), runtime) {
+                        (Some(kind @ ("claude" | "codex" | "pi")), Some(runtime))
+                            if debrief.is_some()
+                                || (matches!(status, AgentStatus::Idle | AgentStatus::Done)
+                                    && now.saturating_sub(status_at.max(input_at))
+                                        >= self.auto_close.config.dormant_age_secs) =>
+                        {
+                            composer::draft(kind, &runtime.visible_ansi())
+                                .map_or(Composer::Unreadable, Composer::Text)
+                        }
+                        _ => Composer::NotRead,
+                    };
                     panes.push(PaneSnapshot {
                         probe: Some(probe),
                         probe_ready: facts.is_some(),
-                        debrief: self.auto_close.debriefs.get(&pane_id).cloned(),
+                        debrief,
+                        composer,
                         pane_id,
                         workspace_id: ws.id.clone(),
                         agent,
@@ -973,9 +1030,7 @@ impl App {
                             || terminal.agent_name.is_some(),
                         status,
                         status_at,
-                        input_at: runtime.map_or(terminal.input_or_command_at, |runtime| {
-                            runtime.input_or_command_at()
-                        }),
+                        input_at,
                         input_seq: runtime.map_or(0, |runtime| runtime.input_or_command_seq()),
                         pinned: terminal.pinned,
                         flagged: terminal.flag.is_some(),
@@ -1316,6 +1371,18 @@ impl App {
                     Action::Debrief if !self.auto_close.debriefs.values().any(Debrief::active) => {
                         self.start_debrief(pane, candidate)
                     }
+                    // A Debrief no longer in flight (retrying or given up) leaves the
+                    // composer as it found it: its own untaken invocation comes out.
+                    Action::Wait
+                        if pane
+                            .debrief
+                            .as_ref()
+                            .is_some_and(|state| !state.active()) =>
+                    {
+                        if let Some(chars) = own_draft(pane, &self.auto_close.config) {
+                            self.clear_debrief_draft(&pane.pane_id, chars);
+                        }
+                    }
                     Action::Close if pane.debrief.is_none() || !self.auto_close.config.debrief => {
                         self.close_dormant_pane(
                             pane,
@@ -1415,6 +1482,7 @@ mod tests {
             starter: None,
             session: None,
             debrief: None,
+            composer: Composer::NotRead,
         }
     }
 
@@ -1682,6 +1750,58 @@ mod tests {
             .action,
             Action::Close
         );
+    }
+
+    #[test]
+    fn auto_close_debrief_waits_on_any_composer_text_and_clears_only_its_own() {
+        let config = Config {
+            dormant_age_secs: 0,
+            ..Config::default()
+        };
+        let reason = |pane: &PaneSnapshot| {
+            debrief_waits(plan(&[pane.clone()], &config, 200), &[pane.clone()], &config, true)
+                .candidates[0]
+                .wait_reason
+                .clone()
+        };
+        let mut pane = shell();
+        pane.agent = Some("codex".into());
+        pane.status = AgentStatus::Idle;
+
+        pane.composer = Composer::Text(String::new());
+        assert_eq!(reason(&pane).as_deref(), Some("gate-pending"));
+        pane.composer = Composer::NotRead;
+        assert_eq!(reason(&pane).as_deref(), Some("gate-pending"));
+        pane.composer = Composer::Unreadable;
+        assert_eq!(reason(&pane).as_deref(), Some("composer-unreadable"));
+        pane.composer = Composer::Text("please check the build".into());
+        assert_eq!(reason(&pane).as_deref(), Some("draft-present"));
+
+        // The invocation with no Debrief of ours behind it is a person's text.
+        pane.composer = Composer::Text("$debrief $debrief".into());
+        assert_eq!(reason(&pane).as_deref(), Some("draft-present"));
+        assert_eq!(own_draft(&pane, &config), None);
+
+        pane.debrief = Some(Debrief {
+            agent: "codex".into(),
+            session: None,
+            age_secs: 0,
+            input_at: pane.input_at,
+            attempt: 1,
+            phase: debrief::Phase::Retry {
+                reason: "no-uptake".into(),
+            },
+            reply_start: None,
+            finished: None,
+            quit_failures: 0,
+            delivery_abort: None,
+            recovered_delivery: false,
+        });
+        assert_eq!(reason(&pane).as_deref(), Some("clearing-own-draft"));
+        assert_eq!(own_draft(&pane, &config), Some(17));
+        pane.composer = Composer::Text("$debrief and also this".into());
+        assert_eq!(reason(&pane).as_deref(), Some("draft-present"));
+        assert_eq!(own_draft(&pane, &config), None);
     }
 
     #[tokio::test]

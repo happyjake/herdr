@@ -477,6 +477,34 @@ impl App {
         }
     }
 
+    /// Remove the desk's own untaken invocation from a composer with backspaces,
+    /// sent like the Debrief prompt itself: they move no input or activity clock.
+    /// A few spare presses cover agents that delete a mention as one token.
+    pub(super) fn clear_debrief_draft(&mut self, pane: &str, chars: usize) {
+        let Some((ws, id)) = self.parse_current_public_pane_id(pane) else {
+            return;
+        };
+        let Some((runtime, _)) = self.lookup_runtime(ws, id) else {
+            return;
+        };
+        let keys = vec!["backspace".to_string(); chars.saturating_add(4)];
+        let Ok(encoded) = crate::app::api_helpers::encode_api_keys(runtime, &keys) else {
+            return;
+        };
+        match runtime.queue_input_submission(
+            bytes::Bytes::new(),
+            bytes::Bytes::from(encoded.concat()),
+            bytes::Bytes::new(),
+            Duration::ZERO,
+            None,
+            None,
+            false,
+        ) {
+            Ok(_) => tracing::info!(pane, chars, "auto-close cleared its own untaken Debrief invocation"),
+            Err(error) => tracing::warn!(pane, %error, "auto-close could not clear its Debrief invocation"),
+        }
+    }
+
     fn persist_debrief_input(&mut self, pane: &str, text: String, event: Event) {
         self.flush_logbook();
         if let Some(writer) = &self.logbook_writer {
