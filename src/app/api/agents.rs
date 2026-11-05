@@ -12,6 +12,22 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
+/// Codex opens its skill-mention picker while the composer ends in a `$name` token, and the
+/// picker takes the next Enter to accept the mention instead of submitting the turn. A trailing
+/// space closes the picker first, so the one Enter submits (live codex, 2026-11-05: a bare
+/// `$skill` prompt submitted 0 of 3 times, with the space 3 of 3).
+fn codex_prompt_text(agent: crate::detect::Agent, text: &str) -> std::borrow::Cow<'_, str> {
+    let ends_in_mention = text
+        .rsplit(char::is_whitespace)
+        .next()
+        .is_some_and(|word| word.len() > 1 && word.starts_with('$'));
+    if agent == crate::detect::Agent::Codex && ends_in_mention {
+        std::borrow::Cow::Owned(format!("{text} "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 // Codex's Windows input reader does not surface bracketed paste. It detects the prompt as a
 // "paste burst" and, while that burst is buffered, rewrites a following Enter into a newline
 // instead of submitting. The burst only flushes after an idle timeout, so any size-based delay is
@@ -351,8 +367,8 @@ impl App {
         } else {
             Bytes::new()
         };
-        let (text, enter) =
-            crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
+        let prompt = codex_prompt_text(expected_agent, &params.text);
+        let (text, enter) = crate::app::api_helpers::encode_api_submission_parts(runtime, &prompt);
         #[cfg(windows)]
         let text = if expected_agent == crate::detect::Agent::Codex {
             let mut text = text;
@@ -954,6 +970,45 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
         assert_eq!(error.error.code, "agent_not_found");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn codex_prompt_ending_in_a_skill_mention_gets_a_closing_space() {
+        use super::codex_prompt_text;
+        assert_eq!(codex_prompt_text(Agent::Codex, "$debrief"), "$debrief ");
+        assert_eq!(codex_prompt_text(Agent::Codex, "run $debrief"), "run $debrief ");
+        assert_eq!(codex_prompt_text(Agent::Codex, "$debrief now"), "$debrief now");
+        assert_eq!(codex_prompt_text(Agent::Codex, "costs $"), "costs $");
+        assert_eq!(codex_prompt_text(Agent::Codex, "$debrief "), "$debrief ");
+        assert_eq!(codex_prompt_text(Agent::Claude, "$debrief"), "$debrief");
+        assert_eq!(codex_prompt_text(Agent::Pi, "/skill:debrief"), "/skill:debrief");
+    }
+
+    #[tokio::test]
+    async fn codex_skill_mention_prompt_is_sent_with_a_closing_space() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        let (runtime, mut rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80, 24, 0, b"", 2,
+            );
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let raw = run_deferred_agent_prompt(&mut app, "req", prompt_params("reviewer", "$debrief"));
+        let raw: SuccessResponse = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(raw.result, ResponseResult::AgentPrompted { .. }));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from_static(b"\x1b[200~$debrief \x1b[201~")
+        );
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
     }
 
     #[tokio::test]
