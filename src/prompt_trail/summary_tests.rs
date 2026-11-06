@@ -49,6 +49,71 @@ fn current(text: &str, expected: &str) {
 }
 
 #[test]
+fn numbered_steps_do_not_end_a_later_numbered_exclusion() {
+    for steps in [
+        "1. Rotate the key\n2. Redeploy",
+        "6. Repeat the opener number",
+        "   7. A nested step with a larger number",
+    ] {
+        current(&format!(
+            "1. Primary Request and Intent:\nShip the release.\n2. Key Technical Concepts:\nRust\n6. All user messages:\nHere is the handoff:\n{steps}\n### In Progress\nsynthetic-secret\n7. Pending Tasks:\nnone\n8. Current Work:\nRunning the release checklist.\n9. Optional Next Step:\nTag it."
+        ), "Running the release checklist.");
+    }
+}
+
+#[test]
+fn bold_wrapped_numbers_open_and_end_excluded_sections() {
+    current(
+        "Summary:\n**1. Primary Request and Intent:**\nShip.\n**6. All user messages:**\nquoted handoff\nGoal: synthetic-secret\n**8. Current Work:**\nChecklist.",
+        "Checklist.",
+    );
+}
+
+#[test]
+fn numbered_quoted_messages_cannot_expose_a_plain_current_title() {
+    for (opener, quoted) in [
+        ("6. All user messages:", "1. quoted synthetic-secret"),
+        ("  6. All user messages:", "   8. nested synthetic-secret"),
+    ] {
+        current(&format!(
+            "1. Primary Request and Intent:\nShip.\n{opener}\n{quoted}\nCurrent state: synthetic-secret\n8. Current Work:\nChecklist."
+        ), "Checklist.");
+    }
+}
+
+#[test]
+fn long_excluded_headings_match_the_title_in_their_prefix() {
+    for padding in ["x".repeat(170), "界".repeat(170)] {
+        current(&format!(
+            "1. Primary Request and Intent:\nShip.\n6. All user messages ({padding}):\nquoted text\nCurrent state: synthetic-secret\n8. Current Work:\nChecklist."
+        ), "Checklist.");
+    }
+}
+
+#[test]
+fn plain_current_title_words_in_a_sentence_do_not_select_a_section() {
+    current(
+        "1. Primary Request and Intent:\nShip.\n4. Errors and fixes:\nCurrent state of the database password was synthetic-secret\n8. Current Work:\nChecklist.",
+        "Checklist.",
+    );
+    for heading in ["Current state:", "Current state (as of now):"] {
+        current(&format!("{heading} Checklist."), "Checklist.");
+    }
+}
+
+#[test]
+fn plain_excluded_title_words_in_a_sentence_remain_body_text() {
+    current(
+        "1. Primary Request and Intent:\nKey technical concepts are covered below.\n8. Current Work:\nChecklist.",
+        "Checklist.",
+    );
+    let got = excerpt("1. Primary Request and Intent:\nKey technical concepts are covered below.")
+        .unwrap();
+    assert_eq!(got.kind, TrailSummaryKind::Request);
+    assert_eq!(got.text, "Key technical concepts are covered below.");
+}
+
+#[test]
 fn quoted_markdown_in_user_messages_cannot_replace_current_work() {
     current(
         "This session is being continued from an earlier conversation.\n\nSummary:\n1. Primary Request and Intent:\n   Ship the release.\n2. Key Technical Concepts:\n   - Rust\n6. All user messages:\n   - \"Here is the handoff:\n## Goal\nRotate the key.\n### In Progress\n- synthetic-secret\n   - thanks\n7. Pending Tasks:\n   - none\n8. Current Work:\n   Running the release checklist.\n9. Optional Next Step:\n   Tag it.",
@@ -161,7 +226,7 @@ fn heading_styles_and_indentation_control_section_boundaries() {
         ),
         (
             "**8. Current Work:**\nReal work.\n**9. Optional Next Step:**\nx",
-            None,
+            Some("Real work."),
         ),
         (
             "## 8. Current Work\nReal work.\n## 9. Optional Next Step\nx",

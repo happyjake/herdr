@@ -354,18 +354,24 @@ enum SummarySection {
 }
 
 #[derive(Clone, Copy)]
-enum SummaryStyle {
-    Numbered,
+enum SummaryStyle<'a> {
+    Numbered { number: &'a str, indent: usize },
     Hash(usize),
     Bold(usize),
     Plain,
 }
 
-impl SummaryStyle {
+impl SummaryStyle<'_> {
     /// Nested headings cannot end an excluded section.
     fn ends_exclusion(self, next: Self) -> bool {
         match (self, next) {
-            (Self::Numbered, Self::Numbered) => true,
+            (
+                Self::Numbered { number, indent },
+                Self::Numbered {
+                    number: next_number,
+                    indent: next_indent,
+                },
+            ) => next_indent <= indent && (next_number.len(), next_number) > (number.len(), number),
             (Self::Hash(depth), Self::Hash(next_depth)) => next_depth <= depth,
             (Self::Bold(indent), Self::Bold(next_indent)) => next_indent == indent,
             _ => false,
@@ -374,7 +380,7 @@ impl SummaryStyle {
 }
 
 struct SummaryHeading<'a> {
-    style: SummaryStyle,
+    style: SummaryStyle<'a>,
     section: Option<SummarySection>,
     inline: &'a str,
 }
@@ -390,17 +396,24 @@ fn summary_heading(line: &str) -> Option<SummaryHeading<'_>> {
     if hashes > 0 {
         rest = rest[hashes..].trim_start();
     }
+    let leading_bold = rest.starts_with("**");
+    if leading_bold {
+        rest = rest[2..].trim_start();
+    }
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    let numbered = digits > 0 && rest[digits..].starts_with('.');
-    if numbered {
+    // Canonical decimal strings compare without overflowing on long numbers.
+    let number = (digits > 0 && rest[digits..].starts_with('.'))
+        .then(|| rest[..digits].trim_start_matches('0'));
+    if number.is_some() {
         rest = rest[digits + 1..].trim_start();
     }
     let bold = rest.starts_with("**");
-    let whole_bold = bold && rest.trim_end_matches(':').trim_end().ends_with("**");
+    let whole_bold =
+        (leading_bold || bold) && rest.trim_end_matches(':').trim_end().ends_with("**");
     let style = if hashes > 0 {
         SummaryStyle::Hash(hashes)
-    } else if numbered {
-        SummaryStyle::Numbered
+    } else if let Some(number) = number {
+        SummaryStyle::Numbered { number, indent }
     } else if whole_bold {
         SummaryStyle::Bold(indent)
     } else {
@@ -409,9 +422,20 @@ fn summary_heading(line: &str) -> Option<SummaryHeading<'_>> {
     if bold {
         rest = rest[2..].trim_start();
     }
-    let title = (line.chars().take(161).count() <= 160)
-        .then(|| SUMMARY_TITLE.find(rest))
-        .flatten();
+    let prefix_end = line
+        .char_indices()
+        .nth(160)
+        .map_or(line.len(), |(index, _)| index);
+    let title = line[..prefix_end]
+        .get(line.len() - rest.len()..)
+        .and_then(|prefix| SUMMARY_TITLE.find(prefix))
+        .filter(|title| {
+            hashes > 0
+                || number.is_some()
+                || leading_bold
+                || bold
+                || plain_summary_title_suffix(&rest[title.end()..])
+        });
     let section = title.map(
         |title| match clean(title.as_str()).to_ascii_lowercase().as_str() {
             "current work" | "in progress" | "progress so far" | "current state" => {
@@ -429,6 +453,18 @@ fn summary_heading(line: &str) -> Option<SummaryHeading<'_>> {
         section,
         inline: title.map_or("", |title| summary_inline(&rest[title.end()..])),
     })
+}
+
+/// Unadorned title words need a colon, optionally after a parenthetical annotation.
+fn plain_summary_title_suffix(text: &str) -> bool {
+    let mut tail = text.trim_start();
+    if let Some(annotation) = tail.strip_prefix('(') {
+        let Some((_, after)) = annotation.split_once(')') else {
+            return false;
+        };
+        tail = after.trim_start();
+    }
+    tail.starts_with(':')
 }
 
 /// An annotation describes the heading; prose after its punctuation is body text.
