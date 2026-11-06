@@ -11243,7 +11243,7 @@
                 }
               ],
               "default": null,
-              "description": "The newest compaction summary, with only the selected work or request\nsection (or cleaned head). Null without one and always null for Codex."
+              "description": "A nonempty work or request section from the newest compaction summary.\nNull without an eligible section and always null for Codex."
             },
             "title": {
               "description": "The title the harness wrote for this conversation, when it wrote one\nworth reading. Null for a harness that writes none, and for a\nfallback title that says nothing the prompts do not.",
@@ -13639,12 +13639,20 @@
         },
         "TrailSummaryKind": {
           "description": "The selected source within a compaction summary, in preference order.",
-          "enum": [
-            "current",
-            "request",
-            "head"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "current",
+                "request"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "head",
+              "description": "Retained for wire compatibility; the server never produces this kind.",
+              "type": "string"
+            }
+          ]
         },
         "TurnEnd": {
           "enum": [

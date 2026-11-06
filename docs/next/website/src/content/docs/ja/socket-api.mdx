@@ -130,6 +130,28 @@ macOS と Linux では、このサーバーの外で実行中と判定された�
 バックグラウンドカタログはパス、更新時刻、サイズで記録を再利用し、30 秒ごとに更新します。ワーカーは変更されたログブックを型付きリーダーで順次読み、集約したメタデータをキャッシュします。検索はキャッシュを使い、2 つの許可枠の待機とアプリへのアクティブセッション情報の要求を含めて約 2 秒以内に返します。未完成のカタログや期限切れの走査は、見つかった行と `partial: true` を返します。読めない記録は個別にスキップし、結果を部分的とします。無関係な履歴の行は次の更新を待たずに返します。期限を過ぎた処理も完了するまでは許可枠を保持します。アプリからペイン識別情報を取得できない場合や、実行中セッションの情報を読み取れない場合は `server_unavailable`。古いサーバーは未知のメソッドとして `invalid_request` を返し、能力フラグやプロトコル番号の変更は不要です。
 
 
+`pane.prompt_trail {pane_id}` は `{type:"prompt_trail", pane_id, terminal_id, trail, reason}` を返します。
+`trail` と `reason` は常に存在し、一方だけが設定されます。trail は `agent`（`claude`、`codex`、`pi`）、
+`first`（最初の実際のプロンプト、約 400 コードポイント）、`recent`（最後の 3 件を古い順、各約 240 コードポイント）、
+`earlier`（recent の直前の最大 9 件を古い順、同じ長さで省略）、`summary`、`title`、`count`、Unix 秒の `newest_at` を持ちます。
+各プロンプトは `{text, at}` で、時刻不明なら `at: null` です。earlier と recent の合計は `min(count, 12)` 件です。
+該当なしでも `earlier: []` と `summary: null` を返し、これらを持たない古い記録も読み込めます。
+
+`summary` は最新の Claude または pi のコンパクションから得た `{text, at, kind}` です。
+認識できる空でない作業節（`kind: "current"`）を依頼節（`kind: "request"`）より優先します。
+該当節がなければ null、Codex では常に null です。`head` は互換性のために残りますが、サーバーは生成しません。
+本文は省略記号を含め最大 480 コードポイント、`at` はその記録の Unix 秒か null です。
+コードフェンスの内容、ファイル一覧タグ、継続用メタデータ、および All user messages、Files and Code Sections、
+Key Technical Concepts の各節は返しません。summary はプロンプトとして数えません。
+
+プロンプトはユーザーターンとして入力された内容で、引数付きスラッシュコマンドも `/name args` として数えます。
+Claude の `queued_command` 添付も、`commandMode: "prompt"`、`origin.kind: "human"`、`isMeta` ではない場合に数えます。
+添付行の位置と時刻で `count` と `newest_at` を更新し、`tool_result` と一緒に書かれた同じテキストは再度数えません。
+セッション検索ではキューに入れた依頼をプロンプト履歴から読み、添付を重複して数えません。
+ツール通信、その他の添付、リマインダー、前置きや環境・権限情報、コマンド出力、通知、コンパクション要約はプロンプトではありません。
+
+trail がない理由は `no_session`、`unsupported_agent`、`no_record`、`unreadable` です。不明なペインは `pane_not_found` です。
+
 `pane.turn_index {pane_id}` は pi または agy ペインについて
 `{type:"turn_index", pane_id, terminal_id, index, reason}` を返します。
 `index` と `reason` の一方だけが設定されます。ペインと記録の検索、

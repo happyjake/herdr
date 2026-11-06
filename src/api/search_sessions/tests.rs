@@ -1297,3 +1297,36 @@ fn search_sessions_zstd_skippable_leading_frames_preserve_prompts() {
 fn search_sessions_zstd_skippable_trailing_frames_preserve_prompts() {
     skippable_frames_preserve_session(false);
 }
+
+#[test]
+fn search_sessions_queued_ask_in_history_and_record_is_listed_once() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".claude/projects/project/session-q.jsonl",
+        &[
+            claude_prompt(
+                "session-q",
+                &cwd,
+                "Start tracing",
+                "2026-10-03T00:00:00.000Z",
+            ),
+            json!({"type": "attachment", "sessionId": "session-q", "cwd": cwd,
+                "timestamp": "2026-10-03T00:00:20.000Z",
+                "attachment": {"type": "queued_command", "commandMode": "prompt",
+                    "origin": {"kind": "human"}, "prompt": "Inspect the buffer"}}),
+        ],
+    );
+    // The harness's own prompt history holds both asks, dated when typed.
+    home.write(".claude/history.jsonl", &[
+        json!({"display": "Start tracing", "project": cwd, "sessionId": "session-q", "timestamp": 1790985600000_u64}),
+        json!({"display": "Inspect the buffer", "project": cwd, "sessionId": "session-q", "timestamp": 1790985610000_u64}),
+    ]);
+    home.catalog.refresh();
+    let response = home.search_all(json!({}), vec![]);
+    let row = by_key(&response, "session-q");
+    assert_eq!(
+        row["recent_prompts"],
+        json!(["Start tracing", "Inspect the buffer"])
+    );
+}

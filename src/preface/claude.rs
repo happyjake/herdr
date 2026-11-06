@@ -120,12 +120,9 @@ impl ClaudeReader {
     /// injects toward a goal, another session's message — so only a queued
     /// prompt that names the person as its origin is one.
     fn attachment(&mut self, line: &Value) {
-        let Some(prompt) = crate::prompt_trail::claude_queued_prompt(line) else {
+        let Some((prompt, _)) = crate::prompt_trail::claude_queued_prompt(line) else {
             return;
         };
-        if crate::prompt_trail::prompt_text(PromptTrailAgent::Claude, line).is_none() {
-            return;
-        }
         let raw = raw_text(prompt);
         self.start(line, TurnStart::Prompt, Some(prompt_body(&raw)));
     }

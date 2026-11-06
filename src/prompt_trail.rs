@@ -6,7 +6,8 @@
 //! harness's own title, how many prompts there have been and when the
 //! newest arrived. Human asks queued during Claude work count once, at
 //! their attachment line. The newest Claude or pi compaction contributes
-//! a separate, cleaned summary excerpt, never a prompt. Tool traffic,
+//! a separate, nonempty work or request excerpt when a section is recognized,
+//! never a prompt or an unstructured fallback. Tool traffic,
 //! results and other harness injections do not enter the trail.
 //!
 //! The read is bounded at every step rather than best-effort. The file is
@@ -216,7 +217,7 @@ fn read_lines(
     let mut first_whole = String::new();
     let mut recent: Vec<TrailPrompt> = Vec::with_capacity(RETAINED_PROMPTS);
     let mut title: Option<String> = None;
-    let mut summary: Option<TrailSummary> = None;
+    let mut newest_compaction: Option<(String, Option<u64>)> = None;
     let mut count: u32 = 0;
     let mut newest_at: Option<u64> = None;
     // Whether this record said anything at all, and whether any of it was
@@ -260,9 +261,16 @@ fn read_lines(
             .and_then(Value::as_str)
             .and_then(unix_seconds_from_rfc3339);
         if let Some(text) = compaction_text(agent, &parsed) {
-            summary = Some(summary_excerpt(&text, at));
+            newest_compaction = Some((text, at));
         }
-        let Some(text) = prompt_text(agent, &parsed) else {
+        let text = prompt_text(agent, &parsed).or_else(|| {
+            if agent == PromptTrailAgent::Claude {
+                claude_queued_prompt(&parsed).map(|(_, text)| text)
+            } else {
+                None
+            }
+        });
+        let Some(text) = text else {
             continue;
         };
 
@@ -301,7 +309,7 @@ fn read_lines(
         first,
         earlier: recent,
         recent: last_three,
-        summary,
+        summary: newest_compaction.and_then(|(text, at)| summary_excerpt(&text, at)),
         title,
         count,
         newest_at,
@@ -314,28 +322,28 @@ fn compaction_text(agent: PromptTrailAgent, line: &Value) -> Option<String> {
             if line.get("type").and_then(Value::as_str) == Some("user")
                 && flag(line, "isCompactSummary") =>
         {
-            line.pointer("/message/content")?
+            line.pointer("/message/content").unwrap_or(&Value::Null)
         }
         PromptTrailAgent::Pi if line.get("type").and_then(Value::as_str) == Some("compaction") => {
-            return line.get("summary")?.as_str().map(str::to_string);
+            return Some(
+                line.get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
         }
         _ => return None,
     };
     match content {
         Value::String(text) => Some(text.clone()),
         Value::Array(blocks) => Some(join_text_blocks(blocks, "text")),
-        _ => None,
+        _ => Some(String::new()),
     }
 }
 
-static SUMMARY_HEADING: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^\s*(?:#{1,4}\s*|\d{1,2}\.\s*)?\**\s*(Current Work|In Progress|Progress So Far|Current state|Primary Request and Intent|Goal|Original Request|All user messages|Files and Code Sections|Key Technical Concepts)\s*:?\**:?\s*$")
-        .expect("valid summary heading pattern")
-});
-
-static SUMMARY_BOUNDARY: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"^(?:[ \t]{0,3}(?:#|\d+\.)|\s*\*\*.+\*\*\s*$)")
-        .expect("valid summary boundary pattern")
+static SUMMARY_TITLE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^(Current\s+Work|In\s+Progress|Progress\s+So\s+Far|Current\s+state|Primary\s+Request\s+and\s+Intent|Goal|Original\s+Request|All\s+user\s+messages|Files\s+and\s+Code\s+Sections|Key\s+Technical\s+Concepts)\b")
+        .expect("valid summary title pattern")
 });
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -345,81 +353,170 @@ enum SummarySection {
     Omit,
 }
 
-fn summary_heading(line: &str) -> Option<SummarySection> {
-    if line.chars().count() > 80 {
+#[derive(Clone, Copy)]
+enum SummaryStyle {
+    Numbered,
+    Hash(usize),
+    Bold(usize),
+    Plain,
+}
+
+impl SummaryStyle {
+    /// Nested headings cannot end an excluded section.
+    fn ends_exclusion(self, next: Self) -> bool {
+        match (self, next) {
+            (Self::Numbered, Self::Numbered) => true,
+            (Self::Hash(depth), Self::Hash(next_depth)) => next_depth <= depth,
+            (Self::Bold(indent), Self::Bold(next_indent)) => next_indent == indent,
+            _ => false,
+        }
+    }
+}
+
+struct SummaryHeading<'a> {
+    style: SummaryStyle,
+    section: Option<SummarySection>,
+    inline: &'a str,
+}
+
+/// Structural headings also end allowed bodies when their title is unknown.
+fn summary_heading(line: &str) -> Option<SummaryHeading<'_>> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
         return None;
     }
-    let heading = SUMMARY_HEADING.captures(line)?.get(1)?.as_str();
-    Some(match heading.to_ascii_lowercase().as_str() {
-        "current work" | "in progress" | "progress so far" | "current state" => {
-            SummarySection::Current
-        }
-        "primary request and intent" | "goal" | "original request" => SummarySection::Request,
-        _ => SummarySection::Omit,
+    let mut rest = &line[indent..];
+    let hashes = rest.bytes().take_while(|byte| *byte == b'#').count();
+    if hashes > 0 {
+        rest = rest[hashes..].trim_start();
+    }
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let numbered = digits > 0 && rest[digits..].starts_with('.');
+    if numbered {
+        rest = rest[digits + 1..].trim_start();
+    }
+    let bold = rest.starts_with("**");
+    let whole_bold = bold && rest.trim_end_matches(':').trim_end().ends_with("**");
+    let style = if hashes > 0 {
+        SummaryStyle::Hash(hashes)
+    } else if numbered {
+        SummaryStyle::Numbered
+    } else if whole_bold {
+        SummaryStyle::Bold(indent)
+    } else {
+        SummaryStyle::Plain
+    };
+    if bold {
+        rest = rest[2..].trim_start();
+    }
+    let title = (line.chars().take(161).count() <= 160)
+        .then(|| SUMMARY_TITLE.find(rest))
+        .flatten();
+    let section = title.map(
+        |title| match clean(title.as_str()).to_ascii_lowercase().as_str() {
+            "current work" | "in progress" | "progress so far" | "current state" => {
+                SummarySection::Current
+            }
+            "primary request and intent" | "goal" | "original request" => SummarySection::Request,
+            _ => SummarySection::Omit,
+        },
+    );
+    if section.is_none() && matches!(style, SummaryStyle::Plain) {
+        return None;
+    }
+    Some(SummaryHeading {
+        style,
+        section,
+        inline: title.map_or("", |title| summary_inline(&rest[title.end()..])),
     })
 }
 
-/// Remove excluded sections before selecting even a fallback excerpt.
-fn summary_excerpt(text: &str, at: Option<u64>) -> TrailSummary {
-    let cleaned = summary_prose(text);
-    let mut omitted = false;
-    let lines: Vec<_> = cleaned
-        .lines()
-        .filter(|line| {
-            let heading = summary_heading(line);
-            if SUMMARY_BOUNDARY.is_match(line) || heading == Some(SummarySection::Omit) {
-                omitted = heading == Some(SummarySection::Omit);
-            }
-            !omitted
-        })
-        .collect();
-    let mut body = lines.as_slice();
-    let mut kind = TrailSummaryKind::Head;
-    for (section, selected_kind) in [
-        (SummarySection::Current, TrailSummaryKind::Current),
-        (SummarySection::Request, TrailSummaryKind::Request),
-    ] {
-        if let Some(start) = lines
-            .iter()
-            .position(|line| summary_heading(line) == Some(section))
-        {
-            body = &lines[start + 1..];
-            let end = body
-                .iter()
-                .position(|line| SUMMARY_BOUNDARY.is_match(line))
-                .unwrap_or(body.len());
-            body = &body[..end];
-            kind = selected_kind;
-            break;
-        }
+/// An annotation describes the heading; prose after its punctuation is body text.
+fn summary_inline(mut text: &str) -> &str {
+    loop {
+        text =
+            text.trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '.' | '*'));
+        let closing = match text.chars().next() {
+            Some('(') => ')',
+            Some('[') => ']',
+            _ => return text,
+        };
+        let Some(end) = text.find(closing) else {
+            return "";
+        };
+        text = &text[end + 1..];
     }
-    let prose = body
+}
+
+/// Only nonempty allowed sections outside excluded extents may be served.
+fn summary_excerpt(text: &str, at: Option<u64>) -> Option<TrailSummary> {
+    #[cfg(test)]
+    summary_tests::EXTRACTIONS.with(|count| count.set(count.get() + 1));
+
+    let cleaned = summary_prose(text);
+    let lines: Vec<_> = cleaned.lines().collect();
+    let headings: Vec<_> = lines
         .iter()
-        .map(|line| {
-            let line = line.trim();
-            let line = line
-                .strip_prefix("- ")
-                .or_else(|| line.strip_prefix("* "))
-                .or_else(|| line.strip_prefix("+ "))
-                .unwrap_or(line);
-            line.replace("**", "")
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let text = clean(&prose);
-    let text = if text.chars().count() > SUMMARY_CHARS {
-        cut(&text, SUMMARY_CHARS - 1)
-    } else {
-        text
-    };
-    TrailSummary { text, at, kind }
+        .enumerate()
+        .filter_map(|(index, line)| summary_heading(line).map(|heading| (index, heading)))
+        .collect();
+    let mut excluded: Option<SummaryStyle> = None;
+    let mut request = None;
+    for (position, (start, heading)) in headings.iter().enumerate() {
+        if let Some(style) = excluded {
+            if !style.ends_exclusion(heading.style) {
+                continue;
+            }
+            excluded = None;
+        }
+        let kind = match heading.section {
+            Some(SummarySection::Omit) => {
+                excluded = Some(heading.style);
+                continue;
+            }
+            Some(SummarySection::Current) => TrailSummaryKind::Current,
+            Some(SummarySection::Request) if request.is_none() => TrailSummaryKind::Request,
+            _ => continue,
+        };
+        let end = headings
+            .get(position + 1)
+            .map_or(lines.len(), |(index, _)| *index);
+        let prose = std::iter::once(heading.inline)
+            .chain(lines[start + 1..end].iter().copied())
+            .map(|line| {
+                let line = line.trim();
+                let line = line
+                    .strip_prefix("- ")
+                    .or_else(|| line.strip_prefix("* "))
+                    .or_else(|| line.strip_prefix("+ "))
+                    .unwrap_or(line);
+                line.replace("**", "")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = clean(&prose);
+        if text.is_empty() {
+            continue;
+        }
+        let text = if text.chars().count() > SUMMARY_CHARS {
+            cut(&text, SUMMARY_CHARS - 1)
+        } else {
+            text
+        };
+        let summary = TrailSummary { text, at, kind };
+        if kind == TrailSummaryKind::Current {
+            return Some(summary);
+        }
+        request = Some(summary);
+    }
+    request
 }
 
 /// Keep line breaks until sections have been selected. Fenced contents are
 /// discarded here so headings inside code cannot select or terminate a section.
 fn summary_prose(text: &str) -> String {
     let mut text = text.replace("\r\n", "\n");
-    for tag in ["system-reminder", "modified-files"] {
+    for tag in ["system-reminder", "modified-files", "read-files"] {
         text = without_summary_element(&text, tag);
     }
     text = text.replace("<summary>", "").replace("</summary>", "");
@@ -436,8 +533,14 @@ fn summary_prose(text: &str) -> String {
     for line in rest.lines() {
         let trimmed = line.trim();
         if preamble {
-            preamble = !trimmed.is_empty();
-            continue;
+            if trimmed.is_empty() {
+                preamble = false;
+                continue;
+            }
+            if summary_heading(line).is_none() {
+                continue;
+            }
+            preamble = false;
         }
         let marker = trimmed.chars().next().unwrap_or(' ');
         let width = trimmed.chars().take_while(|ch| *ch == marker).count();
@@ -447,8 +550,18 @@ fn summary_prose(text: &str) -> String {
             }
             continue;
         }
-        if matches!(marker, '`' | '~') && width >= 3 {
+        if matches!(marker, '`' | '~')
+            && width >= 3
+            && !trimmed[width..].contains(&trimmed[..width])
+        {
             fence = Some((marker, width));
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("read the full transcript at:")
+            || lower.starts_with("continue the conversation")
+            || lower.starts_with("please continue the conversation")
+        {
             continue;
         }
         prose.push_str(line);
@@ -475,7 +588,8 @@ fn without_summary_element(text: &str, tag: &str) -> String {
     kept
 }
 
-/// What one line of a record says was asked, when it says anything.
+/// A prompt on a line of its own. Queued attachments have a separate reader
+/// because session search already reads those asks from prompt history.
 pub(crate) fn prompt_text(agent: PromptTrailAgent, line: &Value) -> Option<String> {
     match agent {
         PromptTrailAgent::Claude => claude_prompt(line),
@@ -486,9 +600,6 @@ pub(crate) fn prompt_text(agent: PromptTrailAgent, line: &Value) -> Option<Strin
 }
 
 fn claude_prompt(line: &Value) -> Option<String> {
-    if line.get("type").and_then(Value::as_str) == Some("attachment") {
-        return claude_prompt_content(claude_queued_prompt(line)?);
-    }
     if line.get("type")?.as_str()? != "user" {
         return None;
     }
@@ -505,9 +616,10 @@ fn claude_prompt(line: &Value) -> Option<String> {
     claude_prompt_content(message.get("content")?)
 }
 
-/// The content of a human ask queued while Claude was working. Both record
-/// readers use this envelope predicate and judge its content with `prompt_text`.
-pub(crate) fn claude_queued_prompt(line: &Value) -> Option<&Value> {
+/// A human ask queued while Claude was working, judged like a standalone
+/// prompt. The trail uses the cleaned text; preface preserves the raw content.
+/// Session search reads queued asks from prompt history instead.
+pub(crate) fn claude_queued_prompt(line: &Value) -> Option<(&Value, String)> {
     let attachment = line.get("attachment")?;
     if line.get("type").and_then(Value::as_str) != Some("attachment")
         || flag(line, "isMeta")
@@ -518,7 +630,8 @@ pub(crate) fn claude_queued_prompt(line: &Value) -> Option<&Value> {
     {
         return None;
     }
-    attachment.get("prompt")
+    let content = attachment.get("prompt")?;
+    Some((content, claude_prompt_content(content)?))
 }
 
 fn claude_prompt_content(content: &Value) -> Option<String> {
@@ -1281,10 +1394,7 @@ pub(crate) mod tests {
         let record = lines(&[compact]);
         let trail =
             read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
-        assert_eq!(
-            trail.summary.unwrap().text,
-            "7. Pending Tasks: Check boundaries."
-        );
+        assert_eq!(trail.summary, None);
     }
 
     #[test]
@@ -1331,7 +1441,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn summary_fallback_removes_the_preamble_and_ignores_headings_in_code() {
+    fn unknown_sections_do_not_select_headings_inside_code() {
         let mut compact = claude_user(
             "<system-reminder>hidden</system-reminder>\nThis session is being continued from earlier.\nMore preamble.\n \nSummary:\n<summary>## Who and what\nMaintain the parser.\n````markdown\n## Current Work\ncode-only work\n```\nstill code\n````\n## Notes\n- Check boundaries.\n</summary>",
             "undated",
@@ -1340,14 +1450,7 @@ pub(crate) mod tests {
         let record = lines(&[compact]);
         let trail =
             read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
-        assert_eq!(
-            trail.summary,
-            Some(TrailSummary {
-                text: "## Who and what Maintain the parser. ## Notes Check boundaries.".into(),
-                at: None,
-                kind: TrailSummaryKind::Head,
-            })
-        );
+        assert_eq!(trail.summary, None);
     }
 
     #[test]
@@ -1401,11 +1504,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn claude_summary_cleans_wrappers_and_prefers_work_then_request_then_head() {
+    fn claude_summary_cleans_wrappers_and_prefers_work_then_request() {
         for (text, kind, expected) in [
             ("<system-reminder>hidden preamble</system-reminder>\nThis session is being continued from an earlier conversation.\nAnother preamble line.\n\nSummary:\n<summary>\n1. Primary Request and Intent:\nTrace the parser.\n8. Current Work:\n* Repair **streaming**.\n~~~rust\nhidden code\n~~~\n9. Next Step:\nOther work.\n</summary>", "current", "Repair streaming."),
             ("1. Primary Request and Intent:\nTrace the parser.\n2. Key Technical Concepts:\ninternal concepts\n3. Files and Code Sections:\ninternal files\n4. Errors and fixes:\nnone\n5. Problem Solving:\nanalysis\n6. All user messages:\nsynthetic-secret\n7. Pending Tasks:\nmore work", "request", "Trace the parser."),
-            ("Summary:\n<summary>\n## Who and what\nMaintain **streaming**.\n## Notes\n- Check boundaries.\n6. **All user messages:**\nsynthetic-secret\n7. **Files and Code Sections:**\ninternal files\n8. **Key Technical Concepts:**\ninternal concepts\n</summary>", "head", "## Who and what Maintain streaming. ## Notes Check boundaries."),
+            ("Summary:\n<summary>\n## Who and what\nMaintain **streaming**.\n## Notes\n- Check boundaries.\n6. **All user messages:**\nsynthetic-secret\n7. **Files and Code Sections:**\ninternal files\n8. **Key Technical Concepts:**\ninternal concepts\n</summary>", "none", ""),
             ("## Goal\nInitial goal.\n## Current state\nFirst work.\n## Current Work\nLater work.", "current", "First work."),
         ] {
             let mut compact = claude_user(text, "2026-03-04T09:15:00Z");
@@ -1414,9 +1517,9 @@ pub(crate) mod tests {
             let trail = read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
             assert_eq!(trail.count, 0);
             let wire = serde_json::to_value(trail).unwrap();
-            assert_eq!(wire["summary"], serde_json::json!({
+            assert_eq!(wire["summary"], if kind == "none" { Value::Null } else { serde_json::json!({
                 "text": expected, "at": 1772615700, "kind": kind
-            }), "{text}");
+            }) }, "{text}");
         }
     }
 
@@ -2323,3 +2426,7 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "prompt_trail/summary_tests.rs"]
+mod summary_tests;

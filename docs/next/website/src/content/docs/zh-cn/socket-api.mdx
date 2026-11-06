@@ -130,6 +130,28 @@ Claude 的 `<project>/<sessionId>/subagents/agent-*.jsonl`、Codex 的 `session_
 后台目录按路径、修改时间和大小复用记录，每 30 秒刷新。后台通过类型化读取器流式读取已变化的日志簿，并缓存折叠后的元数据。查询使用缓存快照，约 2 秒的预算包含等待两个并发名额之一和请求应用的活动会话快照。目录尚未完成或扫描超时，会返回已找到的行及 `partial: true`。无法读取的记录会被单独跳过，并将结果标为部分结果；无关的历史行仍可直接返回，无需等待下一次刷新。超时工作在真正结束前仍占用名额。应用不能提供窗格身份或无法读取运行会话信息时返回 `server_unavailable`。旧服务器按未知方法返回 `invalid_request`，无需能力标志或协议版本升级。
 
 
+`pane.prompt_trail {pane_id}` 返回 `{type:"prompt_trail", pane_id, terminal_id, trail, reason}`。
+`trail` 和 `reason` 始终存在，恰有一个非空。trail 包含 `agent`（`claude`、`codex`、`pi`）、
+`first`（第一个真实提示，截到约 400 个码点）、`recent`（最后三个提示，按时间从旧到新，每条约 240 个码点）、
+`earlier`（紧邻 recent 之前的最多九条提示，按时间从旧到新，截断规则相同）、`summary`、`title`、`count` 和 Unix 秒的 `newest_at`。
+每条提示为 `{text, at}`，时间未知时 `at: null`。earlier 与 recent 的总条数为 `min(count, 12)`。
+即使没有内容，也始终返回 `earlier: []` 和 `summary: null`；省略这两个字段的旧记录仍可反序列化。
+
+`summary` 为最新一条 Claude 或 pi 压缩记录中的 `{text, at, kind}`。
+只返回可识别且非空的当前工作节（`kind: "current"`）或原始请求节（`kind: "request"`），优先选择当前工作。
+没有符合条件的节时返回 null，Codex 始终返回 null。`head` 为保持协议兼容而保留，但服务器不再生成该值。
+正文包括省略号在内最多 480 个码点，`at` 是该条记录的 Unix 秒，或 null。
+代码围栏及其内容、文件列表标签、继续会话的元数据，以及 All user messages、Files and Code Sections、
+Key Technical Concepts 各节均不返回。summary 不计入提示数量。
+
+提示是以用户回合输入的内容；带参数的斜杠命令也计入，并还原为 `/name args`。
+Claude 的 `queued_command` 附件在 `commandMode: "prompt"`、`origin.kind: "human"` 且不是 `isMeta` 时也计入。
+它使用附件行的位置和时间更新 `count` 与 `newest_at`；与 `tool_result` 一起出现的同一段文本仍跳过，避免重复计数。
+会话搜索从提示历史中读取这些排队请求，不再次计入附件。
+工具通信、其他附件、提醒、前言、环境或权限上下文、命令输出、通知及压缩摘要均不是提示。
+
+没有 trail 的原因包括 `no_session`、`unsupported_agent`、`no_record` 和 `unreadable`。未知窗格返回 `pane_not_found`。
+
 `pane.turn_index {pane_id}` 为 pi 或 agy 窗格返回
 `{type:"turn_index", pane_id, terminal_id, index, reason}`。
 `index` 和 `reason` 恰有一个非空。窗格、记录查找及原因与 prompt trail 共用：

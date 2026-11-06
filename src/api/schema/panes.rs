@@ -857,8 +857,8 @@ pub struct PromptTrail {
     /// prompts; the first prompt appears in either window when it falls there.
     #[serde(default)]
     pub earlier: Vec<TrailPrompt>,
-    /// The newest compaction summary, with only the selected work or request
-    /// section (or cleaned head). Null without one and always null for Codex.
+    /// A nonempty work or request section from the newest compaction summary.
+    /// Null without an eligible section and always null for Codex.
     #[serde(default)]
     pub summary: Option<TrailSummary>,
     /// The title the harness wrote for this conversation, when it wrote one
@@ -901,6 +901,7 @@ pub struct TrailSummary {
 pub enum TrailSummaryKind {
     Current,
     Request,
+    /// Retained for wire compatibility; the server never produces this kind.
     Head,
 }
 
