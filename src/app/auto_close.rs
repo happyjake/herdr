@@ -560,9 +560,11 @@ fn debrief_waits(
     plan
 }
 
+/// A kind's Debrief gate. The gate is opt-in: with no command configured the
+/// Debrief runs; a configured command opens it by exiting 0.
 async fn gate(command: &str, timeout_secs: u64) -> Result<(), &'static str> {
     if command.trim().is_empty() {
-        return Err("gate-closed");
+        return Ok(());
     }
     let mut process = crate::platform::detached_custom_command_process(command);
     process
@@ -1864,6 +1866,24 @@ mod tests {
         pane.composer = Composer::Text("$debrief and also this".into());
         assert_eq!(reason(&pane).as_deref(), Some("draft-present"));
         assert_eq!(own_draft(&pane, &config), None);
+    }
+
+    #[tokio::test]
+    async fn auto_close_debrief_gate_is_opt_in() {
+        // No gate configured: Debrief must not depend on any quota tool being installed.
+        assert_eq!(gate("", 5).await, Ok(()));
+        assert_eq!(gate("   ", 5).await, Ok(()));
+        // A configured gate keeps its meaning: exit 0 opens, anything else closes.
+        assert_eq!(gate("exit 0", 5).await, Ok(()));
+        assert_eq!(gate("exit 3", 5).await, Err("gate-closed"));
+        assert_eq!(
+            gate("herdr-test-no-such-quota-tool --debrief-gate pi", 5).await,
+            Err("gate-closed")
+        );
+        let defaults = Config::default();
+        for kind in [&defaults.claude, &defaults.codex, &defaults.pi] {
+            assert_eq!(kind.gate_command, "", "the default Debrief has no gate");
+        }
     }
 
     #[tokio::test]

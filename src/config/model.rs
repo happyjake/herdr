@@ -418,17 +418,17 @@ impl Default for AutoCloseConfig {
             quit_grace_secs: 60,
             gate_timeout_secs: 10,
             claude: AutoCloseKindConfig {
-                gate_command: "usage --debrief-gate claude".into(),
+                gate_command: String::new(),
                 invocation: "/debrief".into(),
                 limit_secs: 600,
             },
             codex: AutoCloseKindConfig {
-                gate_command: "usage --debrief-gate codex".into(),
+                gate_command: String::new(),
                 invocation: "$debrief".into(),
                 limit_secs: 900,
             },
             pi: AutoCloseKindConfig {
-                gate_command: "usage --debrief-gate pi".into(),
+                gate_command: String::new(),
                 // pi passes `/skill:<name>` through as bare text when its session
                 // started before the skill was installed; the sentence that follows
                 // points such a session at the skill file.

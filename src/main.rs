@@ -433,17 +433,17 @@ quit_grace_secs = 60
 gate_timeout_secs = 10
 
 [auto_close.claude]
-gate_command = "usage --debrief-gate claude"
+gate_command = ""                     # empty: no gate; e.g. "usage --debrief-gate claude"
 invocation = "/debrief"
 limit_secs = 600
 
 [auto_close.codex]
-gate_command = "usage --debrief-gate codex"
+gate_command = ""                     # empty: no gate; e.g. "usage --debrief-gate codex"
 invocation = "$debrief"
 limit_secs = 900
 
 [auto_close.pi]
-gate_command = "usage --debrief-gate pi"
+gate_command = ""                     # empty: no gate; e.g. "usage --debrief-gate pi"
 invocation = "/skill:debrief If the debrief skill is not loaded in this session, read ~/.agents/skills/debrief/SKILL.md and follow it now."
 limit_secs = 600
 
