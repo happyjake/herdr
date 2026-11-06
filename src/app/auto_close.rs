@@ -185,6 +185,8 @@ struct PaneSnapshot {
     group_refusal: bool,
     group_members: Vec<String>,
     bare_prompt: bool,
+    /// The pane's restore failed (its directory is gone): no process runs in it.
+    restore_failed: bool,
     starter: Option<String>,
     session: Option<CloseSession>,
     debrief: Option<Debrief>,
@@ -204,6 +206,7 @@ impl PaneSnapshot {
             && self.agent == other.agent
             && self.ended == other.ended
             && self.ended_at == other.ended_at
+            && self.restore_failed == other.restore_failed
             && self.pinned == other.pinned
             && self.flagged == other.flagged
             && self.desk_focused == other.desk_focused
@@ -438,7 +441,7 @@ fn decide(
         if pane.seen_agent && !pane.ended {
             return Err("agent-history");
         }
-        if !pane.bare_prompt {
+        if !pane.bare_prompt && !pane.restore_failed {
             return Err("not-bare-prompt");
         }
         if pane.ended {
@@ -1051,6 +1054,7 @@ impl App {
                         group_refusal,
                         group_members: group_members.clone(),
                         bare_prompt: facts.is_some_and(|facts| facts.bare_prompt),
+                        restore_failed: runtime.is_none() && terminal.restore_error.is_some(),
                         starter: terminal.started_by.as_ref().and_then(live_starter),
                         session: self.state.logbook_key(id).map(|key| CloseSession {
                             agent: key.agent,
@@ -1489,6 +1493,7 @@ mod tests {
             group_refusal: false,
             group_members: Vec::new(),
             bare_prompt: true,
+            restore_failed: false,
             starter: None,
             session: None,
             debrief: None,
@@ -1569,6 +1574,42 @@ mod tests {
         let candidate = decide(&pane, &[], &config, 135).unwrap();
         assert_eq!(candidate.kind, Kind::Ended);
         assert_eq!(candidate.age_secs, 10);
+    }
+
+    #[test]
+    fn auto_close_a_pane_whose_restore_failed_closes_as_a_bare_prompt() {
+        let config = Config {
+            ended_age_secs: 10,
+            plain_shell_age_secs: 20,
+            ..Config::default()
+        };
+        // No process runs in a pane whose saved directory is gone, so the probe
+        // cannot report a bare prompt; nothing runs there either.
+        let mut pane = shell();
+        pane.bare_prompt = false;
+        pane.restore_failed = true;
+        pane.ended = true;
+        pane.ended_at = Some(100);
+        assert_eq!(decide(&pane, &[], &config, 109), Err("too-young"));
+        let candidate = decide(&pane, &[], &config, 110).unwrap();
+        assert_eq!(candidate.kind, Kind::Ended);
+        pane.ended = false;
+        pane.ended_at = None;
+        assert_eq!(decide(&pane, &[], &config, 119), Err("too-young"));
+        assert_eq!(
+            decide(&pane, &[], &config, 120).unwrap().kind,
+            Kind::PlainShell
+        );
+        // Every other exemption still holds for it.
+        pane.pinned = true;
+        assert_eq!(decide(&pane, &[], &config, 120), Err("pinned"));
+        pane.pinned = false;
+        pane.seen_agent = true;
+        assert_eq!(decide(&pane, &[], &config, 120), Err("agent-history"));
+        // A live pane that is not at a bare prompt is still spared.
+        pane.seen_agent = false;
+        pane.restore_failed = false;
+        assert_eq!(decide(&pane, &[], &config, 120), Err("not-bare-prompt"));
     }
 
     #[test]

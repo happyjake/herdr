@@ -440,6 +440,13 @@ fn restore_workspace(
     )
 }
 
+/// An ended pane's end date as restored. A pane that ended before the date was
+/// persisted has none saved; the restore time stands in for it, the latest the
+/// agent can have left, so the ended clock never starts before the truth.
+fn restored_ended_at(ended_agent: Option<&String>, saved: Option<u64>) -> Option<u64> {
+    ended_agent.map(|_| saved.unwrap_or_else(crate::pane::unix_now_secs))
+}
+
 fn unavailable_restored_terminal(
     pane: Option<&super::snapshot::PaneSnapshot>,
     cwd: PathBuf,
@@ -456,7 +463,7 @@ fn unavailable_restored_terminal(
             .filter(|_| terminal.manual_label.is_some());
         terminal.restore_flag(pane.flag.clone(), pane.flag_set_through);
         terminal.ended_agent = pane.ended_agent.clone();
-        terminal.ended_at = pane.ended_at.filter(|_| terminal.ended_agent.is_some());
+        terminal.ended_at = restored_ended_at(terminal.ended_agent.as_ref(), pane.ended_at);
         terminal.input_or_command_at = pane
             .input_or_command_at
             .unwrap_or(terminal.input_or_command_at);
@@ -693,9 +700,10 @@ fn restore_tab(
             terminal.set_pinned(saved_pinned);
             terminal.restore_flag(saved_flag, saved_flag_set_through);
             terminal.ended_agent = saved_pane.and_then(|pane| pane.ended_agent.clone());
-            terminal.ended_at = saved_pane
-                .and_then(|pane| pane.ended_at)
-                .filter(|_| terminal.ended_agent.is_some());
+            terminal.ended_at = restored_ended_at(
+                terminal.ended_agent.as_ref(),
+                saved_pane.and_then(|pane| pane.ended_at),
+            );
             terminal.input_or_command_at = saved_pane
                 .and_then(|pane| pane.input_or_command_at)
                 .unwrap_or(terminal.input_or_command_at);
@@ -809,9 +817,10 @@ fn restore_tab(
                 terminal.set_pinned(saved_pinned);
                 terminal.restore_flag(saved_flag, saved_flag_set_through);
                 terminal.ended_agent = saved_pane.and_then(|pane| pane.ended_agent.clone());
-                terminal.ended_at = saved_pane
-                    .and_then(|pane| pane.ended_at)
-                    .filter(|_| terminal.ended_agent.is_some());
+                terminal.ended_at = restored_ended_at(
+                    terminal.ended_agent.as_ref(),
+                    saved_pane.and_then(|pane| pane.ended_at),
+                );
                 terminal.input_or_command_at = saved_pane
                     .and_then(|pane| pane.input_or_command_at)
                     .unwrap_or(terminal.input_or_command_at);
@@ -2482,17 +2491,96 @@ mod tests {
     }
 
     #[test]
-    fn ended_at_unavailable_restore_preserves_known_and_missing_dates() {
+    fn ended_at_unavailable_restore_keeps_a_known_date_and_stamps_a_missing_one() {
         for ended_at in [None, Some(123)] {
             let mut value = serde_json::json!({"cwd":"/missing-checkout","ended_agent":"pi"});
             if let Some(at) = ended_at {
                 value["ended_at"] = at.into();
             }
             let pane: super::super::snapshot::PaneSnapshot = serde_json::from_value(value).unwrap();
+            let before = crate::pane::unix_now_secs();
             let terminal =
                 unavailable_restored_terminal(Some(&pane), pane.cwd.clone(), "unavailable".into());
             assert_eq!(terminal.ended_agent.as_deref(), Some("pi"));
-            assert_eq!(terminal.ended_at, ended_at);
+            match ended_at {
+                Some(at) => assert_eq!(terminal.ended_at, Some(at)),
+                // A legacy pane ended before the date was persisted: the restore
+                // time is the latest the agent can have left, so the ended clock
+                // starts no earlier than the truth.
+                None => assert!(terminal.ended_at.is_some_and(|at| at >= before)),
+            }
+        }
+        let pane: super::super::snapshot::PaneSnapshot =
+            serde_json::from_value(serde_json::json!({"cwd":"/missing-checkout"})).unwrap();
+        let terminal =
+            unavailable_restored_terminal(Some(&pane), pane.cwd.clone(), "unavailable".into());
+        assert_eq!(
+            terminal.ended_at, None,
+            "a pane that never ended gets no date"
+        );
+    }
+
+    #[tokio::test]
+    async fn ended_at_live_restore_keeps_a_known_date_and_stamps_a_missing_one() {
+        for ended_at in [None, Some(123)] {
+            let mut value = serde_json::json!({
+                "cwd": std::env::current_dir().unwrap(),
+                "ended_agent": "codex",
+            });
+            if let Some(at) = ended_at {
+                value["ended_at"] = at.into();
+            }
+            let pane: super::super::snapshot::PaneSnapshot = serde_json::from_value(value).unwrap();
+            let cwd = pane.cwd.clone();
+            let snapshot = SessionSnapshot {
+                version: super::super::snapshot::SNAPSHOT_VERSION,
+                workspaces: vec![WorkspaceSnapshot {
+                    id: Some("workspace".into()),
+                    custom_name: None,
+                    identity_cwd: cwd,
+                    worktree_space: None,
+                    public_pane_numbers: HashMap::new(),
+                    next_public_pane_number: 0,
+                    public_tab_numbers: Vec::new(),
+                    next_public_tab_number: 0,
+                    tabs: vec![TabSnapshot {
+                        custom_name: None,
+                        layout: LayoutSnapshot::Pane(0),
+                        panes: HashMap::from([(0, pane)]),
+                        zoomed: false,
+                        focused: Some(0),
+                        root_pane: Some(0),
+                    }],
+                    active_tab: 0,
+                }],
+                active: Some(0),
+                selected: 0,
+                sidebar_width: None,
+                sidebar_section_split: None,
+                collapsed_space_keys: Default::default(),
+            };
+            let (events, _event_rx) = mpsc::channel(4);
+            let before = crate::pane::unix_now_secs();
+            let (_workspaces, terminals, _runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            let terminal = terminals.values().next().expect("restored terminal");
+            assert!(terminal.restore_error.is_none());
+            assert_eq!(terminal.ended_agent.as_deref(), Some("codex"));
+            match ended_at {
+                Some(at) => assert_eq!(terminal.ended_at, Some(at)),
+                None => assert!(terminal.ended_at.is_some_and(|at| at >= before)),
+            }
         }
     }
 
