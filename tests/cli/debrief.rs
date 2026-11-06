@@ -1,6 +1,10 @@
 use super::harness::*;
 use serde_json::{json, Value};
 
+/// What a pi Debrief types with no invocation configured: since #730 the
+/// default names the skill file for a session that never loaded the skill.
+const PI_INVOCATION: &str = "/skill:debrief If the debrief skill is not loaded in this session, read ~/.agents/skills/debrief/SKILL.md and follow it now.";
+
 struct Session {
     base: PathBuf,
     socket: PathBuf,
@@ -281,6 +285,7 @@ fn scripted_agent() {
         assert!(response.get("error").is_none(), "{response}");
     };
     println!("debrief v2: 3 memories saved");
+    println!("{}", crate::support::empty_composer(&agent));
     std::io::stdout().flush().unwrap();
     report("idle");
     fs::write(base.join("ready"), "ready").unwrap();
@@ -435,7 +440,7 @@ fn debrief_finishes_quietly_then_quits_and_records_the_last_sentinel() {
     );
     assert_eq!(
         fs::read_to_string(session.base.join("received")).unwrap(),
-        "/skill:debrief\n/quit\n"
+        format!("{PI_INVOCATION}\n/quit\n")
     );
     assert!(session.request("pane.list", json!({}))["panes"]
         .as_array()
@@ -613,7 +618,7 @@ fn debrief_live_handoff_waits_for_the_original_reply_without_reprompting() {
     assert_eq!(session.sent(), 1);
     assert_eq!(
         fs::read_to_string(session.base.join("received")).unwrap(),
-        "/skill:debrief\n/quit\n"
+        format!("{PI_INVOCATION}\n/quit\n")
     );
 }
 
@@ -890,10 +895,13 @@ fn debrief_cancelled_backpressured_prompts_cannot_run_after_the_next_agent_start
         Duration::from_millis(50),
         || session.base.join("second/received").exists()
     ));
-    assert_eq!(
-        session.request("pane.get", json!({"pane_id":second}))["pane"]["agent_status"],
-        "working"
-    );
+    // The agent writes `received` before it reports working.
+    assert!(wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+        || session.request("pane.get", json!({"pane_id":second}))["pane"]["agent_status"]
+            == "working"
+    ));
     assert_eq!(
         session
             .logbook()

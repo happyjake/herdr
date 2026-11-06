@@ -285,6 +285,21 @@ impl PaneCommandInbox {
     }
 }
 
+/// The screen an idle `agent` draws around its empty composer, in the place
+/// Auto-close's composer reader looks for it: Claude's `❯` between two rules,
+/// pi's blank line between two rules, codex's `›` line ended by a blank one.
+/// A Debrief reads the composer before typing, and a stand-in that draws none
+/// waits as composer-unreadable and is never debriefed.
+#[allow(dead_code)]
+pub fn empty_composer(agent: &str) -> String {
+    let rule = "─".repeat(40);
+    match agent {
+        "codex" => "› \n".to_owned(),
+        "claude" => format!("{rule}\n❯ \n{rule}"),
+        _ => format!("{rule}\n \n{rule}"),
+    }
+}
+
 /// A stand-in agent that serves a [`PaneCommandInbox`]: started in a pane
 /// under the agent's name, so the pane detects that agent.
 #[allow(dead_code)]
@@ -300,6 +315,12 @@ impl InPaneReporter {
     /// Writes the stand-in for `agent` under `dir`, reporting to `socket`.
     pub fn write(dir: &Path, agent: &str, socket: &Path) -> Self {
         Self::write_showing(dir, agent, socket, "")
+    }
+
+    /// Like [`Self::write`], showing `agent`'s [`empty_composer`]: a stand-in
+    /// that a Debrief can type into.
+    pub fn write_with_composer(dir: &Path, agent: &str, socket: &Path) -> Self {
+        Self::write_showing(dir, agent, socket, &empty_composer(agent))
     }
 
     /// Like [`Self::write`], with `screen` printed when the stand-in starts

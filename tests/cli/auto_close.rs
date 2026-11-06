@@ -177,7 +177,8 @@ fn auto_close_off_is_silent_and_config_reloads() {
 
 impl Session {
     fn agent(&self, kind: &str) -> crate::support::InPaneReporter {
-        let agent = crate::support::InPaneReporter::write(&self.base, kind, &self.socket);
+        let agent =
+            crate::support::InPaneReporter::write_with_composer(&self.base, kind, &self.socket);
         let output = run_cli(&self.socket, &["pane", "run", &self.pane, &agent.command()]);
         assert!(output.status.success(), "{output:?}");
         agent.wait_until_started(Duration::from_secs(10));
@@ -1060,14 +1061,16 @@ fn auto_close_ended_age_survives_restart_without_restarting_its_clock() {
 }
 
 #[test]
-fn auto_close_legacy_ended_pane_waits_for_a_known_exit_time() {
-    let config = "[auto_close]\nmode = 'report'\nended_age_secs = 0\npass_floor_secs = 1\n";
+fn auto_close_legacy_ended_pane_ages_from_its_restore() {
+    // A pane that ended before ended_at was persisted restores with the restore
+    // time as its end date (#732): the ended clock starts no earlier than the
+    // truth, and the stamp is saved so a later restore does not restart it.
+    let config = "[auto_close]\nmode = 'report'\nended_age_secs = 2\npass_floor_secs = 1\n";
     let mut session = Session::new(config);
     let agent = session.agent("pi");
     agent.stop();
     session.wait_for_ended("pi");
     session.stop();
-    let reports_before = session.reports().len();
     let path = session
         .base
         .join("config")
@@ -1082,61 +1085,53 @@ fn auto_close_legacy_ended_pane_waits_for_a_known_exit_time() {
         assert!(pane.as_object_mut().unwrap().remove("ended_at").is_some());
     }
     fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let now = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let before_restore = now();
     session.start(config);
+    let after_restore = now();
     assert!(wait_until(
         Duration::from_secs(3),
         Duration::from_millis(25),
-        || session.plan()["spared"][0]["exemption"] == "ended-time-unknown"
+        || session.plan()["spared"][0]["exemption"] == "too-young"
     ));
-    thread::sleep(Duration::from_secs(2));
-    assert_eq!(session.reports().len(), reports_before);
+    assert!(wait_until(
+        Duration::from_secs(8),
+        Duration::from_millis(50),
+        || session.plan()["candidates"][0]["kind"] == "ended"
+    ));
+    let before_plan = now();
+    let age = session.plan()["candidates"][0]["age_secs"]
+        .as_u64()
+        .unwrap();
+    let after_plan = now();
+    assert!((before_plan - after_restore..=after_plan - before_restore).contains(&age));
     session.stop();
-    assert!(session.saved_pane().get("ended_at").is_none());
+    let stamped = session.saved_pane()["ended_at"]
+        .as_u64()
+        .expect("the restore time is saved as the end date");
+    assert!((before_restore..=after_restore).contains(&stamped));
+    thread::sleep(Duration::from_millis(1100));
     session.start(config);
-    let next = session.agent("codex");
-    next.stop();
-    session.wait_for_ended("codex");
     assert!(wait_until(
         Duration::from_secs(3),
         Duration::from_millis(25),
         || session.plan()["candidates"][0]["kind"] == "ended"
     ));
     session.stop();
-    assert!(session.saved_pane()["ended_at"].as_u64().is_some());
+    assert_eq!(session.saved_pane()["ended_at"], stamped);
 }
 
 #[test]
 fn auto_close_close_mode_closes_ended_pane_and_plain_shell_and_preserves_resumable_session_search()
 {
-    let config =
-        "[auto_close]\nmode = 'close'\nended_age_secs = 2\nplain_shell_age_secs = 5\npass_floor_secs = 1\n";
-    let mut session = Session::new("[auto_close]\nmode = 'off'\n");
-    let legacy = session.agent("pi");
-    legacy.stop();
-    session.wait_for_ended("pi");
-    session.stop();
-    let snapshot_path = session
-        .base
-        .join("config")
-        .join(app_dir_name())
-        .join("session.json");
-    let mut snapshot: Value = serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
-    for pane in snapshot["workspaces"][0]["tabs"][0]["panes"]
-        .as_object_mut()
-        .unwrap()
-        .values_mut()
-    {
-        assert!(pane.as_object_mut().unwrap().remove("ended_at").is_some());
-    }
-    fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
-    session.start(config);
-    assert!(wait_until(
-        Duration::from_secs(3),
-        Duration::from_millis(25),
-        || session.plan()["spared"][0]["exemption"] == "ended-time-unknown"
-    ));
-    thread::sleep(Duration::from_millis(1200));
-    assert!(session.closes().is_empty());
+    let session = Session::new(
+        "[auto_close]\nmode = 'close'\nended_age_secs = 2\nplain_shell_age_secs = 5\npass_floor_secs = 1\n",
+    );
 
     let claude_record = session
         .base
