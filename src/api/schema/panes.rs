@@ -837,9 +837,10 @@ pub struct ClosedPaneStarter {
 ///
 /// Read from the harness's own file of the conversation, never from the
 /// screen: the person's words, or a supervising agent's, and never the
-/// agent's tool traffic, its results, or what the harness injected on the
-/// person's behalf. Every field is always serialized, so a client reads a
-/// null as a real absence rather than as a server that has nothing to say.
+/// agent's tool traffic or its results. Human queued asks are prompts; the
+/// newest compaction excerpt is separate summary evidence. Every field is
+/// always serialized, so a client reads a null as a real absence rather
+/// than as a server that has nothing to say.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PromptTrail {
     /// The harness whose record this was read from.
@@ -851,11 +852,20 @@ pub struct PromptTrail {
     /// hundred and forty code points. The first prompt appears here too
     /// while it is still among the last three.
     pub recent: Vec<TrailPrompt>,
+    /// Up to nine real prompts immediately before `recent`, oldest first,
+    /// cut to the same length. Together the windows hold min(count, 12)
+    /// prompts; the first prompt appears in either window when it falls there.
+    #[serde(default)]
+    pub earlier: Vec<TrailPrompt>,
+    /// The newest compaction summary, with only the selected work or request
+    /// section (or cleaned head). Null without one and always null for Codex.
+    #[serde(default)]
+    pub summary: Option<TrailSummary>,
     /// The title the harness wrote for this conversation, when it wrote one
     /// worth reading. Null for a harness that writes none, and for a
     /// fallback title that says nothing the prompts do not.
     pub title: Option<String>,
-    /// Real prompts in the record.
+    /// Real prompts in the record, including human queued asks.
     pub count: u32,
     /// Unix seconds at which the newest real prompt arrived, as the harness
     /// dated it. Null when the record dates nothing.
@@ -870,6 +880,28 @@ pub struct TrailPrompt {
     pub text: String,
     /// Unix seconds at which the harness recorded it, when it recorded one.
     pub at: Option<u64>,
+}
+
+/// A compact excerpt of the newest harness-written compaction summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TrailSummary {
+    /// Cleaned prose, at most 480 code points, excluding fenced code and
+    /// sections titled All user messages, Files and Code Sections, or
+    /// Key Technical Concepts.
+    pub text: String,
+    /// Unix seconds at which the harness recorded this summary, when known.
+    pub at: Option<u64>,
+    /// Which part of the summary supplied the excerpt.
+    pub kind: TrailSummaryKind,
+}
+
+/// The selected source within a compaction summary, in preference order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TrailSummaryKind {
+    Current,
+    Request,
+    Head,
 }
 
 /// A harness whose session record a trail can be read from.

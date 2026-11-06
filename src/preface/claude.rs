@@ -120,25 +120,10 @@ impl ClaudeReader {
     /// injects toward a goal, another session's message — so only a queued
     /// prompt that names the person as its origin is one.
     fn attachment(&mut self, line: &Value) {
-        let Some(attachment) = line.get("attachment") else {
+        let Some(prompt) = crate::prompt_trail::claude_queued_prompt(line) else {
             return;
         };
-        if attachment.get("type").and_then(Value::as_str) != Some("queued_command")
-            || attachment.get("commandMode").and_then(Value::as_str) != Some("prompt")
-            || flag(attachment, "isMeta")
-            || origin(attachment) != Some(HUMAN_ORIGIN)
-        {
-            return;
-        }
-        let Some(prompt) = attachment.get("prompt") else {
-            return;
-        };
-        // Judged by the same rules as a prompt on a line of its own.
-        let as_line = serde_json::json!({
-            "type": "user",
-            "message": { "role": "user", "content": prompt },
-        });
-        if crate::prompt_trail::prompt_text(PromptTrailAgent::Claude, &as_line).is_none() {
+        if crate::prompt_trail::prompt_text(PromptTrailAgent::Claude, line).is_none() {
             return;
         }
         let raw = raw_text(prompt);

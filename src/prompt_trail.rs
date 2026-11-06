@@ -2,14 +2,16 @@
 //!
 //! Every harness keeps its own file of one conversation on this desk. This
 //! reads the few things in one that say what the work is: the first real
-//! prompt, the last three, the harness's own title, how many prompts there
-//! have been and when the newest arrived. Nothing else in a record is a
-//! trail's business — not the agent's tool traffic, not its results, and
-//! not what the harness injected on the person's behalf.
+//! prompt, the last three, up to nine immediately earlier prompts, the
+//! harness's own title, how many prompts there have been and when the
+//! newest arrived. Human asks queued during Claude work count once, at
+//! their attachment line. The newest Claude or pi compaction contributes
+//! a separate, cleaned summary excerpt, never a prompt. Tool traffic,
+//! results and other harness injections do not enter the trail.
 //!
 //! The read is bounded at every step rather than best-effort. The file is
 //! never loaded whole: it is walked a line at a time, a line past its own
-//! cap is stepped over rather than parsed, and a file past the record cap
+//! cap refuses the read, and a file past the record cap
 //! is not opened at all. A line that is no JSON is skipped the way the
 //! harness's own half-written last line has to be; a record whose lines
 //! all say nothing is an empty trail, which is a different answer from no
@@ -21,11 +23,14 @@
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde_json::Value;
 
 use crate::agent_resume::AgentSessionRefKind;
-use crate::api::schema::{PromptTrail, PromptTrailAgent, PromptTrailReason, TrailPrompt};
+use crate::api::schema::{
+    PromptTrail, PromptTrailAgent, PromptTrailReason, TrailPrompt, TrailSummary, TrailSummaryKind,
+};
 
 /// Largest record this opens. A file past it is a record this server
 /// declines to read rather than one it reads slowly.
@@ -48,6 +53,12 @@ const RECENT_PROMPT_CHARS: usize = 240;
 
 /// Recent prompts a trail carries.
 const RECENT_PROMPTS: usize = 3;
+
+/// Prompts retained across the earlier and recent windows.
+const RETAINED_PROMPTS: usize = 12;
+
+/// Code points in a summary excerpt, including its truncation marker.
+const SUMMARY_CHARS: usize = 480;
 
 /// Directories one search for a record walks before it gives up. The
 /// layouts below are dated, so the bound cuts off old history rather than
@@ -203,8 +214,9 @@ fn read_lines(
     // The first prompt whole, only so a title can be judged against what it
     // would be repeating rather than against a cut of it.
     let mut first_whole = String::new();
-    let mut recent: Vec<TrailPrompt> = Vec::with_capacity(RECENT_PROMPTS);
+    let mut recent: Vec<TrailPrompt> = Vec::with_capacity(RETAINED_PROMPTS);
     let mut title: Option<String> = None;
+    let mut summary: Option<TrailSummary> = None;
     let mut count: u32 = 0;
     let mut newest_at: Option<u64> = None;
     // Whether this record said anything at all, and whether any of it was
@@ -243,13 +255,16 @@ fn read_lines(
             title = Some(found);
         }
 
-        let Some(text) = prompt_text(agent, &parsed) else {
-            continue;
-        };
         let at = parsed
             .get("timestamp")
             .and_then(Value::as_str)
             .and_then(unix_seconds_from_rfc3339);
+        if let Some(text) = compaction_text(agent, &parsed) {
+            summary = Some(summary_excerpt(&text, at));
+        }
+        let Some(text) = prompt_text(agent, &parsed) else {
+            continue;
+        };
 
         count = count.saturating_add(1);
         newest_at = at;
@@ -260,7 +275,7 @@ fn read_lines(
             });
             first_whole = text.clone();
         }
-        if recent.len() == RECENT_PROMPTS {
+        if recent.len() == RETAINED_PROMPTS {
             recent.remove(0);
         }
         recent.push(TrailPrompt {
@@ -279,15 +294,185 @@ fn read_lines(
     // A title that is the harness's own name, or the first prompt said
     // again, tells a reader nothing the trail does not already carry.
     let title = judged_title(title, &first_whole);
+    let last_three = recent.split_off(recent.len().saturating_sub(RECENT_PROMPTS));
 
     Ok(PromptTrail {
         agent,
         first,
-        recent,
+        earlier: recent,
+        recent: last_three,
+        summary,
         title,
         count,
         newest_at,
     })
+}
+
+fn compaction_text(agent: PromptTrailAgent, line: &Value) -> Option<String> {
+    let content = match agent {
+        PromptTrailAgent::Claude
+            if line.get("type").and_then(Value::as_str) == Some("user")
+                && flag(line, "isCompactSummary") =>
+        {
+            line.pointer("/message/content")?
+        }
+        PromptTrailAgent::Pi if line.get("type").and_then(Value::as_str) == Some("compaction") => {
+            return line.get("summary")?.as_str().map(str::to_string);
+        }
+        _ => return None,
+    };
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => Some(join_text_blocks(blocks, "text")),
+        _ => None,
+    }
+}
+
+static SUMMARY_HEADING: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^\s*(?:#{1,4}\s*|\d{1,2}\.\s*)?\**\s*(Current Work|In Progress|Progress So Far|Current state|Primary Request and Intent|Goal|Original Request|All user messages|Files and Code Sections|Key Technical Concepts)\s*:?\**:?\s*$")
+        .expect("valid summary heading pattern")
+});
+
+static SUMMARY_BOUNDARY: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^(?:[ \t]{0,3}(?:#|\d+\.)|\s*\*\*.+\*\*\s*$)")
+        .expect("valid summary boundary pattern")
+});
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SummarySection {
+    Current,
+    Request,
+    Omit,
+}
+
+fn summary_heading(line: &str) -> Option<SummarySection> {
+    if line.chars().count() > 80 {
+        return None;
+    }
+    let heading = SUMMARY_HEADING.captures(line)?.get(1)?.as_str();
+    Some(match heading.to_ascii_lowercase().as_str() {
+        "current work" | "in progress" | "progress so far" | "current state" => {
+            SummarySection::Current
+        }
+        "primary request and intent" | "goal" | "original request" => SummarySection::Request,
+        _ => SummarySection::Omit,
+    })
+}
+
+/// Remove excluded sections before selecting even a fallback excerpt.
+fn summary_excerpt(text: &str, at: Option<u64>) -> TrailSummary {
+    let cleaned = summary_prose(text);
+    let mut omitted = false;
+    let lines: Vec<_> = cleaned
+        .lines()
+        .filter(|line| {
+            let heading = summary_heading(line);
+            if SUMMARY_BOUNDARY.is_match(line) || heading == Some(SummarySection::Omit) {
+                omitted = heading == Some(SummarySection::Omit);
+            }
+            !omitted
+        })
+        .collect();
+    let mut body = lines.as_slice();
+    let mut kind = TrailSummaryKind::Head;
+    for (section, selected_kind) in [
+        (SummarySection::Current, TrailSummaryKind::Current),
+        (SummarySection::Request, TrailSummaryKind::Request),
+    ] {
+        if let Some(start) = lines
+            .iter()
+            .position(|line| summary_heading(line) == Some(section))
+        {
+            body = &lines[start + 1..];
+            let end = body
+                .iter()
+                .position(|line| SUMMARY_BOUNDARY.is_match(line))
+                .unwrap_or(body.len());
+            body = &body[..end];
+            kind = selected_kind;
+            break;
+        }
+    }
+    let prose = body
+        .iter()
+        .map(|line| {
+            let line = line.trim();
+            let line = line
+                .strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .or_else(|| line.strip_prefix("+ "))
+                .unwrap_or(line);
+            line.replace("**", "")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = clean(&prose);
+    let text = if text.chars().count() > SUMMARY_CHARS {
+        cut(&text, SUMMARY_CHARS - 1)
+    } else {
+        text
+    };
+    TrailSummary { text, at, kind }
+}
+
+/// Keep line breaks until sections have been selected. Fenced contents are
+/// discarded here so headings inside code cannot select or terminate a section.
+fn summary_prose(text: &str) -> String {
+    let mut text = text.replace("\r\n", "\n");
+    for tag in ["system-reminder", "modified-files"] {
+        text = without_summary_element(&text, tag);
+    }
+    text = text.replace("<summary>", "").replace("</summary>", "");
+    text = text
+        .lines()
+        .filter(|line| !line.trim().eq_ignore_ascii_case("Summary:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rest = text.trim_start();
+    let mut preamble = rest.starts_with("This session is being continued");
+
+    let mut prose = String::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in rest.lines() {
+        let trimmed = line.trim();
+        if preamble {
+            preamble = !trimmed.is_empty();
+            continue;
+        }
+        let marker = trimmed.chars().next().unwrap_or(' ');
+        let width = trimmed.chars().take_while(|ch| *ch == marker).count();
+        if let Some((opened, length)) = fence {
+            if marker == opened && width >= length && trimmed[width..].trim().is_empty() {
+                fence = None;
+            }
+            continue;
+        }
+        if matches!(marker, '`' | '~') && width >= 3 {
+            fence = Some((marker, width));
+            continue;
+        }
+        prose.push_str(line);
+        prose.push('\n');
+    }
+    prose
+}
+
+fn without_summary_element(text: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut rest = text;
+    let mut kept = String::new();
+    while let Some(start) = rest.find(&open) {
+        kept.push_str(&rest[..start]);
+        kept.push('\n');
+        rest = &rest[start + open.len()..];
+        let Some(end) = rest.find(&close) else {
+            return kept;
+        };
+        rest = &rest[end + close.len()..];
+    }
+    kept.push_str(rest);
+    kept
 }
 
 /// What one line of a record says was asked, when it says anything.
@@ -301,6 +486,9 @@ pub(crate) fn prompt_text(agent: PromptTrailAgent, line: &Value) -> Option<Strin
 }
 
 fn claude_prompt(line: &Value) -> Option<String> {
+    if line.get("type").and_then(Value::as_str) == Some("attachment") {
+        return claude_prompt_content(claude_queued_prompt(line)?);
+    }
     if line.get("type")?.as_str()? != "user" {
         return None;
     }
@@ -314,7 +502,27 @@ fn claude_prompt(line: &Value) -> Option<String> {
         return None;
     }
 
-    let text = match message.get("content")? {
+    claude_prompt_content(message.get("content")?)
+}
+
+/// The content of a human ask queued while Claude was working. Both record
+/// readers use this envelope predicate and judge its content with `prompt_text`.
+pub(crate) fn claude_queued_prompt(line: &Value) -> Option<&Value> {
+    let attachment = line.get("attachment")?;
+    if line.get("type").and_then(Value::as_str) != Some("attachment")
+        || flag(line, "isMeta")
+        || attachment.get("type").and_then(Value::as_str) != Some("queued_command")
+        || attachment.get("commandMode").and_then(Value::as_str) != Some("prompt")
+        || flag(attachment, "isMeta")
+        || attachment.pointer("/origin/kind").and_then(Value::as_str) != Some("human")
+    {
+        return None;
+    }
+    attachment.get("prompt")
+}
+
+fn claude_prompt_content(content: &Value) -> Option<String> {
+    let text = match content {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => {
             // A turn carrying a tool's answer is the agent's traffic wearing
@@ -1061,6 +1269,276 @@ pub(crate) mod tests {
 
     fn texts(prompts: &[TrailPrompt]) -> Vec<&str> {
         prompts.iter().map(|prompt| prompt.text.as_str()).collect()
+    }
+
+    #[test]
+    fn a_plain_title_inside_an_excluded_section_cannot_expose_its_body() {
+        let mut compact = claude_user(
+            "6. All user messages:\nCurrent Work\nsynthetic-secret\n7. Pending Tasks:\nCheck boundaries.",
+            "2026-03-04T09:15:00Z",
+        );
+        compact["isCompactSummary"] = serde_json::json!(true);
+        let record = lines(&[compact]);
+        let trail =
+            read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
+        assert_eq!(
+            trail.summary.unwrap().text,
+            "7. Pending Tasks: Check boundaries."
+        );
+    }
+
+    #[test]
+    fn codex_keeps_earlier_prompts_but_never_guesses_a_summary() {
+        let mut entries: Vec<_> = (1..=5)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "response_item", "timestamp": "2026-03-04T09:15:00Z",
+                    "payload": {"type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": format!("ask {index}")}
+                    ]}
+                })
+            })
+            .collect();
+        entries.push(serde_json::json!({"type": "compaction", "summary": "## Goal\nOther work."}));
+        entries.push(serde_json::json!({"type": "user", "isCompactSummary": true,
+            "message": {"role": "user", "content": "## Current Work\nOther work."}}));
+        let record = lines(&entries);
+        let trail =
+            read_lines(record.as_bytes(), PromptTrailAgent::Codex, Bounds::DEFAULT).unwrap();
+        assert_eq!(trail.count, 5);
+        assert_eq!(texts(&trail.earlier), ["ask 1", "ask 2"]);
+        assert_eq!(texts(&trail.recent), ["ask 3", "ask 4", "ask 5"]);
+        assert_eq!(
+            serde_json::to_value(trail).unwrap().get("summary"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[test]
+    fn earlier_prompts_use_the_recent_cut_and_keep_their_timestamps() {
+        let record = lines(
+            &(1..=4)
+                .map(|index| claude_user(&"界".repeat(500), &format!("2026-03-04T09:0{index}:00Z")))
+                .collect::<Vec<_>>(),
+        );
+        let trail =
+            read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
+        assert_eq!(trail.earlier.len(), 1);
+        assert_eq!(trail.earlier[0].text, format!("{}…", "界".repeat(240)));
+        assert_eq!(trail.earlier[0].at, Some(1772614860));
+        assert_eq!(trail.recent[0].text, trail.earlier[0].text);
+        assert_eq!(trail.first.unwrap().text, format!("{}…", "界".repeat(400)));
+    }
+
+    #[test]
+    fn summary_fallback_removes_the_preamble_and_ignores_headings_in_code() {
+        let mut compact = claude_user(
+            "<system-reminder>hidden</system-reminder>\nThis session is being continued from earlier.\nMore preamble.\n \nSummary:\n<summary>## Who and what\nMaintain the parser.\n````markdown\n## Current Work\ncode-only work\n```\nstill code\n````\n## Notes\n- Check boundaries.\n</summary>",
+            "undated",
+        );
+        compact["isCompactSummary"] = serde_json::json!(true);
+        let record = lines(&[compact]);
+        let trail =
+            read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
+        assert_eq!(
+            trail.summary,
+            Some(TrailSummary {
+                text: "## Who and what Maintain the parser. ## Notes Check boundaries.".into(),
+                at: None,
+                kind: TrailSummaryKind::Head,
+            })
+        );
+    }
+
+    #[test]
+    fn pi_compactions_select_progress_or_goal_and_strip_modified_files() {
+        for (text, kind, expected) in [
+            ("## Goal\nTrace the parser.\n## Progress\n### Done\nStarted.\n### In Progress\n- Repair **streaming**.\n<modified-files>\nprivate-file\n</modified-files>\n### Blocked\nOther work.", TrailSummaryKind::Current, "Repair streaming."),
+            ("## Goal\nTrace the parser.\n<modified-files>private-file</modified-files>", TrailSummaryKind::Request, "Trace the parser."),
+            ("# Checkpoint\n## Original Request\nTrace the parser.\n## Progress So Far\nRepair streaming.\n## Context Needed to Continue\nOther work.", TrailSummaryKind::Current, "Repair streaming."),
+        ] {
+            let record = lines(&[
+                serde_json::json!({"type": "compaction", "summary": "## Goal\nOld work.", "timestamp": "2026-03-04T09:14:00Z"}),
+                serde_json::json!({"type": "compaction", "summary": text, "timestamp": "2026-03-04T09:15:00Z"}),
+            ]);
+            let trail = read_lines(record.as_bytes(), PromptTrailAgent::Pi, Bounds::DEFAULT).unwrap();
+            assert_eq!(trail.count, 0);
+            assert_eq!(trail.summary, Some(TrailSummary {
+                text: expected.into(), at: Some(1772615700), kind,
+            }));
+        }
+    }
+
+    #[test]
+    fn the_newest_compaction_wins_and_its_excerpt_fits_480_code_points() {
+        for length in [479, 480, 481, 600] {
+            let mut older = claude_user("## Current Work\nOld work.", "2026-03-04T09:16:00Z");
+            older["isCompactSummary"] = serde_json::json!(true);
+            let mut newest = claude_user("", "2026-03-04T09:15:00Z");
+            newest["isCompactSummary"] = serde_json::json!(true);
+            newest["message"]["content"] = serde_json::json!([
+                {"type": "text", "text": format!("## Goal\n{}", "界".repeat(length))},
+                {"type": "image", "text": "not summary text"}
+            ]);
+            let record = lines(&[
+                older,
+                newest,
+                claude_user("next ask", "2026-03-04T09:17:00Z"),
+            ]);
+            let trail =
+                read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
+            assert_eq!(trail.count, 1);
+            let summary = trail.summary.unwrap();
+            assert_eq!(summary.kind, TrailSummaryKind::Request);
+            assert_eq!(summary.at, Some(1772615700), "newest means record order");
+            assert!(summary.text.chars().count() <= 480);
+            if length <= 480 {
+                assert_eq!(summary.text, "界".repeat(length));
+            } else {
+                assert!(summary.text.starts_with(&"界".repeat(479)));
+            }
+        }
+    }
+
+    #[test]
+    fn claude_summary_cleans_wrappers_and_prefers_work_then_request_then_head() {
+        for (text, kind, expected) in [
+            ("<system-reminder>hidden preamble</system-reminder>\nThis session is being continued from an earlier conversation.\nAnother preamble line.\n\nSummary:\n<summary>\n1. Primary Request and Intent:\nTrace the parser.\n8. Current Work:\n* Repair **streaming**.\n~~~rust\nhidden code\n~~~\n9. Next Step:\nOther work.\n</summary>", "current", "Repair streaming."),
+            ("1. Primary Request and Intent:\nTrace the parser.\n2. Key Technical Concepts:\ninternal concepts\n3. Files and Code Sections:\ninternal files\n4. Errors and fixes:\nnone\n5. Problem Solving:\nanalysis\n6. All user messages:\nsynthetic-secret\n7. Pending Tasks:\nmore work", "request", "Trace the parser."),
+            ("Summary:\n<summary>\n## Who and what\nMaintain **streaming**.\n## Notes\n- Check boundaries.\n6. **All user messages:**\nsynthetic-secret\n7. **Files and Code Sections:**\ninternal files\n8. **Key Technical Concepts:**\ninternal concepts\n</summary>", "head", "## Who and what Maintain streaming. ## Notes Check boundaries."),
+            ("## Goal\nInitial goal.\n## Current state\nFirst work.\n## Current Work\nLater work.", "current", "First work."),
+        ] {
+            let mut compact = claude_user(text, "2026-03-04T09:15:00Z");
+            compact["isCompactSummary"] = serde_json::json!(true);
+            let record = lines(&[compact]);
+            let trail = read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
+            assert_eq!(trail.count, 0);
+            let wire = serde_json::to_value(trail).unwrap();
+            assert_eq!(wire["summary"], serde_json::json!({
+                "text": expected, "at": 1772615700, "kind": kind
+            }), "{text}");
+        }
+    }
+
+    #[test]
+    fn claude_summary_selects_current_work_without_counting_a_prompt() {
+        let mut compact = claude_user(
+            "1. **Primary Request and Intent:**\nTrace the parser.\n\n6. **All user messages:**\nsynthetic-secret\n\n8. **Current Work:**\n- Repair **streaming**.\n```rust\nlet hidden = 1;\n```\n- Check boundaries.\n9. **Optional Next Step:**\nOther work.",
+            "2026-03-04T09:15:00Z",
+        );
+        compact["isCompactSummary"] = serde_json::json!(true);
+        let record = lines(&[compact]);
+        let trail =
+            read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
+        assert_eq!(trail.count, 0);
+        assert_eq!(trail.newest_at, None);
+        let wire = serde_json::to_value(trail).unwrap();
+        assert_eq!(
+            wire["summary"],
+            serde_json::json!({
+                "text": "Repair streaming. Check boundaries.", "at": 1772615700, "kind": "current"
+            })
+        );
+    }
+
+    #[test]
+    fn earlier_prompts_immediately_precede_the_last_three() {
+        for (count, earlier, recent) in [
+            (
+                14,
+                vec![
+                    "turn 3", "turn 4", "turn 5", "turn 6", "turn 7", "turn 8", "turn 9",
+                    "turn 10", "turn 11",
+                ],
+                vec!["turn 12", "turn 13", "turn 14"],
+            ),
+            (
+                5,
+                vec!["turn 1", "turn 2"],
+                vec!["turn 3", "turn 4", "turn 5"],
+            ),
+            (3, vec![], vec!["turn 1", "turn 2", "turn 3"]),
+            (0, vec![], vec![]),
+        ] {
+            let record = lines(
+                &(1..=count)
+                    .map(|turn| claude_user(&format!("turn {turn}"), "2026-03-04T09:15:00Z"))
+                    .collect::<Vec<_>>(),
+            );
+            let trail =
+                read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
+            assert_eq!(trail.count, count);
+            assert_eq!(texts(&trail.recent), recent);
+            let wire = serde_json::to_value(&trail).unwrap();
+            let actual: Vec<_> = wire["earlier"]
+                .as_array()
+                .expect("earlier is always serialized")
+                .iter()
+                .map(|prompt| prompt["text"].as_str().unwrap())
+                .collect();
+            assert_eq!(actual, earlier);
+            assert_eq!(actual.len() + trail.recent.len(), count.min(12) as usize);
+        }
+    }
+
+    #[test]
+    fn queued_human_prompts_count_once_at_the_attachment_position() {
+        let queued = serde_json::json!({
+            "type": "attachment", "timestamp": "2026-03-04T09:16:00Z",
+            "attachment": {"type": "queued_command", "commandMode": "prompt",
+                "origin": {"kind": "human"}, "prompt": "inspect the buffer"}
+        });
+        let mut entries = vec![claude_user("start tracing", "2026-03-04T09:15:00Z")];
+        let mut meta_line = queued.clone();
+        meta_line["isMeta"] = serde_json::json!(true);
+        entries.push(meta_line);
+        for (key, value) in [
+            ("origin", serde_json::json!({"kind": "task-notification"})),
+            ("origin", serde_json::json!({"kind": "hook"})),
+            ("origin", Value::Null),
+            ("isMeta", serde_json::json!(true)),
+            ("commandMode", serde_json::json!("task-notification")),
+            ("commandMode", serde_json::json!("shell")),
+            ("type", serde_json::json!("other")),
+            (
+                "prompt",
+                serde_json::json!("<system-reminder>injected</system-reminder>"),
+            ),
+            ("prompt", serde_json::json!("  ")),
+            (
+                "prompt",
+                serde_json::json!([{"type": "tool_result", "content": "done"}, {"type": "text", "text": "inspect the buffer"}]),
+            ),
+        ] {
+            let mut ignored = queued.clone();
+            ignored["attachment"][key] = value;
+            entries.push(ignored);
+        }
+        entries.push(queued);
+        entries.push(serde_json::json!({
+            "type": "user", "timestamp": "2026-03-04T09:17:00Z",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "content": "done"},
+                {"type": "text", "text": "inspect the buffer"}
+            ]}
+        }));
+        entries.push(serde_json::json!({
+            "type": "attachment", "timestamp": "2026-03-04T09:18:00Z",
+            "attachment": {"type": "queued_command", "commandMode": "prompt",
+                "origin": {"kind": "human"}, "timestamp": "2026-03-04T09:20:00Z",
+                "prompt": [{"type": "text", "text": "check\n the boundary"}, {"type": "image", "text": "not prompt text"}]}
+        }));
+        let record = lines(&entries);
+        let trail =
+            read_lines(record.as_bytes(), PromptTrailAgent::Claude, Bounds::DEFAULT).unwrap();
+        assert_eq!(trail.count, 3);
+        assert_eq!(
+            texts(&trail.recent),
+            ["start tracing", "inspect the buffer", "check the boundary"]
+        );
+        assert_eq!(trail.recent[1].at, Some(1772615760));
+        assert_eq!(trail.newest_at, Some(1772615880));
+        assert_eq!(trail.recent[2].at, trail.newest_at);
     }
 
     #[test]

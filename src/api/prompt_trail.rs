@@ -1009,6 +1009,54 @@ mod tests {
             response,
             r#"{"id":"req_trail","result":{"type":"prompt_trail","pane_id":"wG4:p1","terminal_id":"term_beacon","trail":null,"reason":"no_session"}}"#
         );
+
+        let mut record = (1..=4)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "user", "timestamp": "2026-03-04T09:15:00Z",
+                    "message": {"role": "user", "content": format!("ask {index}")}
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        record.push('\n');
+        record.push_str(
+            &serde_json::json!({
+                "type": "user", "isCompactSummary": true, "timestamp": "2026-03-04T09:16:00Z",
+                "message": {"role": "user", "content": "## Current Work\nRepair the parser."}
+            })
+            .to_string(),
+        );
+        let path = fixture.write("records/trail.jsonl", &record);
+        let mut identity = session("claude", AgentSessionRefKind::Id, CLAUDE_SESSION);
+        identity.record_path = Some(path.to_str().unwrap().into());
+        let response = respond(
+            "req_trail".into(),
+            fixture.sources(pane_response(pane(Some(identity)))),
+        );
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let trail = &json["result"]["trail"];
+        assert_eq!(trail["count"], 4);
+        assert_eq!(
+            trail["earlier"],
+            serde_json::json!([{"text": "ask 1", "at": 1772615700}])
+        );
+        assert_eq!(
+            trail["recent"],
+            serde_json::json!([
+                {"text": "ask 2", "at": 1772615700},
+                {"text": "ask 3", "at": 1772615700},
+                {"text": "ask 4", "at": 1772615700}
+            ])
+        );
+        assert_eq!(
+            trail["summary"],
+            serde_json::json!({
+                "text": "Repair the parser.", "at": 1772615760, "kind": "current"
+            })
+        );
+        assert_eq!(serde_json::to_value(trail_of(&response)).unwrap(), *trail);
     }
 
     #[test]

@@ -1189,6 +1189,8 @@ fn a_prompt_trail_result_keeps_every_field_it_has_nothing_to_say_about() {
                     text: "pin it to the encoder".into(),
                     at: None,
                 }],
+                earlier: vec![],
+                summary: None,
                 title: None,
                 count: 2,
                 newest_at: Some(1772617212),
@@ -1203,6 +1205,22 @@ fn a_prompt_trail_result_keeps_every_field_it_has_nothing_to_say_about() {
     assert!(json["result"]["trail"]["title"].is_null());
     assert!(json["result"]["trail"]["recent"][0]["at"].is_null());
     assert!(json["result"]["reason"].is_null());
+    assert_eq!(
+        json["result"]["trail"].get("earlier"),
+        Some(&serde_json::json!([]))
+    );
+    assert_eq!(
+        json["result"]["trail"].get("summary"),
+        Some(&serde_json::Value::Null)
+    );
+    let mut legacy = json.clone();
+    let legacy_trail = legacy["result"]["trail"].as_object_mut().unwrap();
+    legacy_trail.remove("earlier");
+    legacy_trail.remove("summary");
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(legacy).unwrap(),
+        answered
+    );
     assert_eq!(
         serde_json::from_value::<SuccessResponse>(json).unwrap(),
         answered

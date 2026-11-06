@@ -11186,17 +11186,25 @@
           "type": "object"
         },
         "PromptTrail": {
-          "description": "What a pane's session record says was asked of it.\n\nRead from the harness's own file of the conversation, never from the\nscreen: the person's words, or a supervising agent's, and never the\nagent's tool traffic, its results, or what the harness injected on the\nperson's behalf. Every field is always serialized, so a client reads a\nnull as a real absence rather than as a server that has nothing to say.",
+          "description": "What a pane's session record says was asked of it.\n\nRead from the harness's own file of the conversation, never from the\nscreen: the person's words, or a supervising agent's, and never the\nagent's tool traffic or its results. Human queued asks are prompts; the\nnewest compaction excerpt is separate summary evidence. Every field is\nalways serialized, so a client reads a null as a real absence rather\nthan as a server that has nothing to say.",
           "properties": {
             "agent": {
               "$ref": "#/schemas/success_response/$defs/PromptTrailAgent",
               "description": "The harness whose record this was read from."
             },
             "count": {
-              "description": "Real prompts in the record.",
+              "description": "Real prompts in the record, including human queued asks.",
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "earlier": {
+              "default": [],
+              "description": "Up to nine real prompts immediately before `recent`, oldest first,\ncut to the same length. Together the windows hold min(count, 12)\nprompts; the first prompt appears in either window when it falls there.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/TrailPrompt"
+              },
+              "type": "array"
             },
             "first": {
               "anyOf": [
@@ -11224,6 +11232,18 @@
                 "$ref": "#/schemas/success_response/$defs/TrailPrompt"
               },
               "type": "array"
+            },
+            "summary": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/TrailSummary"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "The newest compaction summary, with only the selected work or request\nsection (or cleaned head). Null without one and always null for Codex."
             },
             "title": {
               "description": "The title the harness wrote for this conversation, when it wrote one\nworth reading. Null for a harness that writes none, and for a\nfallback title that says nothing the prompts do not.",
@@ -13589,6 +13609,42 @@
             "text"
           ],
           "type": "object"
+        },
+        "TrailSummary": {
+          "description": "A compact excerpt of the newest harness-written compaction summary.",
+          "properties": {
+            "at": {
+              "description": "Unix seconds at which the harness recorded this summary, when known.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/TrailSummaryKind",
+              "description": "Which part of the summary supplied the excerpt."
+            },
+            "text": {
+              "description": "Cleaned prose, at most 480 code points, excluding fenced code and\nsections titled All user messages, Files and Code Sections, or\nKey Technical Concepts.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "TrailSummaryKind": {
+          "description": "The selected source within a compaction summary, in preference order.",
+          "enum": [
+            "current",
+            "request",
+            "head"
+          ],
+          "type": "string"
         },
         "TurnEnd": {
           "enum": [
