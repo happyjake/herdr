@@ -322,6 +322,47 @@ fn main_checkout_home<'a>(
         })
 }
 
+fn is_home(pane: &PaneSnapshot, panes: &[PaneSnapshot]) -> bool {
+    pane.single_pane_workspace
+        && main_checkout_home(pane, panes).is_some_and(|home| home.workspace_id == pane.workspace_id)
+}
+
+/// When the pane last showed activity of its own. A Debrief's status changes
+/// are not the pane's own, so a pane in one keeps its input stamp.
+fn idle_since(pane: &PaneSnapshot) -> u64 {
+    if pane.debrief.is_some() {
+        pane.input_at
+    } else if pane.agent.is_some() {
+        pane.status_at.max(pane.input_at)
+    } else if pane.ended {
+        pane.ended_at.unwrap_or(pane.input_at).max(pane.input_at)
+    } else {
+        pane.input_at
+    }
+}
+
+/// A repo's home pane is spared, but not forever. It loses the exemption once
+/// idle past the home age, or while the server holds more panes than its cap:
+/// the oldest homes first, as many as the server is over the cap.
+fn home_released(pane: &PaneSnapshot, panes: &[PaneSnapshot], config: &Config, now: u64) -> bool {
+    if now.saturating_sub(idle_since(pane)) >= config.home_age_secs {
+        return true;
+    }
+    let count = panes.len() + usize::from(!panes.iter().any(|other| other.pane_id == pane.pane_id));
+    let over = count.saturating_sub(usize::try_from(config.pane_cap).unwrap_or(usize::MAX));
+    if config.pane_cap == 0 || over == 0 {
+        return false;
+    }
+    let mut homes: Vec<&PaneSnapshot> = panes
+        .iter()
+        .filter(|other| other.pane_id != pane.pane_id)
+        .chain(std::iter::once(pane))
+        .filter(|other| is_home(other, panes))
+        .collect();
+    homes.sort_by_key(|home| (idle_since(home), home.pane_id.as_str()));
+    homes.iter().take(over).any(|home| home.pane_id == pane.pane_id)
+}
+
 fn main_checkout_fields(
     pane: &PaneSnapshot,
     panes: &[PaneSnapshot],
@@ -370,10 +411,7 @@ fn decide(
     if !pane.probe_ready {
         return Err("probe-pending");
     }
-    if pane.single_pane_workspace
-        && main_checkout_home(pane, panes)
-            .is_some_and(|home| home.workspace_id == pane.workspace_id)
-    {
+    if is_home(pane, panes) && !home_released(pane, panes, config, now) {
         return Err("last-main-checkout-pane");
     }
     if pane.group_refusal {
@@ -1793,6 +1831,97 @@ mod tests {
             decide(&debriefing, &panes, &config, 200),
             Err("last-main-checkout-pane")
         );
+    }
+
+    #[test]
+    fn auto_close_a_home_is_spared_only_until_idle_past_the_home_age() {
+        let config = Config {
+            plain_shell_age_secs: 0,
+            dormant_age_secs: 0,
+            home_age_secs: 1000,
+            pane_cap: 0,
+            ..Config::default()
+        };
+        let mut home = main_checkout_shell("w1", 100, 100);
+        assert_eq!(decide(&home, &[], &config, 1099), Err("last-main-checkout-pane"));
+        assert_eq!(decide(&home, &[], &config, 1100).unwrap().kind, Kind::PlainShell);
+        // Every other exemption still holds for a released home.
+        home.pinned = true;
+        assert_eq!(decide(&home, &[], &config, 1100), Err("pinned"));
+        home.pinned = false;
+        home.group_refusal = true;
+        assert_eq!(decide(&home, &[], &config, 1100), Err("worktree-group"));
+        home.group_refusal = false;
+
+        // An agent home counts its own activity; its Debrief's status changes do not.
+        home.agent = Some("claude".into());
+        home.status = AgentStatus::Idle;
+        home.status_at = 1050;
+        assert_eq!(decide(&home, &[], &config, 1100), Err("last-main-checkout-pane"));
+        home.status_at = 100;
+        assert_eq!(decide(&home, &[], &config, 1100).unwrap().kind, Kind::Dormant);
+        home.status_at = 1090;
+        home.debrief = Some(Debrief {
+            agent: "claude".into(),
+            session: None,
+            age_secs: 1000,
+            input_at: 100,
+            attempt: 1,
+            phase: debrief::Phase::Quitting {
+                at: 1_095_000,
+                result: crate::persist::logbook::CloseDebrief {
+                    outcome: crate::api::schema::DebriefOutcome::Finished,
+                    memories: Some(1),
+                    skill_version: Some("v1".into()),
+                },
+            },
+            reply_start: None,
+            finished: None,
+            quit_failures: 0,
+            delivery_abort: None,
+            recovered_delivery: false,
+        });
+        assert_ne!(decide(&home, &[], &config, 1100), Err("last-main-checkout-pane"));
+    }
+
+    #[test]
+    fn auto_close_over_the_pane_cap_releases_the_oldest_homes_first() {
+        let home = |workspace: &str, checkout: &str, input_at: u64| {
+            let mut pane = main_checkout_shell(workspace, input_at, input_at);
+            pane.main_checkout = Some(checkout.into());
+            pane
+        };
+        let mut other = shell();
+        other.pane_id = "w9:p1".into();
+        other.workspace_id = "w9".into();
+        other.input_at = 500;
+        let panes = [
+            home("w2", "b", 200),
+            home("w1", "a", 100),
+            home("w3", "c", 300),
+            other,
+        ];
+        let spared_homes = |pane_cap: u64| {
+            let config = Config {
+                plain_shell_age_secs: 0,
+                pane_cap,
+                ..Config::default()
+            };
+            let result = plan(&panes, &config, 1000);
+            let mut homes: Vec<String> = result
+                .spared
+                .iter()
+                .filter(|spared| spared.exemption == "last-main-checkout-pane")
+                .map(|spared| spared.pane_id.clone())
+                .collect();
+            homes.sort();
+            homes
+        };
+        assert_eq!(spared_homes(0), ["w1:p1", "w2:p1", "w3:p1"], "no cap");
+        assert_eq!(spared_homes(4), ["w1:p1", "w2:p1", "w3:p1"], "at the cap");
+        assert_eq!(spared_homes(3), ["w2:p1", "w3:p1"], "one over: the oldest home goes");
+        assert_eq!(spared_homes(2), ["w3:p1"], "two over: the two oldest go");
+        assert!(spared_homes(1).is_empty());
     }
 
     #[test]

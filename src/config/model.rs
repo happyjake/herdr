@@ -346,6 +346,11 @@ pub struct AutoCloseConfig {
     pub dormant_age_secs: u64,
     pub plain_shell_age_secs: u64,
     pub pass_floor_secs: u64,
+    /// A repo's main-checkout home pane loses its exemption once idle this long.
+    pub home_age_secs: u64,
+    /// Above this many open panes the oldest homes lose their exemption, as many
+    /// as the server is over. Zero turns the cap off.
+    pub pane_cap: u64,
     pub debrief: bool,
     pub debrief_skill_path: String,
     pub uptake_window_secs: u64,
@@ -411,6 +416,8 @@ impl Default for AutoCloseConfig {
             dormant_age_secs: 72 * 3600,
             plain_shell_age_secs: 7 * 24 * 3600,
             pass_floor_secs: 600,
+            home_age_secs: 14 * 24 * 3600,
+            pane_cap: 120,
             debrief: true,
             debrief_skill_path: "~/.agents/skills/debrief/SKILL.md".into(),
             uptake_window_secs: 60,
