@@ -678,6 +678,14 @@ fn next_pass_delay(panes: &[PaneSnapshot], config: &Config, now: u64) -> u64 {
     config.pass_floor_secs.max(1).max(next_age)
 }
 
+/// Whether the pane's agent has ended. A pane whose restore failed runs
+/// nothing: once the failure dated the end of the agent that ran there, that
+/// agent has ended, though it never reported an exit.
+fn pane_ended(terminal: &crate::terminal::TerminalState, live: bool) -> bool {
+    terminal.ended_agent.is_some()
+        || (!live && terminal.restore_error.is_some() && terminal.ended_at.is_some())
+}
+
 fn live_starter(link: &PaneStartedBy) -> Option<String> {
     match link {
         PaneStartedBy::Pane { pane_id } => Some(pane_id.clone()),
@@ -1036,7 +1044,7 @@ impl App {
                         pane_id,
                         workspace_id: ws.id.clone(),
                         agent,
-                        ended: terminal.ended_agent.is_some(),
+                        ended: pane_ended(terminal, runtime.is_some()),
                         ended_at: terminal.ended_at,
                         seen_agent: terminal.session_reported
                             || terminal.persisted_agent_session.is_some()
@@ -1610,6 +1618,48 @@ mod tests {
         pane.seen_agent = false;
         pane.restore_failed = false;
         assert_eq!(decide(&pane, &[], &config, 120), Err("not-bare-prompt"));
+    }
+
+    #[test]
+    fn auto_close_a_restore_failed_agent_pane_has_ended_once_its_failure_dated_it() {
+        let mut terminal =
+            crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), "/gone".into());
+        terminal.session_reported = true;
+        assert!(!pane_ended(&terminal, false), "a pane whose restore has not failed");
+        terminal.fail_restore("Saved directory is unavailable.".into(), None);
+        assert!(terminal.ended_at.is_some());
+        assert!(pane_ended(&terminal, false));
+        assert!(!pane_ended(&terminal, true), "a live runtime decides for itself");
+        // A failed shell pane that never ran an agent gets no date: it stays a plain shell.
+        let mut shell =
+            crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), "/gone".into());
+        shell.fail_restore("Saved directory is unavailable.".into(), None);
+        assert_eq!(shell.ended_at, None);
+        assert!(!pane_ended(&shell, false));
+        // Every kind of agent history dates the failure; a known date is kept.
+        for mark in 0..3 {
+            let mut agent =
+                crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), "/gone".into());
+            match mark {
+                0 => agent.agent_name = Some("helper".into()),
+                1 => agent.ended_agent = Some("pi".into()),
+                _ => {
+                    agent.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+                        source: "herdr:codex".into(),
+                        agent: "codex".into(),
+                        session_ref: crate::agent_resume::AgentSessionRef::id("s").unwrap(),
+                    })
+                }
+            }
+            agent.fail_restore("x".into(), None);
+            assert!(agent.ended_at.is_some(), "mark {mark}");
+        }
+        let mut known =
+            crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), "/gone".into());
+        known.session_reported = true;
+        known.ended_at = Some(123);
+        known.fail_restore("x".into(), Some(456));
+        assert_eq!(known.ended_at, Some(123));
     }
 
     #[test]

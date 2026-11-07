@@ -257,7 +257,7 @@ impl App {
         if !cwd.is_dir() {
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.pending_agent_resume_plan = None;
-                terminal.restore_error = Some("Saved directory is unavailable. Restore the directory and restart this session.".into());
+                terminal.fail_restore("Saved directory is unavailable. Restore the directory and restart this session.".into(), None);
                 terminal.revision = terminal.revision.saturating_add(1);
             }
             // The resume is over and it failed, which classifies the pane just
@@ -294,7 +294,7 @@ impl App {
                 );
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                     terminal.pending_agent_resume_plan = None;
-                    terminal.restore_error = Some(format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."));
+                    terminal.fail_restore(format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."), None);
                     terminal.revision = terminal.revision.saturating_add(1);
                 }
                 // The resume is over and it failed, which classifies the pane
@@ -549,12 +549,15 @@ mod tests {
                 argv: long_running_test_argv(),
                 dedupe_key: "resume-test".into(),
             });
+            let before = crate::pane::unix_now_secs();
             app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
             assert!(app.terminal_runtimes.get(&terminal_id).is_none());
             let terminal = &app.state.terminals[&terminal_id];
             assert!(terminal.pending_agent_resume_plan.is_none());
             assert_eq!(terminal.persisted_agent_session.as_ref(), Some(&session));
             assert!(terminal.restore_error.is_some());
+            // The agent can no longer run here, so the failure dates its end.
+            assert!(terminal.ended_at.is_some_and(|at| at >= before));
             assert!(!app.has_pending_agent_resumes());
             assert!(!app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
         }

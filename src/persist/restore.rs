@@ -454,7 +454,6 @@ fn unavailable_restored_terminal(
 ) -> TerminalState {
     warn!(cwd = %cwd.display(), reason = %reason, "preserving unavailable restored pane");
     let mut terminal = TerminalState::new(TerminalId::alloc(), cwd);
-    terminal.restore_error = Some(reason);
     if let Some(pane) = pane {
         terminal.manual_label = pane.label.clone();
         terminal.name_kept_through = pane
@@ -488,6 +487,7 @@ fn unavailable_restored_terminal(
             _ => {}
         }
     }
+    terminal.fail_restore(reason, pane.and_then(|pane| pane.ended_at));
     terminal
 }
 
@@ -2516,8 +2516,28 @@ mod tests {
             unavailable_restored_terminal(Some(&pane), pane.cwd.clone(), "unavailable".into());
         assert_eq!(
             terminal.ended_at, None,
-            "a pane that never ended gets no date"
+            "a pane that never ran an agent gets no date"
         );
+        // An agent that ran in a pane whose directory is gone can no longer run:
+        // it never reported an exit, so the failed restore dates its end.
+        let pane: super::super::snapshot::PaneSnapshot = serde_json::from_value(
+            serde_json::json!({"cwd":"/missing-checkout","session_reported":true}),
+        )
+        .unwrap();
+        let before = crate::pane::unix_now_secs();
+        let terminal =
+            unavailable_restored_terminal(Some(&pane), pane.cwd.clone(), "unavailable".into());
+        assert_eq!(terminal.ended_agent, None);
+        assert!(terminal.ended_at.is_some_and(|at| at >= before));
+        assert!(terminal.restore_error.is_some());
+        // The date persists: a later restart keeps it, so the clock never restarts.
+        let pane: super::super::snapshot::PaneSnapshot = serde_json::from_value(
+            serde_json::json!({"cwd":"/missing-checkout","session_reported":true,"ended_at":123}),
+        )
+        .unwrap();
+        let terminal =
+            unavailable_restored_terminal(Some(&pane), pane.cwd.clone(), "unavailable".into());
+        assert_eq!(terminal.ended_at, Some(123));
     }
 
     #[tokio::test]

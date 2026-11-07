@@ -1694,6 +1694,22 @@ impl TerminalState {
             == ("herdr:opencode", "opencode", Some("select"), None)
     }
 
+    /// Records that this pane's restore failed, so no process runs in it. An
+    /// agent that ran here can no longer run, though it never reported an exit:
+    /// the failure dates its end unless a date is already known. `saved` is the
+    /// date an earlier failure stored, so a restart never restarts the clock.
+    pub fn fail_restore(&mut self, reason: String, saved: Option<u64>) {
+        self.restore_error = Some(reason);
+        if self.ended_at.is_none()
+            && (self.ended_agent.is_some()
+                || self.session_reported
+                || self.persisted_agent_session.is_some()
+                || self.agent_name.is_some())
+        {
+            self.ended_at = Some(saved.unwrap_or_else(crate::pane::unix_now_secs));
+        }
+    }
+
     pub fn set_persisted_agent_session(
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
