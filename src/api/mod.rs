@@ -97,13 +97,30 @@ pub enum PeerInPane {
     Inside,
     Outside,
     Unknown,
+    /// The sender runs under an agent's shared daemon that itself runs in
+    /// the pane. The daemon serves clients in every pane, so the sender may
+    /// speak for any of them: its place cannot be told.
+    UnderSharedDaemon,
 }
 
 impl RequestPeer {
     /// A sender with a controlling terminal is in the pane whose terminal
     /// that is. A sender without one (a hook started detached) is in the
     /// pane whose shell it descends from.
+    /// A sender below an agent's shared daemon is never placed by its
+    /// parents: the daemon inherited the pane of the client that started it.
     pub fn in_pane(&self, pane_shell_pid: u32, pane_tty: Option<u64>) -> PeerInPane {
+        if let (Some(daemon), Some(chain)) =
+            (self.placement.shared_daemon, &self.placement.ancestry)
+        {
+            let daemon_at = chain.iter().position(|&link| link == daemon);
+            let shell_at = chain.iter().position(|&link| link == pane_shell_pid);
+            if let (Some(daemon_at), Some(shell_at)) = (daemon_at, shell_at) {
+                if daemon_at < shell_at {
+                    return PeerInPane::UnderSharedDaemon;
+                }
+            }
+        }
         if let (Some(peer_tty), Some(pane_tty)) = (self.placement.tty, pane_tty) {
             return if peer_tty == pane_tty {
                 PeerInPane::Inside
@@ -154,6 +171,7 @@ mod tests {
             placement: crate::platform::ProcessPlacement {
                 tty,
                 ancestry: ancestry.map(<[u32]>::to_vec),
+                shared_daemon: None,
             },
         }
     }
@@ -206,6 +224,31 @@ mod tests {
         assert_eq!(
             outside.in_pane(PANE_SHELL, None),
             super::PeerInPane::Outside
+        );
+    }
+
+    /// A hook run by an agent's shared daemon descends from the pane whose
+    /// agent started the daemon, but the daemon serves every pane (#805).
+    #[test]
+    fn a_sender_under_a_shared_daemon_in_the_pane_cannot_be_placed() {
+        let mut hook = peer(None, Some(&[900, 800, 700, PANE_SHELL, 1]));
+        hook.placement.shared_daemon = Some(800);
+        let mut daemon_above_the_pane = peer(None, Some(&[900, 700, PANE_SHELL, 800, 1]));
+        daemon_above_the_pane.placement.shared_daemon = Some(800);
+        let mut on_the_terminal = peer(Some(PANE_TTY), Some(&[900, 800, PANE_SHELL, 1]));
+        on_the_terminal.placement.shared_daemon = Some(800);
+
+        assert_eq!(
+            hook.in_pane(PANE_SHELL, Some(PANE_TTY)),
+            super::PeerInPane::UnderSharedDaemon
+        );
+        assert_eq!(
+            on_the_terminal.in_pane(PANE_SHELL, Some(PANE_TTY)),
+            super::PeerInPane::UnderSharedDaemon
+        );
+        assert_eq!(
+            daemon_above_the_pane.in_pane(PANE_SHELL, Some(PANE_TTY)),
+            super::PeerInPane::Inside
         );
     }
 

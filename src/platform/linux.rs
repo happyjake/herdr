@@ -850,7 +850,7 @@ fn process_ppid_and_comm_from_stat(stat: &str) -> Option<(u32, String)> {
     u32::try_from(ppid).ok().map(|ppid| (ppid, comm))
 }
 
-fn process_argv(pid: u32) -> Option<Vec<String>> {
+pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     if bytes.is_empty() {
         return None;

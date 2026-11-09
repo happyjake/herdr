@@ -1821,8 +1821,25 @@ impl App {
         let (runtime, _workspace_id) = self.lookup_runtime(ws_idx, pane_id)?;
         let shell_pid = runtime.child_pid()?;
         let pane_tty = crate::platform::process_tty(shell_pid).flatten();
-        if peer.in_pane(shell_pid, pane_tty) != crate::api::PeerInPane::Outside {
-            return None;
+        match peer.in_pane(shell_pid, pane_tty) {
+            crate::api::PeerInPane::Outside => {}
+            crate::api::PeerInPane::UnderSharedDaemon => {
+                tracing::info!(
+                    source,
+                    peer_pid = peer.pid,
+                    shell_pid,
+                    daemon_pid = peer.placement.shared_daemon,
+                    "refused an agent report from under a shared agent daemon"
+                );
+                return Some(encode_error(
+                    id.to_string(),
+                    "reporter_shared_daemon",
+                    format!(
+                        "{source} reports from under a shared agent daemon cannot be placed in a pane"
+                    ),
+                ));
+            }
+            crate::api::PeerInPane::Inside | crate::api::PeerInPane::Unknown => return None,
         }
         tracing::info!(
             source,
@@ -2854,6 +2871,67 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    /// codex's shared app-server daemon descends from the pane whose TUI
+    /// started it but runs every pane's session hooks (#805): a builtin
+    /// report from under it is refused, and the pane keeps its session.
+    #[tokio::test]
+    async fn a_builtin_session_report_from_under_a_shared_daemon_is_refused() {
+        use std::sync::atomic::Ordering;
+
+        let (mut app, pane_id) = app_with_test_workspace();
+        let terminal_id = app.state.terminals.keys().next().unwrap().clone();
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
+        runtime.child_pid_handle().store(500, Ordering::Relaxed);
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let report =
+            |session: &str, seq: u64, shared_daemon: Option<u32>| PaneReportAgentSessionParams {
+                pane_id: pane_id.clone(),
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                seq: Some(seq),
+                agent_session_id: Some(session.into()),
+                agent_session_path: None,
+                resume_argv: None,
+                session_start_source: Some("resume".into()),
+                peer: Some(crate::api::RequestPeer {
+                    pid: 9000,
+                    placement: crate::platform::ProcessPlacement {
+                        tty: None,
+                        ancestry: Some(vec![9000, 8000, 7000, 500, 1]),
+                        shared_daemon,
+                    },
+                }),
+            };
+        let session_of = |app: &mut App| -> serde_json::Value {
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "get", "method": "pane.get", "params": {"pane_id": pane_id}
+            }))
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            response["result"]["pane"]["agent_session"]["value"].clone()
+        };
+        let owner = "01a167f0-50cf-7711-b047-9a9bd2ff73f7";
+        let other = "01a169aa-2547-77d1-ba69-4433c4c75339";
+
+        let accepted: serde_json::Value = serde_json::from_str(
+            &app.handle_pane_report_agent_session("own".into(), report(owner, 1, None)),
+        )
+        .unwrap();
+        assert_eq!(accepted["result"]["type"], "ok", "{accepted}");
+        assert_eq!(session_of(&mut app), owner);
+
+        let refused: serde_json::Value = serde_json::from_str(
+            &app.handle_pane_report_agent_session("daemon".into(), report(other, 2, Some(8000))),
+        )
+        .unwrap();
+        assert_eq!(
+            refused["error"]["code"], "reporter_shared_daemon",
+            "{refused}"
+        );
+        assert_eq!(session_of(&mut app), owner);
     }
 
     #[test]

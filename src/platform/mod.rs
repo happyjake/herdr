@@ -937,15 +937,42 @@ pub struct ProcessPlacement {
     /// The process, then each parent up to init; `None` when a link in the
     /// chain could not be read (a parent exited mid-climb, say).
     pub ancestry: Option<Vec<u32>>,
+    /// The nearest process in `ancestry` that is an agent's shared daemon
+    /// (codex's app-server), if any. A daemon serves every pane its clients
+    /// run in, but carries the environment of the one pane that started it,
+    /// so whatever runs under it cannot be placed in a pane by its parents.
+    pub shared_daemon: Option<u32>,
+}
+
+/// An agent process that serves sessions for clients in any pane: codex's
+/// app-server (`codex app-server …`, the managed daemon and its
+/// `pid-update-loop` keeper alike). An app-server embedded in a TUI runs in
+/// the TUI's own process and never shows up as a separate process.
+pub fn is_shared_agent_daemon_argv(argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return false;
+    };
+    let name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    name.starts_with("codex") && argv.iter().skip(1).any(|arg| arg == "app-server")
 }
 
 /// Placement of a live process, or `None` when it cannot be read.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn process_placement(pid: u32) -> Option<ProcessPlacement> {
     let (parent, tty) = process_parent_and_tty(pid)?;
+    let ancestry = process_ancestry(pid, parent);
+    let shared_daemon = ancestry.as_ref().and_then(|chain| {
+        chain.iter().copied().find(|&link| {
+            link > 1 && process_argv(link).is_some_and(|argv| is_shared_agent_daemon_argv(&argv))
+        })
+    });
     Some(ProcessPlacement {
         tty,
-        ancestry: process_ancestry(pid, parent),
+        ancestry,
+        shared_daemon,
     })
 }
 
@@ -1502,6 +1529,73 @@ mod tests {
             process_tty(std::process::id()),
             "a child shares its starter's controlling terminal"
         );
+    }
+
+    #[test]
+    fn codex_app_server_processes_are_shared_daemons() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let bin = "/Users/u/.codex/packages/app-server-daemon/releases/0.167.0-aarch64-apple-darwin/bin/codex";
+        assert!(is_shared_agent_daemon_argv(&argv(&[
+            bin,
+            "app-server",
+            "daemon",
+            "pid-update-loop"
+        ])));
+        assert!(is_shared_agent_daemon_argv(&argv(&[
+            bin,
+            "app-server",
+            "--listen",
+            "unix://",
+            "--managed-daemon"
+        ])));
+        assert!(!is_shared_agent_daemon_argv(&argv(&[
+            bin, "resume", "01a167f0"
+        ])));
+        assert!(!is_shared_agent_daemon_argv(&argv(&["codex"])));
+        assert!(!is_shared_agent_daemon_argv(&argv(&[
+            "/x/bin/codex-code-mode-host"
+        ])));
+        assert!(!is_shared_agent_daemon_argv(&argv(&[
+            "/bin/sh",
+            "-c",
+            "echo app-server"
+        ])));
+        assert!(!is_shared_agent_daemon_argv(&[]));
+    }
+
+    /// A live process named codex with an app-server argument is found in a
+    /// placement's parents; an ordinary child is not under one.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn process_placement_names_a_shared_daemon_among_the_parents() {
+        let daemon = spawn_fixture(
+            "/usr/bin/perl",
+            &[
+                "-e",
+                "exec {'/bin/sh'} 'codex', '-c', 'sleep 30; :', 'app-server'",
+            ],
+            None,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let child = loop {
+            let child = process_group_member_pids(daemon.pid())
+                .into_iter()
+                .find(|&pid| pid != daemon.pid());
+            if let Some(child) = child {
+                break child;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon's child never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+
+        let under = process_placement(child).expect("the daemon's child is placed");
+        assert_eq!(under.shared_daemon, Some(daemon.pid()), "{under:?}");
+        let plain = spawn_fixture("/bin/sleep", &["30"], None);
+        let ordinary = process_placement(plain.pid()).expect("a live child is placed");
+        assert_eq!(ordinary.shared_daemon, None, "{ordinary:?}");
     }
 
     /// A process left running by a parent that exited is adopted elsewhere,

@@ -117,6 +117,7 @@ mod tests {
             placement: ProcessPlacement {
                 tty: None,
                 ancestry: Some(vec![9000, 8000, shell_pid, 1]),
+                shared_daemon: None,
             },
         }
     }
