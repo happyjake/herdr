@@ -3128,8 +3128,9 @@ impl HeadlessServer {
             if let Ok(mut success) = serde_json::from_str::<api::schema::SuccessResponse>(&response)
             {
                 if let api::schema::ResponseResult::PaneRead { read } = &mut success.result {
-                    read.text = snapshot.text;
-                    read.truncated = snapshot.truncated;
+                    crate::server::alt_screen_read::answer_with_alternate_screen_text(
+                        read, snapshot,
+                    );
                     if let Ok(serialized) = serde_json::to_string(&success) {
                         response = serialized;
                     }

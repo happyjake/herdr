@@ -410,8 +410,7 @@ impl PendingAltScreenRead {
         let truncated = !self.reached_top || self.history.len() > self.lines;
         let snapshot =
             crate::terminal::snapshot_text(&self.history, self.lines, self.unwrap, truncated);
-        self.read.text = snapshot.text;
-        self.read.truncated = snapshot.truncated;
+        answer_with_alternate_screen_text(&mut self.read, snapshot);
         let response = serde_json::to_string(&SuccessResponse {
             id: self.request_id,
             result: ResponseResult::PaneRead { read: self.read },
@@ -436,6 +435,33 @@ impl PendingAltScreenRead {
 }
 
 pub(crate) type PollOutcome = Option<PendingAltScreenRead>;
+
+/// Replace a read reply's text with an alternate-screen snapshot taken
+/// after the handler ran (a harvest's history or its frozen screen), and
+/// make every other field describe the text actually sent:
+/// - `alternate_screen` becomes `true` where the reply carries the fact,
+///   whatever the live handler sampled; agent.read replies keep it absent;
+/// - no continuity token or elision survives, because both were proved over
+///   the live text, not this one: a `continue_from` read gets the full
+///   snapshot;
+/// - offset reads echo the window sent, the bottom of the snapshot, with
+///   `has_more` from its own truncation.
+pub(crate) fn answer_with_alternate_screen_text(
+    read: &mut PaneReadResult,
+    snapshot: crate::pane::TerminalReadSnapshot,
+) {
+    read.text = snapshot.text;
+    read.truncated = snapshot.truncated;
+    if read.alternate_screen.is_some() {
+        read.alternate_screen = Some(true);
+    }
+    read.continuity = None;
+    read.continued = None;
+    if read.effective_offset.is_some() || read.has_more.is_some() {
+        read.effective_offset = Some(0);
+        read.has_more = Some(snapshot.truncated);
+    }
+}
 
 fn restore_batch_size(snapshot: &ScreenSnapshot) -> usize {
     snapshot.rows.len().saturating_div(2).max(1)
@@ -1050,5 +1076,113 @@ mod tests {
         drop(runtime);
         drop(_guard);
         rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    /// Runs one harvest to completion after `prepare` adjusts the live
+    /// handler's reply, with a `?1049l` / `?1049h` flip between the spec
+    /// (taken on the alternate screen) and the live read. Returns the reply
+    /// the harvest sends.
+    fn harvest_after_a_screen_flip(prepare: impl FnOnce(&mut PaneReadResult)) -> PaneReadResult {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _guard = rt.enter();
+        let (runtime, mut input_rx) = TerminalRuntime::test_with_channel_capacity(80, 5, 8);
+        runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], true));
+        let started = Instant::now();
+        let (mut pending, response_rx) = pending_read(&runtime, started, 8);
+        prepare(&mut pending.read);
+        runtime.test_process_pty_bytes(b"\x1b[?1049lprimary\r\n");
+        runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], true));
+
+        let settle = started + Duration::from_millis(12);
+        let harvest = settle + INITIAL_QUIET + STEP_TIMEOUT;
+        let pending = pending
+            .poll(Some(&runtime), started + Duration::from_millis(1))
+            .expect("OUTPUT_QUIET coalescing");
+        let pending = pending
+            .poll(Some(&runtime), settle)
+            .expect("SettleInitial re-seeds on Alternate");
+        let pending = pending
+            .poll(Some(&runtime), settle + INITIAL_QUIET)
+            .expect("ProbeBottom armed");
+        input_rx.try_recv().expect("probe wheel down");
+        let pending = pending
+            .poll(Some(&runtime), harvest)
+            .expect("Harvest armed");
+        input_rx.try_recv().expect("harvest wheel up");
+        runtime.test_process_pty_bytes(&draw(&["13", "14", "15", "16", "17"], false));
+        let pending = pending
+            .poll(Some(&runtime), harvest + Duration::from_millis(1))
+            .expect("OUTPUT_QUIET");
+        let pending = pending
+            .poll(Some(&runtime), harvest + Duration::from_millis(12))
+            .expect("Restore armed");
+        input_rx.try_recv().expect("restore wheel down");
+        runtime.test_process_pty_bytes(&draw(&["16", "17", "18", "19", "20"], false));
+        let pending = pending
+            .poll(Some(&runtime), harvest + Duration::from_millis(13))
+            .expect("Restore OUTPUT_QUIET");
+        assert!(pending
+            .poll(Some(&runtime), harvest + Duration::from_millis(24))
+            .is_none());
+
+        let reply: SuccessResponse =
+            serde_json::from_str(&response_rx.recv_timeout(Duration::from_millis(50)).unwrap())
+                .unwrap();
+        let ResponseResult::PaneRead { read } = reply.result else {
+            panic!("expected PaneRead");
+        };
+        drop(runtime);
+        drop(_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+        read
+    }
+
+    /// Review rv4fork F1(2): the live read sampled the primary screen, but the
+    /// harvest answers alternate-screen text, so the reply says so.
+    #[test]
+    fn a_harvest_reports_the_alternate_screen_even_when_the_live_read_saw_primary() {
+        let read = harvest_after_a_screen_flip(|read| read.alternate_screen = Some(false));
+        assert_eq!(read.text, "13\n14\n15\n16\n17\n18\n19\n20\n");
+        assert_eq!(read.alternate_screen, Some(true));
+    }
+
+    /// A reply whose text the harvest replaced carries no continuity token
+    /// or elision computed over the live text, and echoes the window it
+    /// actually answers: the bottom, with `has_more` from its own truncation.
+    #[test]
+    fn a_harvest_answers_its_own_full_window_without_continuity() {
+        let read = harvest_after_a_screen_flip(|read| {
+            read.text = String::new();
+            read.alternate_screen = Some(false);
+            read.effective_offset = Some(5);
+            read.has_more = Some(false);
+            read.continuity = Some(crate::api::schema::PaneReadContinuity {
+                token: "issued over the live text".into(),
+            });
+            read.continued = Some(crate::api::schema::PaneReadContinued {
+                before: "live".into(),
+                after: String::new(),
+                utf16_len: 4,
+            });
+        });
+        assert_eq!(read.text, "13\n14\n15\n16\n17\n18\n19\n20\n");
+        assert_eq!(read.continuity, None);
+        assert_eq!(read.continued, None, "never an elision over replaced text");
+        assert_eq!(read.effective_offset, Some(0));
+        assert_eq!(read.has_more, Some(read.truncated));
+        assert_eq!(read.alternate_screen, Some(true));
+    }
+
+    /// agent.read replies never carry the fact; a harvest keeps it absent,
+    /// and keeps offset echoes absent on reads that sent no offset.
+    #[test]
+    fn a_harvest_keeps_absent_fields_absent() {
+        let read = harvest_after_a_screen_flip(|_| {});
+        assert_eq!(read.alternate_screen, None);
+        assert_eq!(read.effective_offset, None);
+        assert_eq!(read.has_more, None);
     }
 }

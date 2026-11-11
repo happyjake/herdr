@@ -8717,3 +8717,192 @@ fn no_handle_internal_event_bypass_in_module() {
         bypass_lines.join("\n  ")
     );
 }
+
+fn text_read_request(
+    id: &str,
+    pane_id: &str,
+    intent: api::schema::ReadIntent,
+) -> api::schema::Request {
+    api::schema::Request {
+        id: id.into(),
+        method: api::schema::Method::PaneRead(api::schema::PaneReadParams {
+            pane_id: pane_id.to_owned(),
+            source: api::schema::ReadSource::Recent,
+            lines: Some(80),
+            format: api::schema::ReadFormat::Text,
+            strip_ansi: false,
+            intent,
+            span: None,
+            offset_from_bottom: None,
+            continuity: false,
+            continue_from: None,
+        }),
+    }
+}
+
+fn send_read(
+    server: &mut HeadlessServer,
+    request: api::schema::Request,
+) -> std::sync::mpsc::Receiver<String> {
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+        request,
+        respond_to,
+        response_write_complete: None,
+    });
+    response_rx
+}
+
+fn pane_read_reply(raw: &str) -> api::schema::PaneReadResult {
+    let reply: api::schema::SuccessResponse = serde_json::from_str(raw).expect("json");
+    let api::schema::ResponseResult::PaneRead { read } = reply.result else {
+        panic!("expected PaneRead: {raw}");
+    };
+    read
+}
+
+/// Start an alternate-screen harvest on an idle mouse-reporting agent, then
+/// leave the alternate screen so later live reads see the primary screen
+/// while the harvest still holds its frozen alternate-screen snapshot.
+fn start_harvest_then_leave_alternate_screen(
+    server: &mut HeadlessServer,
+    terminal_id: &crate::terminal::TerminalId,
+    public_pane_id: &str,
+    alternate_rows: &[u8],
+) {
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(terminal_id)
+        .expect("terminal")
+        .set_detected_state(
+            Some(crate::detect::Agent::Claude),
+            crate::detect::AgentState::Idle,
+        );
+    let runtime = server
+        .app
+        .terminal_runtimes
+        .get(terminal_id)
+        .expect("runtime");
+    runtime.test_process_pty_bytes(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+    runtime.test_process_pty_bytes(alternate_rows);
+
+    let first_rx = send_read(
+        server,
+        text_read_request(
+            "read-1",
+            public_pane_id,
+            api::schema::ReadIntent::Interactive,
+        ),
+    );
+    assert!(first_rx.try_recv().is_err());
+    assert_eq!(server.pending_alt_screen_reads.len(), 1);
+
+    server
+        .app
+        .terminal_runtimes
+        .get(terminal_id)
+        .expect("runtime")
+        .test_process_pty_bytes(b"\x1b[?1049lprimary-only-row\r\n");
+    server.poll_pending_alt_screen_reads(Instant::now());
+    assert_eq!(server.pending_alt_screen_reads.len(), 1);
+}
+
+/// Review rv4fork F1(1): a text read answered from the harvest's frozen
+/// alternate-screen snapshot says it is alternate-screen text, although the
+/// live handler sampled the primary screen.
+#[test]
+fn a_frozen_alt_screen_read_reports_the_alternate_screen() {
+    with_terminal_session_test_server(
+        |server, terminal_id, _terminal_id_string, public_pane_id| {
+            start_harvest_then_leave_alternate_screen(
+                server,
+                &terminal_id,
+                &public_pane_id,
+                b"alt-screen-only-row\r\n",
+            );
+
+            let second_rx = send_read(
+                server,
+                text_read_request("read-2", &public_pane_id, api::schema::ReadIntent::Passive),
+            );
+            let read = pane_read_reply(&second_rx.recv().expect("second read reply"));
+            assert!(
+                read.text.contains("alt-screen-only-row")
+                    && !read.text.contains("primary-only-row"),
+                "expected frozen alternate-screen text, got {:?}",
+                read.text
+            );
+            assert_eq!(read.alternate_screen, Some(true));
+        },
+    );
+}
+
+/// A frozen reply's text was replaced after the handler, so it carries no
+/// continuity token, a `continue_from` on it answers the full frozen window
+/// (never an elision), and its offset echoes describe the window it sends.
+#[test]
+fn a_frozen_alt_screen_read_answers_its_full_window_without_continuity() {
+    with_terminal_session_test_server(
+        |server, terminal_id, _terminal_id_string, public_pane_id| {
+            let rows: Vec<u8> = (0..20)
+                .flat_map(|row| {
+                    format!("alternate row {row:02} with enough text to cover\r\n").into_bytes()
+                })
+                .collect();
+            // A token over the alternate screen's text, from an ANSI read
+            // before the harvest starts.
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .test_process_pty_bytes(b"\x1b[?1049h");
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .test_process_pty_bytes(&rows);
+            let mut ansi = text_read_request(
+                "token",
+                &public_pane_id,
+                api::schema::ReadIntent::Interactive,
+            );
+            if let api::schema::Method::PaneRead(params) = &mut ansi.method {
+                params.format = api::schema::ReadFormat::Ansi;
+                params.continuity = true;
+            }
+            let token_read = pane_read_reply(&send_read(server, ansi).recv().expect("token read"));
+            let token = token_read
+                .continuity
+                .expect("an ANSI read issues a token")
+                .token;
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .test_process_pty_bytes(b"\x1b[?1049l");
+
+            start_harvest_then_leave_alternate_screen(server, &terminal_id, &public_pane_id, &rows);
+
+            let mut frozen =
+                text_read_request("read-2", &public_pane_id, api::schema::ReadIntent::Passive);
+            if let api::schema::Method::PaneRead(params) = &mut frozen.method {
+                params.continuity = true;
+                params.continue_from = Some(token);
+                params.offset_from_bottom = Some(3);
+            }
+            let read = pane_read_reply(&send_read(server, frozen).recv().expect("frozen reply"));
+            assert!(read.text.contains("alternate row 19"), "{:?}", read.text);
+            assert!(!read.text.contains("primary-only-row"));
+            assert_eq!(read.continuity, None);
+            assert_eq!(read.continued, None, "never an elision over replaced text");
+            assert_eq!(read.alternate_screen, Some(true));
+            assert_eq!(read.effective_offset, Some(0));
+            assert_eq!(read.has_more, Some(read.truncated));
+        },
+    );
+}
