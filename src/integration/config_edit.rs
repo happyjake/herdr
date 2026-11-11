@@ -826,6 +826,13 @@ pub(crate) fn build_codex_config_with_hooks(content: &str) -> String {
         }
     }
 
+    // Already enabled: hand back the exact text, line endings and comments
+    // included, so the caller sees no change and does not rewrite the file.
+    let already_enabled = hooks_index.is_some_and(|index| toml_key_is_true(&lines[index]));
+    if already_enabled && deprecated_hooks_indexes.is_empty() {
+        return content.to_string();
+    }
+
     if let Some(index) = hooks_index {
         lines[index] = "hooks = true".to_string();
     }
@@ -981,4 +988,13 @@ pub(crate) fn is_toml_key(line: &str, key: &str) -> bool {
     }
 
     trimmed[key.len()..].trim_start().starts_with('=')
+}
+
+/// Whether a `key = value` line, as matched by `is_toml_key`, sets `true`.
+fn toml_key_is_true(line: &str) -> bool {
+    let Some((_, value)) = line.split_once('=') else {
+        return false;
+    };
+    let value = value.split_once('#').map_or(value, |(value, _)| value);
+    value.trim() == "true"
 }

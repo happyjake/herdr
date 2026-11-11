@@ -1597,6 +1597,269 @@ fn install_codex_removes_turn_status_hooks_from_previous_integration() {
     let _ = fs::remove_dir_all(base);
 }
 
+// codex trusts each hook by its position in hooks.json
+// (`session_start:<group>:<hook>` in config.toml): an install that moves a
+// hook makes codex run no SessionStart hook at all until the user reviews.
+
+fn codex_canonical_session_hook(hook_path: &Path) -> Value {
+    json!({"type": "command", "command": hook_command(hook_path, Some("session")), "timeout": 10})
+}
+
+fn codex_foreign_group(command: &str) -> Value {
+    json!({"hooks": [{"type": "command", "command": command, "timeout": 30}]})
+}
+
+fn backdate(path: &Path) -> std::time::SystemTime {
+    let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    past
+}
+
+fn modified(path: &Path) -> std::time::SystemTime {
+    fs::metadata(path).unwrap().modified().unwrap()
+}
+
+#[test]
+fn install_codex_leaves_canonical_hooks_and_config_untouched() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let hook_path = codex_dir.join(CODEX_HOOK_INSTALL_NAME);
+    let hooks_path = codex_dir.join("hooks.json");
+    let config_path = codex_dir.join("config.toml");
+    let session = serde_json::to_string(&hook_command(&hook_path, Some("session"))).unwrap();
+    // herdr first, two foreign hooks after it; foreign keys are not in the
+    // sorted order a serde_json rewrite would produce.
+    let hooks_text = format!(
+        concat!(
+            "{{\n",
+            "  \"hooks\": {{\n",
+            "    \"SessionStart\": [\n",
+            "      {{\n",
+            "        \"hooks\": [\n",
+            "          {{\n",
+            "            \"command\": {session},\n",
+            "            \"timeout\": 10,\n",
+            "            \"type\": \"command\"\n",
+            "          }}\n",
+            "        ]\n",
+            "      }},\n",
+            "      {{\n",
+            "        \"hooks\": [\n",
+            "          {{\n",
+            "            \"type\": \"command\",\n",
+            "            \"command\": \"dejavu codex-sessionstart\",\n",
+            "            \"timeout\": 30\n",
+            "          }}\n",
+            "        ]\n",
+            "      }},\n",
+            "      {{\n",
+            "        \"hooks\": [\n",
+            "          {{\n",
+            "            \"type\": \"command\",\n",
+            "            \"command\": \"dejavu sync --background\",\n",
+            "            \"timeout\": 5\n",
+            "          }}\n",
+            "        ]\n",
+            "      }}\n",
+            "    ]\n",
+            "  }}\n",
+            "}}\n",
+        ),
+        session = session,
+    );
+    let state = |group: usize| {
+        format!(
+            "[hooks.state.\"{}:session_start:{group}:0\"]\ntrusted_hash = \"sha256:{group}\"\n",
+            hooks_path.display()
+        )
+    };
+    let config_text = format!(
+        "model = \"gpt-5.4\"\n\n[features]\nhooks = true\n\n{}\n{}\n{}",
+        state(0),
+        state(1),
+        state(2)
+    );
+    fs::write(&hooks_path, &hooks_text).unwrap();
+    fs::write(&config_path, &config_text).unwrap();
+    let past = backdate(&hooks_path);
+    backdate(&config_path);
+    std::env::set_var("HOME", &home);
+
+    install_codex().unwrap();
+
+    assert_eq!(fs::read_to_string(&hooks_path).unwrap(), hooks_text);
+    assert_eq!(modified(&hooks_path), past, "hooks.json was rewritten");
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), config_text);
+    assert_eq!(modified(&config_path), past, "config.toml was rewritten");
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_codex_updates_herdr_session_hook_where_it_stands() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let hook_path = codex_dir.join(CODEX_HOOK_INSTALL_NAME);
+    let hooks_path = codex_dir.join("hooks.json");
+    std::env::set_var("HOME", &home);
+
+    let stale_timeout = json!({"type": "command", "command": hook_command(&hook_path, Some("session")), "timeout": 5});
+    let stale_command = json!({"type": "command", "command": hook_command(&hook_path, Some("idle")), "timeout": 10});
+    for stale in [stale_timeout, stale_command] {
+        let before = json!({"hooks": {"SessionStart": [
+            codex_foreign_group("echo a"),
+            {"hooks": [stale]},
+            codex_foreign_group("echo b"),
+            codex_foreign_group("echo c"),
+        ]}});
+        fs::write(&hooks_path, serde_json::to_string_pretty(&before).unwrap()).unwrap();
+
+        install_codex().unwrap();
+
+        let after: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let groups = after["hooks"]["SessionStart"].as_array().unwrap();
+        let expected = before["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0], expected[0]);
+        assert_eq!(
+            groups[1],
+            json!({"hooks": [codex_canonical_session_hook(&hook_path)]})
+        );
+        assert_eq!(groups[2], expected[2]);
+        assert_eq!(groups[3], expected[3]);
+    }
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_codex_appends_session_hook_after_foreign_hooks() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let hook_path = codex_dir.join(CODEX_HOOK_INSTALL_NAME);
+    let hooks_path = codex_dir.join("hooks.json");
+    let before = json!({"hooks": {
+        "SessionStart": [codex_foreign_group("echo a"), codex_foreign_group("echo b")],
+        "UserPromptSubmit": [codex_foreign_group("echo x")],
+    }});
+    fs::write(&hooks_path, serde_json::to_string_pretty(&before).unwrap()).unwrap();
+    std::env::set_var("HOME", &home);
+
+    install_codex().unwrap();
+
+    let after: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    assert_eq!(
+        after["hooks"]["SessionStart"],
+        json!([
+            codex_foreign_group("echo a"),
+            codex_foreign_group("echo b"),
+            {"hooks": [codex_canonical_session_hook(&hook_path)]},
+        ])
+    );
+    assert_eq!(
+        after["hooks"]["UserPromptSubmit"],
+        before["hooks"]["UserPromptSubmit"]
+    );
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_codex_removes_legacy_hooks_without_reordering_foreign_hooks() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let home = base.join("home");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    let hook_path = codex_dir.join(CODEX_HOOK_INSTALL_NAME);
+    let hooks_path = codex_dir.join("hooks.json");
+    let herdr = |action| json!({"type": "command", "command": hook_command(&hook_path, Some(action)), "timeout": 10});
+    let foreign = |command: &str| json!({"type": "command", "command": command});
+    let before = json!({"hooks": {
+        "SessionStart": [
+            {"hooks": [codex_canonical_session_hook(&hook_path)]},
+            codex_foreign_group("echo a"),
+        ],
+        "UserPromptSubmit": [
+            codex_foreign_group("echo x"),
+            {"hooks": [herdr("working")]},
+            codex_foreign_group("echo y"),
+        ],
+        "Stop": [
+            {"matcher": "keep", "hooks": [foreign("echo z"), herdr("idle"), foreign("echo w")]},
+            {"hooks": []},
+            codex_foreign_group("echo v"),
+        ],
+        "PermissionRequest": [{"hooks": [herdr("blocked")]}],
+        "PostToolUse": [codex_foreign_group("echo p"), codex_foreign_group("echo q")],
+    }});
+    fs::write(&hooks_path, serde_json::to_string_pretty(&before).unwrap()).unwrap();
+    std::env::set_var("HOME", &home);
+
+    install_codex().unwrap();
+
+    let after: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    assert_eq!(
+        after["hooks"]["SessionStart"],
+        before["hooks"]["SessionStart"]
+    );
+    assert_eq!(
+        after["hooks"]["UserPromptSubmit"],
+        json!([codex_foreign_group("echo x"), codex_foreign_group("echo y")])
+    );
+    assert_eq!(
+        after["hooks"]["Stop"],
+        json!([
+            {"matcher": "keep", "hooks": [foreign("echo z"), foreign("echo w")]},
+            {"hooks": []},
+            codex_foreign_group("echo v"),
+        ])
+    );
+    assert!(after["hooks"].get("PermissionRequest").is_none());
+    assert_eq!(
+        after["hooks"]["PostToolUse"],
+        before["hooks"]["PostToolUse"]
+    );
+
+    std::env::remove_var("HOME");
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn build_codex_config_returns_an_enabled_config_verbatim() {
+    for config in [
+        "[features]\r\nhooks = true\r\n",
+        "model = \"gpt-5.4\"\n[features]\nhooks=true # herdr\nother = 1",
+    ] {
+        assert_eq!(build_codex_config_with_hooks(config), config);
+    }
+    assert_eq!(
+        build_codex_config_with_hooks("[features]\nhooks = false # off\n"),
+        "[features]\nhooks = true\n"
+    );
+    assert_eq!(
+        build_codex_config_with_hooks("[features]\nhooks = true\ncodex_hooks = true\n"),
+        "[features]\nhooks = true\n"
+    );
+}
+
 #[test]
 fn uninstall_codex_removes_herdr_hooks_and_leaves_config_alone() {
     let _lock = integration_env_lock();

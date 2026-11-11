@@ -7,6 +7,7 @@ use serde_json::{json, Map, Value};
 use super::claude_settings::{
     install as install_claude_settings, uninstall as uninstall_claude_settings,
 };
+use super::codex_hooks::install as install_codex_hooks;
 use super::command::hook_command;
 #[cfg(windows)]
 use super::command::powershell_encoded_hook_command;
@@ -171,38 +172,20 @@ pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
     fs::write(&hook_path, CODEX_HOOK_ASSET)?;
     make_executable(&hook_path)?;
 
+    // codex trusts hooks by their position in hooks.json, so herdr's entries
+    // are edited where they stand and an unchanged file is never rewritten.
     let hooks_path = dir.join("hooks.json");
-    let mut hooks_file = if hooks_path.is_file() {
-        serde_json::from_str::<Value>(&fs::read_to_string(&hooks_path)?).map_err(|err| {
-            io::Error::other(format!("failed to parse {}: {err}", hooks_path.display()))
-        })?
+    let existing_hooks = if hooks_path.is_file() {
+        Some(fs::read_to_string(&hooks_path)?)
     } else {
-        json!({})
+        None
     };
-
-    let hooks = ensure_hooks_object(
-        &mut hooks_file,
-        &hooks_path,
-        "codex hooks file",
-        "codex hooks file hooks",
-    )?;
-    remove_hook_commands(hooks, "PermissionRequest", &hook_path, Some("blocked"))?;
-    remove_hook_commands(hooks, "SessionStart", &hook_path, Some("idle"))?;
-    remove_hook_commands(hooks, "UserPromptSubmit", &hook_path, Some("working"))?;
-    remove_hook_commands(hooks, "PreToolUse", &hook_path, Some("working"))?;
-    remove_hook_commands(hooks, "Stop", &hook_path, Some("idle"))?;
-    remove_hook_commands(hooks, "Interrupt", &hook_path, Some("idle"))?;
-    remove_hook_commands(hooks, "SessionStart", &hook_path, Some("session"))?;
-    ensure_command_hook(
-        hooks,
-        "SessionStart",
-        hook_command(&hook_path, Some("session")),
-        10,
-        None,
-    )?;
+    let updated_hooks = install_codex_hooks(existing_hooks.as_deref(), &hooks_path, &hook_path)?;
     remove_legacy_bash_hook_file(&hook_path)?;
 
-    write_config(&hooks_path, serde_json::to_string_pretty(&hooks_file)?)?;
+    if existing_hooks.as_deref() != Some(updated_hooks.as_str()) {
+        write_config(&hooks_path, updated_hooks)?;
+    }
 
     let config_path = dir.join("config.toml");
     let existing_config = if config_path.is_file() {
