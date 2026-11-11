@@ -1768,16 +1768,33 @@ impl App {
         let Some((pane, workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        let (text, truncated, effective_offset, has_more) = match super::pane_read_window(
-            pane,
-            params.source,
-            params.format,
-            params.lines,
-            params.offset_from_bottom,
-            params.span,
-        ) {
+        // The alternate-screen fact and the window come from one content
+        // state, so a client may trust the reply's own fact for its text.
+        let (alternate_screen, window) = pane.read_content_stable(|| {
+            (
+                pane.alternate_screen_active(),
+                super::pane_read_window(
+                    pane,
+                    params.source,
+                    params.format,
+                    params.lines,
+                    params.offset_from_bottom,
+                    params.span,
+                ),
+            )
+        });
+        let (text, truncated, effective_offset, has_more) = match window {
             Ok(window) => window,
             Err(message) => return encode_error(id, "invalid_request", message),
+        };
+        let continuity = if super::read_continuity::honored_for(params.format, params.source) {
+            super::read_continuity::apply(text, params.continuity, params.continue_from.as_deref())
+        } else {
+            super::read_continuity::ContinuityReply {
+                text,
+                continuity: None,
+                continued: None,
+            }
         };
 
         encode_success(
@@ -1790,11 +1807,14 @@ impl App {
                     cols: Some(pane.current_size().1),
                     source: params.source,
                     format: params.format,
-                    text,
+                    text: continuity.text,
                     revision: 0,
                     truncated,
                     effective_offset,
                     has_more,
+                    alternate_screen: Some(alternate_screen),
+                    continuity: continuity.continuity,
+                    continued: continuity.continued,
                 },
             },
         )
@@ -3249,6 +3269,8 @@ mod tests {
             intent: Default::default(),
             span: None,
             offset_from_bottom,
+            continuity: false,
+            continue_from: None,
         }
     }
 
@@ -5584,6 +5606,8 @@ mod tests {
                 intent: crate::api::schema::ReadIntent::Interactive,
                 span: None,
                 offset_from_bottom: None,
+                continuity: false,
+                continue_from: None,
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -8056,3 +8080,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "panes/read_continuity_tests.rs"]
+mod read_continuity_tests;

@@ -524,6 +524,19 @@ crate::cli::projection::cli_params! {
         /// `has_more: false` at offset zero and reject nonzero offsets.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub offset_from_bottom: Option<u64> => Field::new(None::<u64>),
+        /// Ask for a continuity token over this reply's text, to send back
+        /// as `continue_from` on a later read. Honored only for `format:
+        /// ansi` with source `recent` or `recent_unwrapped`; ignored
+        /// otherwise. Servers that predate it ignore it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub continuity: bool => Field::new(false),
+        /// A token from an earlier `pane.read` reply's `continuity`. When
+        /// the server proves that token's covered bytes lie inside this
+        /// window, the reply leaves them out and answers `continued` with
+        /// `text: ""`; otherwise the reply is the full window. Same
+        /// format/source rule as `continuity`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub continue_from: Option<String> => Field::new(None::<String>),
     }
 }
 
@@ -1146,6 +1159,43 @@ pub struct PaneReadResult {
     /// window. Absent when the request carried no offset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_more: Option<bool>,
+    /// Whether the pane was on the alternate screen when this window was
+    /// read, sampled with the window's text so no output lands between
+    /// them. `pane.read` replies from servers advertising
+    /// `capabilities.read_alternate_screen` always carry it; older servers
+    /// and `agent.read` omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alternate_screen: Option<bool>,
+    /// Present when the request asked `continuity` and the text has a
+    /// covered part worth naming: everything after its first line feed,
+    /// at least 256 bytes. Computed over the full window text, also on a
+    /// `continued` reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity: Option<PaneReadContinuity>,
+    /// Present only when the request's `continue_from` was proved: `text`
+    /// is then `""`, and the window's text is `before`, the token's covered
+    /// bytes, then `after`. Every other field describes the full window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued: Option<PaneReadContinued>,
+}
+
+/// A continuity token over a `pane.read` reply's covered text. Opaque to
+/// clients; it carries no server state and stays valid across reconnects
+/// and live handoffs to servers that support it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReadContinuity {
+    pub token: String,
+}
+
+/// The parts of a `pane.read` window around the covered bytes a
+/// `continue_from` token named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReadContinued {
+    pub before: String,
+    pub after: String,
+    /// Length of the full window text in UTF-16 code units, so a client can
+    /// check its reassembly.
+    pub utf16_len: u64,
 }
 
 /// Inclusive display-cell columns on a pane's current viewport.

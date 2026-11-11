@@ -696,6 +696,8 @@ fn pane_read(
                 intent: crate::api::schema::ReadIntent::Passive,
                 span: None,
                 offset_from_bottom: None,
+                continuity: false,
+                continue_from: None,
             }),
         },
         api_tx,

@@ -436,6 +436,8 @@ mod tests {
                 turn_index: false,
                 agent_settings: false,
                 preface: false,
+                read_continuity: false,
+                read_alternate_screen: false,
             }),
         }
     }

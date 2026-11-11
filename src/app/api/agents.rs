@@ -435,6 +435,9 @@ impl App {
                     truncated,
                     effective_offset,
                     has_more,
+                    alternate_screen: None,
+                    continuity: None,
+                    continued: None,
                 },
             },
         )
@@ -976,12 +979,21 @@ mod tests {
     fn codex_prompt_ending_in_a_skill_mention_gets_a_closing_space() {
         use super::codex_prompt_text;
         assert_eq!(codex_prompt_text(Agent::Codex, "$debrief"), "$debrief ");
-        assert_eq!(codex_prompt_text(Agent::Codex, "run $debrief"), "run $debrief ");
-        assert_eq!(codex_prompt_text(Agent::Codex, "$debrief now"), "$debrief now");
+        assert_eq!(
+            codex_prompt_text(Agent::Codex, "run $debrief"),
+            "run $debrief "
+        );
+        assert_eq!(
+            codex_prompt_text(Agent::Codex, "$debrief now"),
+            "$debrief now"
+        );
         assert_eq!(codex_prompt_text(Agent::Codex, "costs $"), "costs $");
         assert_eq!(codex_prompt_text(Agent::Codex, "$debrief "), "$debrief ");
         assert_eq!(codex_prompt_text(Agent::Claude, "$debrief"), "$debrief");
-        assert_eq!(codex_prompt_text(Agent::Pi, "/skill:debrief"), "/skill:debrief");
+        assert_eq!(
+            codex_prompt_text(Agent::Pi, "/skill:debrief"),
+            "/skill:debrief"
+        );
     }
 
     #[tokio::test]

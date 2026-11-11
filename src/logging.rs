@@ -132,6 +132,33 @@ pub(crate) fn api_preface_answered(reason: Option<&'static str>, turns: usize, o
     );
 }
 
+/// How one `pane.read` carrying `continue_from` ended — `hit`, `miss` or
+/// `invalid` — and how many bytes a hit left out; never any pane text.
+/// Debug: pane.read is routine and polls may continue every second.
+pub(crate) fn api_read_continued(outcome: &'static str, elided_bytes: usize) {
+    tracing::debug!(
+        event = "api.read.continued",
+        subsystem = "api",
+        outcome,
+        elided_bytes,
+        "pane read continued"
+    );
+}
+
+/// Process-wide `pane.read` continuation totals since the server started,
+/// written at most once a minute so the hit rate is visible at info level.
+pub(crate) fn api_read_continuity_totals(hits: u64, misses: u64, invalid: u64, elided_bytes: u64) {
+    tracing::info!(
+        event = "api.read.continuity",
+        subsystem = "api",
+        hits,
+        misses,
+        invalid,
+        elided_bytes,
+        "pane read continuity totals"
+    );
+}
+
 pub(crate) fn api_request_failed(request_id: &str, method: &'static str, err: &str) {
     tracing::warn!(
         event = "api.request.fail",

@@ -1597,6 +1597,9 @@ fn subscription_event_envelope_round_trips() {
                 truncated: false,
                 effective_offset: None,
                 has_more: None,
+                alternate_screen: None,
+                continuity: None,
+                continued: None,
             },
         }),
     };
@@ -1721,6 +1724,8 @@ fn success_response_round_trips() {
                 turn_index: true,
                 agent_settings: true,
                 preface: true,
+                read_continuity: true,
+                read_alternate_screen: true,
             }),
             name: Some("test-server".into()),
             reach: Some("test-server".into()),

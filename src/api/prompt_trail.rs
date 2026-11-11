@@ -597,6 +597,8 @@ fn ask_for_span(
                     max_lines: crate::preface::seam::MAX_SCREEN_LINES,
                 }),
                 offset_from_bottom: None,
+                continuity: false,
+                continue_from: None,
             }),
         },
         api_tx,
@@ -1878,6 +1880,9 @@ mod tests {
                 truncated: top > 0,
                 effective_offset: Some(0),
                 has_more: Some(top > 0),
+                alternate_screen: None,
+                continuity: None,
+                continued: None,
             }
         }
 
@@ -1900,6 +1905,9 @@ mod tests {
                 truncated: top > 0,
                 effective_offset: Some(landed as u64),
                 has_more: Some(top > 0),
+                alternate_screen: None,
+                continuity: None,
+                continued: None,
             }
         }
     }

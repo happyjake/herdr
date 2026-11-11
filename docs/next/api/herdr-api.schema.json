@@ -3385,6 +3385,17 @@
         },
         "PaneReadParams": {
           "properties": {
+            "continue_from": {
+              "description": "A token from an earlier `pane.read` reply's `continuity`. When\nthe server proves that token's covered bytes lie inside this\nwindow, the reply leaves them out and answers `continued` with\n`text: \"\"`; otherwise the reply is the full window. Same\nformat/source rule as `continuity`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "continuity": {
+              "description": "Ask for a continuity token over this reply's text, to send back\nas `continue_from` on a later read. Honored only for `format:\nansi` with source `recent` or `recent_unwrapped`; ignored\notherwise. Servers that predate it ignore it.",
+              "type": "boolean"
+            },
             "format": {
               "$ref": "#/schemas/request/$defs/ReadFormat",
               "default": "text"
@@ -7603,8 +7614,50 @@
           ],
           "type": "object"
         },
+        "PaneReadContinued": {
+          "description": "The parts of a `pane.read` window around the covered bytes a\n`continue_from` token named.",
+          "properties": {
+            "after": {
+              "type": "string"
+            },
+            "before": {
+              "type": "string"
+            },
+            "utf16_len": {
+              "description": "Length of the full window text in UTF-16 code units, so a client can\ncheck its reassembly.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "before",
+            "after",
+            "utf16_len"
+          ],
+          "type": "object"
+        },
+        "PaneReadContinuity": {
+          "description": "A continuity token over a `pane.read` reply's covered text. Opaque to\nclients; it carries no server state and stays valid across reconnects\nand live handoffs to servers that support it.",
+          "properties": {
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "token"
+          ],
+          "type": "object"
+        },
         "PaneReadResult": {
           "properties": {
+            "alternate_screen": {
+              "description": "Whether the pane was on the alternate screen when this window was\nread, sampled with the window's text so no output lands between\nthem. `pane.read` replies from servers advertising\n`capabilities.read_alternate_screen` always carry it; older servers\nand `agent.read` omit it.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "cols": {
               "description": "Current terminal width in columns. Older servers omit this field.",
               "format": "uint16",
@@ -7614,6 +7667,28 @@
                 "integer",
                 "null"
               ]
+            },
+            "continued": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneReadContinued"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present only when the request's `continue_from` was proved: `text`\nis then `\"\"`, and the window's text is `before`, the token's covered\nbytes, then `after`. Every other field describes the full window."
+            },
+            "continuity": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_event/$defs/PaneReadContinuity"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present when the request asked `continuity` and the text has a\ncovered part worth naming: everything after its first line feed,\nat least 256 bytes. Computed over the full window text, also on a\n`continued` reply."
             },
             "effective_offset": {
               "description": "Echoed on offset reads: the requested offset_from_bottom clamped at\nthe top of scrollback. Absent when the request carried no offset.",
@@ -10106,8 +10181,50 @@
           ],
           "type": "object"
         },
+        "PaneReadContinued": {
+          "description": "The parts of a `pane.read` window around the covered bytes a\n`continue_from` token named.",
+          "properties": {
+            "after": {
+              "type": "string"
+            },
+            "before": {
+              "type": "string"
+            },
+            "utf16_len": {
+              "description": "Length of the full window text in UTF-16 code units, so a client can\ncheck its reassembly.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "before",
+            "after",
+            "utf16_len"
+          ],
+          "type": "object"
+        },
+        "PaneReadContinuity": {
+          "description": "A continuity token over a `pane.read` reply's covered text. Opaque to\nclients; it carries no server state and stays valid across reconnects\nand live handoffs to servers that support it.",
+          "properties": {
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "token"
+          ],
+          "type": "object"
+        },
         "PaneReadResult": {
           "properties": {
+            "alternate_screen": {
+              "description": "Whether the pane was on the alternate screen when this window was\nread, sampled with the window's text so no output lands between\nthem. `pane.read` replies from servers advertising\n`capabilities.read_alternate_screen` always carry it; older servers\nand `agent.read` omit it.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "cols": {
               "description": "Current terminal width in columns. Older servers omit this field.",
               "format": "uint16",
@@ -10117,6 +10234,28 @@
                 "integer",
                 "null"
               ]
+            },
+            "continued": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneReadContinued"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present only when the request's `continue_from` was proved: `text`\nis then `\"\"`, and the window's text is `before`, the token's covered\nbytes, then `after`. Every other field describes the full window."
+            },
+            "continuity": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PaneReadContinuity"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present when the request asked `continuity` and the text has a\ncovered part worth naming: everything after its first line feed,\nat least 256 bytes. Computed over the full window text, also on a\n`continued` reply."
             },
             "effective_offset": {
               "description": "Echoed on offset reads: the requested offset_from_bottom clamped at\nthe top of scrollback. Absent when the request carried no offset.",
@@ -13056,6 +13195,16 @@
             "preface": {
               "default": false,
               "description": "Supports `pane.preface`: a pane's earlier turns quoted from its\nsession record. Additive: absent (false) in pongs of servers that\npredate it.",
+              "type": "boolean"
+            },
+            "read_alternate_screen": {
+              "default": false,
+              "description": "Every `pane.read` reply carries `alternate_screen`, sampled with the\nwindow's text. Additive: absent (false) in pongs of servers that\npredate it, whose replies omit the field.",
+              "type": "boolean"
+            },
+            "read_continuity": {
+              "default": false,
+              "description": "`pane.read` honors `continuity` and `continue_from` on ANSI reads of\n`recent` and `recent_unwrapped`. Additive: absent (false) in pongs of\nservers that predate it, which ignore both fields.",
               "type": "boolean"
             },
             "send_affirm": {

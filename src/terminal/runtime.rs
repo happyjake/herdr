@@ -689,6 +689,16 @@ impl TerminalRuntime {
     pub(crate) fn content_seq(&self) -> u64 {
         self.0.content_seq()
     }
+
+    /// See [`crate::pane::PaneRuntime::read_content_stable`].
+    pub(crate) fn read_content_stable<R>(&self, read: impl FnOnce() -> R) -> R {
+        self.0.read_content_stable(read)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_content_writers_excluded(&self) -> bool {
+        self.0.test_content_writers_excluded()
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ mod integrations;
 mod layouts;
 mod panes;
 pub(crate) mod plugins;
+mod read_continuity;
 pub(super) mod responses;
 mod session;
 mod started_by;

@@ -1518,6 +1518,32 @@ units, so page by the echoed `effective_offset` instead of adding a fixed
 amount. A pane whose history cannot be paged answers `has_more: false` at
 offset zero and refuses larger offsets.
 
+Every `pane.read` reply carries `alternate_screen`: whether the pane was on
+the alternate screen when the window was read. It is sampled together with
+the window's text, so no output lands between them, and a client can decide
+how to show the text from the reply alone instead of a separate `pane.get`.
+Servers advertise it with `capabilities.read_alternate_screen: true` in their
+pong; older servers omit the field.
+
+A client that reads the same pane twice in a row can skip the bytes it
+already holds. Pass `continuity: true` on the first read; when the reply's
+text has a line feed and at least 256 bytes after it, the reply carries
+`continuity: {token}`. The token covers everything after the text's first
+line feed. Send it back as `continue_from` on a later read. When the server
+proves those covered bytes lie inside the new window, the reply's `text` is
+`""` and `continued: {before, after, utf16_len}` describes it: the window is
+`before`, then the covered bytes, then `after`, and `utf16_len` is its length
+in UTF-16 code units. Every other reply field describes the full window. When
+the server cannot prove it (the tail was rewritten, the screen was cleared or
+resized, the window slid past, or the token is malformed or foreign), the
+reply is the full window, exactly as without `continue_from`; this is never
+an error. A reply can carry both fields, and its token then covers the full
+window, so successive reads can chain. Tokens are opaque and stateless: they
+survive reconnects and live handoffs. Both fields apply only to `format:
+ansi` reads of `recent` and `recent_unwrapped`; other reads ignore them.
+Servers advertise them with `capabilities.read_continuity: true`; older
+servers ignore both fields and always answer the full window.
+
 ## Waiting for state
 
 Use waits to coordinate agents and scripts.

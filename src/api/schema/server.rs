@@ -294,4 +294,14 @@ pub struct ServerCapabilities {
     /// predate it.
     #[serde(default)]
     pub preface: bool,
+    /// `pane.read` honors `continuity` and `continue_from` on ANSI reads of
+    /// `recent` and `recent_unwrapped`. Additive: absent (false) in pongs of
+    /// servers that predate it, which ignore both fields.
+    #[serde(default)]
+    pub read_continuity: bool,
+    /// Every `pane.read` reply carries `alternate_screen`, sampled with the
+    /// window's text. Additive: absent (false) in pongs of servers that
+    /// predate it, whose replies omit the field.
+    #[serde(default)]
+    pub read_alternate_screen: bool,
 }

@@ -3710,6 +3710,27 @@ impl PaneRuntime {
         self.content_seq.load(Ordering::Acquire)
     }
 
+    /// Run `read` with PTY output, resize and clear held off, so every
+    /// terminal fact it reads describes one content state. Writers already
+    /// wait on the terminal core while a read formats, so this extends their
+    /// wait only by the gap between the facts `read` collects. `read` must
+    /// not resize or clear this pane: those take the same lock.
+    pub(crate) fn read_content_stable<R>(&self, read: impl FnOnce() -> R) -> R {
+        let _content_guard = self
+            .content_write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_content_writers_excluded(&self) -> bool {
+        matches!(
+            self.content_write_lock.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
     /// Resize if the dimensions actually changed.
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         let rows = rows.max(MIN_PANE_ROWS);

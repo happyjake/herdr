@@ -2272,6 +2272,8 @@ mod tests {
             turn_index: false,
             agent_settings: false,
             preface: false,
+            read_continuity: false,
+            read_alternate_screen: false,
         }));
         let mut websocket = connect_authorized(&server);
 

@@ -70,6 +70,8 @@ pub fn server_capabilities() -> crate::api::schema::ServerCapabilities {
         turn_index: true,
         agent_settings: true,
         preface: true,
+        read_continuity: true,
+        read_alternate_screen: true,
     }
 }
 
@@ -160,6 +162,8 @@ mod tests {
         assert!(capabilities.turn_index);
         assert!(capabilities.agent_settings);
         assert!(capabilities.preface);
+        assert!(capabilities.read_continuity);
+        assert!(capabilities.read_alternate_screen);
     }
 
     const PANE_SHELL: u32 = 500;
