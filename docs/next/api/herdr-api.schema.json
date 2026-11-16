@@ -8156,6 +8156,37 @@
           ],
           "type": "string"
         },
+        "AgyAgentSettings": {
+          "properties": {
+            "models": {
+              "description": "Every model `agy models` listed, in its order. Empty while agy is not\ninstalled, cannot list, or has not answered since the server started.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/AgyModel"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "models"
+          ],
+          "type": "object"
+        },
+        "AgyModel": {
+          "description": "One model agy offers: the id its `--model` flag takes and the name agy\nshows for it.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "name"
+          ],
+          "type": "object"
+        },
         "Candidate": {
           "properties": {
             "action": {
@@ -11584,6 +11615,9 @@
             },
             {
               "properties": {
+                "agy": {
+                  "$ref": "#/schemas/success_response/$defs/AgyAgentSettings"
+                },
                 "claude": {
                   "$ref": "#/schemas/success_response/$defs/AgentSettings"
                 },
@@ -11602,7 +11636,8 @@
                 "type",
                 "pi",
                 "claude",
-                "codex"
+                "codex",
+                "agy"
               ],
               "type": "object"
             },

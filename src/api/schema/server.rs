@@ -157,6 +157,21 @@ pub struct PiAgentSettings {
     pub models: Vec<String>,
 }
 
+/// One model agy offers: the id its `--model` flag takes and the name agy
+/// shows for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgyModel {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgyAgentSettings {
+    /// Every model `agy models` listed, in its order. Empty while agy is not
+    /// installed, cannot list, or has not answered since the server started.
+    pub models: Vec<AgyModel>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AttachmentCreateParams {
     /// Attachment bytes encoded as standard base64 (RFC 4648, padding

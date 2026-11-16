@@ -683,6 +683,26 @@ fn agent_settings_websocket_reads_fixture_home_without_leaking_secrets_to_tracin
         "model = 'model'\nmodel_reasoning_effort = 'high'\n[env]\nTOKEN = 'codex-private-token'\n",
     )
     .unwrap();
+    // The server lists agy's models by running `agy models`; this one is first
+    // on the server's PATH, so the answer does not depend on the machine.
+    let bin_dir = base.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agy = bin_dir.join("agy");
+    fs::write(
+        &fake_agy,
+        "#!/bin/sh\n[ \"$1\" = models ] || exit 2\necho 'Fetching available models...' >&2\n\
+         printf 'gemini-pro-orchestrator-argon\\tOrchestrator (Argon)\\ngemini-4-argon-high\\tGemini 4 Argon (High)\\n'\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let port = pick_free_port();
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
     let mut child = spawn_herdr_with_config_and_env(
@@ -696,6 +716,7 @@ fn agent_settings_websocket_reads_fixture_home_without_leaking_secrets_to_tracin
             ("CLAUDE_CONFIG_DIR", claude_dir.to_str().unwrap()),
             ("CODEX_HOME", codex_dir.to_str().unwrap()),
             ("HERDR_LOG", "herdr=trace"),
+            ("PATH", path.as_str()),
         ],
     );
     wait_for_socket(&socket_path, Duration::from_secs(10));
@@ -711,7 +732,11 @@ fn agent_settings_websocket_reads_fixture_home_without_leaking_secrets_to_tracin
             "type":"server_agent_settings",
             "pi":{"default":{"model":"provider/model", "effort":"xhigh"}, "reason":null, "models":["provider/second", "provider/first"]},
             "claude":{"default":{"model":"sonnet", "effort":"high"}, "reason":null},
-            "codex":{"default":{"model":"model", "effort":"high"}, "reason":null}
+            "codex":{"default":{"model":"model", "effort":"high"}, "reason":null},
+            "agy":{"models":[
+                {"id":"gemini-pro-orchestrator-argon", "name":"Orchestrator (Argon)"},
+                {"id":"gemini-4-argon-high", "name":"Gemini 4 Argon (High)"}
+            ]}
         }})
     );
     assert_eq!(unix_request(&socket_path, request), response);

@@ -2569,7 +2569,8 @@ fn agent_settings_request_and_response_round_trip() {
             "type":"server_agent_settings",
             "pi":{"default":{"model":"provider/model", "effort":"high"}, "reason":null, "models":["provider/second", "provider/first"]},
             "claude":{"default":{"model":null, "effort":null}, "reason":null},
-            "codex":{"default":null, "reason":reason}
+            "codex":{"default":null, "reason":reason},
+            "agy":{"models":[{"id":"model-id", "name":"Model Name"}]}
         }});
         let decoded: SuccessResponse = serde_json::from_value(response.clone()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), response);

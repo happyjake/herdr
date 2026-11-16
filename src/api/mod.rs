@@ -1,5 +1,6 @@
 mod advertised_endpoint;
 mod agent_settings;
+mod agy_models;
 mod attachment;
 pub mod client;
 pub(crate) mod credentials;
@@ -19,6 +20,7 @@ mod websocket;
 
 pub use advertised_endpoint::SharedAdvertisedEndpoint;
 pub(crate) use advertised_endpoint::{declared_advertised_endpoint, normalize_advertised_endpoint};
+pub(crate) use agy_models::warm as warm_agy_models;
 pub use credentials::SharedCredentialRegistry;
 pub use event_hub::EventHub;
 pub(crate) use search_sessions::handle_active_session_snapshot;

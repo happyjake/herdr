@@ -7,16 +7,21 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::schema::{
-    AgentDefault, AgentSettings, AgentSettingsReason, PiAgentSettings, ResponseResult,
-    SuccessResponse,
+    AgentDefault, AgentSettings, AgentSettingsReason, AgyAgentSettings, PiAgentSettings,
+    ResponseResult, SuccessResponse,
 };
 
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 
 pub(super) fn handle_settings(id: String) -> String {
-    let result = read_settings(crate::worktree::home_dir().as_deref(), |key| {
-        std::env::var_os(key)
-    });
+    let agy = AgyAgentSettings {
+        models: super::agy_models::models(),
+    };
+    let result = read_settings_with_agy(
+        crate::worktree::home_dir().as_deref(),
+        |key| std::env::var_os(key),
+        agy,
+    );
     serde_json::to_string(&SuccessResponse {
         id: id.clone(),
         result,
@@ -54,7 +59,17 @@ struct CodexFile {
     model_reasoning_effort: Option<String>,
 }
 
+/// The settings files as read, with no agy models.
+#[cfg(test)]
 fn read_settings(home: Option<&Path>, env: impl Fn(&str) -> Option<OsString>) -> ResponseResult {
+    read_settings_with_agy(home, env, AgyAgentSettings { models: Vec::new() })
+}
+
+fn read_settings_with_agy(
+    home: Option<&Path>,
+    env: impl Fn(&str) -> Option<OsString>,
+    agy: AgyAgentSettings,
+) -> ResponseResult {
     let pi_dir = pi_config_dir(home, env("PI_CODING_AGENT_DIR"));
     let claude_dir = config_dir(home, env("CLAUDE_CONFIG_DIR"), ".claude");
     let codex_dir = config_dir(home, env("CODEX_HOME"), ".codex");
@@ -98,6 +113,7 @@ fn read_settings(home: Option<&Path>, env: impl Fn(&str) -> Option<OsString>) ->
         },
         claude: settings(claude),
         codex: settings(codex),
+        agy,
     }
 }
 
@@ -293,7 +309,8 @@ mod tests {
                 "type":"server_agent_settings",
                 "pi":{"default":{"model":"provider/model", "effort":"high"}, "reason":null, "models":["provider/second", "provider/first", "provider/second"]},
                 "claude":{"default":{"model":"sonnet", "effort":"max"}, "reason":null},
-                "codex":{"default":{"model":"model", "effort":"high"}, "reason":null}
+                "codex":{"default":{"model":"model", "effort":"high"}, "reason":null},
+                "agy":{"models":[]}
             })
         );
     }
@@ -334,7 +351,8 @@ mod tests {
                 "type":"server_agent_settings",
                 "pi":{"default":{"model":"model", "effort":null}, "reason":null, "models":[]},
                 "claude":{"default":{"model":null, "effort":"high"}, "reason":null},
-                "codex":{"default":{"model":"model", "effort":null}, "reason":null}
+                "codex":{"default":{"model":"model", "effort":null}, "reason":null},
+                "agy":{"models":[]}
             })
         );
         fixture.write(
@@ -482,7 +500,8 @@ mod tests {
                     "type":"server_agent_settings",
                     "pi":{"default":null, "reason":"unreadable", "models":[]},
                     "claude":{"default":{"model":"kept", "effort":null}, "reason":null},
-                    "codex":{"default":{"model":"kept", "effort":null}, "reason":null}
+                    "codex":{"default":{"model":"kept", "effort":null}, "reason":null},
+                    "agy":{"models":[]}
                 })
             );
         }

@@ -18,7 +18,9 @@ use super::plugins::{
     PluginPaneInfo,
 };
 use super::search_sessions::SessionHit;
-use super::server::{AgentSettings, PiAgentSettings, PlaceInfo, ServerCapabilities};
+use super::server::{
+    AgentSettings, AgyAgentSettings, PiAgentSettings, PlaceInfo, ServerCapabilities,
+};
 use super::session::SessionSnapshot;
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
@@ -102,6 +104,7 @@ pub enum ResponseResult {
         pi: PiAgentSettings,
         claude: AgentSettings,
         codex: AgentSettings,
+        agy: AgyAgentSettings,
     },
     ServerSearchSessions {
         sessions: Vec<SessionHit>,
