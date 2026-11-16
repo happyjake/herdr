@@ -835,7 +835,9 @@ pub(crate) fn process_group_member_pids(process_group_id: u32) -> Vec<u32> {
         else {
             continue;
         };
-        if process_pgrp_and_comm(pid).is_some_and(|(pgrp, _)| pgrp == process_group_id as i32) {
+        if process_pgrp_comm_and_state(pid)
+            .is_some_and(|(pgrp, _, _)| pgrp == process_group_id as i32)
+        {
             pids.push(pid);
         }
     }
