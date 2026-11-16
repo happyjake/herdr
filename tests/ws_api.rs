@@ -2606,7 +2606,7 @@ struct PairOutcome {
 /// Run `herdr pair` against the same config dir and API socket a spawned
 /// test server uses, with inherited herdr overrides cleared.
 fn run_pair_cli(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> PairOutcome {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let output = crate::support::herdr_command()
         .arg("pair")
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_RUNTIME_DIR", runtime_dir)

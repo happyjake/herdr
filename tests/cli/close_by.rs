@@ -31,7 +31,7 @@ fn spawn_herdr_with_home(
     )
     .unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut command = crate::support::herdr_command();
     command
         .arg("server")
         .env("HOME", home)

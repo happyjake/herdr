@@ -26,9 +26,34 @@ const CLIENT_MESSAGE_CLIENT_SHELL_PANE_INPUT: u32 = 13;
 const CLIENT_MESSAGE_CLIENT_SHELL_FOCUS: u32 = 18;
 const CLIENT_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
 
+/// The HERDR_* variables this test process inherited. A test run from inside
+/// a herdr pane inherits that pane's session, socket, config and pane ids: a
+/// herdr the test starts would read the live server's config and bind its
+/// listeners, or name the live pane in the requests it sends.
+fn inherited_herdr_env() -> Vec<std::ffi::OsString> {
+    std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| key.to_str().is_some_and(|key| key.starts_with("HERDR_")))
+        .collect()
+}
+
+/// Remove every inherited HERDR_* variable. Call it before setting the ones
+/// the test means to pass.
 pub fn isolate_herdr_test_process(command: &mut CommandBuilder) {
-    command.env_remove("HERDR_STARTUP_CWD");
-    command.env_remove("HERDR_SESSION");
+    for key in inherited_herdr_env() {
+        command.env_remove(key);
+    }
+}
+
+/// The herdr under test as a plain process, with every inherited HERDR_*
+/// variable removed, as [`isolate_herdr_test_process`] does for a pty.
+#[allow(dead_code)]
+pub fn herdr_command() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_herdr"));
+    for key in inherited_herdr_env() {
+        command.env_remove(key);
+    }
+    command
 }
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {

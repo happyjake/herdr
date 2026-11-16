@@ -202,7 +202,7 @@ fn wait_for_log_contains(path: &Path, needle: &str, timeout: Duration) {
 }
 
 fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut command = crate::support::herdr_command();
     command.args(args);
     command.env("HERDR_SOCKET_PATH", socket_path);
     command.output().unwrap()
@@ -257,7 +257,7 @@ fn session_attach_without_terminal_leaves_no_session() {
     };
     let session_dir = config_home.join(app_dir).join("sessions").join(name);
     let run = |args: &[&str]| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+        let mut command = crate::support::herdr_command();
         command
             .args(args)
             .env("XDG_CONFIG_HOME", &config_home)
@@ -711,7 +711,7 @@ fn auto_detect_respects_nested_guard_before_auto_attach() {
         .map(|workspaces| workspaces.len())
         .unwrap_or(0);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+    let output = crate::support::herdr_command()
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("HERDR_SOCKET_PATH", &api_socket)

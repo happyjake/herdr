@@ -554,7 +554,7 @@ fn plugin_update_does_not_resurrect_a_plugin_unlinked_during_build() {
     run_git(&source_repo, &["add", "."]);
     run_git(&source_repo, &["commit", "--quiet", "-m", "update plugin"]);
 
-    let mut update = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    let mut update = crate::support::herdr_command();
     update
         .args([
             "--session",

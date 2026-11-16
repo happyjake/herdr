@@ -208,9 +208,13 @@ pub(super) fn caller_pane_id() -> Option<String> {
     if is_remote() {
         return None;
     }
-    std::env::var("HERDR_PANE_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    #[cfg(not(test))]
+    let pane = std::env::var("HERDR_PANE_ID").ok();
+    // Unit tests run inside whatever pane started them; the requests they
+    // project must not name that pane.
+    #[cfg(test)]
+    let pane: Option<String> = None;
+    pane.filter(|value| !value.trim().is_empty())
 }
 
 fn parse_machine_prefix(args: &[String]) -> Result<Option<(String, Vec<String>)>, String> {

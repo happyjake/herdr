@@ -272,7 +272,7 @@ fn started_by_refuses_forged_environment_from_outside() {
     let workspace = session.starter.split(':').next().unwrap();
     let checkout = session.base.join("outside-checkout");
     for (key, args) in create_lanes(&session.starter, workspace, checkout.to_str().unwrap()) {
-        let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        let output = crate::support::herdr_command()
             .args(&args)
             .env("HERDR_SOCKET_PATH", &session.socket)
             .env("HERDR_PANE_ID", &session.starter)
@@ -737,7 +737,7 @@ fn started_by_stdio_forward_cannot_claim_a_local_agent_pane() {
     let session = Session::new();
     session.create(&["tab", "create"], "root_pane");
     for (key, request) in create_requests(&session) {
-        let mut bridge = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        let mut bridge = crate::support::herdr_command()
             .arg("remote-api-bridge")
             .env("HERDR_SOCKET_PATH", &session.socket)
             .stdin(Stdio::piped())

@@ -167,7 +167,7 @@ fn assert_restore_responsive(auto_close: &str, replay_debrief: bool) {
             fs::write(data_dir.join("logbook.jsonl"), format!("{sent}\n")).unwrap();
         }
         support::register_runtime_dir(&runtime_dir);
-        let child = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        let child = crate::support::herdr_command()
             .arg("server")
             .env("XDG_CONFIG_HOME", &config_home)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
