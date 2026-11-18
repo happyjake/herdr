@@ -1330,3 +1330,192 @@ fn search_sessions_queued_ask_in_history_and_record_is_listed_once() {
         json!(["Start tracing", "Inspect the buffer"])
     );
 }
+
+fn agy_user_explicit(content: &str, created_at: &str) -> Value {
+    json!({
+        "step_index": 0,
+        "source": "USER_EXPLICIT",
+        "type": "USER_INPUT",
+        "status": "DONE",
+        "created_at": created_at,
+        "content": content
+    })
+}
+
+#[test]
+fn agy_sessions_and_history_are_searchable_clean_and_resumable() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".gemini/antigravity-cli/brain/agy-a/.system_generated/logs/transcript_full.jsonl",
+        &[
+            agy_user_explicit(
+                "<USER_REQUEST>\nFix the relay\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nexcluded-metadata\n</ADDITIONAL_METADATA>",
+                "2026-10-03T00:00:00.100Z",
+            ),
+            json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-10-03T00:01:00.200Z",
+                "thinking": "excluded-thinking",
+                "content": "excluded-assistant",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "excluded-tool"}}]
+            }),
+            json!({
+                "step_index": 2,
+                "source": "SYSTEM",
+                "type": "USER_INPUT",
+                "created_at": "2026-10-03T00:02:00.000Z",
+                "content": "excluded-system-input"
+            }),
+            agy_user_explicit(
+                "<USER_REQUEST>\nCheck the beacon\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nmore-excluded-metadata\n</ADDITIONAL_METADATA>",
+                "2026-10-03T01:00:00.500Z",
+            ),
+        ],
+    );
+    // Truncated transcript.jsonl alone must never be indexed.
+    home.write(
+        ".gemini/antigravity-cli/brain/agy-truncated-only/.system_generated/logs/transcript.jsonl",
+        &[agy_user_explicit(
+            "excluded-truncated-transcript",
+            "2026-10-03T00:00:00Z",
+        )],
+    );
+    home.write(
+        ".gemini/antigravity-cli/history.jsonl",
+        &[
+            json!({
+                "display": "<USER_REQUEST>\nFix the relay\n</USER_REQUEST>\n<ADDITIONAL_METADATA>ignored</ADDITIONAL_METADATA>",
+                "timestamp": 1790985600100_u64,
+                "workspace": cwd,
+                "conversationId": "agy-a"
+            }),
+            json!({
+                "display": "/clear",
+                "timestamp": 1790985605000_u64,
+                "workspace": cwd,
+                "conversationId": "agy-a",
+                "type": "slash_command"
+            }),
+            json!({
+                "display": "excluded-missing-id",
+                "timestamp": 1790985610000_u64,
+                "workspace": cwd
+            }),
+            json!({
+                "display": "excluded-empty-id",
+                "timestamp": 1790985610000_u64,
+                "workspace": cwd,
+                "conversationId": "   "
+            }),
+            json!({
+                "display": "   ",
+                "timestamp": 1790985610000_u64,
+                "workspace": cwd,
+                "conversationId": "agy-empty-display"
+            }),
+            json!({
+                "display": "Recover deleted transcript",
+                "timestamp": 1790985620000_u64,
+                "workspace": cwd,
+                "conversationId": "agy-gone"
+            }),
+        ],
+    );
+    home.catalog.refresh();
+
+    let browse = home.search(json!({}), vec![]);
+    assert_eq!(browse["result"]["partial"], false);
+    assert_eq!(browse["result"]["scanned"], 2);
+    assert_eq!(browse["result"]["sessions"].as_array().unwrap().len(), 2);
+
+    let agy = by_key(&browse, "agy-a");
+    assert_eq!(agy["agent"], "agy");
+    assert_eq!(agy["cwd"], cwd);
+    assert_eq!(agy["place_state"], "present");
+    assert_eq!(agy["first_prompt"], "Fix the relay");
+    assert_eq!(
+        agy["recent_prompts"],
+        json!(["Fix the relay", "Check the beacon"])
+    );
+    assert_eq!(agy["started_at_ms"], 1790985600100_u64);
+    assert_eq!(agy["last_active_at_ms"], 1790989200500_u64);
+    assert_eq!(agy["state"], "ended");
+    assert_eq!(
+        agy["resume"],
+        json!({"command": "agy --conversation agy-a", "cwd": cwd})
+    );
+    assert_eq!(agy["headless"], false);
+
+    let gone = by_key(&browse, "agy-gone");
+    assert_eq!(gone["agent"], "agy");
+    assert_eq!(gone["cwd"], cwd);
+    assert_eq!(gone["first_prompt"], "Recover deleted transcript");
+    assert_eq!(gone["state"], "record_gone");
+    assert_eq!(gone["resume_blocked"], "record_gone");
+    assert_eq!(gone["resume"], Value::Null);
+
+    assert_eq!(
+        home.search_all(
+            json!({"terms": ["excluded", "/clear", "agy-empty-display"]}),
+            vec![]
+        )["result"]["sessions"],
+        json!([])
+    );
+
+    let hit = home.search(json!({"terms": ["beacon"], "agent": "agy"}), vec![]);
+    assert_eq!(by_key(&hit, "agy-a")["why"]["line"], "Check the beacon");
+
+    let live = home.search(json!({}), vec![live_pane("agy", "id", "agy-a")]);
+    assert_eq!(by_key(&live, "agy-a")["state"], "live");
+    assert_eq!(by_key(&live, "agy-a")["resume_blocked"], "live");
+}
+
+#[cfg(unix)]
+#[test]
+fn agy_catalog_skips_symlinks_in_brain_and_history() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    let target = home.write(
+        "outside-target.jsonl",
+        &[agy_user_explicit(
+            "Should stay hidden",
+            "2026-10-03T00:00:00Z",
+        )],
+    );
+    let brain = home.root.join(".gemini/antigravity-cli/brain");
+    std::fs::create_dir_all(&brain).unwrap();
+
+    // Symlinked conversation directory.
+    let linked_conv_target = home.root.join("linked-conv-target");
+    std::fs::create_dir_all(linked_conv_target.join(".system_generated/logs")).unwrap();
+    std::fs::copy(
+        &target,
+        linked_conv_target.join(".system_generated/logs/transcript_full.jsonl"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&linked_conv_target, brain.join("agy-linked-dir")).unwrap();
+
+    // Symlinked transcript_full.jsonl inside real conversation directory.
+    let logs = brain.join("agy-linked-file/.system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::os::unix::fs::symlink(&target, logs.join("transcript_full.jsonl")).unwrap();
+
+    // Symlinked history.jsonl.
+    let history_target = home.write(
+        "history-target.jsonl",
+        &[json!({"display": "Hidden history", "timestamp": 1790985600000_u64, "workspace": cwd, "conversationId": "agy-linked-history"})],
+    );
+    std::os::unix::fs::symlink(
+        history_target,
+        home.root.join(".gemini/antigravity-cli/history.jsonl"),
+    )
+    .unwrap();
+
+    home.catalog.refresh();
+    let response = home.search_all(json!({}), vec![]);
+    assert_eq!(response["result"]["partial"], false);
+    assert_eq!(response["result"]["sessions"], json!([]));
+}

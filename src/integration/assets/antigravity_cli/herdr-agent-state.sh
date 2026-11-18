@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=antigravity_cli
-# HERDR_INTEGRATION_VERSION=5
+# HERDR_INTEGRATION_VERSION=6
 
 # Session-only: this hook reports the Antigravity conversation so Herdr can
 # resume the pane. Lifecycle state comes from Herdr's screen detection.
@@ -42,6 +42,9 @@ if not isinstance(payload, dict):
 def text(name):
     value = payload.get(name)
     return value if isinstance(value, str) and value else None
+
+if text("parentConversationId") is not None:
+    raise SystemExit(0)
 
 session_id = text("conversationId")
 if session_id is None:

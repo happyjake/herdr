@@ -110,10 +110,19 @@ impl Catalog {
             ] {
                 walk(&home.join(root), depth, kind, &mut files, &mut complete);
             }
+            walk_agy_brain(
+                &home.join(".gemini/antigravity-cli/brain"),
+                &mut files,
+                &mut complete,
+            );
             for (path, kind) in [
                 (".claude/history.jsonl", FileKind::ClaudeHistory),
                 (".codex/history.jsonl", FileKind::CodexHistory),
                 (".codex/session_index.jsonl", FileKind::CodexIndex),
+                (
+                    ".gemini/antigravity-cli/history.jsonl",
+                    FileKind::AgyHistory,
+                ),
             ] {
                 let path = home.join(path);
                 if let Ok(metadata) = std::fs::symlink_metadata(&path) {
@@ -265,6 +274,74 @@ fn walk(
                         .is_some_and(|name| name.ends_with(".jsonl.zst"))))
         {
             found.push((path, stamp(&metadata), kind));
+        }
+    }
+}
+
+/// Discover `brain/<id>/.system_generated/logs/transcript_full.jsonl` without
+/// following symlinks or picking up truncated `transcript.jsonl` files.
+fn walk_agy_brain(
+    brain_dir: &Path,
+    found: &mut Vec<(PathBuf, Stamp, FileKind)>,
+    complete: &mut bool,
+) {
+    match std::fs::symlink_metadata(brain_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                *complete = false;
+            }
+            return;
+        }
+    }
+    let entries = match std::fs::read_dir(brain_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                *complete = false;
+            }
+            return;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            *complete = false;
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            *complete = false;
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let logs_dir = entry.path().join(".system_generated").join("logs");
+        if !is_real_dir(&entry.path().join(".system_generated"), complete)
+            || !is_real_dir(&logs_dir, complete)
+        {
+            continue;
+        }
+        let transcript = logs_dir.join("transcript_full.jsonl");
+        match std::fs::symlink_metadata(&transcript) {
+            Ok(metadata) if metadata.is_file() => {
+                found.push((transcript, stamp(&metadata), FileKind::Agy));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => *complete = false,
+        }
+    }
+}
+
+fn is_real_dir(path: &Path, complete: &mut bool) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                *complete = false;
+            }
+            false
         }
     }
 }

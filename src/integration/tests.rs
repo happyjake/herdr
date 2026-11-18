@@ -5217,21 +5217,138 @@ fn install_antigravity_cli_rewrites_stale_herdr_block() {
     // install is migrated to session-only rather than merged with.
     assert_eq!(
         block.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["PreInvocation"],
+        vec!["PreInvocation", "SessionStart"],
         "stale lifecycle events should be gone"
     );
-    let entries = block
-        .get("PreInvocation")
-        .and_then(Value::as_array)
-        .unwrap();
-    assert_eq!(entries.len(), 1);
-    assert!(entries[0].get("hooks").is_none());
-    assert!(entries[0]
-        .get("command")
-        .and_then(Value::as_str)
-        .is_some_and(|command| command != "stale" && command != "stale idle"));
+    for event in ["SessionStart", "PreInvocation"] {
+        let entries = block.get(event).and_then(Value::as_array).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].get("hooks").is_none());
+        assert!(entries[0]
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command != "stale" && command != "stale idle"));
+    }
 
     std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
+    let _ = fs::remove_dir_all(base);
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_cli_hook_ignores_subagents_and_reports_top_level_conversations() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let agy_dir = base.join(".gemini").join("config");
+    fs::create_dir_all(&agy_dir).unwrap();
+    std::env::set_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
+    let installed = install_antigravity_cli().unwrap();
+
+    let marker = base.join("herdr-invoked");
+    let fake_herdr = base.join("herdr");
+    fs::write(
+        &fake_herdr,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf 'true\\n'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_herdr).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_herdr, permissions).unwrap();
+
+    let socket_path = PathBuf::from(format!("/tmp/herdr-agy-hook-{}.sock", std::process::id()));
+    let _ = fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        line
+    });
+
+    // Subagent payloads carry parentConversationId and must exit before
+    // invoking herdr or reporting to the parent pane's socket.
+    let sub_transcript = base.join("sub.jsonl");
+    let sub_payload = serde_json::json!({
+        "conversationId": "sub-1",
+        "parentConversationId": "parent-1",
+        "transcriptPath": sub_transcript,
+    })
+    .to_string();
+    let mut subagent = Command::new("sh")
+        .arg(&installed.hook_path)
+        .arg("session")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    subagent
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(sub_payload.as_bytes())
+        .unwrap();
+    let subagent_out = subagent.wait_with_output().unwrap();
+    assert!(subagent_out.status.success());
+    assert_eq!(String::from_utf8_lossy(&subagent_out.stdout), "{}\n");
+    assert!(
+        !marker.exists(),
+        "subagent hook must not invoke herdr check"
+    );
+
+    let transcript = base.join("transcript_full.jsonl");
+    let payload = serde_json::json!({
+        "conversationId": "conv-123",
+        "transcriptPath": transcript,
+    })
+    .to_string();
+    let mut top = Command::new("sh")
+        .arg(&installed.hook_path)
+        .arg("session")
+        .env("HERDR_ENV", "1")
+        .env("HERDR_PANE_ID", "w1:p1")
+        .env("HERDR_SOCKET_PATH", &socket_path)
+        .env("HERDR_BIN_PATH", &fake_herdr)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    top.stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let top_out = top.wait_with_output().unwrap();
+    assert!(top_out.status.success());
+    assert_eq!(String::from_utf8_lossy(&top_out.stdout), "{}\n");
+    assert!(marker.exists(), "top-level hook should validate with herdr");
+
+    let received: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+    assert_eq!(received["method"], "pane.report_agent_session");
+    assert_eq!(received["params"]["pane_id"], "w1:p1");
+    assert_eq!(received["params"]["source"], "herdr:antigravity_cli");
+    assert_eq!(received["params"]["agent"], "agy");
+    assert_eq!(received["params"]["agent_session_id"], "conv-123");
+    assert_eq!(
+        received["params"]["agent_session_path"],
+        transcript.to_string_lossy().as_ref()
+    );
+
+    std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
+    let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_dir_all(base);
 }
 

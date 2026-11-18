@@ -225,11 +225,11 @@ fn hit(
                 SearchSessionKeyKind::Path => AgentSessionRef::path(&session.key.value)?,
                 SearchSessionKeyKind::Day => return None,
             };
-            let plan = agent_resume::plan(
-                &format!("herdr:{}", session.key.agent),
-                &session.key.agent,
-                &reference,
-            )?;
+            let source = match session.key.agent.as_str() {
+                "agy" => "herdr:antigravity_cli".to_string(),
+                agent => format!("herdr:{agent}"),
+            };
+            let plan = agent_resume::plan(&source, &session.key.agent, &reference)?;
             Some(SessionResume {
                 command: crate::platform::interactive_shell_command(&plan.argv, "sh")?,
                 cwd: cwd.clone(),

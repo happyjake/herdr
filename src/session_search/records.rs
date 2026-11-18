@@ -19,9 +19,11 @@ pub(super) enum FileKind {
     ClaudeSubagent,
     Codex,
     Pi,
+    Agy,
     ClaudeHistory,
     CodexHistory,
     CodexIndex,
+    AgyHistory,
 }
 
 impl FileKind {
@@ -30,6 +32,7 @@ impl FileKind {
             Self::Claude | Self::ClaudeSubagent | Self::ClaudeHistory => PromptTrailAgent::Claude,
             Self::Codex | Self::CodexHistory | Self::CodexIndex => PromptTrailAgent::Codex,
             Self::Pi => PromptTrailAgent::Pi,
+            Self::Agy | Self::AgyHistory => PromptTrailAgent::Agy,
         }
     }
 
@@ -151,8 +154,17 @@ pub(super) fn read(
                     Some(path.into()),
                 )
             }),
+        FileKind::Agy => crate::preface::agy::session_id(path)
+            .and_then(AgentSessionRef::id)
+            .map(|id| {
+                Session::new(
+                    key(kind, SearchSessionKeyKind::Id, id.value),
+                    Some(path.into()),
+                )
+            }),
         _ => None,
     };
+    let mut saw_explicit_user_input = false;
     let mut line = Vec::new();
     let mut consumed = 0;
     loop {
@@ -172,7 +184,7 @@ pub(super) fn read(
             continue;
         };
         match kind {
-            FileKind::ClaudeHistory | FileKind::CodexHistory => {
+            FileKind::ClaudeHistory | FileKind::CodexHistory | FileKind::AgyHistory => {
                 read_history(kind, &line, &mut history);
                 continue;
             }
@@ -207,9 +219,20 @@ pub(super) fn read(
         let Some(session) = session.as_mut() else {
             continue;
         };
+        if matches!(kind, FileKind::Agy)
+            && line.get("type").and_then(Value::as_str) == Some("USER_INPUT")
+            && line.get("source").and_then(Value::as_str) == Some("USER_EXPLICIT")
+        {
+            saw_explicit_user_input = true;
+        }
         read_metadata(session, kind, &line);
         let at = line
             .get("timestamp")
+            .or_else(|| {
+                matches!(kind, FileKind::Agy)
+                    .then(|| line.get("created_at"))
+                    .flatten()
+            })
             .and_then(Value::as_str)
             .and_then(timestamp_ms);
         if let Some(at) = at {
@@ -228,6 +251,9 @@ pub(super) fn read(
     }
     data.sessions.extend(history.into_values());
     if let Some(mut session) = session {
+        if matches!(kind, FileKind::Agy) && !saw_explicit_user_input {
+            session.non_interactive = true;
+        }
         if session.started_at_ms == u64::MAX {
             session.at(modified_ms);
         }
@@ -306,6 +332,21 @@ fn read_history(kind: FileKind, line: &Value, sessions: &mut BTreeMap<SearchSess
                 .and_then(Value::as_u64)
                 .and_then(|seconds| seconds.checked_mul(1000)),
         ),
+        FileKind::AgyHistory => {
+            if line.get("type").and_then(Value::as_str) == Some("slash_command") {
+                return;
+            }
+            (
+                line.get("conversationId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty()),
+                line.get("workspace")
+                    .and_then(Value::as_str)
+                    .filter(|cwd| !cwd.is_empty()),
+                line.get("display").and_then(Value::as_str),
+                line.get("timestamp").and_then(Value::as_u64),
+            )
+        }
         _ => return,
     };
     let (Some(text), Some(at)) = (text, at) else {
@@ -314,6 +355,9 @@ fn read_history(kind: FileKind, line: &Value, sessions: &mut BTreeMap<SearchSess
     let prompt = match kind {
         FileKind::ClaudeHistory => json!({"type": "user", "isMeta": line.get("isMeta"),
             "isCompactSummary": line.get("isCompactSummary"), "message": {"role": "user", "content": text}}),
+        FileKind::AgyHistory => {
+            json!({"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": text})
+        }
         _ => json!({"type": "response_item", "payload": {"type": "message", "role": "user",
             "content": [{"type": "input_text", "text": text}]}}),
     };

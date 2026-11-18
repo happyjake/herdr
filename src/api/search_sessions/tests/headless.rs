@@ -287,3 +287,91 @@ fn codex_sources_outside_session_meta_do_not_hide_interactive_records() {
     let found = home.search(json!({}), vec![]);
     assert_eq!(by_key(&found, "interactive")["headless"], false);
 }
+
+#[test]
+fn agy_records_without_explicit_user_input_are_headless_and_fold_under_host_windows() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".gemini/antigravity-cli/brain/parent/.system_generated/logs/transcript_full.jsonl",
+        &[
+            agy_user_explicit(
+                "<USER_REQUEST>\nParent work\n</USER_REQUEST>",
+                "2026-10-03T00:00:00Z",
+            ),
+            json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-10-03T00:10:00Z",
+                "content": "Done"
+            }),
+        ],
+    );
+    home.write(
+        ".gemini/antigravity-cli/history.jsonl",
+        &[json!({
+            "display": "Parent work",
+            "timestamp": 1790985600000_u64,
+            "workspace": cwd,
+            "conversationId": "parent"
+        })],
+    );
+    // Subagent transcript: starts with SYSTEM_MESSAGE and has no USER_EXPLICIT step.
+    home.write(
+        ".gemini/antigravity-cli/brain/child/.system_generated/logs/transcript_full.jsonl",
+        &[
+            json!({
+                "step_index": 0,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-10-03T00:05:00Z",
+                "content": "Subagent instructions"
+            }),
+            json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-10-03T00:06:00Z",
+                "content": "Subagent output"
+            }),
+        ],
+    );
+    // Subagent whose logbook/history didn't report a host pane stays headless and hidden.
+    home.write(
+        ".gemini/antigravity-cli/brain/alone/.system_generated/logs/transcript_full.jsonl",
+        &[json!({
+            "step_index": 0,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "created_at": "2026-10-03T01:00:00Z",
+            "content": "Background task"
+        })],
+    );
+    home.write(
+        "logbook.jsonl",
+        &[folding::reported(
+            "agy",
+            "parent",
+            "w1:p1",
+            &cwd,
+            1790985600000,
+        )],
+    );
+    home.catalog.refresh();
+
+    let visible = home.search(json!({}), vec![]);
+    assert_eq!(visible["result"]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(by_key(&visible, "parent")["headless"], false);
+
+    let all = home.search(json!({"include_headless": true}), vec![]);
+    assert_eq!(all["result"]["sessions"].as_array().unwrap().len(), 3);
+    assert_eq!(by_key(&all, "child")["headless"], true);
+    assert_eq!(by_key(&all, "alone")["headless"], true);
+    assert!(by_key(&all, "alone").get("parent").is_none());
+
+    // Live pane overrides non_interactive marker just like other agents.
+    let live = home.search(json!({}), vec![live_pane("agy", "id", "alone")]);
+    assert_eq!(by_key(&live, "alone")["headless"], false);
+    assert_eq!(by_key(&live, "alone")["state"], "live");
+}

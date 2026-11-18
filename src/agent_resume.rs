@@ -175,18 +175,54 @@ pub fn persisted_session_from_launch_args(
     agent: crate::detect::Agent,
     args: &[String],
 ) -> Option<PersistedAgentSession> {
-    let [command, session_id] = args else {
-        return None;
-    };
-    if agent != crate::detect::Agent::Codex || command != "resume" || session_id.starts_with('-') {
-        return None;
+    match agent {
+        crate::detect::Agent::Codex => {
+            let [command, session_id] = args else {
+                return None;
+            };
+            if command != "resume" || session_id.starts_with('-') {
+                return None;
+            }
+            Some(PersistedAgentSession {
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                session_ref: AgentSessionRef::id(session_id.clone())?,
+            })
+        }
+        crate::detect::Agent::Antigravity => {
+            let session_id = antigravity_conversation_arg(args)?;
+            Some(PersistedAgentSession {
+                source: "herdr:antigravity_cli".into(),
+                agent: "agy".into(),
+                session_ref: AgentSessionRef::id(session_id)?,
+            })
+        }
+        _ => None,
     }
+}
 
-    Some(PersistedAgentSession {
-        source: "herdr:codex".into(),
-        agent: "codex".into(),
-        session_ref: AgentSessionRef::id(session_id.clone())?,
-    })
+fn antigravity_conversation_arg(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter().peekable();
+    let mut conversation_id = None;
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--conversation" || arg == "-c" {
+            if iter.peek().is_some_and(|value| !value.starts_with('-')) {
+                let value = iter.next()?.trim();
+                if !value.is_empty() {
+                    conversation_id = Some(value);
+                }
+            }
+        } else if let Some(value) = arg.strip_prefix("--conversation=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                conversation_id = Some(value);
+            }
+        }
+    }
+    conversation_id
 }
 
 pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
@@ -491,6 +527,46 @@ mod tests {
             ]
         )
         .is_none());
+    }
+
+    #[test]
+    fn antigravity_conversation_launch_args_extract_resumed_session() {
+        for args in [
+            argv(&["--conversation", "agy-session"]),
+            argv(&["-c", "agy-session"]),
+            argv(&["--conversation=agy-session"]),
+            argv(&["--model", "auto", "-c", "  agy-session  ", "--yolo"]),
+            argv(&["--conversation", "old", "-c", "agy-session"]),
+            argv(&["-c", "agy-session", "--", "--conversation", "ignored"]),
+        ] {
+            let session =
+                persisted_session_from_launch_args(crate::detect::Agent::Antigravity, &args)
+                    .unwrap_or_else(|| panic!("expected session for {args:?}"));
+            assert_eq!(session.source, "herdr:antigravity_cli", "{args:?}");
+            assert_eq!(session.agent, "agy", "{args:?}");
+            assert_eq!(session.session_ref.kind, AgentSessionRefKind::Id);
+            assert_eq!(session.session_ref.value, "agy-session", "{args:?}");
+        }
+
+        for args in [
+            argv(&[]),
+            argv(&["--model", "auto"]),
+            argv(&["--conversation"]),
+            argv(&["-c"]),
+            argv(&["--conversation", ""]),
+            argv(&["--conversation", "   "]),
+            argv(&["--conversation="]),
+            argv(&["--conversation=   "]),
+            argv(&["-c", "--model", "auto"]),
+            argv(&["--", "--conversation", "agy-session"]),
+            argv(&["--", "-c", "agy-session"]),
+        ] {
+            assert!(
+                persisted_session_from_launch_args(crate::detect::Agent::Antigravity, &args)
+                    .is_none(),
+                "unexpected session for {args:?}"
+            );
+        }
     }
 
     #[test]

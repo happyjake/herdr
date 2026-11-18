@@ -705,3 +705,78 @@ fn a_stalled_process_view_obeys_the_request_deadline() {
     assert_eq!(response["result"]["partial"], true);
     assert_eq!(response["result"]["sessions"], json!([]));
 }
+
+#[test]
+fn agy_conversation_process_arguments_mark_saved_session_outside() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".gemini/antigravity-cli/brain/agy-a/.system_generated/logs/transcript_full.jsonl",
+        &[agy_user_explicit(
+            "Continue the relay",
+            "2026-10-12T11:39:11Z",
+        )],
+    );
+    home.write(
+        ".gemini/antigravity-cli/history.jsonl",
+        &[json!({
+            "display": "Continue the relay",
+            "timestamp": 1791805151000_u64,
+            "workspace": cwd,
+            "conversationId": "agy-a"
+        })],
+    );
+    home.catalog.refresh();
+
+    for argv in [
+        vec!["agy", "--conversation", "agy-a"],
+        vec!["/usr/local/bin/agy", "-c", "agy-a"],
+        vec!["agy", "--model", "auto", "--conversation=agy-a"],
+    ] {
+        *home.processes.lock().unwrap() = vec![SessionProcess {
+            cwd: None,
+            pid: 244,
+            started_at: "Mon Oct 12 11:39:11 2026".into(),
+            argv: argv.iter().map(|arg| (*arg).into()).collect(),
+        }];
+        let response = home.search_all(json!({}), vec![]);
+        let row = by_key(&response, "agy-a");
+        assert_eq!(row["state"], "outside", "{argv:?}");
+        assert_eq!(
+            row["outside"],
+            json!({"pid": 244, "detail": "agy pid 244"}),
+            "{argv:?}"
+        );
+        assert_eq!(row["resume"], Value::Null, "{argv:?}");
+        assert_eq!(row["resume_blocked"], "outside", "{argv:?}");
+    }
+
+    // Live pane wins over outside process match.
+    let live = home.search_all(json!({}), vec![live_pane("agy", "id", "agy-a")]);
+    let row = by_key(&live, "agy-a");
+    assert_eq!(row["state"], "live");
+    assert_eq!(row["resume_blocked"], "live");
+    assert!(row.get("outside").is_none());
+
+    // Arguments after `--` or unrelated flags do not claim the session.
+    for argv in [
+        vec!["agy"],
+        vec!["agy", "--", "--conversation", "agy-a"],
+        vec!["agy", "-c", "--other"],
+    ] {
+        *home.processes.lock().unwrap() = vec![SessionProcess {
+            cwd: None,
+            pid: 244,
+            started_at: "Mon Oct 12 11:39:11 2026".into(),
+            argv: argv.iter().map(|arg| (*arg).into()).collect(),
+        }];
+        let response = home.search_all(json!({}), vec![]);
+        let row = by_key(&response, "agy-a");
+        assert_eq!(row["state"], "ended", "{argv:?}");
+        assert_eq!(
+            row["resume"],
+            json!({"command": "agy --conversation agy-a", "cwd": cwd}),
+            "{argv:?}"
+        );
+    }
+}

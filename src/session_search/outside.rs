@@ -251,6 +251,7 @@ fn owning_argument<'a>(process: &'a SessionProcess, agent: &str) -> Option<(&'a 
             };
             (command == "resume" && !identity.starts_with('-')).then_some((identity.as_str(), true))
         }
+        "agy" => option_identity(args, &["--conversation", "-c"]).map(|(_, value)| (value, false)),
         _ => None,
     }
 }
@@ -291,6 +292,7 @@ fn process_agent(process: &SessionProcess) -> Option<&'static str> {
         Agent::Claude => Some("claude"),
         Agent::Codex => Some("codex"),
         Agent::Pi => Some("pi"),
+        Agent::Antigravity => Some("agy"),
         _ => None,
     }
 }
