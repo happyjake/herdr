@@ -5274,15 +5274,31 @@ fn antigravity_cli_ps1_hook_guards_parent_and_blank_conversation_ids() {
     let parent_guard = ps1
         .find("if (-not [string]::IsNullOrWhiteSpace($parentConversationId)) { Exit-Hook }")
         .expect("PowerShell hook must ignore subagent payloads");
+    let conv_trim = ps1
+        .find("$payload.conversationId.Trim()")
+        .expect("PowerShell hook must trim conversationId");
     let conv_guard = ps1
-        .find("if ([string]::IsNullOrWhiteSpace($conversationId)) { Exit-Hook }")
+        .find("if ($null -eq $conversationId) { Exit-Hook }")
         .expect("PowerShell hook must ignore blank conversationId");
+    let transcript_trim = ps1
+        .find("$payload.transcriptPath.Trim()")
+        .expect("PowerShell hook must trim transcriptPath");
+    let transcript_arg = ps1
+        .find(r#"@("--agent-session-path", "$transcriptPath")"#)
+        .expect("PowerShell hook must forward trimmed transcriptPath");
     let invoke = ps1
         .find("report-agent-session")
         .expect("PowerShell hook must report top-level sessions");
+    let exec_invoke = ps1
+        .find("& $herdr @sessionArgs")
+        .expect("PowerShell hook must invoke herdr after building args");
     assert!(ps1.contains("$payload.parentConversationId"));
     assert!(parent_guard < invoke);
+    assert!(conv_trim < conv_guard);
     assert!(conv_guard < invoke);
+    assert!(invoke < transcript_trim);
+    assert!(transcript_trim < transcript_arg);
+    assert!(transcript_arg < exec_invoke);
 }
 
 #[test]

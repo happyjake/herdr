@@ -167,6 +167,7 @@ pub fn session_ref_from_report(
     // — and the file rides along, so whatever wants to read the
     // conversation is spared deriving a path the harness already knows.
     agent_session_id
+        .filter(|id| agent != "agy" || valid_agy_conversation_id(id))
         .and_then(AgentSessionRef::id)
         .map(|session_ref| session_ref.with_record_path(agent_session_path))
 }
@@ -292,6 +293,12 @@ pub fn session_ref_from_snapshot(
     }
     let session_ref = match (agent, kind) {
         ("pi" | "omp", AgentSessionRefKind::Path) => AgentSessionRef::path(value)?,
+        ("agy", AgentSessionRefKind::Id) => {
+            if !valid_agy_conversation_id(value) {
+                return None;
+            }
+            AgentSessionRef::id(value)?.with_record_path(record_path)
+        }
         // A captured record path comes back with the id it was captured
         // beside, so a restart reads the conversation where the harness
         // said it was rather than where a derivation would look.
@@ -387,7 +394,9 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
                 session_ref.value.clone(),
             ]
         }
-        ("herdr:antigravity_cli", "agy", AgentSessionRefKind::Id) => {
+        ("herdr:antigravity_cli", "agy", AgentSessionRefKind::Id)
+            if valid_agy_conversation_id(&session_ref.value) =>
+        {
             vec![
                 "agy".into(),
                 "--conversation".into(),
@@ -1148,5 +1157,71 @@ mod tests {
             &AgentSessionRef::path(&agy_session).unwrap()
         )
         .is_none());
+    }
+
+    #[test]
+    fn agy_validation_rejects_unsafe_conversation_ids_across_report_snapshot_and_plan() {
+        let valid = "agy-session";
+        assert_eq!(
+            session_ref_from_report("herdr:antigravity_cli", "agy", Some(valid.into()), None)
+                .unwrap()
+                .value,
+            valid
+        );
+        assert_eq!(
+            session_ref_from_snapshot(
+                "herdr:antigravity_cli",
+                "agy",
+                AgentSessionRefKind::Id,
+                valid,
+                None
+            )
+            .unwrap()
+            .session_ref
+            .value,
+            valid
+        );
+        assert_eq!(
+            plan(
+                "herdr:antigravity_cli",
+                "agy",
+                &AgentSessionRef::id(valid).unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["agy", "--conversation", valid]
+        );
+
+        for invalid in [
+            "../other",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "-p",
+            "  conv-0  ",
+            "bad id",
+        ] {
+            assert!(
+                session_ref_from_report("herdr:antigravity_cli", "agy", Some(invalid.into()), None)
+                    .is_none(),
+                "report unexpectedly accepted {invalid:?}"
+            );
+            assert!(
+                session_ref_from_snapshot(
+                    "herdr:antigravity_cli",
+                    "agy",
+                    AgentSessionRefKind::Id,
+                    invalid,
+                    None
+                )
+                .is_none(),
+                "snapshot unexpectedly accepted {invalid:?}"
+            );
+            let raw_ref = AgentSessionRef::id(invalid).unwrap();
+            assert!(
+                plan("herdr:antigravity_cli", "agy", &raw_ref).is_none(),
+                "plan unexpectedly accepted {invalid:?}"
+            );
+        }
     }
 }

@@ -35,8 +35,8 @@ if ($null -eq $payload) { Exit-Hook }
 $parentConversationId = if ($payload.parentConversationId -is [string]) { $payload.parentConversationId } else { $null }
 if (-not [string]::IsNullOrWhiteSpace($parentConversationId)) { Exit-Hook }
 
-$conversationId = if ($payload.conversationId -is [string]) { $payload.conversationId } else { $null }
-if ([string]::IsNullOrWhiteSpace($conversationId)) { Exit-Hook }
+$conversationId = if ($payload.conversationId -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.conversationId)) { $payload.conversationId.Trim() } else { $null }
+if ($null -eq $conversationId) { Exit-Hook }
 
 $seq = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $herdr = if ([string]::IsNullOrWhiteSpace($env:HERDR_BIN_PATH)) { "herdr" } else { $env:HERDR_BIN_PATH }
@@ -54,8 +54,9 @@ try {
         "--agent-session-id",
         "$conversationId"
     )
-    if ($payload.transcriptPath -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.transcriptPath)) {
-        $sessionArgs += @("--agent-session-path", "$($payload.transcriptPath)")
+    $transcriptPath = if ($payload.transcriptPath -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.transcriptPath)) { $payload.transcriptPath.Trim() } else { $null }
+    if ($null -ne $transcriptPath) {
+        $sessionArgs += @("--agent-session-path", "$transcriptPath")
     }
     & $herdr @sessionArgs 2>$null | Out-Null
 } catch {
