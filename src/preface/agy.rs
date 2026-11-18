@@ -157,7 +157,7 @@ fn reopen(turn: &mut AgyTurn) {
 /// What the person typed: agy wraps it in a request block followed by
 /// metadata blocks it adds itself. The metadata can quote anything, so the
 /// request ends where the first metadata block begins.
-fn request_text(content: &str) -> &str {
+pub(crate) fn request_text(content: &str) -> &str {
     let Some(body) = content.strip_prefix(REQUEST_OPEN) else {
         return content;
     };
@@ -193,6 +193,10 @@ impl super::Reader for AgyReader {
 
     fn prompt_markers(&self) -> &'static [&'static str] {
         &[PROMPT_MARKER]
+    }
+
+    fn editor_box(&self) -> bool {
+        true
     }
 }
 
@@ -648,5 +652,91 @@ mod tests {
             Some("conv-1")
         );
         assert_eq!(session_id(Path::new("transcript_full.jsonl")), None);
+    }
+
+    #[test]
+    fn agy_reader_declares_its_ruled_editor_box_so_drafts_do_not_break_the_seam() {
+        use crate::preface::seam::{preface, PromptEvidence, Span, Top};
+        use crate::preface::{ReadTurns, Reader};
+
+        let reader = AgyReader::default();
+        assert!(reader.editor_box());
+
+        let source = prompt(0, "prompt alpha")
+            + &answer(1, "answer alpha")
+            + &prompt(2, "prompt beta")
+            + &answer(3, "answer beta");
+        let mut agy_reader = Box::new(AgyReader::default());
+        for line in source.lines() {
+            let value: Value = serde_json::from_str(line).unwrap();
+            agy_reader.accept(&value);
+        }
+        let read = ReadTurns {
+            turns: std::sync::Arc::new(agy_reader.finish()),
+            revision: String::new(),
+        };
+        let rule = "─".repeat(40);
+        let screen = [
+            "> prompt beta",
+            "answer beta",
+            &rule,
+            "> prompt alpha",
+            &rule,
+            "  status line",
+        ]
+        .join("\n");
+        let top = Top {
+            offset: None,
+            lines: None,
+        };
+
+        let with_box = preface(
+            "agy",
+            "conv-1",
+            &read,
+            top,
+            10,
+            PromptEvidence {
+                markers: reader.prompt_markers(),
+                background: reader.prompt_background(),
+                editor_box: reader.editor_box(),
+            },
+            |_| {
+                Some(Span {
+                    text: screen.clone(),
+                    has_more: false,
+                })
+            },
+        );
+        let turns: Vec<_> = with_box
+            .unwrap()
+            .turns
+            .into_iter()
+            .filter_map(|turn| turn.prompt)
+            .collect();
+        assert_eq!(turns, vec!["prompt alpha"]);
+
+        let without_box = preface(
+            "agy",
+            "conv-1",
+            &read,
+            top,
+            10,
+            PromptEvidence {
+                markers: reader.prompt_markers(),
+                background: reader.prompt_background(),
+                editor_box: false,
+            },
+            |_| {
+                Some(Span {
+                    text: screen,
+                    has_more: false,
+                })
+            },
+        );
+        assert_eq!(
+            without_box,
+            Err(crate::api::schema::PrefaceReason::SeamNotFound)
+        );
     }
 }

@@ -25,7 +25,7 @@ pub(super) fn draft(agent: &str, screen: &str) -> Option<String> {
             }
             strip_marker(&body.join(" "), &['›'])?
         }
-        "claude" | "pi" => {
+        "claude" | "pi" | "agy" => {
             let rules: Vec<usize> = lines
                 .iter()
                 .enumerate()
@@ -40,7 +40,7 @@ pub(super) fn draft(agent: &str, screen: &str) -> Option<String> {
                 .map(|line| typed(line))
                 .collect::<Vec<_>>()
                 .join(" ");
-            if agent == "claude" {
+            if matches!(agent, "claude" | "agy") {
                 strip_marker(&body, &['❯', '>'])?
             } else {
                 body
@@ -168,6 +168,10 @@ mod tests {
         format!(" \x1b[0m\x1b[38;2;157;165;169mDone.\x1b[0m\n\n{rule}\n{composer}\n{rule}\n~/code/app · 9% · worker · $0.00")
     }
 
+    fn agy(composer: &str) -> String {
+        format!("• Done.\n\n{RULE}\n{composer}\n{RULE}\n  ~/code/app · main")
+    }
+
     #[test]
     fn empty_composers_read_empty_through_their_placeholders_and_cursors() {
         assert_eq!(draft("claude", &claude("❯\u{a0}")).as_deref(), Some(""));
@@ -185,6 +189,11 @@ mod tests {
         );
         assert_eq!(
             draft("pi", &pi("\x1b[0m\x1b[7m \x1b[0m                    ")).as_deref(),
+            Some("")
+        );
+        assert_eq!(draft("agy", &agy("> ")).as_deref(), Some(""));
+        assert_eq!(
+            draft("agy", &agy("> \x1b[0m\x1b[2mAsk anything\x1b[0m")).as_deref(),
             Some("")
         );
     }
@@ -206,6 +215,10 @@ mod tests {
         assert_eq!(
             draft("pi", &pi("please check the build\x1b[7m \x1b[0m")).as_deref(),
             Some("please check the build")
+        );
+        assert_eq!(
+            draft("agy", &agy("> ship them all")).as_deref(),
+            Some("ship them all")
         );
     }
 

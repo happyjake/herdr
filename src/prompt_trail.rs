@@ -5,7 +5,7 @@
 //! prompt, the last three, up to nine immediately earlier prompts, the
 //! harness's own title, how many prompts there have been and when the
 //! newest arrived. Human asks queued during Claude work count once, at
-//! their attachment line. The newest Claude or pi compaction contributes
+//! their attachment line. The newest Claude, pi, or agy compaction contributes
 //! a separate, nonempty work or request excerpt when a section is recognized,
 //! never a prompt or an unstructured fallback. Tool traffic,
 //! results and other harness injections do not enter the trail.
@@ -258,6 +258,11 @@ fn read_lines(
 
         let at = parsed
             .get("timestamp")
+            .or_else(|| {
+                (agent == PromptTrailAgent::Agy)
+                    .then(|| parsed.get("created_at"))
+                    .flatten()
+            })
             .and_then(Value::as_str)
             .and_then(unix_seconds_from_rfc3339);
         if let Some(text) = compaction_text(agent, &parsed) {
@@ -332,6 +337,14 @@ fn compaction_text(agent: PromptTrailAgent, line: &Value) -> Option<String> {
                     .to_string(),
             );
         }
+        PromptTrailAgent::Agy if line.get("type").and_then(Value::as_str) == Some("CHECKPOINT") => {
+            return line
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned);
+        }
         _ => return None,
     };
     match content {
@@ -342,7 +355,7 @@ fn compaction_text(agent: PromptTrailAgent, line: &Value) -> Option<String> {
 }
 
 static SUMMARY_TITLE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^(Current\s+Work|In\s+Progress|Progress\s+So\s+Far|Current\s+state|Primary\s+Request\s+and\s+Intent|Goal|Original\s+Request|All\s+user\s+messages|Files\s+and\s+Code\s+Sections|Key\s+Technical\s+Concepts)\b")
+    regex::Regex::new(r"(?i)^(Current\s+Work|In\s+Progress|Progress\s+So\s+Far|Current\s+state|Active\s+Context|Primary\s+Request\s+and\s+Intent|Goal|Original\s+Request|Task\s+Overview|All\s+user\s+messages|Files\s+and\s+Code\s+Sections|Key\s+Technical\s+Concepts)\b")
         .expect("valid summary title pattern")
 });
 
@@ -438,10 +451,11 @@ fn summary_heading(line: &str) -> Option<SummaryHeading<'_>> {
         });
     let section = title.map(
         |title| match clean(title.as_str()).to_ascii_lowercase().as_str() {
-            "current work" | "in progress" | "progress so far" | "current state" => {
-                SummarySection::Current
+            "current work" | "in progress" | "progress so far" | "current state"
+            | "active context" => SummarySection::Current,
+            "primary request and intent" | "goal" | "original request" | "task overview" => {
+                SummarySection::Request
             }
-            "primary request and intent" | "goal" | "original request" => SummarySection::Request,
             _ => SummarySection::Omit,
         },
     );
@@ -631,8 +645,19 @@ pub(crate) fn prompt_text(agent: PromptTrailAgent, line: &Value) -> Option<Strin
         PromptTrailAgent::Claude => claude_prompt(line),
         PromptTrailAgent::Codex => codex_prompt(line),
         PromptTrailAgent::Pi => pi_prompt(line),
-        PromptTrailAgent::Agy => None,
+        PromptTrailAgent::Agy => agy_prompt(line),
     }
+}
+
+fn agy_prompt(line: &Value) -> Option<String> {
+    if line.get("type")?.as_str()? != "USER_INPUT"
+        || line.get("source")?.as_str()? != "USER_EXPLICIT"
+    {
+        return None;
+    }
+    let content = line.get("content")?.as_str()?;
+    let text = clean(crate::preface::agy::request_text(content));
+    (!text.is_empty()).then_some(text)
 }
 
 fn claude_prompt(line: &Value) -> Option<String> {
@@ -2460,6 +2485,171 @@ pub(crate) mod tests {
                 "time {nonsense:?}"
             );
         }
+    }
+
+    #[test]
+    fn agy_prompt_trail_reads_explicit_prompts_timestamps_and_checkpoints() {
+        let lines = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-03-04T09:15:00Z",
+                "content": "<USER_REQUEST>\n  Explain\t the relay\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nignored\n</USER_SETTINGS_CHANGE>"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "USER_IMPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-03-04T09:16:00Z",
+                "content": "<USER_REQUEST>\nImplicit input\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "SYSTEM",
+                "type": "CHECKPOINT",
+                "created_at": "2026-03-04T09:17:00Z",
+                "content": "## Current Work\nWiring the relay."
+            }),
+            serde_json::json!({
+                "step_index": 3,
+                "source": "SYSTEM",
+                "type": "CHECKPOINT",
+                "created_at": "2026-03-04T09:18:00Z",
+                "content": "   \n  "
+            }),
+            serde_json::json!({
+                "step_index": 4,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-03-04T09:20:00Z",
+                "content": "<USER_REQUEST>\n   \n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 5,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-03-04T09:25:00Z",
+                "content": "<USER_REQUEST>\nShip the relay\n</USER_REQUEST>"
+            }),
+        ];
+        let record = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trail = read_lines(record.as_bytes(), PromptTrailAgent::Agy, Bounds::DEFAULT).unwrap();
+        assert_eq!(trail.agent, PromptTrailAgent::Agy);
+        assert_eq!(trail.count, 2);
+        assert_eq!(trail.newest_at, Some(1772616300));
+        assert_eq!(
+            trail.first,
+            Some(TrailPrompt {
+                text: "Explain the relay".into(),
+                at: Some(1772615700),
+            })
+        );
+        assert_eq!(
+            trail.recent,
+            vec![
+                TrailPrompt {
+                    text: "Explain the relay".into(),
+                    at: Some(1772615700),
+                },
+                TrailPrompt {
+                    text: "Ship the relay".into(),
+                    at: Some(1772616300),
+                },
+            ]
+        );
+        assert_eq!(
+            trail.summary,
+            Some(TrailSummary {
+                text: "Wiring the relay.".into(),
+                at: Some(1772615820),
+                kind: TrailSummaryKind::Current,
+            })
+        );
+    }
+
+    #[test]
+    fn agy_checkpoint_headings_extract_active_context_and_task_overview() {
+        let checkpoint = [
+            "# Resuming from a compaction",
+            "",
+            "# User Requests",
+            "1. Wire the relay",
+            "",
+            "<summary>",
+            "1. **Task Overview**",
+            "Wire the relay and verify its tests.",
+            "2. **Progress**",
+            "Updated the reader.",
+            "3. **Key Findings**",
+            "Timestamps use created_at.",
+            "4. **Errors & Fixes**",
+            "None.",
+            "5. **Active Context**",
+            "Running the targeted test suite on the relay module.",
+            "6. **Next Steps**",
+            "Commit the branch.",
+            "7. **Commitments & Constraints**",
+            "Keep names generic.",
+            "</summary>",
+            "",
+            "# Conversation Logs",
+            "Step 0: ...",
+        ]
+        .join("\n");
+        let record = serde_json::json!({
+            "step_index": 1,
+            "source": "SYSTEM",
+            "type": "CHECKPOINT",
+            "created_at": "2026-03-04T09:21:00Z",
+            "content": checkpoint,
+        })
+        .to_string();
+        let trail = read_lines(record.as_bytes(), PromptTrailAgent::Agy, Bounds::DEFAULT).unwrap();
+        assert_eq!(
+            trail.summary,
+            Some(TrailSummary {
+                text: "Running the targeted test suite on the relay module.".into(),
+                at: Some(1772616060),
+                kind: TrailSummaryKind::Current,
+            })
+        );
+
+        let overview_only = [
+            "# Resuming from a compaction",
+            "",
+            "# User Requests",
+            "1. Wire the relay",
+            "",
+            "<summary>",
+            "1. **Task Overview**",
+            "Wire the relay and verify its tests.",
+            "2. **Progress**",
+            "Updated the reader.",
+            "</summary>",
+        ]
+        .join("\n");
+        let record = serde_json::json!({
+            "step_index": 2,
+            "source": "SYSTEM",
+            "type": "CHECKPOINT",
+            "created_at": "2026-03-04T09:22:00Z",
+            "content": overview_only,
+        })
+        .to_string();
+        let trail = read_lines(record.as_bytes(), PromptTrailAgent::Agy, Bounds::DEFAULT).unwrap();
+        assert_eq!(
+            trail.summary,
+            Some(TrailSummary {
+                text: "Wire the relay and verify its tests.".into(),
+                at: Some(1772616120),
+                kind: TrailSummaryKind::Request,
+            })
+        );
     }
 }
 

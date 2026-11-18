@@ -1298,7 +1298,6 @@ mod tests {
         for agent in [
             crate::api::schema::PromptTrailAgent::Codex,
             crate::api::schema::PromptTrailAgent::Pi,
-            crate::api::schema::PromptTrailAgent::Agy,
         ] {
             for (width, footer) in [(10, false), (40, true)] {
                 let rule = "─".repeat(width);

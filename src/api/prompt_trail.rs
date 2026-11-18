@@ -367,7 +367,8 @@ pub(super) trait RecordOutput: Send + 'static {
 impl RecordOutput for PromptTrail {
     type Reason = PromptTrailReason;
     fn supports(agent: PromptTrailAgent) -> bool {
-        agent != PromptTrailAgent::Agy
+        let _ = agent;
+        true
     }
     fn response(
         pane_id: String,
@@ -1636,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn agy_panes_have_a_turn_index_but_no_prompt_trail() {
+    fn agy_panes_have_a_turn_index_and_prompt_trail() {
         let fixture = Fixture::new();
         let response = respond(
             "request".into(),
@@ -1677,9 +1678,62 @@ mod tests {
             "request".into(),
             fixture.sources(pane_response(pane(Some(agy_session(None))))),
         );
+        let trail = trail_of(&response);
+        assert_eq!(trail.agent, PromptTrailAgent::Agy);
+        assert_eq!(trail.count, 5);
+        assert_eq!(trail.newest_at, Some(1772617200));
         assert_eq!(
-            reason_of(&response),
-            Some(PromptTrailReason::UnsupportedAgent)
+            trail.first.as_ref().map(|p| (p.text.as_str(), p.at)),
+            Some(("Explain the relay and why it waits", Some(1772615700)))
+        );
+        assert_eq!(
+            trail
+                .recent
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Rename the beacon to lighthouse instead",
+                "Ship the lighthouse",
+                "Try shipping again",
+            ]
+        );
+        assert_eq!(trail.summary, None);
+
+        let with_checkpoint = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-03-04T09:15:00Z",
+                "content": "<USER_REQUEST>\nBuild the lighthouse\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "SYSTEM",
+                "type": "CHECKPOINT",
+                "created_at": "2026-03-04T09:21:00Z",
+                "content": "## Current Work\nTesting the checkpoint excerpt."
+            })
+        );
+        fixture.write(
+            &format!("{AGY_LOGS}/transcript_full.jsonl"),
+            &with_checkpoint,
+        );
+        let response = respond(
+            "request".into(),
+            fixture.sources(pane_response(pane(Some(agy_session(None))))),
+        );
+        let trail = trail_of(&response);
+        assert_eq!(trail.count, 1);
+        assert_eq!(
+            trail.summary,
+            Some(crate::api::schema::TrailSummary {
+                text: "Testing the checkpoint excerpt.".into(),
+                at: Some(1772616060),
+                kind: crate::api::schema::TrailSummaryKind::Current,
+            })
         );
     }
 
