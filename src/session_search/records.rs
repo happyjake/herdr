@@ -20,6 +20,7 @@ pub(super) enum FileKind {
     Codex,
     Pi,
     Agy,
+    AgySubagent,
     ClaudeHistory,
     CodexHistory,
     CodexIndex,
@@ -32,7 +33,7 @@ impl FileKind {
             Self::Claude | Self::ClaudeSubagent | Self::ClaudeHistory => PromptTrailAgent::Claude,
             Self::Codex | Self::CodexHistory | Self::CodexIndex => PromptTrailAgent::Codex,
             Self::Pi => PromptTrailAgent::Pi,
-            Self::Agy | Self::AgyHistory => PromptTrailAgent::Agy,
+            Self::Agy | Self::AgySubagent | Self::AgyHistory => PromptTrailAgent::Agy,
         }
     }
 
@@ -51,6 +52,7 @@ pub(super) struct Prompt {
     pub text: Arc<str>,
     pub folded: Arc<str>,
     pub at: u64,
+    pub from_history: bool,
 }
 
 #[derive(Clone)]
@@ -70,6 +72,7 @@ pub(super) struct Session {
     pub closed_at_ms: Option<u64>,
     pub parent: Option<SearchSessionKey>,
     pub reported: bool,
+    pub from_history: bool,
     pub non_interactive: bool,
     pub claude_subagent: bool,
 }
@@ -91,6 +94,7 @@ impl Session {
             closed_at_ms: None,
             parent: None,
             reported: false,
+            from_history: false,
             non_interactive: false,
             claude_subagent: false,
         }
@@ -114,6 +118,9 @@ pub(super) fn read(
     size: u64,
     modified_ms: u64,
 ) -> std::io::Result<FileData> {
+    if matches!(kind, FileKind::AgySubagent) {
+        return read_agy_subagent(path, size);
+    }
     let file = std::fs::File::open(path)?;
     let input = BufReader::new(file.take(size));
     let mut reader: Box<dyn BufRead> = if path.extension().is_some_and(|ext| ext == "zst") {
@@ -123,6 +130,7 @@ pub(super) fn read(
     };
     let mut data = FileData::default();
     let mut history = BTreeMap::new();
+    let mut agy_subagents: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut session = match kind {
         FileKind::Claude | FileKind::ClaudeSubagent => path
             .file_stem()
@@ -155,16 +163,20 @@ pub(super) fn read(
                 )
             }),
         FileKind::Agy => crate::preface::agy::session_id(path)
+            .filter(|id| crate::agent_resume::valid_agy_conversation_id(id))
             .and_then(AgentSessionRef::id)
             .map(|id| {
-                Session::new(
+                let mut session = Session::new(
                     key(kind, SearchSessionKeyKind::Id, id.value),
                     Some(path.into()),
-                )
+                );
+                // Agy transcripts are provisionally headless until corroborated
+                // by history.jsonl, logbook state, or a live pane.
+                session.non_interactive = true;
+                session
             }),
         _ => None,
     };
-    let mut saw_explicit_user_input = false;
     let mut line = Vec::new();
     let mut consumed = 0;
     loop {
@@ -220,21 +232,35 @@ pub(super) fn read(
             continue;
         };
         if matches!(kind, FileKind::Agy)
-            && line.get("type").and_then(Value::as_str) == Some("USER_INPUT")
-            && line.get("source").and_then(Value::as_str) == Some("USER_EXPLICIT")
+            && line.get("type").and_then(Value::as_str) == Some("GENERIC")
         {
-            saw_explicit_user_input = true;
+            if let Some(content) = line.get("content").and_then(Value::as_str) {
+                for (child_id, child_cwd) in parse_agy_generic_subagents(content) {
+                    if child_id != session.key.value {
+                        agy_subagents
+                            .entry(child_id)
+                            .and_modify(|existing| {
+                                if existing.is_none() {
+                                    *existing = child_cwd.clone();
+                                }
+                            })
+                            .or_insert(child_cwd);
+                    }
+                }
+            }
         }
         read_metadata(session, kind, &line);
         let at = line
             .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(timestamp_ms)
             .or_else(|| {
                 matches!(kind, FileKind::Agy)
                     .then(|| line.get("created_at"))
                     .flatten()
-            })
-            .and_then(Value::as_str)
-            .and_then(timestamp_ms);
+                    .and_then(Value::as_str)
+                    .and_then(timestamp_ms)
+            });
         if let Some(at) = at {
             session.at(at);
         }
@@ -246,19 +272,22 @@ pub(super) fn read(
                 folded: text.to_lowercase().into(),
                 text: text.into(),
                 at: at.unwrap_or(modified_ms),
+                from_history: false,
             });
         }
     }
     data.sessions.extend(history.into_values());
     if let Some(mut session) = session {
-        if matches!(kind, FileKind::Agy) && !saw_explicit_user_input {
-            session.non_interactive = true;
-        }
+        let parent_key = session.key.clone();
         if session.started_at_ms == u64::MAX {
             session.at(modified_ms);
         }
         session.prompts.sort_by_key(|prompt| prompt.at);
         data.sessions.push(session);
+        for (child_id, child_cwd) in agy_subagents {
+            data.sessions
+                .push(agy_subagent_stub(child_id, parent_key.clone(), child_cwd));
+        }
     }
     Ok(data)
 }
@@ -339,7 +368,8 @@ fn read_history(kind: FileKind, line: &Value, sessions: &mut BTreeMap<SearchSess
             (
                 line.get("conversationId")
                     .and_then(Value::as_str)
-                    .filter(|id| !id.trim().is_empty()),
+                    .map(str::trim)
+                    .filter(|id| crate::agent_resume::valid_agy_conversation_id(id)),
                 line.get("workspace")
                     .and_then(Value::as_str)
                     .filter(|cwd| !cwd.is_empty()),
@@ -383,6 +413,7 @@ fn read_history(kind: FileKind, line: &Value, sessions: &mut BTreeMap<SearchSess
     let session = sessions
         .entry(reference.clone())
         .or_insert_with(|| Session::new(reference, None));
+    session.from_history = true;
     session.at(at);
     if let Some(cwd) = cwd {
         session.cwd = Some(cwd.into());
@@ -391,7 +422,151 @@ fn read_history(kind: FileKind, line: &Value, sessions: &mut BTreeMap<SearchSess
         folded: text.to_lowercase().into(),
         text: text.into(),
         at,
+        from_history: true,
     });
+}
+
+fn read_agy_subagent(path: &Path, size: u64) -> std::io::Result<FileData> {
+    let mut data = FileData::default();
+    let Some(parent_id) = path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|id| crate::agent_resume::valid_agy_conversation_id(id))
+    else {
+        return Ok(data);
+    };
+    let limit = size.min(prompt_trail::MAX_LINE_BYTES as u64);
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > prompt_trail::MAX_LINE_BYTES {
+        return Err(std::io::Error::other(
+            "subagent metadata exceeds read bound",
+        ));
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(data);
+    };
+    let child_id = match value.get("conversationId") {
+        Some(raw) => raw
+            .as_str()
+            .map(str::trim)
+            .filter(|id| crate::agent_resume::valid_agy_conversation_id(id))
+            .map(str::to_owned),
+        None => path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|id| crate::agent_resume::valid_agy_conversation_id(id))
+            .map(str::to_owned),
+    };
+    let Some(child_id) = child_id else {
+        return Ok(data);
+    };
+    if child_id == parent_id {
+        return Ok(data);
+    }
+    let parent_key = key(
+        FileKind::AgySubagent,
+        SearchSessionKeyKind::Id,
+        parent_id.to_string(),
+    );
+    let cwd = first_workspace_uri_path(&value);
+    data.sessions
+        .push(agy_subagent_stub(child_id, parent_key, cwd));
+    Ok(data)
+}
+
+fn agy_subagent_stub(
+    child_id: String,
+    parent_key: SearchSessionKey,
+    cwd: Option<String>,
+) -> Session {
+    let mut session = Session::new(
+        key(FileKind::AgySubagent, SearchSessionKeyKind::Id, child_id),
+        None,
+    );
+    session.parent = Some(parent_key);
+    session.non_interactive = true;
+    session.cwd = cwd;
+    session
+}
+
+fn parse_agy_generic_subagents(content: &str) -> Vec<(String, Option<String>)> {
+    let mut rest = content.trim_start();
+    for prefix in ["Created At:", "Completed At:"] {
+        if rest.starts_with(prefix) {
+            let Some((_, after)) = rest.split_once('\n') else {
+                return Vec::new();
+            };
+            rest = after.trim_start();
+        }
+    }
+    let Some(after_header) = rest
+        .strip_prefix("Created the following subagents:")
+        .or_else(|| rest.strip_prefix("Created the following subagent:"))
+    else {
+        return Vec::new();
+    };
+    let json_text = after_header.trim_start();
+    let mut results = Vec::new();
+    for item in serde_json::Deserializer::from_str(json_text).into_iter::<Value>() {
+        let Ok(value) = item else { break };
+        match value {
+            Value::Object(_) => {
+                if let Some(parsed) = agy_subagent_fields(&value) {
+                    results.push(parsed);
+                }
+            }
+            Value::Array(items) => {
+                for entry in items {
+                    if let Some(parsed) = agy_subagent_fields(&entry) {
+                        results.push(parsed);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    results
+}
+
+fn agy_subagent_fields(value: &Value) -> Option<(String, Option<String>)> {
+    let id = value
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| crate::agent_resume::valid_agy_conversation_id(id))?
+        .to_string();
+    Some((id, first_workspace_uri_path(value)))
+}
+
+fn first_workspace_uri_path(value: &Value) -> Option<String> {
+    value
+        .get("workspaceUris")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(workspace_uri_to_path)
+}
+
+fn workspace_uri_to_path(uri: &str) -> Option<String> {
+    let uri = uri.trim();
+    if uri.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = url::Url::parse(uri) {
+        if parsed.scheme() == "file" {
+            return parsed
+                .to_file_path()
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_owned));
+        }
+        return None;
+    }
+    Path::new(uri).is_absolute().then(|| uri.to_string())
 }
 
 fn timestamp_ms(text: &str) -> Option<u64> {

@@ -313,7 +313,7 @@ Herdr uses `~/.gemini/config/` by default, or `ANTIGRAVITY_CLI_CONFIG_DIR` when 
 
 This session-only integration reports the pane's current conversation, but not agent state. Herdr keeps deriving working, idle, and blocked from what Antigravity CLI draws on screen.
 
-The hook runs on `PreInvocation`, so Herdr learns the conversation once the first prompt is sent. From then on Herdr can resume the pane with `agy --conversation <id>` after a Herdr server restart.
+The hook runs on `SessionStart` and `PreInvocation`, so Herdr learns new, resumed, or switched conversations immediately without waiting for a user hook on every turn. Launching a pane with `agy --conversation <id>` (or `-conversation <id>`) also binds the session at start. From then on Herdr can resume the pane with `agy --conversation <id>` after a Herdr server restart.
 
 ## Grok CLI
 

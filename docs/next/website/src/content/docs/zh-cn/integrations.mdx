@@ -315,7 +315,7 @@ Herdr 默认使用 `~/.gemini/config/`,设置了 `ANTIGRAVITY_CLI_CONFIG_DIR` �
 
 该集成仅上报会话。它会上报窗格当前运行的对话,但不上报智能体状态,因此 Herdr 仍根据 Antigravity CLI 在屏幕上绘制的内容判断 `working`、`idle` 和 `blocked`。
 
-钩子在 `PreInvocation` 时运行,所以 Herdr 会在发送第一个提示词后获知对话。此后,Herdr 服务器重启时可以用 `agy --conversation <id>` 恢复窗格。
+钩子会在 `SessionStart` 和 `PreInvocation` 时运行，因此新建、恢复或切换对话时 Herdr 都会立即获知。使用 `agy --conversation <id>`（或 `-conversation <id>`）启动的窗格也会在启动时绑定会话。此后，Herdr 服务器重启时可以用 `agy --conversation <id>` 恢复窗格。
 
 ## Grok CLI
 

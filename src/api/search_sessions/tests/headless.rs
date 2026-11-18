@@ -292,6 +292,8 @@ fn codex_sources_outside_session_meta_do_not_hide_interactive_records() {
 fn agy_records_without_explicit_user_input_are_headless_and_fold_under_host_windows() {
     let home = FixtureHome::new();
     let cwd = home.dir("project");
+    let worker_cwd = home.dir("worker");
+    let worker_uri = url::Url::from_file_path(&worker_cwd).unwrap().to_string();
     home.write(
         ".gemini/antigravity-cli/brain/parent/.system_generated/logs/transcript_full.jsonl",
         &[
@@ -317,6 +319,15 @@ fn agy_records_without_explicit_user_input_are_headless_and_fold_under_host_wind
             "conversationId": "parent"
         })],
     );
+    // Subagent metadata under parent/.system_generated/subagents/<child>.json links
+    // child structurally to parent even when running in another worktree.
+    home.write(
+        ".gemini/antigravity-cli/brain/parent/.system_generated/subagents/child.json",
+        &[json!({
+            "conversationId": "child",
+            "workspaceUris": [worker_uri]
+        })],
+    );
     // Subagent transcript: starts with SYSTEM_MESSAGE and has no USER_EXPLICIT step.
     home.write(
         ".gemini/antigravity-cli/brain/child/.system_generated/logs/transcript_full.jsonl",
@@ -337,7 +348,7 @@ fn agy_records_without_explicit_user_input_are_headless_and_fold_under_host_wind
             }),
         ],
     );
-    // Subagent whose logbook/history didn't report a host pane stays headless and hidden.
+    // Subagent without metadata/logbook/history stays headless and unparented.
     home.write(
         ".gemini/antigravity-cli/brain/alone/.system_generated/logs/transcript_full.jsonl",
         &[json!({
@@ -347,6 +358,14 @@ fn agy_records_without_explicit_user_input_are_headless_and_fold_under_host_wind
             "created_at": "2026-10-03T01:00:00Z",
             "content": "Background task"
         })],
+    );
+    // Unhosted `agy -p` run writes USER_EXPLICIT without history.jsonl or logbook.
+    home.write(
+        ".gemini/antigravity-cli/brain/print-run/.system_generated/logs/transcript_full.jsonl",
+        &[agy_user_explicit(
+            "<USER_REQUEST>\nHeadless print prompt\n</USER_REQUEST>",
+            "2026-10-03T02:00:00Z",
+        )],
     );
     home.write(
         "logbook.jsonl",
@@ -363,15 +382,86 @@ fn agy_records_without_explicit_user_input_are_headless_and_fold_under_host_wind
     let visible = home.search(json!({}), vec![]);
     assert_eq!(visible["result"]["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(by_key(&visible, "parent")["headless"], false);
+    assert!(
+        by_key(&visible, "parent")["subagent_count"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
 
     let all = home.search(json!({"include_headless": true}), vec![]);
-    assert_eq!(all["result"]["sessions"].as_array().unwrap().len(), 3);
+    assert_eq!(all["result"]["sessions"].as_array().unwrap().len(), 4);
     assert_eq!(by_key(&all, "child")["headless"], true);
+    assert_eq!(
+        by_key(&all, "child")["parent"],
+        json!({"agent": "agy", "kind": "id", "value": "parent"})
+    );
+    assert_eq!(by_key(&all, "child")["cwd"], worker_cwd);
     assert_eq!(by_key(&all, "alone")["headless"], true);
     assert!(by_key(&all, "alone").get("parent").is_none());
+    assert_eq!(by_key(&all, "print-run")["headless"], true);
+    assert!(by_key(&all, "print-run").get("parent").is_none());
 
     // Live pane overrides non_interactive marker just like other agents.
     let live = home.search(json!({}), vec![live_pane("agy", "id", "alone")]);
     assert_eq!(by_key(&live, "alone")["headless"], false);
     assert_eq!(by_key(&live, "alone")["state"], "live");
+}
+
+#[test]
+fn agy_generic_subagent_step_links_child_without_subagent_metadata_file() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    let worker_cwd = home.dir("worker");
+    let worker_uri = url::Url::from_file_path(&worker_cwd).unwrap().to_string();
+    let subagent_payload = json!({
+        "conversationId": "child-generic",
+        "workspaceUris": [worker_uri]
+    });
+    home.write(
+        ".gemini/antigravity-cli/brain/parent/.system_generated/logs/transcript_full.jsonl",
+        &[
+            agy_user_explicit(
+                "<USER_REQUEST>\nParent ask\n</USER_REQUEST>",
+                "2026-10-03T00:00:00Z",
+            ),
+            json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "created_at": "2026-10-03T00:01:00Z",
+                "content": format!(
+                    "Created At: 2026-10-03T00:01:00Z\nCompleted At: 2026-10-03T00:01:01Z\nCreated the following subagent:\n{}",
+                    serde_json::to_string_pretty(&subagent_payload).unwrap()
+                )
+            }),
+        ],
+    );
+    home.write(
+        ".gemini/antigravity-cli/history.jsonl",
+        &[json!({
+            "display": "Parent ask",
+            "timestamp": 1790985600000_u64,
+            "workspace": cwd,
+            "conversationId": "parent"
+        })],
+    );
+    home.write(
+        ".gemini/antigravity-cli/brain/child-generic/.system_generated/logs/transcript_full.jsonl",
+        &[agy_user_explicit("Child task", "2026-10-03T00:02:00Z")],
+    );
+    home.catalog.refresh();
+
+    let visible = home.search(json!({}), vec![]);
+    assert_eq!(visible["result"]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(by_key(&visible, "parent")["subagent_count"], 1);
+
+    let all = home.search(json!({"include_headless": true}), vec![]);
+    let child = by_key(&all, "child-generic");
+    assert_eq!(child["headless"], true);
+    assert_eq!(
+        child["parent"],
+        json!({"agent": "agy", "kind": "id", "value": "parent"})
+    );
+    assert_eq!(child["cwd"], worker_cwd);
 }

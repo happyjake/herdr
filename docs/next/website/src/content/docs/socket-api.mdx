@@ -276,8 +276,8 @@ one `attachment.create` or `attachment.append` may carry; size chunks from it
 rather than from a hard-coded number. A server without the capability takes
 photos through `attachment.create` only.
 
-`server.search_sessions` searches saved Claude, Codex, and pi sessions on this
-server, including Claude and Codex prompt histories. All parameters are optional:
+`server.search_sessions` searches saved Claude, Codex, pi, and Antigravity CLI (`agy`) sessions on this
+server, including Claude, Codex, and Antigravity CLI prompt histories. All parameters are optional:
 
 ```json
 {"id":"req_search","method":"server.search_sessions","params":{"terms":["keyboard","layout"],"agent":"claude","limit":50}}
@@ -297,7 +297,7 @@ considered before filtering), and `partial`. Each row includes its `key`
 (`agent`, `kind`, `value`), `cwd` (null when unknown), optional `branch` and judged
 `title`, `first_prompt` (about 400 characters), up to three `recent_prompts`
 (about 240 characters each, newest last), and activity times in milliseconds.
-Claude and Codex use id keys; pi uses a path key. Claude history without a session
+Claude, Codex, and Antigravity CLI use id keys; pi uses a path key. Claude history without a session
 id groups by project and UTC day with kind `day` and value `<cwd>|<YYYY-MM-DD>`.
 Claude ids remain the same when records move between project directories.
 
@@ -305,7 +305,7 @@ Claude ids remain the same when records move between project directories.
 `live_pane_id` for this server. `place_state` is `present` or `gone`; a gone place includes
 `nearest_existing` when an ancestor exists. `resume` contains the planner's
 `command` and `cwd`, or is null with `resume_blocked` (`live`, `outside`, `record_gone`,
-`folder_gone`, or `subagent`). Claude/Codex ids and pi paths can resume from the nearest existing
+`folder_gone`, or `subagent`). Claude/Codex/Antigravity CLI ids and pi paths can resume from the nearest existing
 ancestor. Unknown places and project-day rows cannot resume.
 Nested Claude subagent transcripts always return `resume: null` and
 `resume_blocked: "subagent"`; their file ids do not identify resumable conversations.
@@ -317,10 +317,13 @@ or pane close ends the previous label. Labels survive closed panes and deleted
 records, and label matches return `why.field: "label"`.
 
 Claude records under `<project>/<sessionId>/subagents/agent-*.jsonl`, Codex
-`session_meta.source.subagent.thread_spawn.parent_thread_id`, and logbook parent
-events supply structural parentage. A record is `headless` only when its harness
-marks it non-interactive: Claude transcript lines with `entrypoint: "sdk-cli"`, or
-Codex `session_meta.source` equal to `"exec"` or an object containing `subagent`.
+`session_meta.source.subagent.thread_spawn.parent_thread_id`, Antigravity CLI
+`brain/<parent>/.system_generated/subagents/<child>.json` and parent `GENERIC`
+subagent creation steps, and logbook parent events supply structural parentage. A
+record is `headless` only when its harness marks it non-interactive or omits
+interactive history: Claude transcript lines with `entrypoint: "sdk-cli"`, Codex
+`session_meta.source` equal to `"exec"` or an object containing `subagent`, or
+Antigravity CLI transcripts without a matching `history.jsonl` entry.
 Pi has no such marker. Interactive sessions remain visible without pane history.
 A session live in one of this server's panes or reported in its logbook is never
 headless. A headless record without a structural parent folds under an interactive
@@ -341,7 +344,8 @@ live pids and process start times. A torn entry for a live pid is read up to thr
 times, about 20 ms apart, then falls back to that Claude process's `--resume`,
 `-r`, or `--session-id` operand. If neither source identifies the session, that
 entry is skipped with a debug log; the saved session can still appear `ended`
-and resumable. Codex and pi use best-effort matches of session-owning operands
+and resumable. Codex, pi, and Antigravity CLI (`--conversation` / `-conversation`)
+use best-effort matches of session-owning operands
 in an agent process's argv; fork source operands do not count. Path operands are
 normalized, using the process cwd for relative paths when available. Ids remain
 exact matches.

@@ -730,8 +730,15 @@ fn agy_conversation_process_arguments_mark_saved_session_outside() {
 
     for argv in [
         vec!["agy", "--conversation", "agy-a"],
-        vec!["/usr/local/bin/agy", "-c", "agy-a"],
+        vec!["/usr/local/bin/agy", "-conversation", "agy-a"],
         vec!["agy", "--model", "auto", "--conversation=agy-a"],
+        vec!["agy", "-conversation=agy-a"],
+        vec![
+            "agy",
+            "--conversation=agy-a",
+            "--log-file",
+            "--conversation=other",
+        ],
     ] {
         *home.processes.lock().unwrap() = vec![SessionProcess {
             cwd: None,
@@ -758,9 +765,24 @@ fn agy_conversation_process_arguments_mark_saved_session_outside() {
     assert_eq!(row["resume_blocked"], "live");
     assert!(row.get("outside").is_none());
 
-    // Arguments after `--` or unrelated flags do not claim the session.
+    // Arguments after `--`, `-c` (boolean `--continue`), shell wrappers,
+    // repeated resets, or value flags consuming `--conversation` do not claim
+    // the session.
+    let expected_resume = crate::platform::interactive_shell_command(
+        &["agy".into(), "--conversation".into(), "agy-a".into()],
+        "sh",
+    )
+    .unwrap();
     for argv in [
         vec!["agy"],
+        vec!["agy", "-c", "agy-a"],
+        vec!["sh", "-c", "agy"],
+        vec!["agy", "--log-file", "--conversation=agy-a"],
+        vec!["agy", "--conversation=agy-a", "--conversation="],
+        vec!["agy", "--conversation=agy-a", "--conversation", ""],
+        vec!["agy", "--conversation=agy-a", "--conversation"],
+        vec!["agy", "--conversation=agy-a", "--conversation=-foo"],
+        vec!["agy", "--conversation", "../example"],
         vec!["agy", "--", "--conversation", "agy-a"],
         vec!["agy", "-c", "--other"],
     ] {
@@ -775,7 +797,7 @@ fn agy_conversation_process_arguments_mark_saved_session_outside() {
         assert_eq!(row["state"], "ended", "{argv:?}");
         assert_eq!(
             row["resume"],
-            json!({"command": "agy --conversation agy-a", "cwd": cwd}),
+            json!({"command": expected_resume, "cwd": cwd}),
             "{argv:?}"
         );
     }

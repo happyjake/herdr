@@ -5124,6 +5124,27 @@ fn install_antigravity_cli_writes_hook_and_updates_hooks_json() {
         );
     }
 
+    // Explicitly pin both events and their session command independent of the
+    // production constant table.
+    assert_eq!(
+        block
+            .get("SessionStart")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("command"))
+            .and_then(Value::as_str),
+        Some(antigravity_cli_hook_command(&installed.hook_path, "session").as_str())
+    );
+    assert_eq!(
+        block
+            .get("PreInvocation")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("command"))
+            .and_then(Value::as_str),
+        Some(antigravity_cli_hook_command(&installed.hook_path, "session").as_str())
+    );
+
     // The integration is session-only. Antigravity CLI cannot express blocked
     // state, skips PostInvocation on interruption, and fires Stop at end of
     // turn rather than process exit, so Herdr never claims lifecycle authority
@@ -5190,6 +5211,81 @@ fn antigravity_cli_v3_install_is_outdated_until_reinstalled() {
 }
 
 #[test]
+fn antigravity_cli_v5_install_is_outdated_until_reinstalled() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let agy_dir = base.join(".gemini").join("config");
+    let hook_dir = agy_dir.join("hooks");
+    fs::create_dir_all(&hook_dir).unwrap();
+    let hook_path = hook_dir.join(ANTIGRAVITY_CLI_HOOK_INSTALL_NAME);
+    assert_eq!(ANTIGRAVITY_CLI_INTEGRATION_VERSION, 6);
+    fs::write(
+        &hook_path,
+        ANTIGRAVITY_CLI_HOOK_ASSET
+            .replace("HERDR_INTEGRATION_VERSION=6", "HERDR_INTEGRATION_VERSION=5"),
+    )
+    .unwrap();
+    fs::write(
+        agy_dir.join("hooks.json"),
+        serde_json::json!({
+            "herdr": {
+                "PreInvocation": [{
+                    "type": "command",
+                    "command": antigravity_cli_hook_command(&hook_path, "session"),
+                    "timeout": 10
+                }]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::env::set_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR, &agy_dir);
+
+    let status = || {
+        installed_integration_statuses()
+            .into_iter()
+            .find(|status| status.target == crate::api::schema::IntegrationTarget::AntigravityCli)
+            .expect("antigravity cli integration status")
+    };
+    let outdated = status();
+    assert_eq!(outdated.state, IntegrationStatusKind::Outdated);
+    assert_eq!(outdated.installed_version, Some(5));
+    assert_eq!(outdated.expected_version, 6);
+
+    install_antigravity_cli().unwrap();
+    assert_eq!(status().state, IntegrationStatusKind::Current);
+
+    let hooks_file: Value =
+        serde_json::from_str(&fs::read_to_string(agy_dir.join("hooks.json")).unwrap()).unwrap();
+    let block = hooks_file
+        .get(ANTIGRAVITY_CLI_HOOK_BLOCK_NAME)
+        .and_then(Value::as_object)
+        .unwrap();
+    assert!(block.contains_key("SessionStart"));
+    assert!(block.contains_key("PreInvocation"));
+
+    std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn antigravity_cli_ps1_hook_guards_parent_and_blank_conversation_ids() {
+    let ps1 = include_str!("assets/antigravity_cli/herdr-agent-state.ps1");
+    let parent_guard = ps1
+        .find("if (-not [string]::IsNullOrWhiteSpace($parentConversationId)) { Exit-Hook }")
+        .expect("PowerShell hook must ignore subagent payloads");
+    let conv_guard = ps1
+        .find("if ([string]::IsNullOrWhiteSpace($conversationId)) { Exit-Hook }")
+        .expect("PowerShell hook must ignore blank conversationId");
+    let invoke = ps1
+        .find("report-agent-session")
+        .expect("PowerShell hook must report top-level sessions");
+    assert!(ps1.contains("$payload.parentConversationId"));
+    assert!(parent_guard < invoke);
+    assert!(conv_guard < invoke);
+}
+
+#[test]
 fn install_antigravity_cli_rewrites_stale_herdr_block() {
     let _lock = integration_env_lock();
     let base = unique_base();
@@ -5237,10 +5333,13 @@ fn install_antigravity_cli_rewrites_stale_herdr_block() {
 #[cfg(unix)]
 #[test]
 fn antigravity_cli_hook_ignores_subagents_and_reports_top_level_conversations() {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, ErrorKind, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
 
     let _lock = integration_env_lock();
     let base = unique_base();
@@ -5266,87 +5365,112 @@ fn antigravity_cli_hook_ignores_subagents_and_reports_top_level_conversations() 
     let socket_path = PathBuf::from(format!("/tmp/herdr-agy-hook-{}.sock", std::process::id()));
     let _ = fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let (tx, rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).unwrap();
-        line
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !server_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut line = String::new();
+                    if BufReader::new(stream).read_line(&mut line).is_ok() && !line.is_empty() {
+                        let _ = tx.send(line);
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
     });
 
-    // Subagent payloads carry parentConversationId and must exit before
-    // invoking herdr or reporting to the parent pane's socket.
+    let run_hook = |payload: &Value| {
+        let mut child = Command::new("sh")
+            .arg(&installed.hook_path)
+            .arg("session")
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", "w1:p1")
+            .env("HERDR_SOCKET_PATH", &socket_path)
+            .env("HERDR_BIN_PATH", &fake_herdr)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "{}\n");
+    };
+
+    // Subagent payloads and empty/whitespace/null conversationIds must exit
+    // before invoking herdr or reporting to the socket.
     let sub_transcript = base.join("sub.jsonl");
-    let sub_payload = serde_json::json!({
-        "conversationId": "sub-1",
-        "parentConversationId": "parent-1",
-        "transcriptPath": sub_transcript,
-    })
-    .to_string();
-    let mut subagent = Command::new("sh")
-        .arg(&installed.hook_path)
-        .arg("session")
-        .env("HERDR_ENV", "1")
-        .env("HERDR_PANE_ID", "w1:p1")
-        .env("HERDR_SOCKET_PATH", &socket_path)
-        .env("HERDR_BIN_PATH", &fake_herdr)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    subagent
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(sub_payload.as_bytes())
-        .unwrap();
-    let subagent_out = subagent.wait_with_output().unwrap();
-    assert!(subagent_out.status.success());
-    assert_eq!(String::from_utf8_lossy(&subagent_out.stdout), "{}\n");
-    assert!(
-        !marker.exists(),
-        "subagent hook must not invoke herdr check"
-    );
+    for ignored_payload in [
+        serde_json::json!({
+            "conversationId": "sub-1",
+            "parentConversationId": "parent-1",
+            "transcriptPath": sub_transcript,
+        }),
+        serde_json::json!({"conversationId": "", "parentConversationId": null}),
+        serde_json::json!({"conversationId": "   ", "parentConversationId": ""}),
+        serde_json::json!({"conversationId": Value::Null, "parentConversationId": "   "}),
+    ] {
+        run_hook(&ignored_payload);
+        assert!(
+            !marker.exists(),
+            "ignored payload must not invoke herdr check: {ignored_payload}"
+        );
+    }
 
     let transcript = base.join("transcript_full.jsonl");
-    let payload = serde_json::json!({
-        "conversationId": "conv-123",
-        "transcriptPath": transcript,
-    })
-    .to_string();
-    let mut top = Command::new("sh")
-        .arg(&installed.hook_path)
-        .arg("session")
-        .env("HERDR_ENV", "1")
-        .env("HERDR_PANE_ID", "w1:p1")
-        .env("HERDR_SOCKET_PATH", &socket_path)
-        .env("HERDR_BIN_PATH", &fake_herdr)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    top.stdin
-        .take()
-        .unwrap()
-        .write_all(payload.as_bytes())
-        .unwrap();
-    let top_out = top.wait_with_output().unwrap();
-    assert!(top_out.status.success());
-    assert_eq!(String::from_utf8_lossy(&top_out.stdout), "{}\n");
-    assert!(marker.exists(), "top-level hook should validate with herdr");
+    for (idx, parent_value) in [
+        Value::String(String::new()),
+        Value::String("   ".into()),
+        Value::Null,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let _ = fs::remove_file(&marker);
+        let conv_id = format!("conv-{idx}");
+        let payload = serde_json::json!({
+            "conversationId": format!("  {conv_id}  "),
+            "parentConversationId": parent_value,
+            "transcriptPath": transcript,
+        });
+        run_hook(&payload);
+        assert!(
+            marker.exists(),
+            "top-level hook should validate with herdr for {payload}"
+        );
+        let line = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("timed out waiting for hook socket report");
+        let received: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(received["method"], "pane.report_agent_session");
+        assert_eq!(received["params"]["pane_id"], "w1:p1");
+        assert_eq!(received["params"]["source"], "herdr:antigravity_cli");
+        assert_eq!(received["params"]["agent"], "agy");
+        assert_eq!(received["params"]["agent_session_id"], conv_id);
+        assert_eq!(
+            received["params"]["agent_session_path"],
+            transcript.to_string_lossy().as_ref()
+        );
+    }
 
-    let received: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
-    assert_eq!(received["method"], "pane.report_agent_session");
-    assert_eq!(received["params"]["pane_id"], "w1:p1");
-    assert_eq!(received["params"]["source"], "herdr:antigravity_cli");
-    assert_eq!(received["params"]["agent"], "agy");
-    assert_eq!(received["params"]["agent_session_id"], "conv-123");
-    assert_eq!(
-        received["params"]["agent_session_path"],
-        transcript.to_string_lossy().as_ref()
-    );
-
+    stop.store(true, Ordering::Release);
+    server.join().unwrap();
     std::env::remove_var(ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR);
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_dir_all(base);

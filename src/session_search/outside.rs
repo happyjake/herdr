@@ -251,7 +251,9 @@ fn owning_argument<'a>(process: &'a SessionProcess, agent: &str) -> Option<(&'a 
             };
             (command == "resume" && !identity.starts_with('-')).then_some((identity.as_str(), true))
         }
-        "agy" => option_identity(args, &["--conversation", "-c"]).map(|(_, value)| (value, false)),
+        "agy" => {
+            crate::agent_resume::antigravity_conversation_arg(args).map(|value| (value, false))
+        }
         _ => None,
     }
 }

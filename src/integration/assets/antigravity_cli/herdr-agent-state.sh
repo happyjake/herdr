@@ -41,7 +41,8 @@ if not isinstance(payload, dict):
 
 def text(name):
     value = payload.get(name)
-    return value if isinstance(value, str) and value else None
+    value = value.strip() if isinstance(value, str) else None
+    return value or None
 
 if text("parentConversationId") is not None:
     raise SystemExit(0)

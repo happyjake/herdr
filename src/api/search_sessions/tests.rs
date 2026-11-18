@@ -1337,6 +1337,7 @@ fn agy_user_explicit(content: &str, created_at: &str) -> Value {
         "source": "USER_EXPLICIT",
         "type": "USER_INPUT",
         "status": "DONE",
+        "timestamp": Value::Null,
         "created_at": created_at,
         "content": content
     })
@@ -1346,6 +1347,11 @@ fn agy_user_explicit(content: &str, created_at: &str) -> Value {
 fn agy_sessions_and_history_are_searchable_clean_and_resumable() {
     let home = FixtureHome::new();
     let cwd = home.dir("project");
+    let mut second_prompt = agy_user_explicit(
+        "<USER_REQUEST>\nCheck the beacon\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nmore-excluded-metadata\n</ADDITIONAL_METADATA>",
+        "2026-10-03T01:00:00.500Z",
+    );
+    second_prompt["timestamp"] = json!("not-a-timestamp");
     home.write(
         ".gemini/antigravity-cli/brain/agy-a/.system_generated/logs/transcript_full.jsonl",
         &[
@@ -1369,13 +1375,10 @@ fn agy_sessions_and_history_are_searchable_clean_and_resumable() {
                 "created_at": "2026-10-03T00:02:00.000Z",
                 "content": "excluded-system-input"
             }),
-            agy_user_explicit(
-                "<USER_REQUEST>\nCheck the beacon\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nmore-excluded-metadata\n</ADDITIONAL_METADATA>",
-                "2026-10-03T01:00:00.500Z",
-            ),
+            second_prompt,
         ],
     );
-    // Truncated transcript.jsonl alone must never be indexed.
+    // Truncated transcript.jsonl alone and invalid brain directory names must never be indexed.
     home.write(
         ".gemini/antigravity-cli/brain/agy-truncated-only/.system_generated/logs/transcript.jsonl",
         &[agy_user_explicit(
@@ -1383,6 +1386,14 @@ fn agy_sessions_and_history_are_searchable_clean_and_resumable() {
             "2026-10-03T00:00:00Z",
         )],
     );
+    for invalid_dir in [".hidden-agy", "-leading-dash", "has space"] {
+        home.write(
+            &format!(
+                ".gemini/antigravity-cli/brain/{invalid_dir}/.system_generated/logs/transcript_full.jsonl"
+            ),
+            &[agy_user_explicit("excluded-invalid-dir", "2026-10-03T00:00:00Z")],
+        );
+    }
     home.write(
         ".gemini/antigravity-cli/history.jsonl",
         &[
@@ -1390,6 +1401,12 @@ fn agy_sessions_and_history_are_searchable_clean_and_resumable() {
                 "display": "<USER_REQUEST>\nFix the relay\n</USER_REQUEST>\n<ADDITIONAL_METADATA>ignored</ADDITIONAL_METADATA>",
                 "timestamp": 1790985600100_u64,
                 "workspace": cwd,
+                "conversationId": "  agy-a  "
+            }),
+            json!({
+                "display": "Check the beacon",
+                "timestamp": 1790989200500_u64,
+                "workspace": "",
                 "conversationId": "agy-a"
             }),
             json!({
@@ -1409,6 +1426,12 @@ fn agy_sessions_and_history_are_searchable_clean_and_resumable() {
                 "timestamp": 1790985610000_u64,
                 "workspace": cwd,
                 "conversationId": "   "
+            }),
+            json!({
+                "display": "excluded-traversal-id",
+                "timestamp": 1790985610000_u64,
+                "workspace": cwd,
+                "conversationId": "../example"
             }),
             json!({
                 "display": "   ",
@@ -1431,6 +1454,11 @@ fn agy_sessions_and_history_are_searchable_clean_and_resumable() {
     assert_eq!(browse["result"]["scanned"], 2);
     assert_eq!(browse["result"]["sessions"].as_array().unwrap().len(), 2);
 
+    let expected_resume = crate::platform::interactive_shell_command(
+        &["agy".into(), "--conversation".into(), "agy-a".into()],
+        "sh",
+    )
+    .unwrap();
     let agy = by_key(&browse, "agy-a");
     assert_eq!(agy["agent"], "agy");
     assert_eq!(agy["cwd"], cwd);
@@ -1445,7 +1473,7 @@ fn agy_sessions_and_history_are_searchable_clean_and_resumable() {
     assert_eq!(agy["state"], "ended");
     assert_eq!(
         agy["resume"],
-        json!({"command": "agy --conversation agy-a", "cwd": cwd})
+        json!({"command": expected_resume, "cwd": cwd})
     );
     assert_eq!(agy["headless"], false);
 
@@ -1473,49 +1501,304 @@ fn agy_sessions_and_history_are_searchable_clean_and_resumable() {
     assert_eq!(by_key(&live, "agy-a")["resume_blocked"], "live");
 }
 
+#[test]
+fn agy_empty_transcript_preserves_interactive_history_and_cwd() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".gemini/antigravity-cli/brain/agy-empty/.system_generated/logs/transcript_full.jsonl",
+        &[],
+    );
+    home.write(
+        ".gemini/antigravity-cli/history.jsonl",
+        &[
+            json!({
+                "display": "Interactive prompt before flush",
+                "timestamp": 1790985600100_u64,
+                "workspace": cwd,
+                "conversationId": "agy-empty"
+            }),
+            json!({
+                "display": "Follow-up without workspace",
+                "timestamp": 1790985605100_u64,
+                "workspace": "",
+                "conversationId": "agy-empty"
+            }),
+        ],
+    );
+    home.catalog.refresh();
+
+    let visible = home.search(json!({}), vec![]);
+    assert_eq!(visible["result"]["sessions"].as_array().unwrap().len(), 1);
+    let row = by_key(&visible, "agy-empty");
+    assert_eq!(row["headless"], false);
+    assert_eq!(row["state"], "ended");
+    assert_eq!(row["cwd"], cwd);
+    assert_eq!(row["first_prompt"], "Interactive prompt before flush");
+    assert_eq!(
+        row["recent_prompts"],
+        json!([
+            "Interactive prompt before flush",
+            "Follow-up without workspace"
+        ])
+    );
+}
+
+#[test]
+fn agy_reconciles_cross_second_prompts_without_collapsing_repeats() {
+    let home = FixtureHome::new();
+    let cwd = home.dir("project");
+    home.write(
+        ".gemini/antigravity-cli/brain/agy-boundary/.system_generated/logs/transcript_full.jsonl",
+        &[
+            agy_user_explicit(
+                "<USER_REQUEST>\nCross boundary\n</USER_REQUEST>",
+                "2026-10-03T00:00:01.000Z",
+            ),
+            agy_user_explicit(
+                "<USER_REQUEST>\nRepeat fast\n</USER_REQUEST>",
+                "2026-10-03T00:00:05.050Z",
+            ),
+            agy_user_explicit(
+                "<USER_REQUEST>\nRepeat fast\n</USER_REQUEST>",
+                "2026-10-03T00:00:05.550Z",
+            ),
+        ],
+    );
+    home.write(
+        ".gemini/antigravity-cli/history.jsonl",
+        &[
+            json!({
+                "display": "Cross boundary",
+                "timestamp": 1790985600992_u64,
+                "workspace": cwd,
+                "conversationId": "agy-boundary"
+            }),
+            json!({
+                "display": "Repeat fast",
+                "timestamp": 1790985605000_u64,
+                "workspace": cwd,
+                "conversationId": "agy-boundary"
+            }),
+            json!({
+                "display": "Repeat fast",
+                "timestamp": 1790985605500_u64,
+                "workspace": cwd,
+                "conversationId": "agy-boundary"
+            }),
+        ],
+    );
+    home.catalog.refresh();
+
+    let visible = home.search(json!({}), vec![]);
+    let row = by_key(&visible, "agy-boundary");
+    assert_eq!(row["first_prompt"], "Cross boundary");
+    assert_eq!(
+        row["recent_prompts"],
+        json!(["Cross boundary", "Repeat fast", "Repeat fast"])
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn agy_catalog_skips_symlinks_in_brain_and_history() {
-    let home = FixtureHome::new();
-    let cwd = home.dir("project");
-    let target = home.write(
-        "outside-target.jsonl",
-        &[agy_user_explicit(
-            "Should stay hidden",
-            "2026-10-03T00:00:00Z",
-        )],
-    );
-    let brain = home.root.join(".gemini/antigravity-cli/brain");
-    std::fs::create_dir_all(&brain).unwrap();
+    let setup_target = |home: &FixtureHome| {
+        home.write(
+            "outside-target.jsonl",
+            &[agy_user_explicit(
+                "Should stay hidden",
+                "2026-10-03T00:00:00Z",
+            )],
+        )
+    };
 
-    // Symlinked conversation directory.
-    let linked_conv_target = home.root.join("linked-conv-target");
-    std::fs::create_dir_all(linked_conv_target.join(".system_generated/logs")).unwrap();
-    std::fs::copy(
-        &target,
-        linked_conv_target.join(".system_generated/logs/transcript_full.jsonl"),
-    )
-    .unwrap();
-    std::os::unix::fs::symlink(&linked_conv_target, brain.join("agy-linked-dir")).unwrap();
+    // 1. Symlinked .gemini directory.
+    {
+        let home = FixtureHome::new();
+        let cwd = home.dir("project");
+        let target = setup_target(&home);
+        let linked = home.root.join("linked-gemini");
+        std::fs::create_dir_all(
+            linked.join("antigravity-cli/brain/agy-gemini/.system_generated/logs"),
+        )
+        .unwrap();
+        std::fs::copy(
+            &target,
+            linked.join(
+                "antigravity-cli/brain/agy-gemini/.system_generated/logs/transcript_full.jsonl",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            linked.join("antigravity-cli/history.jsonl"),
+            format!(
+                "{}\n",
+                json!({"display": "Hidden gemini", "timestamp": 1790985600000_u64, "workspace": cwd, "conversationId": "agy-gemini"})
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&linked, home.root.join(".gemini")).unwrap();
+        home.catalog.refresh();
+        let response = home.search_all(json!({}), vec![]);
+        assert_eq!(response["result"]["partial"], false);
+        assert_eq!(response["result"]["sessions"], json!([]));
+    }
 
-    // Symlinked transcript_full.jsonl inside real conversation directory.
-    let logs = brain.join("agy-linked-file/.system_generated/logs");
-    std::fs::create_dir_all(&logs).unwrap();
-    std::os::unix::fs::symlink(&target, logs.join("transcript_full.jsonl")).unwrap();
+    // 2. Symlinked .gemini/antigravity-cli directory.
+    {
+        let home = FixtureHome::new();
+        let cwd = home.dir("project");
+        let target = setup_target(&home);
+        let linked = home.root.join("linked-agy");
+        std::fs::create_dir_all(linked.join("brain/agy-cli/.system_generated/logs")).unwrap();
+        std::fs::copy(
+            &target,
+            linked.join("brain/agy-cli/.system_generated/logs/transcript_full.jsonl"),
+        )
+        .unwrap();
+        std::fs::write(
+            linked.join("history.jsonl"),
+            format!(
+                "{}\n",
+                json!({"display": "Hidden cli", "timestamp": 1790985600000_u64, "workspace": cwd, "conversationId": "agy-cli"})
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.root.join(".gemini")).unwrap();
+        std::os::unix::fs::symlink(&linked, home.root.join(".gemini/antigravity-cli")).unwrap();
+        home.catalog.refresh();
+        let response = home.search_all(json!({}), vec![]);
+        assert_eq!(response["result"]["partial"], false);
+        assert_eq!(response["result"]["sessions"], json!([]));
+    }
 
-    // Symlinked history.jsonl.
-    let history_target = home.write(
-        "history-target.jsonl",
-        &[json!({"display": "Hidden history", "timestamp": 1790985600000_u64, "workspace": cwd, "conversationId": "agy-linked-history"})],
-    );
-    std::os::unix::fs::symlink(
-        history_target,
-        home.root.join(".gemini/antigravity-cli/history.jsonl"),
-    )
-    .unwrap();
+    // 3. Symlinked brain directory.
+    {
+        let home = FixtureHome::new();
+        let target = setup_target(&home);
+        let linked = home.root.join("linked-brain");
+        std::fs::create_dir_all(linked.join("agy-brain/.system_generated/logs")).unwrap();
+        std::fs::copy(
+            &target,
+            linked.join("agy-brain/.system_generated/logs/transcript_full.jsonl"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.root.join(".gemini/antigravity-cli")).unwrap();
+        std::os::unix::fs::symlink(&linked, home.root.join(".gemini/antigravity-cli/brain"))
+            .unwrap();
+        home.catalog.refresh();
+        let response = home.search_all(json!({}), vec![]);
+        assert_eq!(response["result"]["partial"], false);
+        assert_eq!(response["result"]["sessions"], json!([]));
+    }
 
-    home.catalog.refresh();
-    let response = home.search_all(json!({}), vec![]);
-    assert_eq!(response["result"]["partial"], false);
-    assert_eq!(response["result"]["sessions"], json!([]));
+    // 4. Symlinked conversation dir, .system_generated, logs, subagents, files, and history.jsonl.
+    {
+        let home = FixtureHome::new();
+        let cwd = home.dir("project");
+        let target = setup_target(&home);
+        let brain = home.root.join(".gemini/antigravity-cli/brain");
+        std::fs::create_dir_all(&brain).unwrap();
+
+        // Symlinked conversation directory.
+        let linked_conv_target = home.root.join("linked-conv-target");
+        std::fs::create_dir_all(linked_conv_target.join(".system_generated/logs")).unwrap();
+        std::fs::copy(
+            &target,
+            linked_conv_target.join(".system_generated/logs/transcript_full.jsonl"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&linked_conv_target, brain.join("agy-linked-dir")).unwrap();
+
+        // Symlinked .system_generated directory.
+        let linked_sys_target = home.root.join("linked-sys-target");
+        std::fs::create_dir_all(linked_sys_target.join("logs")).unwrap();
+        std::fs::copy(
+            &target,
+            linked_sys_target.join("logs/transcript_full.jsonl"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(brain.join("agy-linked-sys")).unwrap();
+        std::os::unix::fs::symlink(
+            &linked_sys_target,
+            brain.join("agy-linked-sys/.system_generated"),
+        )
+        .unwrap();
+
+        // Symlinked logs directory.
+        let linked_logs_target = home.root.join("linked-logs-target");
+        std::fs::create_dir_all(&linked_logs_target).unwrap();
+        std::fs::copy(&target, linked_logs_target.join("transcript_full.jsonl")).unwrap();
+        std::fs::create_dir_all(brain.join("agy-linked-logs/.system_generated")).unwrap();
+        std::os::unix::fs::symlink(
+            &linked_logs_target,
+            brain.join("agy-linked-logs/.system_generated/logs"),
+        )
+        .unwrap();
+
+        // Symlinked transcript_full.jsonl inside real logs directory.
+        let logs = brain.join("agy-linked-file/.system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::os::unix::fs::symlink(&target, logs.join("transcript_full.jsonl")).unwrap();
+
+        // Symlinked subagents directory and symlinked subagent JSON file.
+        let linked_subagents_dir = home.root.join("linked-subagents-dir");
+        std::fs::create_dir_all(&linked_subagents_dir).unwrap();
+        std::fs::write(
+            linked_subagents_dir.join("sub-from-linked-dir.json"),
+            json!({"conversationId": "sub-from-linked-dir"}).to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(brain.join("agy-parent-linked-sub/.system_generated")).unwrap();
+        std::os::unix::fs::symlink(
+            &linked_subagents_dir,
+            brain.join("agy-parent-linked-sub/.system_generated/subagents"),
+        )
+        .unwrap();
+
+        let sub_target = home.root.join("linked-subagent.json");
+        std::fs::write(
+            &sub_target,
+            json!({"conversationId": "sub-from-linked-file"}).to_string(),
+        )
+        .unwrap();
+        let real_subagents = brain.join("agy-parent-real/.system_generated/subagents");
+        std::fs::create_dir_all(&real_subagents).unwrap();
+        std::os::unix::fs::symlink(
+            &sub_target,
+            real_subagents.join("sub-from-linked-file.json"),
+        )
+        .unwrap();
+        home.write(
+            ".gemini/antigravity-cli/brain/sub-from-linked-dir/.system_generated/logs/transcript_full.jsonl",
+            &[agy_user_explicit("Child one", "2026-10-03T00:00:00Z")],
+        );
+        home.write(
+            ".gemini/antigravity-cli/brain/sub-from-linked-file/.system_generated/logs/transcript_full.jsonl",
+            &[agy_user_explicit("Child two", "2026-10-03T00:00:00Z")],
+        );
+
+        // Symlinked history.jsonl.
+        let history_target = home.write(
+            "history-target.jsonl",
+            &[json!({"display": "Hidden history", "timestamp": 1790985600000_u64, "workspace": cwd, "conversationId": "agy-linked-history"})],
+        );
+        std::os::unix::fs::symlink(
+            history_target,
+            home.root.join(".gemini/antigravity-cli/history.jsonl"),
+        )
+        .unwrap();
+
+        home.catalog.refresh();
+        let response = home.search_all(json!({}), vec![]);
+        assert_eq!(response["result"]["partial"], false);
+        assert_eq!(
+            response["result"]["sessions"].as_array().unwrap().len(),
+            2,
+            "only real child transcripts exist, without linked parent or linked history"
+        );
+        for id in ["sub-from-linked-dir", "sub-from-linked-file"] {
+            assert!(by_key(&response, id).get("parent").is_none());
+        }
+    }
 }

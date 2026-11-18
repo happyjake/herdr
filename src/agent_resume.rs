@@ -201,28 +201,58 @@ pub fn persisted_session_from_launch_args(
     }
 }
 
-fn antigravity_conversation_arg(args: &[String]) -> Option<&str> {
-    let mut iter = args.iter().peekable();
+pub(crate) fn antigravity_conversation_arg(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter();
     let mut conversation_id = None;
     while let Some(arg) = iter.next() {
         if arg == "--" {
             break;
         }
-        if arg == "--conversation" || arg == "-c" {
-            if iter.peek().is_some_and(|value| !value.starts_with('-')) {
-                let value = iter.next()?.trim();
-                if !value.is_empty() {
-                    conversation_id = Some(value);
-                }
-            }
-        } else if let Some(value) = arg.strip_prefix("--conversation=") {
+        if arg == "--conversation" || arg == "-conversation" {
+            conversation_id = iter
+                .next()
+                .map(|value| value.trim())
+                .filter(|value| valid_agy_conversation_id(value));
+        } else if let Some(value) = arg
+            .strip_prefix("--conversation=")
+            .or_else(|| arg.strip_prefix("-conversation="))
+        {
             let value = value.trim();
-            if !value.is_empty() {
-                conversation_id = Some(value);
-            }
+            conversation_id = valid_agy_conversation_id(value).then_some(value);
+        } else if is_agy_value_flag(arg) {
+            let _ = iter.next();
+        } else if !arg.starts_with('-') {
+            break;
         }
     }
     conversation_id
+}
+
+fn is_agy_value_flag(arg: &str) -> bool {
+    if matches!(arg, "-i" | "-p") {
+        return true;
+    }
+    let Some(name) = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) else {
+        return false;
+    };
+    matches!(
+        name,
+        "add-dir"
+            | "agent"
+            | "effort"
+            | "input-format"
+            | "json-schema"
+            | "log-file"
+            | "mode"
+            | "model"
+            | "output-format"
+            | "print"
+            | "print-timeout"
+            | "project"
+            | "prompt"
+            | "prompt-interactive"
+            | "settings"
+    )
 }
 
 pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
@@ -432,6 +462,15 @@ fn valid_session_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_SESSION_ID_LEN && !value.chars().any(char::is_control)
 }
 
+pub(crate) fn valid_agy_conversation_id(value: &str) -> bool {
+    valid_session_id(value)
+        && !value.starts_with('.')
+        && !value.contains("..")
+        && !value.starts_with('-')
+        && !value.contains(['/', '\\'])
+        && !value.chars().any(char::is_whitespace)
+}
+
 fn valid_session_path(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_SESSION_PATH_LEN
@@ -533,11 +572,28 @@ mod tests {
     fn antigravity_conversation_launch_args_extract_resumed_session() {
         for args in [
             argv(&["--conversation", "agy-session"]),
-            argv(&["-c", "agy-session"]),
+            argv(&["-conversation", "agy-session"]),
             argv(&["--conversation=agy-session"]),
-            argv(&["--model", "auto", "-c", "  agy-session  ", "--yolo"]),
-            argv(&["--conversation", "old", "-c", "agy-session"]),
-            argv(&["-c", "agy-session", "--", "--conversation", "ignored"]),
+            argv(&["-conversation=agy-session"]),
+            argv(&[
+                "--model",
+                "auto",
+                "--conversation",
+                "  agy-session  ",
+                "--sandbox",
+            ]),
+            argv(&["--conversation", "old", "-conversation", "agy-session"]),
+            argv(&[
+                "--conversation=agy-session",
+                "--log-file",
+                "--conversation=ignored",
+            ]),
+            argv(&[
+                "-conversation=agy-session",
+                "--",
+                "--conversation",
+                "ignored",
+            ]),
         ] {
             let session =
                 persisted_session_from_launch_args(crate::detect::Agent::Antigravity, &args)
@@ -551,15 +607,31 @@ mod tests {
         for args in [
             argv(&[]),
             argv(&["--model", "auto"]),
+            argv(&["-c", "agy-session"]),
+            argv(&["--continue", "agy-session"]),
             argv(&["--conversation"]),
-            argv(&["-c"]),
+            argv(&["-conversation"]),
             argv(&["--conversation", ""]),
             argv(&["--conversation", "   "]),
             argv(&["--conversation="]),
+            argv(&["-conversation="]),
             argv(&["--conversation=   "]),
-            argv(&["-c", "--model", "auto"]),
+            argv(&["--conversation=A", "--conversation="]),
+            argv(&["--conversation=A", "--conversation", ""]),
+            argv(&["--conversation=A", "--conversation"]),
+            argv(&["--conversation=A", "-conversation=-foo"]),
+            argv(&["--conversation=A", "--conversation", "-foo"]),
+            argv(&["--conversation", "../example"]),
+            argv(&["--conversation=../example"]),
+            argv(&["--conversation", "a/b"]),
+            argv(&["--conversation", "a\\b"]),
+            argv(&["--conversation", "."]),
+            argv(&["--conversation", ".."]),
+            argv(&["--conversation", ".hidden"]),
+            argv(&["--conversation", "bad id"]),
+            argv(&["--conversation", "--model", "auto"]),
             argv(&["--", "--conversation", "agy-session"]),
-            argv(&["--", "-c", "agy-session"]),
+            argv(&["--", "-conversation", "agy-session"]),
         ] {
             assert!(
                 persisted_session_from_launch_args(crate::detect::Agent::Antigravity, &args)

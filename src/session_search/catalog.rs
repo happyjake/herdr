@@ -1,11 +1,11 @@
 //! Incremental disk refresh. Queries never walk record directories or open records.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::records::{self, FileData, FileKind, Session};
+use super::records::{self, FileData, FileKind, Prompt, Session};
 
 pub(crate) struct Desk {
     pub home: Option<PathBuf>,
@@ -110,19 +110,24 @@ impl Catalog {
             ] {
                 walk(&home.join(root), depth, kind, &mut files, &mut complete);
             }
-            walk_agy_brain(
-                &home.join(".gemini/antigravity-cli/brain"),
-                &mut files,
-                &mut complete,
-            );
+            let gemini_dir = home.join(".gemini");
+            let agy_dir = gemini_dir.join("antigravity-cli");
+            if is_real_dir(&gemini_dir, &mut complete) && is_real_dir(&agy_dir, &mut complete) {
+                walk_agy_brain(&agy_dir.join("brain"), &mut files, &mut complete);
+                let history_path = agy_dir.join("history.jsonl");
+                match std::fs::symlink_metadata(&history_path) {
+                    Ok(metadata) if metadata.is_file() => {
+                        files.push((history_path, stamp(&metadata), FileKind::AgyHistory));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => complete = false,
+                }
+            }
             for (path, kind) in [
                 (".claude/history.jsonl", FileKind::ClaudeHistory),
                 (".codex/history.jsonl", FileKind::CodexHistory),
                 (".codex/session_index.jsonl", FileKind::CodexIndex),
-                (
-                    ".gemini/antigravity-cli/history.jsonl",
-                    FileKind::AgyHistory,
-                ),
             ] {
                 let path = home.join(path);
                 if let Ok(metadata) = std::fs::symlink_metadata(&path) {
@@ -278,22 +283,16 @@ fn walk(
     }
 }
 
-/// Discover `brain/<id>/.system_generated/logs/transcript_full.jsonl` without
-/// following symlinks or picking up truncated `transcript.jsonl` files.
+/// Discover `brain/<id>/.system_generated/logs/transcript_full.jsonl` and
+/// `brain/<id>/.system_generated/subagents/*.json` without following symlinks
+/// or picking up truncated `transcript.jsonl` files.
 fn walk_agy_brain(
     brain_dir: &Path,
     found: &mut Vec<(PathBuf, Stamp, FileKind)>,
     complete: &mut bool,
 ) {
-    match std::fs::symlink_metadata(brain_dir) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => return,
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                *complete = false;
-            }
-            return;
-        }
+    if !is_real_dir(brain_dir, complete) {
+        return;
     }
     let entries = match std::fs::read_dir(brain_dir) {
         Ok(entries) => entries,
@@ -316,16 +315,68 @@ fn walk_agy_brain(
         if file_type.is_symlink() || !file_type.is_dir() {
             continue;
         }
-        let logs_dir = entry.path().join(".system_generated").join("logs");
-        if !is_real_dir(&entry.path().join(".system_generated"), complete)
-            || !is_real_dir(&logs_dir, complete)
-        {
+        let Some(conv_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !crate::agent_resume::valid_agy_conversation_id(&conv_id) {
             continue;
         }
-        let transcript = logs_dir.join("transcript_full.jsonl");
-        match std::fs::symlink_metadata(&transcript) {
+        let system_generated = entry.path().join(".system_generated");
+        if !is_real_dir(&system_generated, complete) {
+            continue;
+        }
+        let logs_dir = system_generated.join("logs");
+        if is_real_dir(&logs_dir, complete) {
+            let transcript = logs_dir.join("transcript_full.jsonl");
+            match std::fs::symlink_metadata(&transcript) {
+                Ok(metadata) if metadata.is_file() => {
+                    found.push((transcript, stamp(&metadata), FileKind::Agy));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => *complete = false,
+            }
+        }
+        let subagents_dir = system_generated.join("subagents");
+        if is_real_dir(&subagents_dir, complete) {
+            walk_agy_subagents(&subagents_dir, found, complete);
+        }
+    }
+}
+
+fn walk_agy_subagents(
+    subagents_dir: &Path,
+    found: &mut Vec<(PathBuf, Stamp, FileKind)>,
+    complete: &mut bool,
+) {
+    let entries = match std::fs::read_dir(subagents_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                *complete = false;
+            }
+            return;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            *complete = false;
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            *complete = false;
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() => {
-                found.push((transcript, stamp(&metadata), FileKind::Agy));
+                found.push((path, stamp(&metadata), FileKind::AgySubagent));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -386,7 +437,16 @@ fn merge(
             session.title = source.title.clone().or(session.title.take());
             session.record_path = source.record_path.clone().or(session.record_path.take());
             session.parent = source.parent.clone().or(session.parent.take());
-            session.non_interactive |= source.non_interactive;
+            session.from_history |= source.from_history;
+            if session.key.agent == "agy" {
+                session.non_interactive = if session.parent.is_some() {
+                    true
+                } else {
+                    !session.from_history
+                };
+            } else {
+                session.non_interactive |= source.non_interactive;
+            }
             session.claude_subagent |= source.claude_subagent;
             session.started_at_ms = session.started_at_ms.min(source.started_at_ms);
             session.last_active_at_ms = session.last_active_at_ms.max(source.last_active_at_ms);
@@ -413,11 +473,15 @@ fn merge(
             session.started_at_ms != u64::MAX && (complete || session.record_path.is_some())
         })
         .map(|mut session| {
-            session.prompts.sort_by_key(|prompt| prompt.at);
-            let mut seen = HashSet::new();
-            session
-                .prompts
-                .retain(|prompt| seen.insert((prompt.at / 1000, Arc::clone(&prompt.text))));
+            if session.key.agent == "agy" {
+                reconcile_agy_prompts(&mut session.prompts);
+            } else {
+                session.prompts.sort_by_key(|prompt| prompt.at);
+                let mut seen = HashSet::new();
+                session
+                    .prompts
+                    .retain(|prompt| seen.insert((prompt.at / 1000, Arc::clone(&prompt.text))));
+            }
             session.title = crate::prompt_trail::judged_title(
                 session.title.take(),
                 session
@@ -428,4 +492,41 @@ fn merge(
             Arc::new(session)
         })
         .collect()
+}
+
+/// Pair history and transcript copies of the same submission 1-to-1 within a
+/// short window so cross-second writes collapse while repeated asks survive.
+fn reconcile_agy_prompts(prompts: &mut Vec<Prompt>) {
+    const CROSS_SOURCE_DEDUP_WINDOW_MS: u64 = 2_000;
+    let mut by_text: BTreeMap<Arc<str>, (Vec<Prompt>, Vec<Prompt>)> = BTreeMap::new();
+    for prompt in prompts.drain(..) {
+        let entry = by_text.entry(Arc::clone(&prompt.text)).or_default();
+        if prompt.from_history {
+            entry.0.push(prompt);
+        } else {
+            entry.1.push(prompt);
+        }
+    }
+    for (_, (mut history, mut transcript)) in by_text {
+        history.sort_by_key(|prompt| prompt.at);
+        transcript.sort_by_key(|prompt| prompt.at);
+        let mut history = VecDeque::from(history);
+        let mut transcript = VecDeque::from(transcript);
+        while let (Some(h), Some(t)) = (history.front(), transcript.front()) {
+            if h.at.abs_diff(t.at) <= CROSS_SOURCE_DEDUP_WINDOW_MS {
+                if let (Some(h), Some(t)) = (history.pop_front(), transcript.pop_front()) {
+                    prompts.push(if h.at <= t.at { h } else { t });
+                }
+            } else if h.at < t.at {
+                if let Some(h) = history.pop_front() {
+                    prompts.push(h);
+                }
+            } else if let Some(t) = transcript.pop_front() {
+                prompts.push(t);
+            }
+        }
+        prompts.extend(history);
+        prompts.extend(transcript);
+    }
+    prompts.sort_by_key(|prompt| prompt.at);
 }

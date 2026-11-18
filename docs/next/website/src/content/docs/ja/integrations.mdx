@@ -315,7 +315,7 @@ Herdr はデフォルトで `~/.gemini/config/` を使い、`ANTIGRAVITY_CLI_CON
 
 このインテグレーションはセッション専用です。ペインで実行中の会話を報告しますが、エージェント状態は報告しません。そのため、Herdr は Antigravity CLI の画面表示から `working`、`idle`、`blocked` を引き続き判定します。
 
-フックは `PreInvocation` で実行されるため、最初のプロンプト送信後に Herdr が会話を認識します。それ以降、Herdr サーバーの再起動後に `agy --conversation <id>` でペインを resume できます。
+フックは `SessionStart` と `PreInvocation` で実行されるため、新規作成・再開・切り替えられた会話を Herdr が即座に認識します。`agy --conversation <id>`（または `-conversation <id>`）で起動したペインも開始時に会話が紐付きます。それ以降、Herdr サーバーの再起動後に `agy --conversation <id>` でペインを resume できます。
 
 ## Grok CLI
 
