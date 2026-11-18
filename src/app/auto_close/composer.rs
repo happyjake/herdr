@@ -25,7 +25,7 @@ pub(super) fn draft(agent: &str, screen: &str) -> Option<String> {
             }
             strip_marker(&body.join(" "), &['›'])?
         }
-        "claude" | "pi" | "agy" => {
+        "claude" | "pi" => {
             let rules: Vec<usize> = lines
                 .iter()
                 .enumerate()
@@ -40,12 +40,13 @@ pub(super) fn draft(agent: &str, screen: &str) -> Option<String> {
                 .map(|line| typed(line))
                 .collect::<Vec<_>>()
                 .join(" ");
-            if matches!(agent, "claude" | "agy") {
-                strip_marker(&body, &['❯', '>'])?
+            if agent == "claude" {
+                strip_marker(&body, &['❯'])?
             } else {
                 body
             }
         }
+        "agy" => agy_draft(&lines)?,
         _ => return None,
     };
     Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -68,15 +69,21 @@ struct Cell {
     ch: char,
     faint: bool,
     inverse: bool,
+    muted_fg: bool,
 }
 
 fn cells(line: &str) -> Vec<Cell> {
     let mut out = Vec::new();
-    let (mut faint, mut inverse) = (false, false);
+    let (mut faint, mut inverse, mut muted_fg) = (false, false, false);
     let mut chars = line.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch != '\x1b' {
-            out.push(Cell { ch, faint, inverse });
+            out.push(Cell {
+                ch,
+                faint,
+                inverse,
+                muted_fg,
+            });
             continue;
         }
         if chars.peek() != Some(&'[') {
@@ -95,16 +102,57 @@ fn cells(line: &str) -> Vec<Cell> {
         if command != Some('m') {
             continue;
         }
-        let params: Vec<&str> = params.split([';', ':']).collect();
+        let params: Vec<&str> = params.split(';').collect();
         let mut index = 0;
         while index < params.len() {
-            match params[index] {
-                "" | "0" => (faint, inverse) = (false, false),
+            let param = params[index];
+            if param.contains(':') {
+                let parts: Vec<&str> = param.split(':').collect();
+                if parts.first() == Some(&"38") {
+                    muted_fg = match parts.get(1) {
+                        Some(&"5") => parts
+                            .get(2)
+                            .and_then(|code| code.parse::<u8>().ok())
+                            .is_some_and(is_muted_grey_256),
+                        Some(&"2") if parts.len() >= 5 => {
+                            rgb(&parts[parts.len() - 3..]).is_some_and(is_muted_grey_rgb)
+                        }
+                        _ => false,
+                    };
+                }
+                index += 1;
+                continue;
+            }
+            match param {
+                "" | "0" => (faint, inverse, muted_fg) = (false, false, false),
                 "2" => faint = true,
                 "22" => faint = false,
                 "7" => inverse = true,
                 "27" => inverse = false,
-                "38" | "48" | "58" => {
+                "39" => muted_fg = false,
+                "90" => muted_fg = true,
+                "30" | "31" | "32" | "33" | "34" | "35" | "36" | "37" | "91" | "92" | "93"
+                | "94" | "95" | "96" | "97" => muted_fg = false,
+                "38" => {
+                    match params.get(index + 1) {
+                        Some(&"5") => {
+                            muted_fg = params
+                                .get(index + 2)
+                                .and_then(|code| code.parse::<u8>().ok())
+                                .is_some_and(is_muted_grey_256);
+                            index += 2;
+                        }
+                        Some(&"2") => {
+                            muted_fg = params
+                                .get(index + 2..index + 5)
+                                .and_then(rgb)
+                                .is_some_and(is_muted_grey_rgb);
+                            index += 4;
+                        }
+                        _ => muted_fg = false,
+                    };
+                }
+                "48" | "58" => {
                     index += match params.get(index + 1) {
                         Some(&"5") => 2,
                         Some(&"2") => 4,
@@ -119,6 +167,23 @@ fn cells(line: &str) -> Vec<Cell> {
     out
 }
 
+fn rgb(parts: &[&str]) -> Option<[u8; 3]> {
+    match parts {
+        [r, g, b] => Some([r.parse().ok()?, g.parse().ok()?, b.parse().ok()?]),
+        _ => None,
+    }
+}
+
+fn is_muted_grey_256(code: u8) -> bool {
+    code == 8 || (232..=252).contains(&code)
+}
+
+fn is_muted_grey_rgb([r, g, b]: [u8; 3]) -> bool {
+    let min = r.min(g).min(b);
+    let max = r.max(g).max(b);
+    max - min <= 24 && min >= 40 && max <= 210
+}
+
 fn plain(line: &[Cell]) -> String {
     line.iter().map(|cell| cell.ch).collect()
 }
@@ -129,6 +194,93 @@ fn typed(line: &[Cell]) -> String {
         .filter(|cell| !cell.faint && !(cell.inverse && cell.ch == ' '))
         .map(|cell| if cell.ch == '\u{a0}' { ' ' } else { cell.ch })
         .collect()
+}
+
+/// Typed draft text for agy: drops faint, muted-grey placeholders/scroll
+/// indicators, and inverse blank cursors.
+fn typed_agy(line: &[Cell]) -> String {
+    line.iter()
+        .filter(|cell| !cell.faint && !cell.muted_fg && !(cell.inverse && cell.ch == ' '))
+        .map(|cell| if cell.ch == '\u{a0}' { ' ' } else { cell.ch })
+        .collect()
+}
+
+fn agy_draft(lines: &[Vec<Cell>]) -> Option<String> {
+    let end = lines
+        .iter()
+        .rposition(|line| !plain(line).trim().is_empty())
+        .map_or(0, |index| index + 1);
+    let bottom = lines[..end].iter().rposition(|line| is_rule(line))?;
+    let footer = &lines[bottom + 1..end];
+    if footer.is_empty() || footer.len() > 6 || !footer.iter().all(|line| is_agy_footer_line(line))
+    {
+        return None;
+    }
+    let bottom_shape = plain(&lines[bottom]);
+    let bottom_trimmed = bottom_shape.trim_end();
+    let top = (0..bottom).rev().find(|&index| {
+        is_rule(&lines[index]) && plain(&lines[index]).trim_end() == bottom_trimmed
+    })?;
+    let first = (top + 1..bottom).find(|&index| !plain(&lines[index]).trim().is_empty())?;
+    if !is_agy_prompt_start(&lines[first]) {
+        return None;
+    }
+    let mut body = vec![typed_agy(&lines[first][1..])];
+    for line in &lines[first + 1..bottom] {
+        body.push(typed_agy(line));
+    }
+    Some(body.join(" "))
+}
+
+fn is_agy_prompt_start(line: &[Cell]) -> bool {
+    matches!(
+        (
+            line.first().map(|cell| cell.ch),
+            line.get(1).map(|cell| cell.ch),
+        ),
+        (Some('>'), None | Some(' ' | '\u{a0}'))
+    )
+}
+
+fn is_agy_footer_line(line: &[Cell]) -> bool {
+    let text = plain(line);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.starts_with('>')
+        || trimmed.starts_with('❯')
+        || trimmed.starts_with('›')
+        || trimmed.starts_with('●')
+        || trimmed.starts_with('•')
+        || trimmed.starts_with('⏺')
+    {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("navigate")
+        || lower.contains("enter select")
+        || lower.contains("enter confirm")
+        || lower.contains("esc skip")
+        || lower.contains("tab amend")
+        || lower.starts_with("1.")
+        || lower.starts_with("2.")
+        || lower.starts_with("3.")
+    {
+        return false;
+    }
+    lower.contains("? for shortcuts")
+        || lower.contains("esc to cancel")
+        || lower.contains("gemini")
+        || lower.contains("claude")
+        || lower.contains("orchestrator")
+        || lower.contains("best-of-n")
+        || lower.contains("accept-edits")
+        || lower.contains("accept edits")
+        || lower.contains("plan mode")
+        || lower.contains("auto mode")
+        || lower.ends_with(" task")
+        || lower.ends_with(" tasks")
 }
 
 /// A composer border: a line that opens with a long horizontal rule (Claude's
@@ -149,7 +301,8 @@ fn strip_marker(text: &str, markers: &[char]) -> Option<String> {
 mod tests {
     use super::{draft, is_own};
 
-    const RULE: &str = "\x1b[0m\x1b[38;2;136;136;136m────────────────────────────────────────\x1b[0m";
+    const RULE: &str =
+        "\x1b[0m\x1b[38;2;136;136;136m────────────────────────────────────────\x1b[0m";
 
     fn claude(composer: &str) -> String {
         format!(
@@ -169,14 +322,18 @@ mod tests {
     }
 
     fn agy(composer: &str) -> String {
-        format!("• Done.\n\n{RULE}\n{composer}\n{RULE}\n  ~/code/app · main")
+        format!("• Done.\n\n{RULE}\n{composer}\n{RULE}\n  ? for shortcuts    Gemini")
     }
 
     #[test]
     fn empty_composers_read_empty_through_their_placeholders_and_cursors() {
         assert_eq!(draft("claude", &claude("❯\u{a0}")).as_deref(), Some(""));
         assert_eq!(
-            draft("claude", &claude("❯ \x1b[0m\x1b[2mTry \"fix lint errors\"\x1b[0m")).as_deref(),
+            draft(
+                "claude",
+                &claude("❯ \x1b[0m\x1b[2mTry \"fix lint errors\"\x1b[0m")
+            )
+            .as_deref(),
             Some("")
         );
         assert_eq!(
@@ -231,6 +388,58 @@ mod tests {
     }
 
     #[test]
+    fn agy_filters_non_faint_grey_placeholders_and_scroll_indicators() {
+        for placeholder in [
+            "> \x1b[38;5;8mAsk anything\x1b[0m",
+            "> \x1b[90mPlan mode: Ask anything\x1b[0m",
+            "> \x1b[38;2;128;128;128mAuto mode: Ask anything\x1b[0m",
+            "\x1b[90m> Accept-edits mode: Ask anything\x1b[0m",
+            "> \x1b[38;2;128;128;128mBest-of-N mode: Ask anything\x1b[0m\n  \x1b[90m↓ 2 more lines\x1b[0m",
+        ] {
+            assert_eq!(draft("agy", &agy(placeholder)).as_deref(), Some(""));
+        }
+        assert_eq!(
+            draft("agy", &agy("> ship it\n  \x1b[90m↓ 2 more lines\x1b[0m")).as_deref(),
+            Some("ship it")
+        );
+    }
+
+    #[test]
+    fn agy_reads_multiline_drafts_including_interior_rules() {
+        assert_eq!(
+            draft("agy", &agy("> line 1\n  line 2")).as_deref(),
+            Some("line 1 line 2")
+        );
+        assert_eq!(
+            draft("agy", &agy("> line 1\n  ──────────\n  line 2")).as_deref(),
+            Some("line 1 ────────── line 2")
+        );
+    }
+
+    #[test]
+    fn agy_rejects_markerless_boxes_and_past_turn_or_dialog_screens() {
+        // Markerless two-rule box, even with an earlier turn rule above it.
+        let markerless = format!(
+            "{RULE}\n> earlier prompt\n• Done.\n\n{RULE}\n  no chevron\n{RULE}\n  ? for shortcuts    Gemini"
+        );
+        assert_eq!(draft("agy", &markerless), None);
+
+        // Single-rule dialog / past-turn overlay screens without a valid live composer box.
+        let single_rule_dialog = format!(
+            "{RULE}\n> past prompt\n• Done.\n\n{RULE}\n  1. Allow once\n  2. Deny\n  ↑/↓ Navigate · enter Select"
+        );
+        assert_eq!(draft("agy", &single_rule_dialog), None);
+
+        let past_turn_overlay =
+            format!("{RULE}\n> past prompt\n{RULE}\n• Past answer\n  More prose below");
+        assert_eq!(draft("agy", &past_turn_overlay), None);
+
+        let dialog_above_cancel_footer =
+            format!("{RULE}\n> past prompt\n{RULE}\n  1. Allow once\n  esc to cancel");
+        assert_eq!(draft("agy", &dialog_above_cancel_footer), None);
+    }
+
+    #[test]
     fn a_screen_without_a_recognisable_composer_is_unreadable() {
         assert_eq!(draft("claude", "⏺ Working…\n"), None);
         assert_eq!(draft("codex", "loading…\n"), None);
@@ -274,7 +483,10 @@ mod tests {
             if label.starts_with("own") {
                 assert!(is_own(&read, invocation), "{name}: {read:?}");
             } else if label.starts_with("draft") {
-                assert!(!read.is_empty() && !is_own(&read, invocation), "{name}: {read:?}");
+                assert!(
+                    !read.is_empty() && !is_own(&read, invocation),
+                    "{name}: {read:?}"
+                );
             } else {
                 assert_eq!(read, "", "{name}");
             }

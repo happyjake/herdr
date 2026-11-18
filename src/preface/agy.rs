@@ -35,9 +35,9 @@ use crate::prompt_trail::{
 /// marker alone.
 const PROMPT_MARKER: &str = ">";
 
-const REQUEST_OPEN: &str = "<USER_REQUEST>\n";
-const REQUEST_CLOSE: &str = "\n</USER_REQUEST>";
-const REQUEST_END: &str = "\n</USER_REQUEST>\n<ADDITIONAL_METADATA>";
+const REQUEST_OPEN_LF: &str = "<USER_REQUEST>\n";
+const REQUEST_OPEN_CRLF: &str = "<USER_REQUEST>\r\n";
+const REQUEST_CLOSE_TAG: &str = "</USER_REQUEST>";
 
 /// One turn as the transcript's steps leave it, its texts whole.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,15 +158,43 @@ fn reopen(turn: &mut AgyTurn) {
 /// metadata blocks it adds itself. The metadata can quote anything, so the
 /// request ends where the first metadata block begins.
 pub(crate) fn request_text(content: &str) -> &str {
-    let Some(body) = content.strip_prefix(REQUEST_OPEN) else {
+    let Some(body) = content
+        .strip_prefix(REQUEST_OPEN_CRLF)
+        .or_else(|| content.strip_prefix(REQUEST_OPEN_LF))
+    else {
         return content;
     };
-    let end = body
-        .find(REQUEST_END)
-        .or_else(|| body.strip_suffix(REQUEST_CLOSE).map(str::len))
-        .or_else(|| body.find(REQUEST_CLOSE))
-        .unwrap_or(body.len());
-    &body[..end]
+    if body == REQUEST_CLOSE_TAG
+        || body.starts_with("</USER_REQUEST>\n")
+        || body.starts_with("</USER_REQUEST>\r\n")
+    {
+        return "";
+    }
+    for (nl, _) in body.match_indices('\n') {
+        let after_nl = &body[nl + 1..];
+        let Some(after_close) = after_nl.strip_prefix(REQUEST_CLOSE_TAG) else {
+            continue;
+        };
+        let end = if nl > 0 && body.as_bytes()[nl - 1] == b'\r' {
+            nl - 1
+        } else {
+            nl
+        };
+        if let Some(after_close_nl) = after_close
+            .strip_prefix("\r\n")
+            .or_else(|| after_close.strip_prefix('\n'))
+        {
+            if after_close_nl.starts_with("<ADDITIONAL_METADATA>")
+                || after_close_nl.starts_with("<USER_SETTINGS_CHANGE>")
+            {
+                return &body[..end];
+            }
+        }
+        if after_close.trim().is_empty() {
+            return &body[..end];
+        }
+    }
+    body
 }
 
 /// The preface's reading of an agy transcript.
@@ -516,6 +544,26 @@ mod tests {
                 "<USER_REQUEST>\nbefore\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nx\n</USER_SETTINGS_CHANGE>",
                 "before",
             ),
+            (
+                "<USER_REQUEST>\r\nfirst line\r\nsecond line\r\n</USER_REQUEST>\r\n<ADDITIONAL_METADATA>\r\nlocal\r\n</ADDITIONAL_METADATA>",
+                "first line\r\nsecond line",
+            ),
+            (
+                "<USER_REQUEST>\r\ncrlf at eof\r\n</USER_REQUEST>\r\n",
+                "crlf at eof",
+            ),
+            (
+                "<USER_REQUEST>\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal\n</ADDITIONAL_METADATA>",
+                "",
+            ),
+            (
+                "<USER_REQUEST>\r\n</USER_REQUEST>\r\n<ADDITIONAL_METADATA>\r\nlocal\r\n</ADDITIONAL_METADATA>",
+                "",
+            ),
+            (
+                "<USER_REQUEST>\nbefore\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nquoted:\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ninner\n</ADDITIONAL_METADATA>\n</USER_SETTINGS_CHANGE>",
+                "before",
+            ),
         ] {
             let source = step(0, "USER_INPUT", "USER_EXPLICIT", json!({"content": content}));
             let record = read_transcript(source.as_bytes()).unwrap();
@@ -738,5 +786,56 @@ mod tests {
             without_box,
             Err(crate::api::schema::PrefaceReason::SeamNotFound)
         );
+    }
+
+    #[test]
+    fn agy_does_not_treat_non_prompt_prose_between_rules_as_an_editor_box() {
+        use crate::preface::seam::{preface, PromptEvidence, Span, Top};
+        use crate::preface::{ReadTurns, Reader};
+
+        let reader = AgyReader::default();
+        let source = prompt(0, "Explain the relay")
+            + &answer(1, "The relay waits.")
+            + &prompt(2, "Ship the lighthouse")
+            + &answer(3, "Working on it.");
+        let mut agy_reader = Box::new(AgyReader::default());
+        for line in source.lines() {
+            let value: Value = serde_json::from_str(line).unwrap();
+            agy_reader.accept(&value);
+        }
+        let read = ReadTurns {
+            turns: std::sync::Arc::new(agy_reader.finish()),
+            revision: String::new(),
+        };
+        let rule40 = "─".repeat(40);
+        let screen = [
+            rule40.as_str(),
+            "Ship the lighthouse",
+            rule40.as_str(),
+            "More output",
+        ]
+        .join("\n");
+        let got = preface(
+            "agy",
+            "conv-1",
+            &read,
+            Top {
+                offset: None,
+                lines: None,
+            },
+            10,
+            PromptEvidence {
+                markers: reader.prompt_markers(),
+                background: reader.prompt_background(),
+                editor_box: reader.editor_box(),
+            },
+            |_| {
+                Some(Span {
+                    text: screen.clone(),
+                    has_more: false,
+                })
+            },
+        );
+        assert_eq!(got, Err(crate::api::schema::PrefaceReason::SeamNotFound));
     }
 }

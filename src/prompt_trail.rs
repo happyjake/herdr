@@ -256,15 +256,17 @@ fn read_lines(
             title = Some(found);
         }
 
-        let at = parsed
-            .get("timestamp")
-            .or_else(|| {
-                (agent == PromptTrailAgent::Agy)
-                    .then(|| parsed.get("created_at"))
-                    .flatten()
-            })
-            .and_then(Value::as_str)
-            .and_then(unix_seconds_from_rfc3339);
+        let parse_timestamp = |key: &str| {
+            parsed
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(unix_seconds_from_rfc3339)
+        };
+        let at = parse_timestamp("timestamp").or_else(|| {
+            (agent == PromptTrailAgent::Agy)
+                .then(|| parse_timestamp("created_at"))
+                .flatten()
+        });
         if let Some(text) = compaction_text(agent, &parsed) {
             newest_compaction = Some((text, at));
         }
@@ -314,7 +316,7 @@ fn read_lines(
         first,
         earlier: recent,
         recent: last_three,
-        summary: newest_compaction.and_then(|(text, at)| summary_excerpt(&text, at)),
+        summary: newest_compaction.and_then(|(text, at)| summary_excerpt(agent, &text, at)),
         title,
         count,
         newest_at,
@@ -338,12 +340,12 @@ fn compaction_text(agent: PromptTrailAgent, line: &Value) -> Option<String> {
             );
         }
         PromptTrailAgent::Agy if line.get("type").and_then(Value::as_str) == Some("CHECKPOINT") => {
-            return line
-                .get("content")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(str::to_owned);
+            return Some(
+                line.get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
         }
         _ => return None,
     };
@@ -355,8 +357,13 @@ fn compaction_text(agent: PromptTrailAgent, line: &Value) -> Option<String> {
 }
 
 static SUMMARY_TITLE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^(Current\s+Work|In\s+Progress|Progress\s+So\s+Far|Current\s+state|Active\s+Context|Primary\s+Request\s+and\s+Intent|Goal|Original\s+Request|Task\s+Overview|All\s+user\s+messages|Files\s+and\s+Code\s+Sections|Key\s+Technical\s+Concepts)\b")
+    regex::Regex::new(r"(?i)^(Current\s+Work|In\s+Progress|Progress\s+So\s+Far|Current\s+state|Primary\s+Request\s+and\s+Intent|Goal|Original\s+Request|All\s+user\s+messages|Files\s+and\s+Code\s+Sections|Key\s+Technical\s+Concepts)\b")
         .expect("valid summary title pattern")
+});
+
+static AGY_SUMMARY_TITLE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^(Current\s+Work|In\s+Progress|Progress\s+So\s+Far|Current\s+state|Active\s+Context|Primary\s+Request\s+and\s+Intent|Goal|Original\s+Request|Task\s+Overview|All\s+user\s+messages|Files\s+and\s+Code\s+Sections|Key\s+Technical\s+Concepts|User\s+Requests|Conversation\s+Logs|Files\s+Already\s+Read|Code\s+Map)\b")
+        .expect("valid agy summary title pattern")
 });
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -399,7 +406,7 @@ struct SummaryHeading<'a> {
 }
 
 /// Structural headings also end allowed bodies when their title is unknown.
-fn summary_heading(line: &str) -> Option<SummaryHeading<'_>> {
+fn summary_heading(is_agy: bool, line: &str) -> Option<SummaryHeading<'_>> {
     let indent = line.bytes().take_while(|byte| *byte == b' ').count();
     if indent > 3 {
         return None;
@@ -439,9 +446,14 @@ fn summary_heading(line: &str) -> Option<SummaryHeading<'_>> {
         .char_indices()
         .nth(160)
         .map_or(line.len(), |(index, _)| index);
+    let titles = if is_agy {
+        &*AGY_SUMMARY_TITLE
+    } else {
+        &*SUMMARY_TITLE
+    };
     let title = line[..prefix_end]
         .get(line.len() - rest.len()..)
-        .and_then(|prefix| SUMMARY_TITLE.find(prefix))
+        .and_then(|prefix| titles.find(prefix))
         .filter(|title| {
             hashes > 0
                 || number.is_some()
@@ -460,6 +472,9 @@ fn summary_heading(line: &str) -> Option<SummaryHeading<'_>> {
         },
     );
     if section.is_none() && matches!(style, SummaryStyle::Plain) {
+        return None;
+    }
+    if is_agy && hashes == 0 && section.is_none() && !whole_bold {
         return None;
     }
     Some(SummaryHeading {
@@ -499,16 +514,17 @@ fn summary_inline(mut text: &str) -> &str {
 }
 
 /// Only nonempty allowed sections outside excluded extents may be served.
-fn summary_excerpt(text: &str, at: Option<u64>) -> Option<TrailSummary> {
+fn summary_excerpt(agent: PromptTrailAgent, text: &str, at: Option<u64>) -> Option<TrailSummary> {
     #[cfg(test)]
     summary_tests::EXTRACTIONS.with(|count| count.set(count.get() + 1));
 
-    let cleaned = summary_prose(text);
+    let is_agy = agent == PromptTrailAgent::Agy;
+    let cleaned = summary_prose(is_agy, text);
     let lines: Vec<_> = cleaned.lines().collect();
     let headings: Vec<_> = lines
         .iter()
         .enumerate()
-        .filter_map(|(index, line)| summary_heading(line).map(|heading| (index, heading)))
+        .filter_map(|(index, line)| summary_heading(is_agy, line).map(|heading| (index, heading)))
         .collect();
     let mut excluded: Option<SummaryStyle> = None;
     let mut request = None;
@@ -564,8 +580,11 @@ fn summary_excerpt(text: &str, at: Option<u64>) -> Option<TrailSummary> {
 
 /// Keep line breaks until sections have been selected. Fenced contents are
 /// discarded here so headings inside code cannot select or terminate a section.
-fn summary_prose(text: &str) -> String {
+fn summary_prose(is_agy: bool, text: &str) -> String {
     let mut text = text.replace("\r\n", "\n");
+    if is_agy {
+        text = isolate_agy_summary(&text).to_string();
+    }
     for tag in ["system-reminder", "modified-files", "read-files"] {
         text = without_summary_element(&text, tag);
     }
@@ -587,7 +606,7 @@ fn summary_prose(text: &str) -> String {
                 preamble = false;
                 continue;
             }
-            if summary_heading(line).is_none() {
+            if summary_heading(is_agy, line).is_none() {
                 continue;
             }
             preamble = false;
@@ -618,6 +637,33 @@ fn summary_prose(text: &str) -> String {
         prose.push('\n');
     }
     prose
+}
+
+fn isolate_agy_summary(text: &str) -> &str {
+    let mut offset = 0usize;
+    let mut exact_open = None;
+    let mut line_open = None;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if exact_open.is_none() && trimmed == "<summary>" {
+            exact_open = Some(offset + line.len());
+        } else if line_open.is_none() && line.trim_start().starts_with("<summary>") {
+            let leading = line.len() - line.trim_start().len();
+            line_open = Some(offset + leading + "<summary>".len());
+        }
+        if let Some(start) = exact_open {
+            if trimmed == "</summary>" && offset >= start {
+                return &text[start..offset];
+            }
+        }
+        offset += line.len();
+    }
+    if let Some(start) = exact_open.or(line_open) {
+        if let Some(end) = text[start..].find("</summary>") {
+            return &text[start..start + end];
+        }
+    }
+    text
 }
 
 fn without_summary_element(text: &str, tag: &str) -> String {
@@ -2562,14 +2608,98 @@ pub(crate) mod tests {
                 },
             ]
         );
-        assert_eq!(
-            trail.summary,
-            Some(TrailSummary {
-                text: "Wiring the relay.".into(),
-                at: Some(1772615820),
-                kind: TrailSummaryKind::Current,
-            })
-        );
+        assert!(trail.summary.is_none());
+    }
+
+    #[test]
+    fn agy_falls_back_to_created_at_when_timestamp_is_null_or_unparseable() {
+        let lines = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "timestamp": Value::Null,
+                "created_at": "2026-03-04T09:15:00Z",
+                "content": "<USER_REQUEST>\nFirst ask\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "timestamp": "not-a-timestamp",
+                "created_at": "2026-03-04T09:16:00Z",
+                "content": "<USER_REQUEST>\nSecond ask\n</USER_REQUEST>"
+            }),
+        ];
+        let record = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trail = read_lines(record.as_bytes(), PromptTrailAgent::Agy, Bounds::DEFAULT).unwrap();
+        assert_eq!(trail.count, 2);
+        assert_eq!(trail.first.as_ref().and_then(|p| p.at), Some(1772615700));
+        assert_eq!(trail.newest_at, Some(1772615760));
+    }
+
+    #[test]
+    fn non_agy_agents_do_not_fall_back_to_created_at() {
+        let claude_record = serde_json::json!({
+            "type": "user",
+            "created_at": "2026-03-04T09:15:00Z",
+            "message": { "role": "user", "content": "ask claude" }
+        })
+        .to_string();
+        let claude_trail = read_lines(
+            claude_record.as_bytes(),
+            PromptTrailAgent::Claude,
+            Bounds::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(claude_trail.count, 1);
+        assert_eq!(claude_trail.first.as_ref().and_then(|p| p.at), None);
+        assert_eq!(claude_trail.newest_at, None);
+
+        let pi_record = serde_json::json!({
+            "type": "message",
+            "created_at": "2026-03-04T09:15:00Z",
+            "message": { "role": "user", "content": "ask pi" }
+        })
+        .to_string();
+        let pi_trail =
+            read_lines(pi_record.as_bytes(), PromptTrailAgent::Pi, Bounds::DEFAULT).unwrap();
+        assert_eq!(pi_trail.count, 1);
+        assert_eq!(pi_trail.first.as_ref().and_then(|p| p.at), None);
+        assert_eq!(pi_trail.newest_at, None);
+    }
+
+    #[test]
+    fn agy_ignores_non_user_input_steps_even_with_user_explicit_source() {
+        let lines = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-03-04T09:15:00Z",
+                "content": "<USER_REQUEST>\nNot a user input step\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "USER_EXPLICIT",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-03-04T09:16:00Z",
+                "content": "<USER_REQUEST>\nAlso not a user input step\n</USER_REQUEST>"
+            }),
+        ];
+        let record = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trail = read_lines(record.as_bytes(), PromptTrailAgent::Agy, Bounds::DEFAULT).unwrap();
+        assert_eq!(trail.count, 0);
+        assert_eq!(trail.first, None);
+        assert!(trail.recent.is_empty());
     }
 
     #[test]
@@ -2648,6 +2778,184 @@ pub(crate) mod tests {
                 text: "Wire the relay and verify its tests.".into(),
                 at: Some(1772616120),
                 kind: TrailSummaryKind::Request,
+            })
+        );
+    }
+
+    #[test]
+    fn agy_empty_or_null_newest_checkpoint_clears_earlier_summary() {
+        for empty_content in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   \n  "),
+        ] {
+            let record = lines(&[
+                serde_json::json!({
+                    "step_index": 0,
+                    "source": "SYSTEM",
+                    "type": "CHECKPOINT",
+                    "created_at": "2026-03-04T09:15:00Z",
+                    "content": "## Current Work\nEarlier work."
+                }),
+                serde_json::json!({
+                    "step_index": 1,
+                    "source": "SYSTEM",
+                    "type": "CHECKPOINT",
+                    "created_at": "2026-03-04T09:16:00Z",
+                    "content": empty_content
+                }),
+            ]);
+            let trail =
+                read_lines(record.as_bytes(), PromptTrailAgent::Agy, Bounds::DEFAULT).unwrap();
+            assert!(trail.summary.is_none(), "content {empty_content}");
+        }
+    }
+
+    #[test]
+    fn agy_checkpoint_isolates_summary_block_and_ignores_surrounding_sections() {
+        let fenced_and_quoted = [
+            "# Resuming from a compaction",
+            "",
+            "# User Requests",
+            "1. Inspect `<summary>` handling",
+            "```rust",
+            "unclosed fence before summary",
+            "## Current Work",
+            "synthetic-secret from user requests",
+            "",
+            "<summary>",
+            "1. **Task Overview**",
+            "Wire the relay.",
+            "5. **Active Context**",
+            "Isolated summary body.",
+            "</summary>",
+            "",
+            "# Conversation Logs",
+            "## Current Work",
+            "synthetic-secret from conversation logs",
+            "# Files Already Read",
+            "## Goal",
+            "synthetic-secret from files read",
+            "# Code Map",
+            "## Goal",
+            "synthetic-secret from code map",
+        ]
+        .join("\n");
+        let record = serde_json::json!({
+            "step_index": 0,
+            "source": "SYSTEM",
+            "type": "CHECKPOINT",
+            "created_at": "2026-03-04T09:21:00Z",
+            "content": fenced_and_quoted,
+        })
+        .to_string();
+        let trail = read_lines(record.as_bytes(), PromptTrailAgent::Agy, Bounds::DEFAULT).unwrap();
+        assert_eq!(
+            trail.summary,
+            Some(TrailSummary {
+                text: "Isolated summary body.".into(),
+                at: Some(1772616060),
+                kind: TrailSummaryKind::Current,
+            })
+        );
+
+        let without_summary_tags = [
+            "# User Requests",
+            "## Current Work",
+            "synthetic-secret",
+            "# Conversation Logs",
+            "## Current Work",
+            "synthetic-secret",
+            "# Files Already Read",
+            "## Goal",
+            "synthetic-secret",
+            "# Code Map",
+            "## Goal",
+            "synthetic-secret",
+        ]
+        .join("\n");
+        let record = serde_json::json!({
+            "step_index": 1,
+            "source": "SYSTEM",
+            "type": "CHECKPOINT",
+            "created_at": "2026-03-04T09:22:00Z",
+            "content": without_summary_tags,
+        })
+        .to_string();
+        let trail = read_lines(record.as_bytes(), PromptTrailAgent::Agy, Bounds::DEFAULT).unwrap();
+        assert_eq!(trail.summary, None);
+    }
+
+    #[test]
+    fn agy_checkpoint_aliases_do_not_apply_to_claude_or_pi() {
+        let text = "## Task Overview\nTask request.\n## Active Context\nAgy only.\n## Goal\nOriginal goal.";
+        let claude_record = serde_json::json!({
+            "type": "user",
+            "isCompactSummary": true,
+            "timestamp": "2026-03-04T09:15:00Z",
+            "message": { "role": "user", "content": text }
+        })
+        .to_string();
+        let claude_trail = read_lines(
+            claude_record.as_bytes(),
+            PromptTrailAgent::Claude,
+            Bounds::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(
+            claude_trail.summary,
+            Some(TrailSummary {
+                text: "Original goal.".into(),
+                at: Some(1772615700),
+                kind: TrailSummaryKind::Request,
+            })
+        );
+
+        let pi_record = serde_json::json!({
+            "type": "compaction",
+            "timestamp": "2026-03-04T09:15:00Z",
+            "summary": text
+        })
+        .to_string();
+        let pi_trail =
+            read_lines(pi_record.as_bytes(), PromptTrailAgent::Pi, Bounds::DEFAULT).unwrap();
+        assert_eq!(
+            pi_trail.summary,
+            Some(TrailSummary {
+                text: "Original goal.".into(),
+                at: Some(1772615700),
+                kind: TrailSummaryKind::Request,
+            })
+        );
+    }
+
+    #[test]
+    fn agy_checkpoint_preserves_numbered_prose_steps_within_a_section() {
+        let checkpoint = [
+            "<summary>",
+            "5. **Active Context**",
+            "1. Run the build",
+            "2. Run the tests",
+            "6. **Next Steps**",
+            "Commit the branch.",
+            "</summary>",
+        ]
+        .join("\n");
+        let record = serde_json::json!({
+            "step_index": 0,
+            "source": "SYSTEM",
+            "type": "CHECKPOINT",
+            "created_at": "2026-03-04T09:21:00Z",
+            "content": checkpoint,
+        })
+        .to_string();
+        let trail = read_lines(record.as_bytes(), PromptTrailAgent::Agy, Bounds::DEFAULT).unwrap();
+        assert_eq!(
+            trail.summary,
+            Some(TrailSummary {
+                text: "1. Run the build 2. Run the tests".into(),
+                at: Some(1772616060),
+                kind: TrailSummaryKind::Current,
             })
         );
     }

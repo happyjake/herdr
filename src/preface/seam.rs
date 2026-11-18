@@ -208,7 +208,7 @@ fn screen_of(span: Span, evidence: PromptEvidence<'_>) -> Screen {
     rows.reverse();
     let editor = evidence
         .editor_box
-        .then(|| bottom_input_box(&rows, evidence.markers))
+        .then(|| bottom_input_box(&rows, evidence.markers, &prompts))
         .flatten()
         .unwrap_or(0..0);
     Screen {
@@ -220,9 +220,14 @@ fn screen_of(span: Span, evidence: PromptEvidence<'_>) -> Screen {
 }
 
 /// A declared editor is the bottom-most pair of identical rule rows, at
-/// least 20 columns wide, with one to six status rows below it. Status text
-/// is configurable; only rule rows and prompt markers disqualify it.
-fn bottom_input_box(rows: &[String], markers: &[&str]) -> Option<std::ops::Range<usize>> {
+/// least 20 columns wide, with one to six status rows below it and prompt
+/// evidence inside. Status text is configurable; only rule rows and prompt
+/// markers disqualify it.
+fn bottom_input_box(
+    rows: &[String],
+    markers: &[&str],
+    prompts: &[bool],
+) -> Option<std::ops::Range<usize>> {
     let rule = |row: &str| !row.is_empty() && row.chars().all(|c| c == '─');
     let bottom = rows.iter().position(|row| rule(row))?;
     if !(1..=6).contains(&bottom)
@@ -235,6 +240,12 @@ fn bottom_input_box(rows: &[String], markers: &[&str]) -> Option<std::ops::Range
     }
     let top = (bottom + 1..rows.len()).find(|&index| rule(&rows[index]))?;
     if top == bottom + 1 || rows[top] != rows[bottom] {
+        return None;
+    }
+    let has_prompt = (bottom + 1..top).any(|index| {
+        prompts.get(index).copied().unwrap_or(false) || prompt_row(&rows[index], markers).is_some()
+    });
+    if !has_prompt {
         return None;
     }
     Some(bottom + 1..top)

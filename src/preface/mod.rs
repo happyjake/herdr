@@ -390,6 +390,7 @@ mod tests {
             PromptTrailAgent::Claude,
             PromptTrailAgent::Codex,
             PromptTrailAgent::Pi,
+            PromptTrailAgent::Agy,
         ] {
             assert!(reader_for(agent).is_some(), "{agent:?}");
         }

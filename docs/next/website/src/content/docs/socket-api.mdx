@@ -178,8 +178,8 @@ refuses the request, which is how a client learns the lookup is absent.
 `pane.prompt_trail` answers what a pane's session record says was asked of
 it. It takes `pane_id` and returns the pane, its terminal, and either a
 `trail` or the `reason` there is none — both keys are always present, and
-exactly one of them is ever set. A trail carries `agent` (`claude`, `codex`
-or `pi`), `first` (the first real prompt, cut to about four hundred code
+exactly one of them is ever set. A trail carries `agent` (`claude`, `codex`,
+`pi`, or `agy`), `first` (the first real prompt, cut to about four hundred code
 points), `recent` (the last three, oldest first, cut to about two hundred
 and forty each), `earlier` (up to nine prompts immediately before `recent`,
 oldest first, cut the same way), `summary` (described below),
@@ -191,8 +191,8 @@ exactly the last three, or all prompts when there are fewer. Both new fields
 are always serialized, as `earlier: []` and `summary: null` when absent.
 Older captures that omit them still deserialize.
 
-`summary` is `{ text, at, kind }` from the newest Claude or pi compaction,
-with its timestamp in Unix seconds or null. Only a nonempty recognized work
+`summary` is `{ text, at, kind }` from the newest Claude, pi, or agy compaction
+(checkpoint), with its timestamp in Unix seconds or null. Only a nonempty recognized work
 (`kind: "current"`) or request (`kind: "request"`) section is served, with
 work preferred over request. Without one, `summary` is null; Codex always
 returns null. `head` remains a valid wire value for compatibility, but the

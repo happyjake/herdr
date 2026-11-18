@@ -925,7 +925,6 @@ pub enum PromptTrailAgent {
     Claude,
     Codex,
     Pi,
-    // Read for turn indexes only; agy panes have no prompt trail.
     Agy,
 }
 
