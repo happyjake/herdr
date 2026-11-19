@@ -1963,6 +1963,7 @@ fn unavailable_restored_pane_keeps_saved_cwd_in_server() {
         read_output(&output)
     );
     drop(client_shell);
+    support::drain_unused_pty_output(&**spawned._master.as_ref().expect("server PTY"));
     let stopped = send_json_request(
         &api_socket,
         r#"{"id":"stop","method":"server.stop","params":{}}"#,

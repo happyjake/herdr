@@ -590,10 +590,9 @@ fn debrief_waits(
                 "unsupported-agent"
             } else if !skill_present {
                 "skill-missing"
-            } else if let Some(reason) = pane.and_then(|pane| composer_wait(pane, config)) {
-                reason
             } else {
-                "gate-pending"
+                pane.and_then(|pane| composer_wait(pane, config))
+                    .unwrap_or("gate-pending")
             }
             .into(),
         );
@@ -2043,7 +2042,12 @@ mod tests {
             ..Config::default()
         };
         let reason = |pane: &PaneSnapshot| {
-            debrief_waits(plan(&[pane.clone()], &config, 200), &[pane.clone()], &config, true)
+            debrief_waits(
+                plan(std::slice::from_ref(pane), &config, 200),
+                std::slice::from_ref(pane),
+                &config,
+                true,
+            )
                 .candidates[0]
                 .wait_reason
                 .clone()

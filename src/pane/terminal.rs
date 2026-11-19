@@ -6752,7 +6752,7 @@ mod tests {
             let mut terminal = crate::ghostty::Terminal::new(20, 20, 100_000).unwrap();
             terminal.write(text.as_bytes());
             let mut state = crate::ghostty::RenderState::new().unwrap();
-            state.update(&mut terminal).unwrap();
+            state.update(&terminal).unwrap();
             let mut iterator = crate::ghostty::RowIterator::new().unwrap();
             let mut rows = state.populate_row_iterator(&mut iterator).unwrap();
             let mut storage = crate::ghostty::RowCells::new().unwrap();

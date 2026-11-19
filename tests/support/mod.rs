@@ -84,6 +84,16 @@ pub fn stop_spawned_herdr(child: &mut (dyn portable_pty::Child + Send + Sync)) {
     }
 }
 
+/// Consume output from a server PTY used only to launch a fixture. On
+/// macOS an unread terminal can keep an exited child stuck in tty drain.
+#[allow(dead_code)] // Some test binaries use their PTY output for assertions.
+pub fn drain_unused_pty_output(master: &dyn portable_pty::MasterPty) {
+    let mut reader = master.try_clone_reader().expect("server PTY reader");
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
+}
+
 /// A bounded diagnostic snapshot taken only when a test is already failing.
 pub fn spawned_pty_diagnostics(
     child: &mut (dyn portable_pty::Child + Send + Sync),

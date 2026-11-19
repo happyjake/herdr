@@ -448,6 +448,7 @@ fn shutdown_preserves_session_after_shell_is_signaled() {
         r#"{"id":"stop","method":"server.stop","params":{}}"#,
     );
     assert_eq!(stopped["result"]["type"], "ok");
+    support::drain_unused_pty_output(&*child._master);
     child.child.wait().expect("server should stop cleanly");
 
     let session: serde_json::Value = serde_json::from_slice(

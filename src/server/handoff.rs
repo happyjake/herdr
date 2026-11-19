@@ -1838,7 +1838,7 @@ mod tests {
             }
         }
         loop {
-            match sender.write(&[b'x']) {
+            match sender.write(b"x") {
                 Ok(0) => break,
                 Ok(count) => written += count,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,

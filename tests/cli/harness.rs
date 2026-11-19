@@ -339,6 +339,7 @@ pub(super) fn spawn_herdr_with_config_and_home(
     }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
+    crate::support::drain_unused_pty_output(&*pair.master);
     register_spawned_herdr_pid(child.process_id());
     SpawnedHerdr {
         _master: pair.master,

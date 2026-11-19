@@ -623,6 +623,7 @@ fn server_stop_request_logs_its_caller() {
     let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
+    support::drain_unused_pty_output(&**spawned._master.as_ref().expect("server PTY"));
     let mut stream = UnixStream::connect(&api_socket).unwrap();
     writeln!(
         stream,

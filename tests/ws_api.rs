@@ -247,6 +247,7 @@ fn spawn_herdr_with_launch_mode(
     }
 
     let child = pair.slave.spawn_command(cmd).unwrap();
+    support::drain_unused_pty_output(&*pair.master);
     register_spawned_herdr_pid(child.process_id());
 
     SpawnedHerdr {

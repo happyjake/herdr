@@ -98,10 +98,10 @@ pub(super) fn read(path: &Path) -> std::io::Result<BTreeMap<SearchSessionKey, Se
     Ok(sessions)
 }
 
-fn ensure_session<'a>(
-    sessions: &'a mut BTreeMap<SearchSessionKey, Session>,
+fn ensure_session(
+    sessions: &mut BTreeMap<SearchSessionKey, Session>,
     key: SearchSessionKey,
-) -> &'a mut Session {
+) -> &mut Session {
     if !sessions.contains_key(&key) {
         let alternate_kind = match key.kind {
             SearchSessionKeyKind::Id => Some(SearchSessionKeyKind::Path),

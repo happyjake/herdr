@@ -773,7 +773,7 @@ impl App {
                     if restoring {
                         continue;
                     }
-                    if let Some(result) = state.finished.or_else(|| {
+                    if let Some(result) = state.finished.or({
                         if let Phase::Quitting { result, .. } = state.phase {
                             Some(result)
                         } else {

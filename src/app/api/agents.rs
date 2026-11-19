@@ -12,6 +12,12 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
+type SubmittedAgentPrompt = (
+    String,
+    Option<crate::api::schema::AgentInfo>,
+    std::sync::mpsc::Receiver<std::io::Result<()>>,
+);
+
 /// Codex opens its skill-mention picker while the composer ends in a `$name` token, and the
 /// picker takes the next Enter to accept the mention instead of submitting the turn. A trailing
 /// space closes the picker first, so the one Enter submits (live codex, 2026-11-05: a bare
@@ -332,14 +338,7 @@ impl App {
         &mut self,
         validated: ValidatedAgentPrompt,
         params: &AgentPromptParams,
-    ) -> Result<
-        (
-            String,
-            Option<crate::api::schema::AgentInfo>,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        ),
-        String,
-    > {
+    ) -> Result<SubmittedAgentPrompt, String> {
         let ValidatedAgentPrompt {
             id,
             ws_idx,

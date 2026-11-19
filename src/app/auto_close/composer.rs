@@ -60,7 +60,7 @@ pub(super) fn is_own(draft: &str, invocation: &str) -> bool {
     let invocation: String = invocation.chars().filter(|c| !c.is_whitespace()).collect();
     !invocation.is_empty()
         && !draft.is_empty()
-        && draft.len() % invocation.len() == 0
+        && draft.len().is_multiple_of(invocation.len())
         && draft == invocation.repeat(draft.len() / invocation.len())
 }
 
@@ -191,7 +191,7 @@ fn plain(line: &[Cell]) -> String {
 /// Normal-intensity text: drops faint placeholders and an inverse blank cursor.
 fn typed(line: &[Cell]) -> String {
     line.iter()
-        .filter(|cell| !cell.faint && !(cell.inverse && cell.ch == ' '))
+        .filter(|cell| !(cell.faint || cell.inverse && cell.ch == ' '))
         .map(|cell| if cell.ch == '\u{a0}' { ' ' } else { cell.ch })
         .collect()
 }
@@ -200,7 +200,7 @@ fn typed(line: &[Cell]) -> String {
 /// indicators, and inverse blank cursors.
 fn typed_agy(line: &[Cell]) -> String {
     line.iter()
-        .filter(|cell| !cell.faint && !cell.muted_fg && !(cell.inverse && cell.ch == ' '))
+        .filter(|cell| !(cell.faint || cell.muted_fg || cell.inverse && cell.ch == ' '))
         .map(|cell| if cell.ch == '\u{a0}' { ' ' } else { cell.ch })
         .collect()
 }
