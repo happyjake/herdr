@@ -3261,7 +3261,7 @@ impl PaneRuntime {
                     let now_for_tick = Instant::now();
                     let tick = if active_pending_release(&pending_release_for_task, now_for_tick)
                         .is_some()
-                        || terminal.has_transient_default_color_override()
+                        || terminal.needs_transient_default_color_restore_probe(last_foreground_pgid)
                     {
                         TICK_PENDING_RELEASE
                     } else if pending_idle.active() {
@@ -3501,7 +3501,13 @@ impl PaneRuntime {
                     let pid = child_pid.load(Ordering::Acquire);
                     // Keep the terminal restore side effect separate from render notification state.
                     #[allow(clippy::collapsible_if)]
-                    if pid > 0 && terminal.maybe_restore_host_terminal_theme(pane_id, pid) {
+                    if pid > 0
+                        && terminal.maybe_restore_host_terminal_theme_with_pgid(
+                            pane_id,
+                            pid,
+                            foreground_pgid,
+                        )
+                    {
                         if render_dirty.request_pty(pane_id) {
                             render_notify.notify_one();
                         }

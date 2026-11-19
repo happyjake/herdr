@@ -805,13 +805,25 @@ impl PaneTerminal {
         self.ghostty.apply_host_terminal_appearance(appearance)
     }
 
-    pub fn has_transient_default_color_override(&self) -> bool {
-        self.ghostty.has_transient_default_color_override()
+    pub fn needs_transient_default_color_restore_probe(
+        &self,
+        observed_foreground_pgid: Option<u32>,
+    ) -> bool {
+        self.ghostty
+            .needs_transient_default_color_restore_probe(observed_foreground_pgid)
     }
 
-    pub fn maybe_restore_host_terminal_theme(&self, pane_id: PaneId, shell_pid: u32) -> bool {
-        self.ghostty
-            .maybe_restore_host_terminal_theme(pane_id, shell_pid)
+    pub fn maybe_restore_host_terminal_theme_with_pgid(
+        &self,
+        pane_id: PaneId,
+        shell_pid: u32,
+        observed_foreground_pgid: Option<u32>,
+    ) -> bool {
+        self.ghostty.maybe_restore_host_terminal_theme_with_pgid(
+            pane_id,
+            shell_pid,
+            observed_foreground_pgid,
+        )
     }
 
     pub fn terminal_title(&self) -> Option<String> {
@@ -1480,6 +1492,7 @@ impl GhosttyPaneTerminal {
         appearance.map(|appearance| Bytes::from_static(appearance.color_scheme_report()))
     }
 
+    #[cfg(test)]
     pub fn has_transient_default_color_override(&self) -> bool {
         self.core
             .lock()
@@ -1487,14 +1500,26 @@ impl GhosttyPaneTerminal {
             .unwrap_or(false)
     }
 
-    pub fn maybe_restore_host_terminal_theme(&self, pane_id: PaneId, shell_pid: u32) -> bool {
-        {
-            let Ok(core) = self.core.lock() else {
-                return false;
-            };
-            if !should_probe_host_terminal_theme_restore(&core) {
-                return false;
-            }
+    pub fn needs_transient_default_color_restore_probe(
+        &self,
+        observed_foreground_pgid: Option<u32>,
+    ) -> bool {
+        self.core
+            .lock()
+            .map(|core| {
+                should_probe_host_terminal_theme_restore_for_pgid(&core, observed_foreground_pgid)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn maybe_restore_host_terminal_theme_with_pgid(
+        &self,
+        pane_id: PaneId,
+        shell_pid: u32,
+        observed_foreground_pgid: Option<u32>,
+    ) -> bool {
+        if !self.needs_transient_default_color_restore_probe(observed_foreground_pgid) {
+            return false;
         }
 
         let foreground_job = crate::detect::foreground_job(shell_pid);
@@ -4110,6 +4135,27 @@ fn should_probe_host_terminal_theme_restore(core: &GhosttyPaneCore) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg_attr(target_os = "macos", allow(unused_variables))]
+fn should_probe_host_terminal_theme_restore_for_pgid(
+    core: &GhosttyPaneCore,
+    observed_foreground_pgid: Option<u32>,
+) -> bool {
+    if !should_probe_host_terminal_theme_restore(core) {
+        return false;
+    }
+
+    // While the owning child process group still owns the foreground tty on
+    // Unix, the app has not exited yet; avoid 20 Hz /proc tree walks.
+    #[cfg(not(target_os = "macos"))]
+    if observed_foreground_pgid.is_some()
+        && observed_foreground_pgid == core.transient_default_color_owner_pgid
+    {
+        return false;
+    }
+
+    true
+}
+
 /// Encode one `key` the way a Unix server's pane does after its app wrote
 /// `app_output` (for example a Kitty keyboard push): the libghostty path,
 /// without the Windows ConPTY record fallback (covered by the Windows harness).
@@ -5174,6 +5220,36 @@ mod tests {
         let core = pane.core.lock().unwrap();
 
         assert!(should_probe_host_terminal_theme_restore(&core));
+    }
+
+    #[test]
+    fn needs_transient_default_color_restore_probe_skips_when_headless_or_same_pgid() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        {
+            let mut core = pane.core.lock().unwrap();
+            core.transient_default_color_owner_pgid = Some(42);
+        }
+        assert!(
+            !pane.needs_transient_default_color_restore_probe(Some(1)),
+            "headless panes with empty host theme must never spin on restore probes"
+        );
+
+        {
+            let mut core = pane.core.lock().unwrap();
+            core.host_terminal_theme = crate::terminal_theme::TerminalTheme {
+                foreground: Some(crate::terminal_theme::RgbColor {
+                    r: 0xaa,
+                    g: 0xbb,
+                    b: 0xcc,
+                }),
+                ..Default::default()
+            };
+        }
+        assert!(pane.needs_transient_default_color_restore_probe(Some(99)));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!pane.needs_transient_default_color_restore_probe(Some(42)));
     }
 
     #[test]

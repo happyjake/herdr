@@ -50,11 +50,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Budget for flushing one outgoing frame to a slow client.
 const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the idle WebSocket accept loop wakes when checking shutdown.
+/// Incoming client connections still wake `libc::poll` immediately via `POLLIN`.
+const WS_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Send a protocol ping once a proven WebSocket client has been inbound-idle
 /// for this long.
-const WS_IDLE_PING_AFTER: Duration = Duration::from_secs(30);
+const WS_IDLE_PING_AFTER: Duration = Duration::from_secs(300);
 /// Close a proven WebSocket client that stays fully silent this long.
-const WS_IDLE_CLOSE_AFTER: Duration = Duration::from_secs(90);
+const WS_IDLE_CLOSE_AFTER: Duration = Duration::from_secs(390);
 const WS_IDLE_REAP_ERROR: &str = "timed out waiting for websocket pong after idle ping";
 /// Sent for a binary frame, whether it arrives between requests or during a
 /// stream: the API is one JSON message per text frame.
@@ -397,7 +400,7 @@ pub fn start_websocket_server_with_capabilities(
         run_accept_loop(
             || listener.accept(),
             &listener_running,
-            || wait_for_connection(&listener, CONNECTION_POLL_INTERVAL),
+            || wait_for_connection(&listener, WS_ACCEPT_POLL_INTERVAL),
             Duration::from_millis(50),
             |(stream, peer)| {
                 let api_tx = api_tx.clone();
@@ -974,10 +977,12 @@ enum WsErrorClass {
 
 fn classify_ws_error(err: tungstenite::Error) -> WsErrorClass {
     match err {
+        // Treat EINTR alongside WouldBlock/TimedOut so kernel freezer / s2idle
+        // wakeups retry cleanly instead of tearing down idle WebSocket clients.
         tungstenite::Error::Io(err)
             if matches!(
                 err.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
             ) =>
         {
             WsErrorClass::WouldBlock
@@ -2876,5 +2881,11 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(read_json(&mut pre_rotation)["result"]["type"], "pong");
+    }
+
+    #[test]
+    fn interrupted_io_error_is_classified_as_retryable() {
+        let err = tungstenite::Error::Io(io::Error::from(io::ErrorKind::Interrupted));
+        assert!(matches!(classify_ws_error(err), WsErrorClass::WouldBlock));
     }
 }
