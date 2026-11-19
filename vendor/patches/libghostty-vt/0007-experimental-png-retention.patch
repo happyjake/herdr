@@ -395,7 +395,7 @@ index b1b968b2..203190f1 100644
 +    try testing.expect(storage.loading == null);
 +}
 diff --git a/vendor/libghostty-vt/src/terminal/kitty/graphics_image.zig b/vendor/libghostty-vt/src/terminal/kitty/graphics_image.zig
-index e411bafe..c841c48d 100644
+index e411bafe..e133d3fb 100644
 --- a/vendor/libghostty-vt/src/terminal/kitty/graphics_image.zig
 +++ b/vendor/libghostty-vt/src/terminal/kitty/graphics_image.zig
 @@ -21,6 +21,24 @@ const max_dimension = 10000;
@@ -549,7 +549,18 @@ index e411bafe..c841c48d 100644
      /// Debug function to write the data to a file. This is useful for
      /// capturing some test data for unit tests.
      pub fn debugDump(io: std.Io, self: LoadingImage) !void {
-@@ -768,11 +854,16 @@ pub const Image = struct {
+@@ -736,6 +822,10 @@ pub const Image = struct {
+     /// current frame), since consumers key texture caches off it.
+     generation: u64 = 0,
+
++    /// Identity of the root pixels. Playback only advances generation.
++    root_generation: u64 = 0,
++    root_lease: ?*RootLease = null,
++
+     /// Animation state, non-null once any animation command (a=f,
+     /// a=a) has attached animation state to this image. Owned by the
+     /// image; replaced/retransmitted images drop it, which implements
+@@ -768,11 +858,16 @@ pub const Image = struct {
          /// Expected decoded byte length for a payload that has not arrived.
          pending: usize,
 
@@ -566,7 +577,7 @@ index e411bafe..c841c48d 100644
              };
          }
 
-@@ -780,7 +871,7 @@ pub const Image = struct {
+@@ -780,7 +875,7 @@ pub const Image = struct {
          pub fn bytes(self: Data) ?[]const u8 {
              return switch (self) {
                  .complete => |data| data,
@@ -575,7 +586,7 @@ index e411bafe..c841c48d 100644
              };
          }
 
-@@ -792,10 +883,43 @@ pub const Image = struct {
+@@ -792,12 +887,90 @@ pub const Image = struct {
              switch (self.*) {
                  .complete => |data| if (data.len > 0) alloc.free(data),
                  .pending => {},
@@ -585,6 +596,51 @@ index e411bafe..c841c48d 100644
          }
      };
 
++    /// A reference to the immutable root allocation that can outlive the
++    /// image and be read without accessing the terminal. Root edits use COW.
++    pub const RootLease = struct {
++        refs: std.atomic.Value(usize) = .init(1),
++        alloc: Allocator,
++        data: Data,
++
++        pub fn release(self: *RootLease) void {
++            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
++            self.data.deinit(self.alloc);
++            self.alloc.destroy(self);
++        }
++    };
++
++    pub fn retainRoot(self: *Image, alloc: Allocator) Allocator.Error!?*RootLease {
++        switch (self.data) {
++            .complete => |bytes| if (bytes.len == 0) return null,
++            .encoded_png => {},
++            .pending, .native_file => return null,
++        }
++        const lease = self.root_lease orelse lease: {
++            const lease = try alloc.create(RootLease);
++            lease.* = .{ .alloc = alloc, .data = self.data };
++            self.root_lease = lease;
++            break :lease lease;
++        };
++        _ = lease.refs.fetchAdd(1, .monotonic);
++        return lease;
++    }
++
++    pub fn releaseRoot(self: *Image, alloc: Allocator) void {
++        if (self.root_lease) |lease| {
++            self.root_lease = null;
++            lease.release();
++        } else self.data.deinit(alloc);
++    }
++
++    pub fn makeRootWritable(self: *Image, alloc: Allocator) Allocator.Error!void {
++        const lease = self.root_lease orelse return;
++        const bytes = try alloc.dupe(u8, self.data.complete);
++        self.root_lease = null;
++        self.data = .{ .complete = bytes };
++        lease.release();
++    }
++
 +    /// Transactional: a failed host read leaves the authoritative backing owned.
 +    pub fn materializeFile(self: *Image, alloc: Allocator) !void {
 +        const file = switch (self.data) {
@@ -612,14 +668,17 @@ index e411bafe..c841c48d 100644
 +        errdefer alloc.free(result.data);
 +        if (result.width != self.width or result.height != self.height or
 +            result.data.len != png.decoded_len) return error.InvalidData;
-+        alloc.free(png.bytes);
++        self.releaseRoot(alloc);
 +        self.data = .{ .complete = result.data };
 +    }
 +
      pub fn deinit(self: *Image, alloc: Allocator) void {
-         self.data.deinit(alloc);
+-        self.data.deinit(alloc);
++        self.releaseRoot(alloc);
          if (self.animation) |anim| {
-@@ -2159,3 +2283,404 @@ test "limits: temporary file medium allowed by limits" {
+             anim.deinit(alloc);
+             alloc.destroy(anim);
+@@ -2159,3 +2332,404 @@ test "limits: temporary file medium allowed by limits" {
      );
      defer loading.deinit(alloc);
  }

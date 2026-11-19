@@ -335,6 +335,7 @@ pub const ImageStorage = struct {
         // (e.g. renderer texture caches) can detect content changes.
         self.markMutated(io);
         gop.value_ptr.generation = self.generation;
+        gop.value_ptr.root_generation = self.generation;
     }
 
     /// Add an image whose decoded payload bytes have not arrived yet.
@@ -1002,10 +1003,11 @@ pub const ImageStorage = struct {
         const rgba = try pixel.rgbaFromFormat(alloc, img.format, old);
         self.total_bytes -= old.len;
         self.total_bytes += rgba.len;
-        img.data.deinit(alloc);
+        img.releaseRoot(alloc);
         img.data = .{ .complete = rgba };
         img.format = .rgba;
         self.markImageContentChanged(io, img);
+        img.root_generation = self.generation;
     }
 
     /// Reserve `bytes` of storage for animation frame data belonging
@@ -1543,9 +1545,10 @@ pub const ImageStorage = struct {
             // promoted frame's bytes stay reserved; only the old root
             // data is freed.
             self.releaseAnimationBytes(img.data.len());
-            img.data.deinit(alloc);
+            img.releaseRoot(alloc);
             const promoted = anim.frames.orderedRemove(0);
             img.data = .{ .complete = promoted.data };
+            img.root_generation = nextGeneration(io);
             anim.root_gap_ms = promoted.gap_ms;
         } else {
             const removed = anim.frames.orderedRemove(number - 2);

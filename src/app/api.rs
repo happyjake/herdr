@@ -88,13 +88,13 @@ enum RuntimeExitAction {
 
 /// Text plus the truncation flag and offset echo fields (`Some` only when
 /// the request carried an offset) produced by [`pane_read_window`].
-type PaneReadWindowParts = (
-    String,
-    bool,
-    Option<u64>,
-    Option<bool>,
-    Option<([u32; 2], Vec<crate::api::schema::PanePicture>)>,
-);
+struct PaneReadWindow {
+    text: String,
+    truncated: bool,
+    effective_offset: Option<u64>,
+    has_more: Option<bool>,
+    pictures: Option<crate::pane::PictureReadSamples>,
+}
 
 /// Read window shared by the pane.read and agent.read handlers so their
 /// source dispatch and offset semantics cannot drift. Returns the text plus
@@ -109,7 +109,7 @@ fn pane_read_window(
     offset_from_bottom: Option<u64>,
     span: Option<crate::api::schema::ReadSpan>,
     include_pictures: bool,
-) -> Result<PaneReadWindowParts, &'static str> {
+) -> Result<PaneReadWindow, &'static str> {
     use crate::api::schema::{ReadFormat, ReadSource};
 
     if span.is_some() && (offset_from_bottom.is_some() || source != ReadSource::RecentUnwrapped) {
@@ -134,13 +134,13 @@ fn pane_read_window(
             return Err("offset paging is unsupported on this pane");
         }
         let paging = offset_from_bottom.is_some();
-        return Ok((
-            read.text,
-            read.truncated,
-            paging.then_some(read.effective_offset as u64),
-            paging.then_some(read.has_more),
-            read.pictures,
-        ));
+        return Ok(PaneReadWindow {
+            text: read.text,
+            truncated: read.truncated,
+            effective_offset: paging.then_some(read.effective_offset as u64),
+            has_more: paging.then_some(read.has_more),
+            pictures: read.pictures,
+        });
     }
     if let Some(span) = span {
         let page_lines = lines.unwrap_or(1000).min(1000) as usize;
@@ -152,7 +152,13 @@ fn pane_read_window(
                 format == ReadFormat::Ansi,
             )
             .ok_or("this pane's history cannot be read as one span")?;
-        return Ok((read.text, read.has_more, Some(0), Some(read.has_more), None));
+        return Ok(PaneReadWindow {
+            text: read.text,
+            truncated: read.has_more,
+            effective_offset: Some(0),
+            has_more: Some(read.has_more),
+            pictures: None,
+        });
     }
     Ok(match offset_from_bottom {
         Some(offset) => {
@@ -166,18 +172,24 @@ fn pane_read_window(
             if window.offset_unsupported {
                 return Err("offset paging is unsupported on this pane");
             }
-            (
-                window.text,
-                window.truncated,
-                Some(window.effective_offset as u64),
-                Some(window.has_more),
-                None,
-            )
+            PaneReadWindow {
+                text: window.text,
+                truncated: window.truncated,
+                effective_offset: Some(window.effective_offset as u64),
+                has_more: Some(window.has_more),
+                pictures: None,
+            }
         }
         None => {
             let snapshot =
                 crate::app::api_helpers::read_terminal_snapshot(pane, source, format, lines);
-            (snapshot.text, snapshot.truncated, None, None, None)
+            PaneReadWindow {
+                text: snapshot.text,
+                truncated: snapshot.truncated,
+                effective_offset: None,
+                has_more: None,
+                pictures: None,
+            }
         }
     })
 }

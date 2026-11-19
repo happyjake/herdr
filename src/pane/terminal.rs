@@ -19,7 +19,7 @@ use crate::protocol::CellData;
 #[cfg(test)]
 mod migration_tests;
 mod pictures;
-pub(crate) use pictures::{PaneAnsiRead, PictureTerminal};
+pub(crate) use pictures::{PaneAnsiRead, PictureReadSamples, PictureTerminal};
 #[cfg(windows)]
 mod windows_recent_fallback;
 
@@ -3493,7 +3493,7 @@ fn ghostty_recent_read_at_offset_for_terminal(
         has_more: start > 0,
         offset_unsupported: false,
         top_is_wrap_tail: unwrapped && terminal.row_wrap_continuation(start as u32)?,
-        row_range: (lines > 0 && start <= page_end).then(|| start as u32..=page_end as u32),
+        row_range: (lines > 0 && start <= page_end).then_some(start as u32..=page_end as u32),
     })
 }
 

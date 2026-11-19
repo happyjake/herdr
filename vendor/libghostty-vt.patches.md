@@ -251,7 +251,9 @@ A separate default-off snapshot callback retains host-owned immutable raw RGBA
 file backing before reading pixels. Herdr installs this callback automatically
 on Linux, using same-filesystem CoW snapshots. It never retains a mutable producer pathname. Unsupported snapshots
 use the original loader; animation materializes pixels transactionally. Backing
-ownership and bounded reads are explicit in the embedding ABI.
+ownership and bounded reads are explicit in the embedding ABI. Root pixel
+allocations can also be retained across eviction and terminal teardown. An
+in-place root frame edit detaches from retained readers before replacing pixels.
 
 remove when: upstream provides an equivalent opt-in owned encoded-image
 representation and immutable host-backed raw sources with bounded storage,
@@ -312,7 +314,7 @@ verification:
 just maintenance-test
 ```
 
-## 0010 visit stored Kitty images
+## 0010 expose Kitty picture geometry and root image references
 
 status: active
 
@@ -328,16 +330,22 @@ vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
 
 local files:
 
+- `vendor/libghostty-vt/include/ghostty/vt/kitty_graphics.h`
 - `vendor/libghostty-vt/src/lib_vt.zig`
 - `vendor/libghostty-vt/src/terminal/c/kitty_graphics.zig`
+- `vendor/libghostty-vt/src/terminal/c/main.zig`
+- `vendor/libghostty-vt/src/terminal/formatter.zig`
+- `vendor/libghostty-vt/src/terminal/kitty/graphics_exec.zig`
+- `vendor/libghostty-vt/src/terminal/kitty/graphics_storage.zig`
 
-reason: A picture fetch resolves a payload fingerprint against the terminal's
-stored images. A placement iterator cannot find an unplaced image or an image
-held by an inactive screen. The visitor borrows each image for the duration of
-the search and stops at the first match.
+reason: A picture fetch validates the root image generation across both screen
+stores and retains its immutable bytes. A picture read shares a page walk and
+uses the formatter's full-row break rules for placement coordinates. Root byte
+ownership is part of patch 0007 because it shares the image backing lifecycle.
 
-remove when: the vendored C API can enumerate stored images across both screens
-and the socket picture tests pass using that API.
+remove when: the vendored C API supports immutable root-frame references,
+per-screen image lookup, and batched page and row evidence, and the socket
+picture tests pass using that API.
 
 verification:
 

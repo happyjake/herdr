@@ -53,7 +53,7 @@ pub(crate) use self::terminal::test_encode_key_for_app;
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    PaneAnsiRead, PictureTerminal, TerminalCompressionStep, TerminalDirtyPatch,
+    PaneAnsiRead, PictureReadSamples, PictureTerminal, TerminalCompressionStep, TerminalDirtyPatch,
     TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow,
     TerminalTextPoint, TerminalWordMotion,
 };
@@ -2851,6 +2851,8 @@ impl PaneRuntime {
             sequence_baseline: _,
             output_capture,
         } = state;
+        let (cell_width_px, cell_height_px) =
+            Self::effective_cell_size(cell_width_px, cell_height_px);
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
 
@@ -3049,12 +3051,11 @@ impl PaneRuntime {
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let (cell_width_px, cell_height_px) = Self::effective_cell_size(0, 0);
+        terminal
+            .resize(cols, rows, cell_width_px, cell_height_px)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         if crate::kitty_graphics::is_enabled() {
-            // Until a client supplies its geometry, use an 8 × 16 cell for
-            // headless Kitty placement sizing and API reads.
-            terminal
-                .resize(cols, rows, 8, 16)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
             terminal
                 .enable_kitty_graphics()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -3652,7 +3653,7 @@ impl PaneRuntime {
             terminal,
             io,
             input_activity,
-            current_size: Cell::new((rows, cols, 0, 0)),
+            current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
             cwd_observation: last_observed_cwd,
@@ -3737,10 +3738,20 @@ impl PaneRuntime {
         )
     }
 
+    fn effective_cell_size(width_px: u32, height_px: u32) -> (u32, u32) {
+        if width_px == 0 || height_px == 0 {
+            (8, 16)
+        } else {
+            (width_px, height_px)
+        }
+    }
+
     /// Resize if the dimensions actually changed.
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         let rows = rows.max(MIN_PANE_ROWS);
         let cols = cols.max(MIN_PANE_COLS);
+        let (cell_width_px, cell_height_px) =
+            Self::effective_cell_size(cell_width_px, cell_height_px);
         let size = (rows, cols, cell_width_px, cell_height_px);
         if self.current_size.get() == size {
             return;
@@ -3975,8 +3986,11 @@ impl PaneRuntime {
         lines: Option<usize>,
         offset: Option<usize>,
     ) -> PaneAnsiRead {
-        let read = self.terminal.ghostty.read_pane_ansi(source, lines, offset);
-        if offset.is_none() {
+        let read = self
+            .terminal
+            .ghostty
+            .read_pane_ansi(source, lines, offset, self.content_seq());
+        if offset.is_none() && source != crate::api::schema::ReadSource::Visible {
             self.compression.wake();
         }
         read

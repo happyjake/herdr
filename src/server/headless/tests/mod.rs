@@ -6470,7 +6470,7 @@ async fn headless_scheduled_tasks_start_pending_agent_resume_without_foreground_
 }
 
 #[test]
-fn terminal_attach_resize_uses_known_cell_geometry_without_pixel_mouse() {
+fn terminal_attach_resize_uses_reported_or_fallback_cell_geometry_without_pixel_mouse() {
     with_terminal_session_test_server(|server, _other_terminal_id, terminal_id, _pane_id| {
         let mut client = ClientConnection::new(
             (80, 24),
@@ -6488,8 +6488,8 @@ fn terminal_attach_resize_uses_known_cell_geometry_without_pixel_mouse() {
             client_id: 1,
             cols: 100,
             rows: 30,
-            cell_width_px: 8,
-            cell_height_px: 16,
+            cell_width_px: 9,
+            cell_height_px: 18,
             pixel_mouse: false,
         }));
         assert_eq!(
@@ -6497,13 +6497,13 @@ fn terminal_attach_resize_uses_known_cell_geometry_without_pixel_mouse() {
                 .runtime_for_terminal_id_string(&terminal_id)
                 .unwrap()
                 .pixel_size(),
-            Some((800, 480))
+            Some((900, 540))
         );
         assert_eq!(
             server.clients[&1].cell_size,
             crate::kitty_graphics::HostCellSize {
-                width_px: 8,
-                height_px: 16,
+                width_px: 9,
+                height_px: 18,
             }
         );
         assert!(!server.clients[&1].pixel_mouse);
@@ -6521,7 +6521,7 @@ fn terminal_attach_resize_uses_known_cell_geometry_without_pixel_mouse() {
                 .runtime_for_terminal_id_string(&terminal_id)
                 .unwrap()
                 .pixel_size(),
-            None
+            Some((100 * 8, 30 * 16))
         );
         assert_eq!(
             server.clients[&1].cell_size,

@@ -822,6 +822,10 @@ pub const Image = struct {
     /// current frame), since consumers key texture caches off it.
     generation: u64 = 0,
 
+    /// Identity of the root pixels. Playback only advances generation.
+    root_generation: u64 = 0,
+    root_lease: ?*RootLease = null,
+
     /// Animation state, non-null once any animation command (a=f,
     /// a=a) has attached animation state to this image. Owned by the
     /// image; replaced/retransmitted images drop it, which implements
@@ -889,6 +893,51 @@ pub const Image = struct {
         }
     };
 
+    /// A reference to the immutable root allocation that can outlive the
+    /// image and be read without accessing the terminal. Root edits use COW.
+    pub const RootLease = struct {
+        refs: std.atomic.Value(usize) = .init(1),
+        alloc: Allocator,
+        data: Data,
+
+        pub fn release(self: *RootLease) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            self.data.deinit(self.alloc);
+            self.alloc.destroy(self);
+        }
+    };
+
+    pub fn retainRoot(self: *Image, alloc: Allocator) Allocator.Error!?*RootLease {
+        switch (self.data) {
+            .complete => |bytes| if (bytes.len == 0) return null,
+            .encoded_png => {},
+            .pending, .native_file => return null,
+        }
+        const lease = self.root_lease orelse lease: {
+            const lease = try alloc.create(RootLease);
+            lease.* = .{ .alloc = alloc, .data = self.data };
+            self.root_lease = lease;
+            break :lease lease;
+        };
+        _ = lease.refs.fetchAdd(1, .monotonic);
+        return lease;
+    }
+
+    pub fn releaseRoot(self: *Image, alloc: Allocator) void {
+        if (self.root_lease) |lease| {
+            self.root_lease = null;
+            lease.release();
+        } else self.data.deinit(alloc);
+    }
+
+    pub fn makeRootWritable(self: *Image, alloc: Allocator) Allocator.Error!void {
+        const lease = self.root_lease orelse return;
+        const bytes = try alloc.dupe(u8, self.data.complete);
+        self.root_lease = null;
+        self.data = .{ .complete = bytes };
+        lease.release();
+    }
+
     /// Transactional: a failed host read leaves the authoritative backing owned.
     pub fn materializeFile(self: *Image, alloc: Allocator) !void {
         const file = switch (self.data) {
@@ -916,12 +965,12 @@ pub const Image = struct {
         errdefer alloc.free(result.data);
         if (result.width != self.width or result.height != self.height or
             result.data.len != png.decoded_len) return error.InvalidData;
-        alloc.free(png.bytes);
+        self.releaseRoot(alloc);
         self.data = .{ .complete = result.data };
     }
 
     pub fn deinit(self: *Image, alloc: Allocator) void {
-        self.data.deinit(alloc);
+        self.releaseRoot(alloc);
         if (self.animation) |anim| {
             anim.deinit(alloc);
             alloc.destroy(anim);

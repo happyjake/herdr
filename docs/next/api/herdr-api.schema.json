@@ -7480,6 +7480,49 @@
           ],
           "type": "string"
         },
+        "EvictedPicture": {
+          "properties": {
+            "col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "evicted": {
+              "const": true,
+              "type": "boolean"
+            },
+            "line": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows_above": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "evicted",
+            "line",
+            "rows_above",
+            "col",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        },
         "LabelSource": {
           "description": "Who wrote a pane's label, when it was not a person.\n\nKept beside the label rather than derived, and never shown: it is there\nso a client that names panes by itself can tell its own names from the\nones people and skills gave, and leave those alone.",
           "oneOf": [
@@ -7652,85 +7695,19 @@
           "type": "object"
         },
         "PanePicture": {
-          "properties": {
-            "col": {
-              "format": "uint16",
-              "maximum": 65535,
-              "minimum": 0,
-              "type": "integer"
+          "anyOf": [
+            {
+              "$ref": "#/schemas/subscription_event/$defs/PlacedPicture"
             },
-            "cols": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "crop": {
-              "items": {
-                "format": "uint32",
-                "minimum": 0,
-                "type": "integer"
-              },
-              "maxItems": 4,
-              "minItems": 4,
-              "type": "array"
-            },
-            "fingerprint": {
-              "type": "string"
-            },
-            "image_px": {
-              "items": {
-                "format": "uint32",
-                "minimum": 0,
-                "type": "integer"
-              },
-              "maxItems": 2,
-              "minItems": 2,
-              "type": "array"
-            },
-            "kind": {
-              "$ref": "#/schemas/subscription_event/$defs/PanePictureKind"
-            },
-            "line": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "opaque": {
-              "type": "boolean"
-            },
-            "rows": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "rows_above": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "z": {
-              "format": "int32",
-              "type": "integer"
+            {
+              "$ref": "#/schemas/subscription_event/$defs/EvictedPicture"
             }
-          },
-          "required": [
-            "fingerprint",
-            "image_px",
-            "line",
-            "rows_above",
-            "col",
-            "cols",
-            "rows",
-            "crop",
-            "z",
-            "opaque",
-            "kind"
-          ],
-          "type": "object"
+          ]
         },
         "PanePictureKind": {
           "enum": [
-            "direct"
+            "direct",
+            "virtual"
           ],
           "type": "string"
         },
@@ -7929,6 +7906,83 @@
             "offset_from_bottom",
             "max_offset_from_bottom",
             "viewport_rows"
+          ],
+          "type": "object"
+        },
+        "PlacedPicture": {
+          "properties": {
+            "col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "crop": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "image_px": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "kind": {
+              "$ref": "#/schemas/subscription_event/$defs/PanePictureKind"
+            },
+            "line": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "opaque": {
+              "type": "boolean"
+            },
+            "rows": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows_above": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "z": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "fingerprint",
+            "image_px",
+            "line",
+            "rows_above",
+            "col",
+            "cols",
+            "rows",
+            "crop",
+            "z",
+            "opaque",
+            "kind"
           ],
           "type": "object"
         },
@@ -9256,6 +9310,49 @@
           ],
           "type": "string"
         },
+        "EvictedPicture": {
+          "properties": {
+            "col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "evicted": {
+              "const": true,
+              "type": "boolean"
+            },
+            "line": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows_above": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "evicted",
+            "line",
+            "rows_above",
+            "col",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        },
         "FileAttachmentsCapability": {
           "description": "What a chunked upload may carry on this server. Absent from the pong\ncapabilities of a server that predates files, which takes photos only.",
           "properties": {
@@ -10273,85 +10370,19 @@
           "type": "object"
         },
         "PanePicture": {
-          "properties": {
-            "col": {
-              "format": "uint16",
-              "maximum": 65535,
-              "minimum": 0,
-              "type": "integer"
+          "anyOf": [
+            {
+              "$ref": "#/schemas/success_response/$defs/PlacedPicture"
             },
-            "cols": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "crop": {
-              "items": {
-                "format": "uint32",
-                "minimum": 0,
-                "type": "integer"
-              },
-              "maxItems": 4,
-              "minItems": 4,
-              "type": "array"
-            },
-            "fingerprint": {
-              "type": "string"
-            },
-            "image_px": {
-              "items": {
-                "format": "uint32",
-                "minimum": 0,
-                "type": "integer"
-              },
-              "maxItems": 2,
-              "minItems": 2,
-              "type": "array"
-            },
-            "kind": {
-              "$ref": "#/schemas/success_response/$defs/PanePictureKind"
-            },
-            "line": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "opaque": {
-              "type": "boolean"
-            },
-            "rows": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "rows_above": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "z": {
-              "format": "int32",
-              "type": "integer"
+            {
+              "$ref": "#/schemas/success_response/$defs/EvictedPicture"
             }
-          },
-          "required": [
-            "fingerprint",
-            "image_px",
-            "line",
-            "rows_above",
-            "col",
-            "cols",
-            "rows",
-            "crop",
-            "z",
-            "opaque",
-            "kind"
-          ],
-          "type": "object"
+          ]
         },
         "PanePictureKind": {
           "enum": [
-            "direct"
+            "direct",
+            "virtual"
           ],
           "type": "string"
         },
@@ -10915,6 +10946,83 @@
               "type": "string"
             }
           ]
+        },
+        "PlacedPicture": {
+          "properties": {
+            "col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "crop": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "image_px": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/PanePictureKind"
+            },
+            "line": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "opaque": {
+              "type": "boolean"
+            },
+            "rows": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows_above": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "z": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "fingerprint",
+            "image_px",
+            "line",
+            "rows_above",
+            "col",
+            "cols",
+            "rows",
+            "crop",
+            "z",
+            "opaque",
+            "kind"
+          ],
+          "type": "object"
         },
         "Plan": {
           "properties": {

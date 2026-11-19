@@ -12,6 +12,7 @@ const terminal_c = @import("terminal.zig");
 const Terminal = @import("../Terminal.zig");
 const PageList = @import("../PageList.zig");
 const Result = @import("result.zig").Result;
+const PageFormatter = @import("../formatter.zig").PageFormatter;
 
 /// C: GhosttyKittyGraphics
 pub const KittyGraphics = if (build_options.kitty_graphics)
@@ -228,6 +229,93 @@ pub fn visit_images(
             if (visitor(image, context)) return;
         }
     }
+}
+
+pub fn storage_for_screen(terminal_: terminal_c.Terminal, alternate: bool) callconv(lib.calling_conv) ?KittyGraphics {
+    if (comptime !build_options.kitty_graphics) return null;
+    const t = terminal_c.zigTerminal(terminal_) orelse return null;
+    const screen = t.screens.get(if (alternate) .alternate else .primary) orelse return null;
+    return &screen.kitty_images;
+}
+
+pub const RootRef = if (build_options.kitty_graphics) ?*Image.RootLease else ?*anyopaque;
+
+pub fn image_root_generation(image_: ImageHandle) callconv(lib.calling_conv) u64 {
+    if (comptime !build_options.kitty_graphics) return 0;
+    const image = image_ orelse return 0;
+    return image.root_generation;
+}
+
+pub fn image_root_ref(
+    terminal_: terminal_c.Terminal,
+    alternate: bool,
+    id: u32,
+    out_ref: *RootRef,
+    out_ptr: *?[*]const u8,
+    out_len: *usize,
+    out_png: *bool,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+    const t = terminal_c.zigTerminal(terminal_) orelse return .invalid_value;
+    const screen = t.screens.get(if (alternate) .alternate else .primary) orelse return .no_value;
+    const image = screen.kitty_images.images.getPtr(id) orelse return .no_value;
+    const lease = (image.retainRoot(screen.alloc) catch return .out_of_memory) orelse return .no_value;
+    const png = lease.data == .encoded_png;
+    const bytes = if (png) lease.data.encoded_png.bytes else lease.data.complete;
+    out_ref.* = lease;
+    out_ptr.* = bytes.ptr;
+    out_len.* = bytes.len;
+    out_png.* = png;
+    return .success;
+}
+
+pub fn image_root_unref(lease: RootRef) callconv(lib.calling_conv) void {
+    if (comptime !build_options.kitty_graphics) return;
+    if (lease) |value| value.release();
+}
+
+pub fn visit_screen_pages(
+    terminal_: terminal_c.Terminal,
+    visitor: *const fn (?*const anyopaque, u32, ?*anyopaque) callconv(lib.calling_conv) void,
+    context: ?*anyopaque,
+) callconv(lib.calling_conv) void {
+    const t = terminal_c.zigTerminal(terminal_) orelse return;
+    const pages = &t.screens.active.pages;
+    var iter = pages.pageIterator(.right_down, .{ .screen = .{} }, null);
+    var start: u32 = 0;
+    while (iter.next()) |chunk| {
+        visitor(chunk.node, start, context);
+        start += chunk.end - chunk.start;
+    }
+}
+
+pub fn screen_row_evidence(
+    terminal_: terminal_c.Terminal,
+    first: u32,
+    out: [*]u8,
+    count: u32,
+) callconv(lib.calling_conv) Result {
+    if (count == 0) return .success;
+    const t = terminal_c.zigTerminal(terminal_) orelse return .invalid_value;
+    const pages = &t.screens.active.pages;
+    const last = std.math.add(u32, first, count - 1) catch return .invalid_value;
+    const tl = pages.pin(.{ .screen = .{ .y = first } }) orelse return .invalid_value;
+    const br = pages.pin(.{ .screen = .{ .y = last } }) orelse return .invalid_value;
+    var iter = tl.pageIterator(.right_down, br);
+    var index: usize = 0;
+    while (iter.next()) |chunk| {
+        const page = chunk.node.page();
+        for (chunk.start..chunk.end) |y| {
+            const row = page.getRow(@intCast(y));
+            const cells = page.getCells(row);
+            const emits_break = PageFormatter.rowEnding(cells, row.wrap, true) != .soft_wrap;
+            out[index] = @as(u8, @intFromBool(row.wrap)) |
+                (@as(u8, @intFromBool(row.wrap_continuation)) << 1) |
+                (@as(u8, @intFromBool(emits_break)) << 2);
+            index += 1;
+        }
+    }
+    return .success;
 }
 
 pub fn image_get(

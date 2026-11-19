@@ -12,7 +12,15 @@ struct PictureServer {
 
 impl PictureServer {
     fn start() -> Self {
-        let server = start_ws_test_server();
+        Self::start_at(unique_test_dir(), &[])
+    }
+
+    fn start_at(base: PathBuf, extra_env: &[(&str, &str)]) -> Self {
+        // Use system utilities only. The production startup can look for
+        // optional agent executables, including its model catalog lister.
+        let mut env = vec![("PATH", "/usr/bin:/bin")];
+        env.extend_from_slice(extra_env);
+        let server = start_ws_test_server_at(Path::new(env!("CARGO_BIN_EXE_herdr")), base, &env);
         let created = unix_request(
             &server.socket_path,
             &wire_request("workspace.create", json!({"cwd":server.base,"focus":true})),
@@ -51,6 +59,21 @@ impl PictureServer {
 
     fn fetch_params(&self, fingerprint: &str, width_px: u32) -> Value {
         json!({"pane_id":self.pane,"fingerprint":fingerprint,"width_px":width_px})
+    }
+
+    fn send_fetch(&self, fingerprint: &str, width_px: u32) -> BufReader<UnixStream> {
+        let path = &self.server.as_ref().unwrap().socket_path;
+        let mut stream = UnixStream::connect(path).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            wire_request("pane.picture", self.fetch_params(fingerprint, width_px))
+        )
+        .unwrap();
+        BufReader::new(stream)
     }
 
     fn run_stages(&self, stages: &[String]) {
@@ -136,7 +159,7 @@ fn image_bytes(response: &Value) -> Vec<u8> {
         .decode(
             response["result"]["data_b64"]
                 .as_str()
-                .expect(&response.to_string()),
+                .unwrap_or_else(|| panic!("{response}")),
         )
         .unwrap()
 }
@@ -159,6 +182,55 @@ fn jpeg_dimensions(data: &[u8]) -> [u32; 2] {
         index += 2 + len;
     }
     panic!("missing baseline JPEG frame header");
+}
+
+fn read_fetch(mut reader: BufReader<UnixStream>) -> Value {
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    serde_json::from_str(&response).unwrap()
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn pane_picture_bounds_admission_and_leaves_other_sockets_responsive() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let barrier = base.join("encode-barrier");
+    fs::create_dir_all(&barrier).unwrap();
+    let server = PictureServer::start_at(
+        base,
+        &[(
+            "HERDR_TEST_PICTURE_ENCODE_BARRIER",
+            barrier.to_str().unwrap(),
+        )],
+    );
+    let image = kitty_data("a=T,f=100,q=2,C=1,i=24,c=4,r=2", &opaque_png());
+    server.run_stages(&[format!("\x1b[2J\x1b[H{image}encode-ready")]);
+    server.wait("encode-ready");
+    let read = server.read("visible", json!({}));
+    let fingerprint = read["pictures"][0]["fingerprint"].as_str().unwrap();
+    let first = server.send_fetch(fingerprint, 64);
+    let second = server.send_fetch(fingerprint, 128);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for entry in ["entered-0", "entered-1"] {
+        while !barrier.join(entry).is_file() {
+            assert!(Instant::now() < deadline, "encoder did not reach {entry}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    let small = server.read("visible", json!({}));
+    assert_eq!(small["pictures"], read["pictures"]);
+    assert_eq!(
+        server.fetch(fingerprint, 192)["error"]["code"],
+        "picture_busy"
+    );
+    fs::write(barrier.join("release"), []).unwrap();
+    assert_eq!(read_fetch(first)["result"]["px"], json!([64, 32]));
+    let native = read_fetch(second);
+    assert_eq!(native["result"]["px"], json!([100, 50]));
+    assert_eq!(server.fetch(fingerprint, 2048), native);
+    assert!(!barrier.join("entered-2").exists());
 }
 
 #[test]
@@ -184,7 +256,7 @@ fn pane_read_lists_direct_kitty_pictures() {
     let visible = server.read("visible", json!({}));
     let fingerprint = visible["pictures"][0]["fingerprint"]
         .as_str()
-        .expect(&visible.to_string());
+        .unwrap_or_else(|| panic!("{visible}"));
     assert_eq!(fingerprint.len(), 16);
     assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
     let expected = json!({
@@ -209,7 +281,7 @@ fn pane_read_lists_direct_kitty_pictures() {
     let full = server.read("recent_unwrapped", json!({"lines":10,"continuity":true}));
     let token = full["continuity"]["token"]
         .as_str()
-        .expect(&full.to_string());
+        .unwrap_or_else(|| panic!("{full}"));
     let continued = server.read("recent_unwrapped", json!({"lines":9,"continue_from":token}));
     assert_eq!(continued["text"], "");
     assert_eq!(continued["continued"]["before"], "");
@@ -253,7 +325,9 @@ fn pane_picture_fetches_alpha_and_checks_current_storage() {
     server.wait("alpha-ready");
     let read = server.read("recent", json!({}));
     let picture = &read["pictures"][0];
-    let fingerprint = picture["fingerprint"].as_str().expect(&read.to_string());
+    let fingerprint = picture["fingerprint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{read}"));
     assert_eq!(picture["opaque"], false);
     assert_eq!(picture["z"], -2);
     assert_eq!(picture["line"], 1);
@@ -325,42 +399,17 @@ fn pane_picture_caps_reply_size_and_longest_edge() {
     server.wait("sizes-ready");
 
     let read = server.read("visible", json!({}));
-    let pictures = read["pictures"].as_array().expect(&read.to_string());
+    let pictures = read["pictures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{read}"));
     assert_eq!(pictures.len(), 2);
     let noisy_fp = pictures[0]["fingerprint"].as_str().unwrap();
     let tall_fp = pictures[1]["fingerprint"].as_str().unwrap();
 
-    // A separate socket can read the pane while the large cache miss is in flight.
-    let path = &server.server.as_ref().unwrap().socket_path;
-    let heavy = UnixStream::connect(path).unwrap();
-    heavy
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    let mut heavy = BufReader::new(heavy);
-    writeln!(
-        heavy.get_mut(),
-        "{}",
-        wire_request("pane.picture", server.fetch_params(noisy_fp, 1024))
-    )
-    .unwrap();
-    let (completed, first) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        let large_done = completed.clone();
-        let large = scope.spawn(move || {
-            let mut reply = String::new();
-            heavy.read_line(&mut reply).unwrap();
-            large_done.send("picture").unwrap();
-            serde_json::from_str::<Value>(&reply).unwrap()
-        });
-        let small = server.read("visible", json!({}));
-        completed.send("read").unwrap();
-        assert_eq!(first.recv_timeout(Duration::from_secs(5)).unwrap(), "read");
-        assert_eq!(small["pictures"], read["pictures"]);
-        let noisy = large.join().unwrap();
-        assert_eq!(noisy["result"]["media_type"], "image/png");
-        assert_eq!(noisy["result"]["px"], json!([256, 256]));
-        assert!(image_bytes(&noisy).len() <= 768 * 1024);
-    });
+    let noisy = read_fetch(server.send_fetch(noisy_fp, 1024));
+    assert_eq!(noisy["result"]["media_type"], "image/png");
+    assert_eq!(noisy["result"]["px"], json!([256, 256]));
+    assert!(image_bytes(&noisy).len() <= 768 * 1024);
 
     let tall = server.fetch(tall_fp, 2048);
     assert_eq!(tall["result"]["px"], json!([1, 2050]));
@@ -386,7 +435,9 @@ fn pane_read_unwrapped_omits_wrapped_placements_and_remaps_later_lines() {
     server.wait("wrapped-ready");
 
     let wrapped = server.read("recent", json!({}));
-    let pictures = wrapped["pictures"].as_array().expect(&wrapped.to_string());
+    let pictures = wrapped["pictures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{wrapped}"));
     assert_eq!(pictures.len(), 2);
     assert_eq!(pictures[0]["line"], 1);
     assert_eq!(pictures[1]["line"], 3);
@@ -403,8 +454,157 @@ fn pane_read_unwrapped_omits_wrapped_placements_and_remaps_later_lines() {
         if read["text"] == "" {
             assert_eq!(read["pictures"][0]["line"], 4, "{read}");
             assert_eq!(read["pictures"][0]["rows"], 2, "{read}");
+            let clamped = server.read("recent_unwrapped", json!({"offset_from_bottom":1}));
+            assert_eq!(clamped["effective_offset"], 0);
+            assert_eq!(clamped["text"], read["text"]);
+            assert_eq!(clamped["pictures"], read["pictures"]);
             break;
         }
         assert!(Instant::now() < deadline, "{read}");
     }
+}
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn pane_picture_keeps_headless_cell_geometry_across_handoff() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+
+    // Before any resize/handoff, the root pane uses the 8x16 headless cell size:
+    // a 100x50 PNG placed with c=10 (pi's column-sized a=T,f=100 style) is
+    // 80px wide -> 40px tall -> ceil(40 / 16) = 3 rows.
+    let before_pic = kitty_data("a=T,f=100,q=2,C=1,i=40,c=10", &opaque_png());
+    let after_pic = kitty_data("a=T,f=100,q=2,C=1,i=41,c=10", &opaque_png());
+    server.run_stages(&[
+        format!("\x1b[2J\x1b[H{before_pic}\x1b[6;1Hbefore-handoff"),
+        format!("\x1b[2J\x1b[H{after_pic}\x1b[12;1Hafter-handoff"),
+    ]);
+    server.wait("before-handoff");
+    let before = server.read("visible", json!({}));
+    assert_eq!(before["cell_px"], json!([8, 16]));
+    assert_eq!(before["pictures"][0]["rows"], json!(3));
+
+    // Perform a live handoff (e.g. `herdr update`) on the headless server.
+    let handoff = server.request("server.live_handoff", json!({}));
+    assert_eq!(handoff["result"]["type"], "ok", "{handoff}");
+
+    server.advance();
+    server.wait("after-handoff");
+    let after = server.read("visible", json!({}));
+    let _ = server.request("server.stop", json!({}));
+
+    assert_eq!(after["cell_px"], json!([8, 16]), "after handoff: {after}");
+    assert_eq!(
+        after["pictures"][0]["rows"],
+        json!(3),
+        "after handoff: {after}"
+    );
+}
+
+#[test]
+fn pane_read_reports_resolved_picture_source_crop() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+
+    // Place a 50x25 crop starting at (20, 10) of a 100x50 image.
+    let cropped = kitty_data(
+        "a=T,f=100,q=2,C=1,i=42,x=20,y=10,w=50,h=25,c=10,r=4",
+        &opaque_png(),
+    );
+    server.run_stages(&[format!("\x1b[2J\x1b[H{cropped}\x1b[6;1Hcrop-ready")]);
+    server.wait("crop-ready");
+
+    let read = server.read("visible", json!({}));
+    assert_eq!(
+        read["pictures"][0]["crop"],
+        json!([20, 10, 50, 25]),
+        "expected placement source crop, got whole image: {read}"
+    );
+}
+
+#[test]
+fn pane_read_unwrapped_uses_the_formatters_break_before_a_wide_character() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let cols = server.read("visible", json!({}))["cols"].as_u64().unwrap();
+    let image = kitty_data("a=T,f=100,q=2,C=1,i=25,c=2,r=1", &opaque_png());
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[1;{cols}H界\x1b[3;1H{image}wide-character-ready"
+    )]);
+    server.wait("wide-character-ready");
+    let read = server.read("recent_unwrapped", json!({}));
+    assert_eq!(read["text"], "\r\n界\r\nwide-character-ready");
+    assert_eq!(read["pictures"][0]["line"], 2, "{read}");
+}
+
+#[test]
+fn pane_read_visible_line_limit_keeps_a_picture_in_the_trailing_blank_rows() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let image = kitty_data("a=T,f=100,q=2,C=1,i=26,c=3,r=2", &opaque_png());
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[Hfirst\r\nlast-visible-line\x1b[5;2H{image}"
+    )]);
+    server.wait("last-visible-line");
+    let read = server.read("visible", json!({"lines":1}));
+    assert_eq!(read["text"], "last-visible-line");
+    assert_eq!(read["pictures"][0]["line"], 3, "{read}");
+    assert_eq!(read["pictures"][0]["rows"], 2);
+}
+
+#[test]
+fn pane_picture_fingerprint_is_stable_across_file_and_inline_uploads() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let root = server.server.as_ref().unwrap().base.clone();
+    let bytes = [19u8, 42, 73, 255].repeat(1024);
+    let mut stages = Vec::new();
+    for (index, name) in ["first.rgba", "second.rgba"].into_iter().enumerate() {
+        let path = root.join(name);
+        fs::write(&path, &bytes).unwrap();
+        let image = kitty_data(
+            "a=T,t=f,f=32,s=32,v=32,q=2,C=1,i=27,c=3,r=2",
+            path.to_str().unwrap().as_bytes(),
+        );
+        stages.push(format!("\x1b[2J\x1b[H{image}source-{index}"));
+    }
+    let inline = kitty_data("a=T,f=32,s=32,v=32,q=2,C=1,i=27,c=3,r=2", &bytes);
+    stages.push(format!("\x1b[2J\x1b[H{inline}source-2"));
+    server.run_stages(&stages);
+
+    server.wait("source-0");
+    let first = server.read("visible", json!({}));
+    let fingerprint = first["pictures"][0]["fingerprint"].as_str().unwrap();
+    assert_eq!(
+        server.fetch(fingerprint, 64)["result"]["media_type"],
+        "image/jpeg"
+    );
+    for index in 1..=2 {
+        server.advance();
+        server.wait(&format!("source-{index}"));
+        let resent = server.read("visible", json!({}));
+        assert_eq!(resent["pictures"], first["pictures"]);
+        assert_eq!(
+            server.fetch(fingerprint, 64)["result"]["px"],
+            json!([32, 32])
+        );
+    }
+}
+
+#[test]
+fn pane_read_reports_picture_crop_after_scrolling_inside_margins() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let picture = kitty_data("a=T,f=100,q=2,C=1,i=28,c=10,r=5", &opaque_png());
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[2;9r\x1b[2;1H{picture}\x1b[9;1H\n\x1b[r\x1b[11;1Hmargin-clipped"
+    )]);
+    server.wait("margin-clipped");
+    let read = server.read("visible", json!({}));
+    assert_eq!(read["pictures"][0]["line"], 1, "{read}");
+    assert_eq!(read["pictures"][0]["rows"], 4, "{read}");
+    assert_eq!(
+        read["pictures"][0]["crop"],
+        json!([0, 10, 100, 40]),
+        "{read}"
+    );
 }

@@ -1022,6 +1022,15 @@ pub const PageFormatter = struct {
         _ = try self.formatWithState(writer);
     }
 
+    pub const RowEnding = enum { blank, soft_wrap, hard_break };
+
+    /// Whether the selected cells end a logical line in this formatter.
+    /// Blank rows always count as one line, even at a wide-character wrap.
+    pub inline fn rowEnding(cells: []const Cell, wrapped: bool, unwrap: bool) RowEnding {
+        if (!Cell.hasTextAny(cells)) return .blank;
+        return if (wrapped and unwrap) .soft_wrap else .hard_break;
+    }
+
     pub fn formatWithState(
         self: PageFormatter,
         writer: *std.Io.Writer,
@@ -1217,7 +1226,8 @@ pub const PageFormatter = struct {
             // If this row is blank, accumulate to avoid a bunch of extra
             // work later. If it isn't blank, make sure we dump all our
             // blanks.
-            if (!Cell.hasTextAny(cells_subset)) {
+            const ending = rowEnding(cells_subset, row.wrap, self.opts.unwrap);
+            if (ending == .blank) {
                 blank_rows += 1;
                 continue;
             }
@@ -1283,7 +1293,7 @@ pub const PageFormatter = struct {
 
             // If we're not wrapped, we always add a newline so after
             // the row is printed we can add a newline.
-            if (!row.wrap or !self.opts.unwrap) blank_rows += 1;
+            if (ending == .hard_break) blank_rows += 1;
 
             // If the row doesn't continue a wrap then we need to reset
             // our blank cell count.

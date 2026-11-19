@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::schema::{PanePicture, PanePictureKind, ReadSource};
+use crate::api::schema::{PanePicture, PanePictureKind, PlacedPicture, ReadSource};
 
 #[derive(Default)]
 pub(crate) struct PaneAnsiRead {
@@ -8,7 +8,7 @@ pub(crate) struct PaneAnsiRead {
     pub effective_offset: usize,
     pub has_more: bool,
     pub offset_unsupported: bool,
-    pub pictures: Option<([u32; 2], Vec<PanePicture>)>,
+    pub pictures: Option<PictureReadSamples>,
 }
 
 /// A fetch may wait for a worker without extending the pane's lifetime.
@@ -19,11 +19,10 @@ impl PictureTerminal {
         Self(Arc::downgrade(terminal))
     }
 
-    pub(crate) fn with_held_image<T>(
+    pub(crate) fn held_image(
         &self,
         fingerprint: u64,
-        read: impl FnOnce(crate::ghostty::KittyPictureImage<'_>) -> std::io::Result<T>,
-    ) -> std::io::Result<Option<T>> {
+    ) -> std::io::Result<Option<crate::ghostty::KittyPictureImage>> {
         let Some(terminal) = self.0.upgrade() else {
             return Ok(None);
         };
@@ -32,10 +31,7 @@ impl PictureTerminal {
             .core
             .lock()
             .map_err(|_| std::io::Error::other("terminal lock poisoned"))?;
-        core.terminal
-            .kitty_picture_by_fingerprint(fingerprint)
-            .map(read)
-            .transpose()
+        Ok(core.terminal.kitty_picture_by_fingerprint(fingerprint))
     }
 }
 
@@ -45,6 +41,7 @@ impl GhosttyPaneTerminal {
         source: ReadSource,
         lines: Option<usize>,
         offset: Option<usize>,
+        revision: u64,
     ) -> PaneAnsiRead {
         let Ok(mut core) = self.core.lock() else {
             return PaneAnsiRead::default();
@@ -120,7 +117,7 @@ impl GhosttyPaneTerminal {
 
         if has_placements && !read.offset_unsupported {
             let row_range = if source != ReadSource::Visible
-                && offset.unwrap_or(0) == 0
+                && read.effective_offset == 0
                 && (row_range.is_some() || read.text.is_empty())
             {
                 extend_recent_picture_rows(&core.terminal, row_range, lines.unwrap_or(80))
@@ -128,10 +125,16 @@ impl GhosttyPaneTerminal {
                 row_range
             };
             if let Some(rows) = row_range {
-                read.pictures = read_pictures(&core.terminal, rows, unwrapped)
-                    .map_err(|error| debug!(%error, "could not read Kitty picture placements"))
-                    .ok()
-                    .flatten();
+                read.pictures = sample_read_pictures(
+                    &core.terminal,
+                    rows,
+                    unwrapped,
+                    offset.is_some_and(|offset| offset > 0),
+                    revision,
+                )
+                .map_err(|error| debug!(%error, "could not read Kitty picture placements"))
+                .ok()
+                .flatten();
             }
         }
         read
@@ -149,7 +152,7 @@ fn visible_picture_rows(
     // the viewport's trailing blank rows available for picture overlays.
     let skipped = lines.map_or(0, |n| text.split_inclusive('\n').count().saturating_sub(n));
     let start = viewport.offset + skipped;
-    (lines != Some(0) && start <= end).then(|| start as u32..=end as u32)
+    (lines != Some(0) && start <= end).then_some(start as u32..=end as u32)
 }
 
 fn extend_recent_picture_rows(
@@ -173,47 +176,68 @@ fn extend_recent_picture_rows(
     Some(start..=end)
 }
 
-fn read_pictures(
+pub(crate) struct PictureReadSamples {
+    cell_px: [u32; 2],
+    first_row: u32,
+    pictures: Vec<crate::ghostty::KittyPictureSample>,
+}
+
+pub(crate) struct ReadPictures {
+    pub cell_px: [u32; 2],
+    pub entries: Vec<PanePicture>,
+}
+
+impl PictureReadSamples {
+    pub(crate) fn finish(self) -> Option<ReadPictures> {
+        let mut entries = Vec::with_capacity(self.pictures.len());
+        for sample in self.pictures {
+            let picture = match sample.finish() {
+                Ok(picture) => picture,
+                Err(error) => {
+                    debug!(%error, "could not resolve a Kitty picture sample");
+                    continue;
+                }
+            };
+            entries.push(PlacedPicture {
+                fingerprint: format!("{:016x}", picture.fingerprint),
+                image_px: picture.image_px,
+                line: picture.line,
+                rows_above: self.first_row.saturating_sub(picture.screen_row),
+                col: picture.col,
+                cols: picture.cols,
+                rows: picture.rows,
+                crop: picture.crop,
+                z: picture.z,
+                opaque: picture.opaque,
+                kind: PanePictureKind::Direct,
+            });
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort_by_key(|p| p.z);
+        Some(ReadPictures {
+            cell_px: self.cell_px,
+            entries: entries.into_iter().map(PanePicture::Placement).collect(),
+        })
+    }
+}
+
+fn sample_read_pictures(
     terminal: &crate::ghostty::Terminal,
     rows: RangeInclusive<u32>,
     unwrapped: bool,
-) -> Result<Option<([u32; 2], Vec<PanePicture>)>, crate::ghostty::Error> {
-    let start = *rows.start();
-    let pictures = terminal.kitty_direct_pictures(rows, unwrapped)?;
+    paged: bool,
+    revision: u64,
+) -> Result<Option<PictureReadSamples>, crate::ghostty::Error> {
+    let first_row = *rows.start();
+    let pictures = terminal.sample_kitty_direct_pictures(rows, unwrapped, paged, Some(revision))?;
     if pictures.is_empty() {
         return Ok(None);
     }
-    // Map physical rows to logical line numbers in one forward pass, up
-    // to the last placement start. A wrap tail at the window top is line 0.
-    let mut row = start;
-    let mut line = 0;
-    let mut placements = Vec::with_capacity(pictures.len());
-    for picture in pictures {
-        let first = picture.screen_row.max(start);
-        if unwrapped {
-            while row < first {
-                row += 1;
-                if !terminal.row_wrap_continuation(row)? {
-                    line += 1;
-                }
-            }
-        } else {
-            line = first - start;
-        }
-        placements.push(PanePicture {
-            fingerprint: format!("{:016x}", picture.fingerprint),
-            image_px: picture.image_px,
-            line,
-            rows_above: start.saturating_sub(picture.screen_row),
-            col: picture.col,
-            cols: picture.cols,
-            rows: picture.rows,
-            crop: [0, 0, picture.image_px[0], picture.image_px[1]],
-            z: picture.z,
-            opaque: picture.opaque,
-            kind: PanePictureKind::Direct,
-        });
-    }
-    placements.sort_by_key(|p| p.z);
-    Ok(Some((terminal.cell_px()?, placements)))
+    Ok(Some(PictureReadSamples {
+        first_row,
+        cell_px: terminal.cell_px()?,
+        pictures,
+    }))
 }

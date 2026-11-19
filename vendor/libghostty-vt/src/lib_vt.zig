@@ -388,7 +388,13 @@ comptime {
         if (features.kitty_graphics) {
             @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
             @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
-            @export(&c.kitty_graphics.visit_images, .{ .name = "herdr_kitty_graphics_visit_images" });
+            @export(&c.kitty_graphics_visit_images, .{ .name = "ghostty_kitty_graphics_visit_images" });
+            @export(&c.kitty_graphics_storage_for_screen, .{ .name = "ghostty_kitty_graphics_storage_for_screen" });
+            @export(&c.kitty_graphics_image_root_generation, .{ .name = "ghostty_kitty_graphics_image_root_generation" });
+            @export(&c.kitty_graphics_image_root_ref, .{ .name = "ghostty_kitty_graphics_image_root_ref" });
+            @export(&c.kitty_graphics_image_root_unref, .{ .name = "ghostty_kitty_graphics_image_root_unref" });
+            @export(&c.kitty_graphics_visit_screen_pages, .{ .name = "ghostty_kitty_graphics_visit_screen_pages" });
+            @export(&c.kitty_graphics_screen_row_evidence, .{ .name = "ghostty_kitty_graphics_screen_row_evidence" });
             @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
             @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });
             @export(&c.kitty_graphics_placement_iterator_new, .{ .name = "ghostty_kitty_graphics_placement_iterator_new" });

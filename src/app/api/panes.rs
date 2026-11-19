@@ -1804,10 +1804,17 @@ impl App {
                 ),
             )
         });
-        let (text, truncated, effective_offset, has_more, pictures) = match window {
+        let super::PaneReadWindow {
+            text,
+            truncated,
+            effective_offset,
+            has_more,
+            pictures,
+        } = match window {
             Ok(window) => window,
             Err(message) => return encode_error(id, "invalid_request", message),
         };
+        let pictures = pictures.and_then(crate::pane::PictureReadSamples::finish);
         let continuity = if super::read_continuity::honored_for(params.format, params.source) {
             super::read_continuity::apply(text, params.continuity, params.continue_from.as_deref())
         } else {
@@ -1836,8 +1843,8 @@ impl App {
                     alternate_screen: Some(alternate_screen),
                     continuity: continuity.continuity,
                     continued: continuity.continued,
-                    cell_px: pictures.as_ref().map(|(cell_px, _)| *cell_px),
-                    pictures: pictures.map(|(_, placements)| placements),
+                    cell_px: pictures.as_ref().map(|pictures| pictures.cell_px),
+                    pictures: pictures.map(|pictures| pictures.entries),
                 },
             },
         )

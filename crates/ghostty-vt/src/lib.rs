@@ -10,7 +10,7 @@
 )]
 pub mod bindings;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -29,7 +29,7 @@ use crate::pane_graphics_files::OwnedExport;
 mod native_image_sources;
 mod native_source;
 mod pictures;
-pub use pictures::{KittyPicture, KittyPictureImage, KittyPicturePixels};
+pub use pictures::{KittyPicture, KittyPictureImage, KittyPicturePixels, KittyPictureSample};
 pub mod pane_graphics_files;
 
 /// Terminfo entry the terminal emulates; child processes should see it as TERM.
@@ -260,7 +260,6 @@ type KittyPlacementPayload = (KittyImageDescriptor, Vec<u8>, Option<Arc<OwnedExp
 struct KittyImageFingerprintEntry {
     generation: u64,
     fingerprint: u64,
-    opaque: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,10 +340,16 @@ impl CursorVisualStyle {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActiveScreen {
     Primary,
     Alternate,
+}
+
+impl ActiveScreen {
+    fn index(self) -> usize {
+        usize::from(self == Self::Alternate)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -854,7 +859,9 @@ pub struct Terminal {
     #[cfg(windows)]
     tracked_row: ffi::GhosttyTrackedGridRef,
     callback_state: Box<TerminalCallbackState>,
-    kitty_fingerprints: Mutex<HashMap<u32, KittyImageFingerprintEntry>>,
+    kitty_fingerprints: Mutex<[HashMap<u32, KittyImageFingerprintEntry>; 2]>,
+    picture_catalog: Arc<Mutex<pictures::PictureCatalog>>,
+    picture_layout: RefCell<Option<pictures::PictureLayout>>,
     kitty_empty_generation: Cell<Option<u64>>,
     kitty_png_forwarding: bool,
 }
@@ -880,7 +887,9 @@ impl Terminal {
                 },
                 ..Default::default()
             }),
-            kitty_fingerprints: Mutex::new(HashMap::new()),
+            kitty_fingerprints: Mutex::default(),
+            picture_catalog: Arc::default(),
+            picture_layout: RefCell::new(None),
             kitty_empty_generation: Cell::new(None),
             kitty_png_forwarding: false,
         };
@@ -1932,6 +1941,7 @@ impl Terminal {
         if graphics.is_null() {
             return Ok(vec![None; image_ids.len()]);
         }
+        let screen = self.active_screen()?;
         image_ids
             .iter()
             .map(|&image_id| {
@@ -1947,7 +1957,7 @@ impl Terminal {
                     ffi::GhosttyKittyGraphicsImageData_GHOSTTY_KITTY_IMAGE_DATA_GENERATION,
                 )?;
                 Ok(self.kitty_fingerprints.lock().ok().and_then(|cache| {
-                    cache
+                    cache[screen.index()]
                         .get(&image_id)
                         .filter(|entry| entry.generation == generation)
                         .map(|entry| entry.fingerprint)
@@ -1979,6 +1989,7 @@ impl Terminal {
             return Ok(Vec::new());
         }
 
+        let screen = self.active_screen()?;
         let mut iterator: ffi::GhosttyKittyGraphicsPlacementIterator = ptr::null_mut();
         unsafe {
             ffi::ghostty_kitty_graphics_placement_iterator_new(ptr::null(), &mut iterator)
@@ -1997,28 +2008,33 @@ impl Terminal {
         while unsafe { ffi::ghostty_kitty_graphics_placement_next(iterator) } {
             storage_has_placements = true;
             if let Some(placement) =
-                self.kitty_image_placement(graphics, iterator, &mut needs_data)?
+                self.kitty_image_placement(graphics, screen, iterator, &mut needs_data)?
             {
                 placements.push(placement);
             }
         }
         if !storage_has_placements {
             self.kitty_empty_generation.set(Some(generation));
-            self.prune_kitty_fingerprints(graphics);
+            self.prune_kitty_fingerprints(graphics, screen);
             return Ok(Vec::new());
         }
 
-        placements.extend(self.kitty_virtual_image_placements(graphics, &mut needs_data)?);
+        placements.extend(self.kitty_virtual_image_placements(
+            graphics,
+            screen,
+            &mut needs_data,
+        )?);
         placements.sort_by_key(|placement| placement.z);
-        self.prune_kitty_fingerprints(graphics);
+        self.prune_kitty_fingerprints(graphics, screen);
         Ok(placements)
     }
 
-    /// Fingerprint for `image`, cached per image id and recomputed only when
+    /// Fingerprint for `image`, cached per screen and image id and recomputed only when
     /// the image's generation changes.
     fn kitty_image_fingerprint_cached(
         &self,
         image: ffi::GhosttyKittyGraphicsImage,
+        screen: ActiveScreen,
         image_id: u32,
         data: (*const u8, usize),
         image_width: u32,
@@ -2034,7 +2050,7 @@ impl Terminal {
         };
 
         if let Ok(cache) = self.kitty_fingerprints.lock() {
-            if let Some(entry) = cache.get(&image_id) {
+            if let Some(entry) = cache[screen.index()].get(&image_id) {
                 if entry.generation == generation {
                     return entry.fingerprint;
                 }
@@ -2044,12 +2060,11 @@ impl Terminal {
         let fingerprint =
             kitty_image_fingerprint(data_ptr, data_len, image_width, image_height, format);
         if let Ok(mut cache) = self.kitty_fingerprints.lock() {
-            cache.insert(
+            cache[screen.index()].insert(
                 image_id,
                 KittyImageFingerprintEntry {
                     generation,
                     fingerprint,
-                    opaque: None,
                 },
             );
         }
@@ -2058,9 +2073,9 @@ impl Terminal {
 
     /// Keeps fingerprints for hidden images so scrolling them back into view
     /// does not re-hash their pixels; generation checks catch replacements.
-    fn prune_kitty_fingerprints(&self, graphics: ffi::GhosttyKittyGraphics) {
+    fn prune_kitty_fingerprints(&self, graphics: ffi::GhosttyKittyGraphics, screen: ActiveScreen) {
         if let Ok(mut cache) = self.kitty_fingerprints.lock() {
-            cache.retain(|image_id, _| {
+            cache[screen.index()].retain(|image_id, _| {
                 !unsafe { ffi::ghostty_kitty_graphics_image(graphics, *image_id) }.is_null()
             });
         }
@@ -2071,6 +2086,7 @@ impl Terminal {
     fn kitty_placement_payload<F>(
         &self,
         image: ffi::GhosttyKittyGraphicsImage,
+        screen: ActiveScreen,
         image_id: u32,
         placement_id: u32,
         image_width: u32,
@@ -2094,6 +2110,7 @@ impl Terminal {
                 kitty_image_transmission_payload(image, decoded_format, self.kitty_png_forwarding)?;
             let fingerprint = self.kitty_image_fingerprint_cached(
                 image,
+                screen,
                 image_id,
                 (data_ptr, data_len),
                 image_width,
@@ -2128,6 +2145,7 @@ impl Terminal {
     fn kitty_image_placement<F>(
         &self,
         graphics: ffi::GhosttyKittyGraphics,
+        screen: ActiveScreen,
         iterator: ffi::GhosttyKittyGraphicsPlacementIterator,
         needs_data: &mut F,
     ) -> Result<Option<KittyImagePlacement>, Error>
@@ -2182,6 +2200,7 @@ impl Terminal {
         )?;
         let (descriptor, data, source_file) = self.kitty_placement_payload(
             image,
+            screen,
             image_id,
             placement_id,
             image_width,
@@ -2239,6 +2258,7 @@ impl Terminal {
     fn kitty_virtual_image_placements<F>(
         &self,
         graphics: ffi::GhosttyKittyGraphics,
+        screen: ActiveScreen,
         needs_data: &mut F,
     ) -> Result<Vec<KittyImagePlacement>, Error>
     where
@@ -2319,6 +2339,7 @@ impl Terminal {
             let placement_id = run.synthetic_placement_id();
             let (descriptor, data, source_file) = self.kitty_placement_payload(
                 image,
+                screen,
                 image_id,
                 placement_id,
                 image_width,
@@ -4013,13 +4034,11 @@ mod tests {
             .kitty_image_placements_with_data_filter(|_| true)
             .unwrap();
         assert_eq!(first.len(), 1);
-        let first_generation = terminal
-            .kitty_fingerprints
-            .lock()
-            .unwrap()
-            .get(&7)
-            .unwrap()
-            .generation;
+        let first_generation = terminal.kitty_fingerprints.lock().unwrap()
+            [ActiveScreen::Primary.index()]
+        .get(&7)
+        .unwrap()
+        .generation;
         assert_ne!(first_generation, 0);
 
         // Retransmission removes old placements; transmit-and-display replaces it.
@@ -4029,13 +4048,11 @@ mod tests {
             .unwrap();
         assert_eq!(second.len(), 1);
         assert_ne!(first[0].data_fingerprint, second[0].data_fingerprint);
-        let second_generation = terminal
-            .kitty_fingerprints
-            .lock()
-            .unwrap()
-            .get(&7)
-            .unwrap()
-            .generation;
+        let second_generation = terminal.kitty_fingerprints.lock().unwrap()
+            [ActiveScreen::Primary.index()]
+        .get(&7)
+        .unwrap()
+        .generation;
         assert_ne!(first_generation, second_generation);
 
         // No retransmission, so the fingerprint and generation stay stable.
@@ -4044,10 +4061,7 @@ mod tests {
             .unwrap();
         assert_eq!(second[0].data_fingerprint, third[0].data_fingerprint);
         assert_eq!(
-            terminal
-                .kitty_fingerprints
-                .lock()
-                .unwrap()
+            terminal.kitty_fingerprints.lock().unwrap()[ActiveScreen::Primary.index()]
                 .get(&7)
                 .unwrap()
                 .generation,
@@ -4059,8 +4073,10 @@ mod tests {
     fn kitty_image_fingerprint_survives_hidden_placements_until_the_image_is_deleted() {
         let mut terminal = Terminal::new(10, 5, 0).unwrap();
         terminal.enable_kitty_graphics().unwrap();
-        let cached =
-            |terminal: &Terminal| terminal.kitty_fingerprints.lock().unwrap().contains_key(&7);
+        let cached = |terminal: &Terminal| {
+            terminal.kitty_fingerprints.lock().unwrap()[ActiveScreen::Primary.index()]
+                .contains_key(&7)
+        };
         terminal.write(b"\x1b_Ga=T,f=32,t=d,i=7,p=3,s=1,v=1,c=10,r=5,q=2;/wAA/w==\x1b\\");
         assert_eq!(
             terminal

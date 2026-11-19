@@ -1191,7 +1191,14 @@ pub struct PanePictureParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct PanePicture {
+#[serde(untagged)]
+pub enum PanePicture {
+    Placement(PlacedPicture),
+    Evicted(EvictedPicture),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PlacedPicture {
     pub fingerprint: String,
     pub image_px: [u32; 2],
     pub line: u32,
@@ -1209,6 +1216,33 @@ pub struct PanePicture {
 #[serde(rename_all = "snake_case")]
 pub enum PanePictureKind {
     Direct,
+    Virtual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EvictedPicture {
+    #[serde(deserialize_with = "deserialize_evicted")]
+    #[schemars(schema_with = "evicted_marker_schema")]
+    pub evicted: bool,
+    pub line: u32,
+    pub rows_above: u32,
+    pub col: u16,
+    pub cols: u32,
+    pub rows: u32,
+}
+
+fn deserialize_evicted<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    if bool::deserialize(deserializer)? {
+        Ok(true)
+    } else {
+        Err(serde::de::Error::custom("evicted must be true"))
+    }
+}
+
+fn evicted_marker_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "boolean", "const": true})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

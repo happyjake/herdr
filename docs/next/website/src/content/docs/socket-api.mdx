@@ -1555,6 +1555,45 @@ ansi` reads of `recent` and `recent_unwrapped`; other reads ignore them.
 Servers advertise them with `capabilities.read_continuity: true`; older
 servers ignore both fields and always answer the full window.
 
+**Kitty pictures.** A pong with `capabilities.pane_pictures: true` indicates
+support for picture placement metadata and a separate fetch method. On
+`format: "ansi"` reads of `visible`, `recent`, and `recent_unwrapped`,
+`result.read.pictures` contains the complete placement list for the window.
+It applies to offset reads and to continued replies, including when
+`before` and `after` are empty. Replace the previous list with each
+reply. Both `pictures` and `cell_px` are omitted when there is nothing to
+show. `cell_px: [width, height]` gives the terminal cell size in pixels.
+
+Each placement has an opaque 16-hex `fingerprint` of the root image
+pixels, `image_px: [width, height]`, and a `kind` of `direct` or
+`virtual`. `line` is the zero-based first covered line in the full
+read window, and `col` is the terminal-grid column. `rows_above`
+counts rows clipped above the window. `cols` and `rows` give the
+full cell span. `crop: [x, y, width, height]` gives the resolved source
+rectangle in image pixels, including any terminal scroll-margin clipping.
+`z` is the stacking order and `opaque` means every root pixel has
+alpha 255. A picture can cover trailing blank rows beyond `text`.
+An unwrapped read omits pictures crossing soft-wrapped rows. Direct
+placements can appear in scrollback. Virtual placements are limited to
+viewport rows, and a virtual entry whose image has been evicted carries
+only `evicted: true`, `line`, `rows_above`, `col`, `cols`, and `rows`.
+
+Fetch a listed fingerprint from the same pane and server process with
+`pane.picture` and params `{pane_id, fingerprint, width_px}`. Use a
+dedicated connection with one request and at most two concurrent fetches
+per client. Request the width of the whole image in pixels, even for a
+cropped placement. The server rounds up to a multiple of 64 and clamps
+to 64–2,048 px and to the source width. It downscales by area averaging.
+
+The result has `type: "pane_picture"`, `fingerprint`, `media_type`,
+`px: [width, height]`, and `data_b64`. Opaque pictures use JPEG at
+quality 85. Pictures with alpha use PNG. The server halves the dimensions
+until the encoded payload is at most 768 KiB (1 MiB of base64) and the
+longest edge is at most 4,096 px. Use the returned `px` as the actual
+dimensions. Before consulting its cache, the server verifies that the pane
+still holds the fingerprint. Treat `picture_not_held` as final for that
+placement. On `picture_busy`, retry with backoff while it is still current.
+
 ## Waiting for state
 
 Use waits to coordinate agents and scripts.

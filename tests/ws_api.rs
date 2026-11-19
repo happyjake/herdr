@@ -545,7 +545,14 @@ fn start_ws_test_server_with_executable_and_env(
     executable: &Path,
     extra_env: &[(&str, &str)],
 ) -> WsTestServer {
-    let base = unique_test_dir();
+    start_ws_test_server_at(executable, unique_test_dir(), extra_env)
+}
+
+fn start_ws_test_server_at(
+    executable: &Path,
+    base: PathBuf,
+    extra_env: &[(&str, &str)],
+) -> WsTestServer {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("herdr.sock");

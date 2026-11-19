@@ -65,15 +65,15 @@ pub(super) fn fetch(
         return;
     };
     let width_bucket = params.width_px.clamp(64, 2048).div_ceil(64) * 64;
-    let key = (fingerprint, width_bucket);
+    let Ok(permit) = ENCODE_JOBS.try_acquire() else {
+        let _ = respond_to.send(encode_error(id, "picture_busy", "picture workers are busy"));
+        return;
+    };
     tokio::spawn(async move {
-        let Ok(permit) = ENCODE_JOBS.acquire().await else {
-            return;
-        };
         let reply_id = id.clone();
         let response = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            match fetch_picture(terminal, key) {
+            match fetch_picture(terminal, fingerprint, width_bucket) {
                 Ok(Some(picture)) => encode_success(
                     id,
                     ResponseResult::PanePicture {
@@ -121,45 +121,59 @@ fn picture_not_held(id: String) -> String {
     )
 }
 
-enum PictureToFetch {
-    Cached(Arc<EncodedPicture>),
-    Pixels(KittyPicturePixels),
-}
-
 fn fetch_picture(
     terminal: PictureTerminal,
-    key: CacheKey,
+    fingerprint: u64,
+    width_bucket: u32,
 ) -> io::Result<Option<Arc<EncodedPicture>>> {
-    let image = terminal.with_held_image(key.0, |image| {
-        // The pane must still own the fingerprint even if another pane or
-        // an earlier fetch populated the process-wide cache.
-        if let Some(picture) = CACHE
-            .lock()
-            .ok()
-            .and_then(|cache| cache.entries.get(&key).cloned())
-        {
-            Ok(PictureToFetch::Cached(picture))
-        } else {
-            image
-                .pixels()
-                .map(PictureToFetch::Pixels)
-                .map_err(io::Error::other)
-        }
-    })?;
-    let pixels = match image {
-        Some(PictureToFetch::Cached(picture)) => return Ok(Some(picture)),
-        Some(PictureToFetch::Pixels(pixels)) => pixels,
-        None => return Ok(None),
+    let Some(image) = terminal.held_image(fingerprint)? else {
+        return Ok(None);
     };
+    // Validate live storage before the process-wide cache. Widths above
+    // the source's native width share one actual encode.
+    let width = width_bucket.min(image.image_px()[0]);
+    let key = (fingerprint, width);
+    if let Some(picture) = CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.entries.get(&key).cloned())
+    {
+        return Ok(Some(picture));
+    }
 
-    let picture = Arc::new(encode_picture(pixels, key.1)?);
+    #[cfg(debug_assertions)]
+    wait_at_test_encode_barrier()?;
+    let picture = Arc::new(encode_picture(image.pixels()?, width)?);
     if let Ok(mut cache) = CACHE.lock() {
         cache.insert(key, picture.clone());
     }
     Ok(Some(picture))
 }
 
-fn encode_picture(image: KittyPicturePixels, width_bucket: u32) -> io::Result<EncodedPicture> {
+#[cfg(debug_assertions)]
+fn wait_at_test_encode_barrier() -> io::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    static ARRIVALS: AtomicUsize = AtomicUsize::new(0);
+    let Some(path) = std::env::var_os("HERDR_TEST_PICTURE_ENCODE_BARRIER") else {
+        return Ok(());
+    };
+    let dir = std::path::PathBuf::from(path);
+    let arrival = ARRIVALS.fetch_add(1, Ordering::Relaxed);
+    std::fs::write(dir.join(format!("entered-{arrival}")), [])?;
+    let release = dir.join("release");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !release.exists() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other("picture encode barrier timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+fn encode_picture(image: KittyPicturePixels<'_>, width_bucket: u32) -> io::Result<EncodedPicture> {
     let [width, height] = image.image_px;
     let channels = match image.format {
         KittyImageFormat::Rgb => 3,
@@ -181,7 +195,7 @@ fn encode_picture(image: KittyPicturePixels, width_bucket: u32) -> io::Result<En
     loop {
         if px[0].max(px[1]) <= MAX_EDGE_PX {
             let data = if px == image.image_px {
-                Cow::Borrowed(image.data.as_slice())
+                Cow::Borrowed(image.data.as_ref())
             } else {
                 Cow::Owned(area_average(&image, px, channels, opaque))
             };
@@ -223,7 +237,7 @@ fn encode_picture(image: KittyPicturePixels, width_bucket: u32) -> io::Result<En
 /// Coordinates are in units of 1/dst_width and 1/dst_height source pixels.
 /// Use premultiplied RGB while averaging transparent pixels.
 fn area_average(
-    image: &KittyPicturePixels,
+    image: &KittyPicturePixels<'_>,
     dst: [u32; 2],
     channels: usize,
     opaque: bool,

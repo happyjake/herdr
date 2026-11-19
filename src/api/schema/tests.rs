@@ -338,6 +338,25 @@ fn bundled_protocol_schema_refs_resolve_inside_bundle() {
 }
 
 #[test]
+fn pane_picture_schema_accepts_virtual_and_evicted_placements() {
+    let virtual_picture = serde_json::json!({
+        "fingerprint": "9f2c4dd683fe9120", "image_px": [100, 50],
+        "line": 12, "rows_above": 0, "col": 4, "cols": 10, "rows": 4,
+        "crop": [5, 0, 95, 50], "z": 0, "opaque": true, "kind": "virtual"
+    });
+    let evicted = serde_json::json!({
+        "evicted": true, "line": 3, "rows_above": 1, "col": 0, "cols": 5, "rows": 2
+    });
+    for value in [virtual_picture, evicted.clone()] {
+        let entry = serde_json::from_value::<PanePicture>(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(entry).unwrap(), value);
+    }
+    let mut invalid = evicted;
+    invalid["evicted"] = false.into();
+    assert!(serde_json::from_value::<PanePicture>(invalid).is_err());
+}
+
+#[test]
 fn generated_protocol_schema_artifact_is_current() {
     let actual = format!(
         "{}\n",

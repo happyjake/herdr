@@ -3023,6 +3023,12 @@ impl HeadlessServer {
             return changed;
         }
 
+        if let api::schema::Method::PanePicture(params) = msg.request.method {
+            self.app
+                .handle_pane_picture(msg.request.id, params, msg.respond_to);
+            return changed;
+        }
+
         // Capture toast and effective pane states before the API call so we can
         // forward resulting client-local notifications. API requests like
         // pane.report_agent trigger handle_internal_event internally, which
@@ -3066,11 +3072,6 @@ impl HeadlessServer {
             })
             .unwrap_or_else(|_| "{}".to_owned());
             let _ = msg.respond_to.send(response);
-            return changed;
-        }
-        if let api::schema::Method::PanePicture(params) = msg.request.method {
-            self.app
-                .handle_pane_picture(msg.request.id, params, msg.respond_to);
             return changed;
         }
         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);

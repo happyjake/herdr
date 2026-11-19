@@ -534,6 +534,60 @@ GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_image(
     GhosttyKittyGraphics graphics,
     uint32_t image_id);
 
+/** Borrowed image storage for the requested screen, or NULL if absent. */
+GHOSTTY_API GhosttyKittyGraphics ghostty_kitty_graphics_storage_for_screen(
+    GhosttyTerminal terminal, bool alternate);
+
+/**
+ * Visit the images of both screens, including images without placements.
+ * Returning true stops iteration. The visitor must not mutate the terminal or
+ * retain the borrowed handles. It is invoked synchronously.
+ */
+GHOSTTY_API void ghostty_kitty_graphics_visit_images(
+    GhosttyTerminal terminal,
+    bool (*visit)(GhosttyKittyGraphicsImage image, void *context),
+    void *context);
+
+/** Generation of the root pixels, unaffected by animation playback. */
+GHOSTTY_API uint64_t ghostty_kitty_graphics_image_root_generation(
+    GhosttyKittyGraphicsImage image);
+
+/** Opaque reference to immutable root bytes independent of the terminal. */
+typedef struct GhosttyKittyImageRootRefImpl *GhosttyKittyImageRootRef;
+
+/**
+ * Retain the image's root bytes without copying them. The bytes are valid
+ * until the reference is released, including after the terminal is freed.
+ * out_png indicates encoded PNG data. Pending and host-backed images
+ * return GHOSTTY_NO_VALUE. Callers releasing a reference across threads
+ * must use a thread-safe terminal allocator.
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_root_ref(
+    GhosttyTerminal terminal, bool alternate, uint32_t id,
+    GhosttyKittyImageRootRef *out_ref, const uint8_t **out_ptr, size_t *out_len,
+    bool *out_png);
+
+/** Release the caller's reference to the root bytes. */
+GHOSTTY_API void ghostty_kitty_graphics_image_root_unref(GhosttyKittyImageRootRef root);
+
+/**
+ * Visit page-node identities and their starting screen rows in one forward
+ * pass. The node identity is comparable to GhosttyGridRef.node only while
+ * the terminal stays unchanged. The callback is synchronous.
+ */
+GHOSTTY_API void ghostty_kitty_graphics_visit_screen_pages(
+    GhosttyTerminal terminal, void (*visit)(const void *node, uint32_t row, void *context),
+    void *context);
+
+/**
+ * Write one byte per screen row, starting at first. Bits 0, 1, and 2
+ * indicate soft wrap, wrap continuation, and an unwrapped formatter
+ * line break respectively.
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_screen_row_evidence(
+    GhosttyTerminal terminal, uint32_t first, uint8_t *out, uint32_t count);
+
+
 /**
  * Get data from a Kitty graphics image.
  *

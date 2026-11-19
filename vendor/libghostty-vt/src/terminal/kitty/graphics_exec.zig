@@ -11,7 +11,8 @@ const Command = command.Command;
 const Response = command.Response;
 const LoadingImage = image.LoadingImage;
 const Image = image.Image;
-const ImageStorage = @import("graphics_storage.zig").ImageStorage;
+const kitty_storage = @import("graphics_storage.zig");
+const ImageStorage = kitty_storage.ImageStorage;
 
 const log = std.log.scoped(.kitty_gfx);
 
@@ -722,6 +723,13 @@ fn completeAnimationFrame(
 
         // The frame data is owned by this storage, so the const cast
         // is safe (same reasoning as the renderer's image uploads).
+        if (number == 1) {
+            img.makeRootWritable(alloc) catch |err| {
+                encodeError(&result, err);
+                return result;
+            };
+            img.root_generation = kitty_storage.nextGeneration(io);
+        }
         const dst = @constCast(img.frameData(number).?);
         pixel.composeRect(
             dst,
@@ -931,6 +939,13 @@ fn composeAnimation(
     // The frame data is owned by this storage, so the const cast is
     // safe. The rectangles were validated disjoint above, so in-place
     // composition within one frame is well-defined.
+    if (c.dest_frame == 1) {
+        img.makeRootWritable(alloc) catch |err| {
+            encodeError(&result, err);
+            return result;
+        };
+        img.root_generation = kitty_storage.nextGeneration(io);
+    }
     const src = img.frameData(c.source_frame).?;
     const dst = @constCast(img.frameData(c.dest_frame).?);
     pixel.composeCanvasRect(
