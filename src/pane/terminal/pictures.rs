@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::schema::{PanePicture, PanePictureKind, PlacedPicture, ReadSource};
+use crate::api::schema::{EvictedPicture, PanePicture, PanePictureKind, PlacedPicture, ReadSource};
 
 #[derive(Default)]
 pub(crate) struct PaneAnsiRead {
@@ -51,7 +51,7 @@ impl GhosttyPaneTerminal {
         let unwrapped = source == ReadSource::RecentUnwrapped;
         let has_placements = core
             .terminal
-            .kitty_graphics_may_have_placements()
+            .kitty_graphics_may_have_picture_cells()
             .unwrap_or(false);
         let (mut read, row_range) = if let Some(offset_from_bottom) = offset {
             let window = ghostty_recent_read_at_offset(
@@ -178,10 +178,16 @@ fn extend_recent_picture_rows(
     Some(start..=end)
 }
 
+enum ReadPictureSample {
+    Direct(crate::ghostty::KittyPictureSample),
+    Virtual(crate::ghostty::KittyPictureSample),
+    Evicted(crate::ghostty::KittyEvictedPictureSample),
+}
+
 pub(crate) struct PictureReadSamples {
     cell_px: [u32; 2],
     first_row: u32,
-    pictures: Vec<crate::ghostty::KittyPictureSample>,
+    pictures: Vec<ReadPictureSample>,
 }
 
 pub(crate) struct ReadPictures {
@@ -193,36 +199,65 @@ impl PictureReadSamples {
     pub(crate) fn finish(self) -> Option<ReadPictures> {
         let mut entries = Vec::with_capacity(self.pictures.len());
         for sample in self.pictures {
-            let picture = match sample.finish() {
-                Ok(picture) => picture,
-                Err(error) => {
-                    debug!(%error, "could not resolve a Kitty picture sample");
-                    continue;
+            let entry = match sample {
+                ReadPictureSample::Direct(sample) => {
+                    finish_placed_sample(sample, self.first_row, PanePictureKind::Direct)
                 }
+                ReadPictureSample::Virtual(sample) => {
+                    finish_placed_sample(sample, self.first_row, PanePictureKind::Virtual)
+                }
+                ReadPictureSample::Evicted(sample) => Some(PanePicture::Evicted(EvictedPicture {
+                    evicted: true,
+                    line: sample.line,
+                    rows_above: self.first_row.saturating_sub(sample.screen_row),
+                    col: sample.col,
+                    cols: sample.cols,
+                    rows: sample.rows,
+                })),
             };
-            entries.push(PlacedPicture {
-                fingerprint: format!("{:016x}", picture.fingerprint),
-                image_px: picture.image_px,
-                line: picture.line,
-                rows_above: self.first_row.saturating_sub(picture.screen_row),
-                col: picture.col,
-                cols: picture.cols,
-                rows: picture.rows,
-                crop: picture.crop,
-                z: picture.z,
-                opaque: picture.opaque,
-                kind: PanePictureKind::Direct,
-            });
+            if let Some(entry) = entry {
+                entries.push(entry);
+            }
         }
         if entries.is_empty() {
             return None;
         }
-        entries.sort_by_key(|p| p.z);
+        entries.sort_by_key(|entry| match entry {
+            PanePicture::Placement(picture) => picture.z,
+            PanePicture::Evicted(_) => 0,
+        });
         Some(ReadPictures {
             cell_px: self.cell_px,
-            entries: entries.into_iter().map(PanePicture::Placement).collect(),
+            entries,
         })
     }
+}
+
+fn finish_placed_sample(
+    sample: crate::ghostty::KittyPictureSample,
+    first_row: u32,
+    kind: PanePictureKind,
+) -> Option<PanePicture> {
+    let picture = match sample.finish() {
+        Ok(picture) => picture,
+        Err(error) => {
+            debug!(%error, "could not resolve a Kitty picture sample");
+            return None;
+        }
+    };
+    Some(PanePicture::Placement(PlacedPicture {
+        fingerprint: format!("{:016x}", picture.fingerprint),
+        image_px: picture.image_px,
+        line: picture.line,
+        rows_above: first_row.saturating_sub(picture.screen_row),
+        col: picture.col,
+        cols: picture.cols,
+        rows: picture.rows,
+        crop: picture.crop,
+        z: picture.z,
+        opaque: picture.opaque,
+        kind,
+    }))
 }
 
 fn sample_read_pictures(
@@ -233,7 +268,24 @@ fn sample_read_pictures(
     revision: u64,
 ) -> Result<Option<PictureReadSamples>, crate::ghostty::Error> {
     let first_row = *rows.start();
-    let pictures = terminal.sample_kitty_direct_pictures(rows, unwrapped, paged, Some(revision))?;
+    let mut pictures: Vec<ReadPictureSample> = terminal
+        .sample_kitty_direct_pictures(rows.clone(), unwrapped, paged, Some(revision))?
+        .into_iter()
+        .map(ReadPictureSample::Direct)
+        .collect();
+    pictures.extend(
+        terminal
+            .sample_kitty_virtual_pictures(rows, unwrapped, paged, Some(revision))?
+            .into_iter()
+            .map(|sample| match sample {
+                crate::ghostty::KittyVirtualPictureSample::Stored(sample) => {
+                    ReadPictureSample::Virtual(sample)
+                }
+                crate::ghostty::KittyVirtualPictureSample::Evicted(sample) => {
+                    ReadPictureSample::Evicted(sample)
+                }
+            }),
+    );
     if pictures.is_empty() {
         return Ok(None);
     }

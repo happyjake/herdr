@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Cursor};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde_json::{json, Value};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde_json::{Value, json};
 
 use super::*;
 
@@ -152,6 +152,86 @@ fn opaque_png() -> Vec<u8> {
             .unwrap();
     }
     png
+}
+
+fn virtual_placeholder_row(image_id: u32, row: usize, cols: usize) -> String {
+    const DIACRITICS: [char; 8] = [
+        '\u{0305}', '\u{030d}', '\u{030e}', '\u{0310}', '\u{0312}', '\u{033d}', '\u{033e}',
+        '\u{033f}',
+    ];
+    let [blue, green, red] = image_id.to_le_bytes()[..3] else {
+        unreachable!()
+    };
+    let mut cells = format!("\x1b[38;2;{red};{green};{blue}m");
+    for col in 0..cols {
+        cells.push('\u{10eeee}');
+        if col == 0 {
+            cells.push(DIACRITICS[row]);
+            cells.push(DIACRITICS[0]);
+        }
+    }
+    cells.push_str("\x1b[0m");
+    cells
+}
+
+#[cfg(unix)]
+struct SharedMemory {
+    name: std::ffi::CString,
+    fd: libc::c_int,
+}
+
+#[cfg(unix)]
+impl SharedMemory {
+    fn new(data: &[u8]) -> Self {
+        let name =
+            std::ffi::CString::new(format!("/kitty-picture-{}", std::process::id())).unwrap();
+        unsafe {
+            libc::shm_unlink(name.as_ptr());
+            let fd = libc::shm_open(
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                0o600,
+            );
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(
+                libc::ftruncate(fd, data.len() as libc::off_t),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            let mapping = libc::mmap(
+                std::ptr::null_mut(),
+                data.len(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            assert_ne!(
+                mapping,
+                libc::MAP_FAILED,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mapping.cast::<u8>(), data.len());
+            assert_eq!(libc::munmap(mapping, data.len()), 0);
+            Self { name, fd }
+        }
+    }
+
+    fn name_bytes(&self) -> Vec<u8> {
+        self.name.as_bytes().to_vec()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SharedMemory {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+            libc::shm_unlink(self.name.as_ptr());
+        }
+    }
 }
 
 fn image_bytes(response: &Value) -> Vec<u8> {
@@ -306,6 +386,211 @@ fn pane_read_lists_direct_kitty_pictures() {
         assert!(paged["effective_offset"].as_u64().unwrap() > 100, "{paged}");
         assert_eq!(paged["pictures"], json!([expected]), "{source}: {paged}");
     }
+}
+
+#[test]
+fn pane_read_merges_virtual_placeholder_rows_and_fetches_the_image() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let rgba = [20, 40, 60, 255].repeat(32 * 64);
+    let picture = kitty_data("a=T,U=1,f=32,s=32,v=64,q=2,i=31,c=4,r=8,z=-1", &rgba);
+    let mut placeholders = String::new();
+    for row in 0..8 {
+        placeholders.push_str(&format!("\x1b[{};5H", row + 2));
+        placeholders.push_str(&virtual_placeholder_row(31, row, 4));
+    }
+    let draw = format!("\x1b[2J\x1b[Hvirtual{picture}{placeholders}\x1b[12;1Hvirtual-ready");
+    let mut scroll = "\r\n".to_owned();
+    for index in 0..125 {
+        scroll.push_str(&format!("virtual history {index}\r\n"));
+    }
+    scroll.push_str("virtual-history-ready");
+    server.run_stages(&[draw, scroll]);
+    server.wait("virtual-ready");
+
+    let visible = server.read("visible", json!({}));
+    let fingerprint = visible["pictures"][0]["fingerprint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{visible}"));
+    let expected = json!({
+        "fingerprint":fingerprint,"image_px":[32,64],"line":1,"rows_above":0,
+        "col":4,"cols":4,"rows":8,"crop":[0,0,32,64],"z":-1,
+        "opaque":true,"kind":"virtual"
+    });
+    for source in ["visible", "recent", "recent_unwrapped"] {
+        let read = server.read(source, json!({}));
+        assert_eq!(read["pictures"], json!([expected]), "{source}: {read}");
+        assert_eq!(read["cell_px"], json!([8, 16]));
+    }
+    let fetch = server.fetch(fingerprint, 2048);
+    assert_eq!(fetch["result"]["media_type"], "image/jpeg", "{fetch}");
+    assert_eq!(fetch["result"]["px"], json!([32, 64]));
+
+    server.advance();
+    server.wait("virtual-history-ready");
+    let visible = server.read("visible", json!({}));
+    assert!(visible.get("pictures").is_none() && visible.get("cell_px").is_none());
+    for source in ["recent", "recent_unwrapped"] {
+        let paged = server.read(source, json!({"lines":8,"offset_from_bottom":10000}));
+        assert!(paged["effective_offset"].as_u64().unwrap() > 100, "{paged}");
+        assert!(paged.get("pictures").is_none(), "{source}: {paged}");
+        assert!(paged.get("cell_px").is_none(), "{source}: {paged}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pane_read_and_fetch_support_shared_memory_virtual_pictures() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let shared = SharedMemory::new(&[50, 100, 150, 255].repeat(8 * 16));
+    let picture = kitty_data(
+        "a=T,U=1,t=s,f=32,s=8,v=16,q=2,i=34,c=2,r=2",
+        &shared.name_bytes(),
+    );
+    let mut placeholders = String::new();
+    for row in 0..2 {
+        placeholders.push_str(&format!("\x1b[{};4H", row + 2));
+        placeholders.push_str(&virtual_placeholder_row(34, row, 2));
+    }
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[Hshared{picture}{placeholders}\x1b[6;1Hshared-ready"
+    )]);
+    server.wait("shared-ready");
+
+    let read = server.read("visible", json!({}));
+    let picture = &read["pictures"][0];
+    assert_eq!(picture["kind"], "virtual", "{read}");
+    assert_eq!(picture["image_px"], json!([8, 16]), "{read}");
+    assert_eq!(picture["cols"], json!(2), "{read}");
+    assert_eq!(picture["rows"], json!(2), "{read}");
+    assert_eq!(picture["crop"], json!([0, 0, 8, 16]), "{read}");
+    let fingerprint = picture["fingerprint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{read}"));
+    let fetch = server.fetch(fingerprint, 2048);
+    assert_eq!(fetch["result"]["media_type"], "image/jpeg", "{fetch}");
+    assert_eq!(fetch["result"]["px"], json!([8, 16]));
+}
+
+#[test]
+fn pane_read_splits_nonrectangular_virtual_runs_and_clips_at_window_top() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let rgba = [10, 80, 30, 255].repeat(40 * 40);
+    let picture = kitty_data("a=T,U=1,f=32,s=40,v=40,q=2,i=33,c=5,r=5", &rgba);
+    let mut placeholders = String::new();
+    for (screen_row, source_row, cols) in [(2, 1, 5), (3, 2, 5), (4, 3, 3), (5, 4, 3)] {
+        placeholders.push_str(&format!("\x1b[{screen_row};3H"));
+        placeholders.push_str(&virtual_placeholder_row(33, source_row, cols));
+    }
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[Hshapes{picture}{placeholders}\x1b[8;1Hshapes-ready"
+    )]);
+    server.wait("shapes-ready");
+
+    let read = server.read("visible", json!({}));
+    let fingerprint = read["pictures"][0]["fingerprint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{read}"));
+    let wide = json!({
+        "fingerprint":fingerprint,"image_px":[40,40],"line":1,"rows_above":0,
+        "col":2,"cols":5,"rows":2,"crop":[0,8,40,16],"z":0,
+        "opaque":true,"kind":"virtual"
+    });
+    let narrow = json!({
+        "fingerprint":fingerprint,"image_px":[40,40],"line":3,"rows_above":0,
+        "col":2,"cols":3,"rows":2,"crop":[0,24,24,16],"z":0,
+        "opaque":true,"kind":"virtual"
+    });
+    assert_eq!(read["pictures"], json!([wide, narrow]), "{read}");
+
+    let clipped = server.read("visible", json!({"lines":6}));
+    let mut clipped_wide = wide.clone();
+    clipped_wide["line"] = json!(0);
+    clipped_wide["rows_above"] = json!(1);
+    let mut clipped_narrow = narrow.clone();
+    clipped_narrow["line"] = json!(1);
+    assert_eq!(
+        clipped["pictures"],
+        json!([clipped_wide, clipped_narrow]),
+        "{clipped}"
+    );
+}
+
+#[test]
+fn pane_read_refreshes_virtual_placeholders_when_text_revision_changes() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let rgba = [25, 75, 125, 255].repeat(8 * 16);
+    let picture = kitty_data("a=T,U=1,f=32,s=8,v=16,q=2,i=35,c=2,r=2", &rgba);
+    let mut placeholders = String::new();
+    for row in 0..2 {
+        placeholders.push_str(&format!("\x1b[{};4H", row + 2));
+        placeholders.push_str(&virtual_placeholder_row(35, row, 2));
+    }
+    server.run_stages(&[
+        format!("\x1b[2J\x1b[Hrevision{picture}{placeholders}\x1b[6;1Hcache-ready"),
+        "\x1b[2;4H  \x1b[3;4H  \x1b[6;1H\x1b[2Kcache-blank-ready".into(),
+        format!("{placeholders}\x1b[6;1H\x1b[2Kcache-redraw-ready"),
+    ]);
+    server.wait("cache-ready");
+    let initial = server.read("visible", json!({}));
+    assert_eq!(initial["pictures"][0]["kind"], "virtual", "{initial}");
+    assert_eq!(initial["pictures"][0]["crop"], json!([0, 0, 8, 16]));
+
+    server.advance();
+    server.wait("cache-blank-ready");
+    let blank = server.read("visible", json!({}));
+    assert!(blank.get("pictures").is_none(), "{blank}");
+    assert!(blank.get("cell_px").is_none(), "{blank}");
+    assert!(server.read("visible", json!({})).get("pictures").is_none());
+
+    server.advance();
+    server.wait("cache-redraw-ready");
+    let redrawn = server.read("visible", json!({}));
+    assert_eq!(redrawn["pictures"], initial["pictures"], "{redrawn}");
+}
+
+#[test]
+fn pane_read_reports_evicted_virtual_placeholders() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let rgba = [90, 30, 10, 255].repeat(24 * 32);
+    let picture = kitty_data("a=T,U=1,f=32,s=24,v=32,q=2,i=32,c=3,r=2", &rgba);
+    let mut placeholders = String::new();
+    for row in 0..2 {
+        placeholders.push_str(&format!("\x1b[{};2H", row + 3));
+        placeholders.push_str(&virtual_placeholder_row(32, row, 3));
+    }
+    server.run_stages(&[
+        format!("\x1b[2J\x1b[Heviction{picture}{placeholders}\x1b[8;1Heviction-ready"),
+        "\x1b_Ga=d,d=I,i=32,q=2;\x1b\\\x1b[8;1H\x1b[2Kevicted-ready".into(),
+    ]);
+    server.wait("eviction-ready");
+    let fingerprint = server.read("visible", json!({}))["pictures"][0]["fingerprint"]
+        .as_str()
+        .expect("stored virtual picture")
+        .to_owned();
+
+    server.advance();
+    server.wait("evicted-ready");
+    let expected = json!({
+        "evicted":true,"line":2,"rows_above":0,"col":1,"cols":3,"rows":2
+    });
+    for source in ["visible", "recent", "recent_unwrapped"] {
+        let read = server.read(source, json!({}));
+        assert_eq!(read["pictures"], json!([expected]), "{source}: {read}");
+        assert_eq!(read["cell_px"], json!([8, 16]));
+    }
+    assert_eq!(
+        server.read("visible", json!({}))["pictures"],
+        json!([expected])
+    );
+    assert_eq!(
+        server.fetch(&fingerprint, 64)["error"]["code"],
+        "picture_not_held"
+    );
 }
 
 #[test]

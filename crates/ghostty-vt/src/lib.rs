@@ -30,7 +30,8 @@ mod native_image_sources;
 mod native_source;
 mod pictures;
 pub use pictures::{
-    KittyPicture, KittyPictureImage, KittyPictureLookup, KittyPicturePixels, KittyPictureSample,
+    KittyEvictedPictureSample, KittyPicture, KittyPictureImage, KittyPictureLookup,
+    KittyPicturePixels, KittyPictureSample, KittyVirtualPictureSample,
 };
 pub mod pane_graphics_files;
 
@@ -864,6 +865,7 @@ pub struct Terminal {
     kitty_fingerprints: Mutex<[HashMap<u32, KittyImageFingerprintEntry>; 2]>,
     picture_catalog: Arc<Mutex<pictures::PictureCatalog>>,
     picture_layout: RefCell<Option<pictures::PictureLayout>>,
+    virtual_picture_layout: RefCell<Option<pictures::VirtualPictureLayout>>,
     kitty_empty_generation: Cell<Option<u64>>,
     kitty_png_forwarding: bool,
 }
@@ -892,6 +894,7 @@ impl Terminal {
             kitty_fingerprints: Mutex::default(),
             picture_catalog: Arc::default(),
             picture_layout: RefCell::new(None),
+            virtual_picture_layout: RefCell::new(None),
             kitty_empty_generation: Cell::new(None),
             kitty_png_forwarding: false,
         };
@@ -1934,6 +1937,12 @@ impl Terminal {
     pub fn kitty_graphics_may_have_placements(&self) -> Result<bool, Error> {
         let generation = self.kitty_graphics_generation()?;
         Ok(generation != 0 && self.kitty_empty_generation.get() != Some(generation))
+    }
+
+    /// Placeholder cells can outlive their image and placement storage, so an
+    /// empty-placement generation cannot prove that a picture read is empty.
+    pub fn kitty_graphics_may_have_picture_cells(&self) -> Result<bool, Error> {
+        Ok(self.kitty_graphics_generation()? != 0)
     }
 
     /// Current fingerprint of each stored image, placed or not, when it is known
