@@ -5,6 +5,14 @@ use std::ptr::NonNull;
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static DIRECT_LAYOUT_BUILDS: Cell<usize> = const { Cell::new(0) };
+    static VIRTUAL_CELL_READS: Cell<usize> = const { Cell::new(0) };
+    static VIRTUAL_STYLE_READS: Cell<usize> = const { Cell::new(0) };
+    pub(super) static VIRTUAL_SPEC_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
 #[derive(Debug)]
 pub struct KittyPicture {
     pub fingerprint: u64,
@@ -380,6 +388,7 @@ struct Placement {
 pub(super) struct PictureLayout {
     generation: u64,
     revision: Option<u64>,
+    has_direct_placements: bool,
     placements: Vec<Placement>,
     evidence: Option<RowEvidence>,
 }
@@ -392,8 +401,10 @@ struct RowRange {
 }
 
 pub(super) struct VirtualPictureLayout {
+    screen: ActiveScreen,
     generation: u64,
     revision: Option<u64>,
+    viewport_origin: usize,
     placements: Vec<VirtualPlacement>,
     evidence: Option<RowEvidence>,
 }
@@ -577,15 +588,18 @@ impl Terminal {
         }
 
         let mut cache = self.picture_layout.borrow_mut();
-        if revision.is_none()
-            || cache
-                .as_ref()
-                .is_none_or(|layout| layout.generation != generation || layout.revision != revision)
-        {
+        if cache.as_ref().is_none_or(|layout| {
+            layout.generation != generation
+                || (layout.has_direct_placements
+                    && (revision.is_none() || layout.revision != revision))
+        }) {
+            let (placements, has_direct_placements) =
+                self.picture_placements(graphics, generation)?;
             *cache = Some(PictureLayout {
                 generation,
                 revision,
-                placements: self.picture_placements(graphics, generation)?,
+                has_direct_placements,
+                placements,
                 evidence: None,
             });
         }
@@ -706,7 +720,9 @@ impl Terminal {
         &self,
         graphics: ffi::GhosttyKittyGraphics,
         generation: u64,
-    ) -> Result<Vec<Placement>, Error> {
+    ) -> Result<(Vec<Placement>, bool), Error> {
+        #[cfg(test)]
+        DIRECT_LAYOUT_BUILDS.with(|count| count.set(count.get() + 1));
         let mut raw = ptr::null_mut();
         unsafe {
             ffi::ghostty_kitty_graphics_placement_iterator_new(ptr::null(), &mut raw)
@@ -724,10 +740,20 @@ impl Terminal {
         }
         let mut pictures = Vec::new();
         let mut has_placements = false;
+        let mut has_direct_placements = false;
         let mut pages = None;
         let last_row = u32::try_from(self.total_rows()?.saturating_sub(1)).unwrap_or(u32::MAX);
         while unsafe { ffi::ghostty_kitty_graphics_placement_next(iterator) } {
             has_placements = true;
+            match kitty_placement_bool(iterator, KITTY_PLACEMENT_DATA_IS_VIRTUAL) {
+                Ok(true) => continue,
+                Ok(false) => has_direct_placements = true,
+                Err(error) => {
+                    has_direct_placements = true;
+                    tracing::debug!(%error, "could not identify a Kitty picture placement");
+                    continue;
+                }
+            }
             match self.picture_placement(graphics, iterator, &mut pages, last_row) {
                 Ok(Some(placement)) => pictures.push(placement),
                 Ok(None) => {}
@@ -743,7 +769,7 @@ impl Terminal {
             max_bottom = max_bottom.max(picture.bottom);
             picture.max_bottom = max_bottom;
         }
-        Ok(pictures)
+        Ok((pictures, has_direct_placements))
     }
 
     fn picture_placement(
@@ -753,9 +779,6 @@ impl Terminal {
         pages: &mut Option<HashMap<usize, u32>>,
         last_row: u32,
     ) -> Result<Option<Placement>, Error> {
-        if kitty_placement_bool(iterator, KITTY_PLACEMENT_DATA_IS_VIRTUAL)? {
-            return Ok(None);
-        }
         let image_id = kitty_placement_u32(
             iterator,
             ffi::GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID,
@@ -849,6 +872,7 @@ struct EvictedPlacement {
     image_id: u32,
     screen_row: u32,
     bottom: u32,
+    wrapped: Option<bool>,
     max_bottom: u32,
     col: u16,
     cols: u32,
@@ -874,6 +898,20 @@ impl VirtualPlacement {
         match self {
             Self::Stored(placement) => placement.bottom,
             Self::Evicted(placement) => placement.bottom,
+        }
+    }
+
+    fn wrapped(self) -> Option<bool> {
+        match self {
+            Self::Stored(placement) => placement.wrapped,
+            Self::Evicted(placement) => placement.wrapped,
+        }
+    }
+
+    fn set_wrapped(&mut self, wrapped: bool) {
+        match self {
+            Self::Stored(placement) => placement.wrapped = Some(wrapped),
+            Self::Evicted(placement) => placement.wrapped = Some(wrapped),
         }
     }
 
@@ -917,27 +955,38 @@ impl Terminal {
         revision: Option<u64>,
     ) -> Result<Vec<KittyVirtualPictureSample>, Error> {
         let graphics = self.kitty_graphics()?;
-        if graphics.is_null() {
+        let generation = if graphics.is_null() {
+            0
+        } else {
+            kitty_graphics_u64(
+                graphics,
+                ffi::GhosttyKittyGraphicsData_GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION,
+            )?
+        };
+        let viewport = self.scrollbar()?;
+        if viewport.offset > *window.end() as usize
+            || *window.start() as usize >= viewport.offset + viewport.len
+        {
             return Ok(Vec::new());
         }
-        let generation = kitty_graphics_u64(
-            graphics,
-            ffi::GhosttyKittyGraphicsData_GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION,
-        )?;
-        if generation == 0 {
-            return Ok(Vec::new());
-        }
+        let screen = self.active_screen()?;
 
         let mut cache = self.virtual_picture_layout.borrow_mut();
         if revision.is_none()
-            || cache
-                .as_ref()
-                .is_none_or(|layout| layout.generation != generation || layout.revision != revision)
+            || cache.as_ref().is_none_or(|layout| {
+                layout.screen != screen
+                    || layout.generation != generation
+                    || layout.revision != revision
+                    || layout.viewport_origin != viewport.offset
+            })
         {
             *cache = Some(VirtualPictureLayout {
+                screen,
                 generation,
                 revision,
-                placements: self.virtual_picture_placements(graphics)?,
+                viewport_origin: viewport.offset,
+                placements: self
+                    .virtual_picture_placements(graphics, screen, generation, viewport)?,
                 evidence: None,
             });
         }
@@ -953,32 +1002,59 @@ impl Terminal {
         if first >= last {
             return Ok(Vec::new());
         }
-        let candidates = &layout.placements[first..last];
+        let candidates = &mut layout.placements[first..last];
         if unwrapped {
-            let evidence_start = candidates[0].screen_row().min(start);
-            let evidence_end = candidates[last - first - 1].bottom();
-            let rows = evidence_start..=evidence_end;
-            if layout.evidence.as_ref().is_none_or(|e| !e.contains(&rows)) {
-                layout.evidence = Some(RowEvidence::new(self, rows)?);
+            let needs_wrap = |p: &VirtualPlacement| p.bottom() >= start && p.wrapped().is_none();
+            let mut ranges: Vec<_> = candidates
+                .iter()
+                .filter(|p| needs_wrap(p))
+                .map(|p| RowRange {
+                    first: p.screen_row(),
+                    last: p.bottom(),
+                    clean_rows: 0,
+                })
+                .collect();
+            if !ranges.is_empty() {
+                unsafe {
+                    ghostty_kitty_graphics_screen_wrap_ranges(
+                        self.raw,
+                        ranges.as_mut_ptr(),
+                        ranges.len(),
+                    )
+                    .into_result()?;
+                }
+                for (p, range) in candidates.iter_mut().filter(|p| needs_wrap(p)).zip(ranges) {
+                    p.set_wrapped(range.clean_rows <= range.last - range.first);
+                }
+            }
+            if let Some(last) = candidates
+                .iter()
+                .rev()
+                .find(|p| p.wrapped() == Some(false) && p.screen_row() > start)
+            {
+                let rows = start..=last.screen_row();
+                if layout.evidence.as_ref().is_none_or(|e| !e.contains(&rows)) {
+                    layout.evidence = Some(RowEvidence::new(self, rows)?);
+                }
             }
         }
 
-        let screen = self.active_screen()?;
         let mut catalog = self
             .picture_catalog
             .lock()
             .map_err(|_| Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE))?;
         catalog.prune(self);
         let mut pictures = Vec::new();
-        for &placement in candidates {
-            if placement.bottom() < start {
+        for &placement in candidates.iter() {
+            if placement.bottom() < start || (unwrapped && placement.wrapped() == Some(true)) {
                 continue;
             }
             let first_row = placement.screen_row().max(start);
-            let line = if let Some(evidence) = layout.evidence.as_ref().filter(|_| unwrapped) {
-                if evidence.is_wrapped_rows(placement.screen_row(), placement.bottom()) {
-                    continue;
-                }
+            let line = if let Some(evidence) = layout
+                .evidence
+                .as_ref()
+                .filter(|_| unwrapped && start < first_row)
+            {
                 evidence.line(start, first_row, paged)
             } else {
                 first_row - start
@@ -1011,95 +1087,133 @@ impl Terminal {
         Ok(pictures)
     }
 
+    fn viewport_row_has_virtual_placeholders(&self, y: u32) -> Result<bool, Error> {
+        let grid_ref = self.grid_ref(ghostty_viewport_point(0, y))?;
+        let mut row = 0;
+        let mut marked = false;
+        unsafe {
+            ffi::ghostty_grid_ref_row(&grid_ref, &mut row).into_result()?;
+            ffi::ghostty_row_get(
+                row,
+                ffi::GhosttyRowData_GHOSTTY_ROW_DATA_KITTY_VIRTUAL_PLACEHOLDER,
+                (&mut marked as *mut bool).cast(),
+            )
+            .into_result()?;
+        }
+        Ok(marked)
+    }
+
+    pub(super) fn collect_viewport_virtual_runs(
+        &self,
+        y: u16,
+        cols: u16,
+        runs: &mut Vec<KittyVirtualRun>,
+        graphemes: &mut Vec<u32>,
+    ) {
+        match self.viewport_row_has_virtual_placeholders(u32::from(y)) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::debug!(%error, y, "could not inspect a virtual placeholder row");
+                return;
+            }
+        }
+
+        let mut current: Option<KittyVirtualRun> = None;
+        for x in 0..cols {
+            let grid_ref = match self.grid_ref(ghostty_viewport_point(x, u32::from(y))) {
+                Ok(grid_ref) => grid_ref,
+                Err(error) => {
+                    // Incomplete reflow can leave the rest of the row outside
+                    // the page. Keep the runs already read and end this row.
+                    tracing::debug!(%error, x, y, "could not locate a virtual placeholder cell");
+                    break;
+                }
+            };
+            match virtual_placeholder_cell(&grid_ref, x, y, graphemes) {
+                Ok(Some(cell)) => {
+                    if let Some(run) = current.as_mut() {
+                        if run.append(cell) {
+                            continue;
+                        }
+                        runs.push(*run);
+                    }
+                    current = Some(KittyVirtualRun::from_cell(cell));
+                }
+                result => {
+                    if let Err(error) = result {
+                        tracing::debug!(%error, x, y, "could not read a virtual placeholder cell");
+                    }
+                    runs.extend(current.take());
+                }
+            }
+        }
+        runs.extend(current);
+    }
+
     fn virtual_picture_placements(
         &self,
         graphics: ffi::GhosttyKittyGraphics,
+        screen: ActiveScreen,
+        generation: u64,
+        viewport: TerminalScrollbar,
     ) -> Result<Vec<VirtualPlacement>, Error> {
-        let specs = kitty_virtual_placement_specs(graphics)?;
-        let viewport = self.scrollbar()?;
-        let viewport_cols = self.cols()?.max(1);
-        let viewport_rows = self.rows()?.max(1);
-        let cell_width = (self.width_px()? / u32::from(viewport_cols)).max(1);
-        let cell_height = (self.height_px()? / u32::from(viewport_rows)).max(1);
+        let cols = self.cols()?;
+        let rows = self.rows()?;
         let mut pictures = Vec::new();
         let mut active: Vec<ActiveVirtualPicture> = Vec::new();
+        let mut next = Vec::new();
+        let mut runs = Vec::new();
+        let mut graphemes = Vec::new();
+        let mut storage = None;
 
-        for y in 0..viewport_rows {
-            let mut runs = Vec::new();
-            let mut current: Option<KittyVirtualRun> = None;
-            for x in 0..viewport_cols {
-                let (graphemes, style) = self.viewport_graphemes_and_style(x, u32::from(y))?;
-                let cell = kitty_virtual_cell(x, y, &graphemes, style);
-                match cell {
-                    Some(cell) => {
-                        if let Some(run) = current.as_mut() {
-                            if run.append(cell) {
-                                continue;
-                            }
-                            runs.push(*run);
-                        }
-                        current = Some(KittyVirtualRun::from_cell(cell));
-                    }
-                    None => {
-                        if let Some(run) = current.take() {
-                            runs.push(run);
-                        }
-                    }
+        for y in 0..rows {
+            self.collect_viewport_virtual_runs(y, cols, &mut runs, &mut graphemes);
+            let mut previous = active.drain(..).peekable();
+            for run in runs.drain(..) {
+                while let Some(picture) = previous.next_if(|picture| picture.x < run.x) {
+                    pictures.extend(picture.finish());
                 }
-            }
-            if let Some(run) = current {
-                runs.push(run);
-            }
 
-            let mut next = Vec::new();
-            for run in runs {
                 let image_id = run.image_id();
-                let image = unsafe { ffi::ghostty_kitty_graphics_image(graphics, image_id) };
-                let spec = (!image.is_null())
-                    .then(|| find_virtual_placement_spec(&specs, image_id, run.placement_id()))
-                    .flatten();
-                if !image.is_null() && spec.is_none() {
+                if image_id == 0 {
                     continue;
                 }
-                if let Some(index) = active
-                    .iter()
-                    .position(|picture| picture.appends(run, image.is_null()))
-                {
-                    let mut picture = active.remove(index);
-                    picture.append();
-                    next.push(picture);
-                    continue;
-                }
-                let screen_row = viewport.offset as u32 + u32::from(run.y);
-                let picture = if image.is_null() {
-                    Some(ActiveVirtualPicture::evicted(run, screen_row))
-                } else {
-                    let Some(spec) = spec.copied() else {
+
+                if let Some(mut picture) = previous.next_if(|picture| picture.x == run.x) {
+                    if picture.appends(run) {
+                        picture.append();
+                        next.push(picture);
                         continue;
-                    };
-                    match self.active_virtual_picture(
-                        image,
-                        run,
-                        spec,
-                        screen_row,
-                        cell_width,
-                        cell_height,
-                    ) {
-                        Ok(picture) => picture,
-                        Err(error) => {
-                            tracing::debug!(%error, "could not locate a virtual Kitty picture");
-                            None
-                        }
                     }
-                };
-                if let Some(picture) = picture {
-                    next.push(picture);
+                    pictures.extend(picture.finish());
                 }
+
+                let (specs, cell_px) = match &storage {
+                    Some(storage) => storage,
+                    None => storage.insert((
+                        self.virtual_placement_specs(graphics, screen, generation)?,
+                        self.cell_px()?.map(|size| size.max(1)),
+                    )),
+                };
+
+                let screen_row = viewport.offset as u32 + u32::from(run.y);
+                let picture = match specs.get(image_id, run.placement_id()) {
+                    Some(spec) => ActiveVirtualPicture::stored(run, spec, screen_row, *cell_px),
+                    None if graphics.is_null()
+                        || unsafe { ffi::ghostty_kitty_graphics_image(graphics, image_id) }
+                            .is_null() =>
+                    {
+                        Some(ActiveVirtualPicture::evicted(run, screen_row))
+                    }
+                    None => None,
+                };
+                next.extend(picture);
             }
-            pictures.extend(active.drain(..).map(ActiveVirtualPicture::finish));
-            active = next;
+            pictures.extend(previous.filter_map(ActiveVirtualPicture::finish));
+            mem::swap(&mut active, &mut next);
         }
-        pictures.extend(active.drain(..).map(ActiveVirtualPicture::finish));
+        pictures.extend(active.into_iter().filter_map(ActiveVirtualPicture::finish));
         pictures.sort_by_key(|picture| {
             (
                 picture.screen_row(),
@@ -1115,59 +1229,40 @@ impl Terminal {
         }
         Ok(pictures)
     }
+}
 
-    fn active_virtual_picture(
-        &self,
-        image: ffi::GhosttyKittyGraphicsImage,
-        run: KittyVirtualRun,
-        spec: KittyVirtualPlacementSpec,
-        screen_row: u32,
-        cell_width: u32,
-        cell_height: u32,
-    ) -> Result<Option<ActiveVirtualPicture>, Error> {
-        let image_px = image_size(image)?;
-        let Some(geometry) = kitty_virtual_placement_geometry(
-            run,
-            spec,
-            image_px[0],
-            image_px[1],
-            cell_width,
-            cell_height,
-        ) else {
-            return Ok(None);
-        };
-        let render = geometry.render;
-        if render.source_width == 0 || render.source_height == 0 {
-            return Ok(None);
-        }
-        let grid_rows = if spec.rows == 0 {
-            image_px[1].saturating_add(cell_height - 1) / cell_height
-        } else {
-            spec.rows
-        }
-        .max(1);
-        Ok(Some(ActiveVirtualPicture::stored(
-            run,
-            grid_rows,
-            image_px,
-            Placement {
-                image_id: run.image_id(),
-                screen_row,
-                bottom: screen_row,
-                max_bottom: 0,
-                col: run.x,
-                cols: render.grid_cols,
-                rows: 1,
-                crop: [
-                    render.source_x,
-                    render.source_y,
-                    render.source_width,
-                    render.source_height,
-                ],
-                z: spec.z,
-            },
-        )))
+fn virtual_placeholder_cell(
+    grid_ref: &ffi::GhosttyGridRef,
+    x: u16,
+    y: u16,
+    graphemes: &mut Vec<u32>,
+) -> Result<Option<KittyVirtualCell>, Error> {
+    #[cfg(test)]
+    VIRTUAL_CELL_READS.with(|count| count.set(count.get() + 1));
+    let mut cell = ffi::GhosttyCell::default();
+    let mut codepoint = 0;
+    unsafe {
+        ffi::ghostty_grid_ref_cell(grid_ref, &mut cell).into_result()?;
+        ffi::ghostty_cell_get(
+            cell,
+            ffi::GhosttyCellData_GHOSTTY_CELL_DATA_CODEPOINT,
+            (&mut codepoint as *mut u32).cast(),
+        )
+        .into_result()?;
     }
+    if codepoint != KITTY_UNICODE_PLACEHOLDER {
+        return Ok(None);
+    }
+
+    #[cfg(test)]
+    VIRTUAL_STYLE_READS.with(|count| count.set(count.get() + 1));
+    let mut style = ffi::GhosttyStyle {
+        size: mem::size_of::<ffi::GhosttyStyle>(),
+        ..Default::default()
+    };
+    unsafe { ffi::ghostty_grid_ref_style(grid_ref, &mut style).into_result()? };
+    grid_ref_graphemes_into(grid_ref, graphemes)?;
+    Ok(kitty_virtual_cell(x, y, graphemes, style.into()))
 }
 
 struct ActiveVirtualPicture {
@@ -1177,14 +1272,14 @@ struct ActiveVirtualPicture {
     source_col: u32,
     width: u32,
     next_source_row: u32,
-    next_viewport_row: u16,
     value: ActiveVirtualPictureValue,
 }
 
 enum ActiveVirtualPictureValue {
     Stored {
         grid_rows: u32,
-        image_px: [u32; 2],
+        crop_y: u32,
+        crop_height: u32,
         placement: Placement,
     },
     Evicted(EvictedPlacement),
@@ -1193,24 +1288,59 @@ enum ActiveVirtualPictureValue {
 impl ActiveVirtualPicture {
     fn stored(
         run: KittyVirtualRun,
-        grid_rows: u32,
-        image_px: [u32; 2],
-        placement: Placement,
-    ) -> Self {
-        Self {
+        spec: KittyVirtualPlacementSpec,
+        screen_row: u32,
+        [cell_width, cell_height]: [u32; 2],
+    ) -> Option<Self> {
+        let grid_cols = if spec.columns == 0 {
+            spec.image_px[0].div_ceil(cell_width)
+        } else {
+            spec.columns
+        };
+        let grid_rows = if spec.rows == 0 {
+            spec.image_px[1].div_ceil(cell_height)
+        } else {
+            spec.rows
+        };
+        let [crop_x, crop_y, crop_width, crop_height] = spec.crop;
+        if run.col >= grid_cols || run.row >= grid_rows || crop_width == 0 || crop_height == 0 {
+            return None;
+        }
+        let cols = run.width.min(grid_cols - run.col);
+        let left = scale_u32(run.col, crop_width, grid_cols);
+        let right = scale_u32(run.col + cols, crop_width, grid_cols);
+        if left == right {
+            return None;
+        }
+        let top = scale_u32(run.row, crop_height, grid_rows);
+        let bottom = scale_u32(run.row + 1, crop_height, grid_rows);
+        // A run can start with a fractional pixel row. Keep it active so a
+        // later continuation can give the whole fragment a nonempty crop.
+        Some(Self {
             image_id: run.image_id(),
             placement_id: run.placement_id(),
             x: run.x,
             source_col: run.col,
             width: run.width,
             next_source_row: run.row + 1,
-            next_viewport_row: run.y + 1,
             value: ActiveVirtualPictureValue::Stored {
                 grid_rows,
-                image_px,
-                placement,
+                crop_y,
+                crop_height,
+                placement: Placement {
+                    image_id: run.image_id(),
+                    screen_row,
+                    bottom: screen_row,
+                    wrapped: None,
+                    max_bottom: 0,
+                    col: run.x,
+                    cols,
+                    rows: 1,
+                    crop: [crop_x + left, crop_y + top, right - left, bottom - top],
+                    z: spec.z,
+                },
             },
-        }
+        })
     }
 
     fn evicted(run: KittyVirtualRun, screen_row: u32) -> Self {
@@ -1221,11 +1351,11 @@ impl ActiveVirtualPicture {
             source_col: run.col,
             width: run.width,
             next_source_row: run.row + 1,
-            next_viewport_row: run.y + 1,
             value: ActiveVirtualPictureValue::Evicted(EvictedPlacement {
                 image_id: run.image_id(),
                 screen_row,
                 bottom: screen_row,
+                wrapped: None,
                 max_bottom: 0,
                 col: run.x,
                 cols: run.width,
@@ -1234,31 +1364,31 @@ impl ActiveVirtualPicture {
         }
     }
 
-    fn appends(&self, run: KittyVirtualRun, image_is_null: bool) -> bool {
+    fn appends(&self, run: KittyVirtualRun) -> bool {
         self.image_id == run.image_id()
             && self.placement_id == run.placement_id()
-            && self.x == run.x
             && self.source_col == run.col
             && self.width == run.width
             && self.next_source_row == run.row
-            && self.next_viewport_row == run.y
-            && matches!(&self.value, ActiveVirtualPictureValue::Evicted(_)) == image_is_null
+            && match self.value {
+                ActiveVirtualPictureValue::Stored { grid_rows, .. } => run.row < grid_rows,
+                ActiveVirtualPictureValue::Evicted(_) => true,
+            }
     }
 
     fn append(&mut self) {
         self.next_source_row += 1;
-        self.next_viewport_row += 1;
         match &mut self.value {
             ActiveVirtualPictureValue::Stored {
                 grid_rows,
-                image_px,
+                crop_y,
+                crop_height,
                 placement,
             } => {
                 placement.rows += 1;
                 placement.bottom += 1;
-                placement.crop[3] = scale_u32(placement.rows, image_px[1], *grid_rows)
-                    .max(1)
-                    .min(image_px[1].saturating_sub(placement.crop[1]));
+                let bottom = *crop_y + scale_u32(self.next_source_row, *crop_height, *grid_rows);
+                placement.crop[3] = bottom - placement.crop[1];
             }
             ActiveVirtualPictureValue::Evicted(placement) => {
                 placement.rows += 1;
@@ -1267,17 +1397,19 @@ impl ActiveVirtualPicture {
         }
     }
 
-    fn finish(self) -> VirtualPlacement {
+    fn finish(self) -> Option<VirtualPlacement> {
         match self.value {
             ActiveVirtualPictureValue::Stored { placement, .. } => {
-                VirtualPlacement::Stored(placement)
+                (placement.crop[3] > 0).then_some(VirtualPlacement::Stored(placement))
             }
-            ActiveVirtualPictureValue::Evicted(placement) => VirtualPlacement::Evicted(placement),
+            ActiveVirtualPictureValue::Evicted(placement) => {
+                Some(VirtualPlacement::Evicted(placement))
+            }
         }
     }
 }
 
-fn image_size(image: ffi::GhosttyKittyGraphicsImage) -> Result<[u32; 2], Error> {
+pub(super) fn image_size(image: ffi::GhosttyKittyGraphicsImage) -> Result<[u32; 2], Error> {
     Ok([
         kitty_image_u32(
             image,
@@ -1293,6 +1425,193 @@ fn image_size(image: ffi::GhosttyKittyGraphicsImage) -> Result<[u32; 2], Error> 
 mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    fn terminal(cols: u16, rows: u16) -> Terminal {
+        let mut terminal = Terminal::new(cols, rows, 1_000_000).unwrap();
+        terminal.resize(cols, rows, 8, 16).unwrap();
+        terminal.enable_kitty_graphics().unwrap();
+        terminal
+    }
+
+    fn transmit_virtual(terminal: &mut Terminal, image_id: u32, cols: u32, rows: u32) {
+        let rgba = STANDARD.encode([80u8, 90, 100, 255].repeat((cols * rows) as usize));
+        terminal.write(
+            format!(
+                "\x1b_Ga=T,U=1,f=32,s={cols},v={rows},i={image_id},c={cols},r={rows},q=2;{rgba}\x1b\\"
+            )
+            .as_bytes(),
+        );
+    }
+
+    fn placeholder(terminal: &mut Terminal, x: u16, y: u16, image_id: u32, row: u16, cols: u16) {
+        const ROWS: [char; 10] = [
+            '\u{0305}', '\u{030d}', '\u{030e}', '\u{0310}', '\u{0312}', '\u{033d}', '\u{033e}',
+            '\u{033f}', '\u{0346}', '\u{034a}',
+        ];
+        let [blue, green, red] = image_id.to_le_bytes()[..3] else {
+            unreachable!()
+        };
+        terminal
+            .write(format!("\x1b[{};{}H\x1b[38;2;{red};{green};{blue}m", y + 1, x + 1).as_bytes());
+        for _ in 0..cols {
+            terminal.write("\u{10eeee}".as_bytes());
+        }
+        // Rewrite the row leader with its diacritics after establishing the run.
+        terminal.write(
+            format!(
+                "\x1b[{};{}H\u{10eeee}{}{}",
+                y + 1,
+                x + 1,
+                ROWS[row as usize],
+                ROWS[0]
+            )
+            .as_bytes(),
+        );
+    }
+
+    fn sample_virtual(
+        terminal: &Terminal,
+        unwrapped: bool,
+        revision: Option<u64>,
+    ) -> Vec<KittyVirtualPictureSample> {
+        let last = terminal.total_rows().unwrap().saturating_sub(1) as u32;
+        terminal
+            .sample_kitty_virtual_pictures(0..=last, unwrapped, false, revision)
+            .unwrap()
+    }
+
+    #[test]
+    fn virtual_unwrapped_handles_different_depths_on_the_same_row() {
+        let mut terminal = terminal(100, 20);
+        transmit_virtual(&mut terminal, 101, 2, 8);
+        transmit_virtual(&mut terminal, 102, 2, 2);
+        for row in 0..8 {
+            placeholder(&mut terminal, 0, row + 2, 101, row, 2);
+        }
+        for row in 0..2 {
+            placeholder(&mut terminal, 50, row + 2, 102, row, 2);
+        }
+
+        let pictures = sample_virtual(&terminal, true, None);
+        assert_eq!(pictures.len(), 2);
+        for (sample, rows) in pictures.into_iter().zip([8, 2]) {
+            let KittyVirtualPictureSample::Stored(sample) = sample else {
+                panic!("expected a stored picture");
+            };
+            assert_eq!(sample.placement.screen_row, 2);
+            assert_eq!(sample.placement.rows, rows);
+        }
+    }
+
+    #[test]
+    fn picture_free_viewport_does_not_decode_cells() {
+        let mut terminal = terminal(180, 60);
+        terminal.write(b"ordinary text only");
+        VIRTUAL_CELL_READS.set(0);
+
+        let pictures = sample_virtual(&terminal, false, Some(1));
+
+        assert!(pictures.is_empty());
+        assert_eq!(VIRTUAL_CELL_READS.get(), 0);
+    }
+
+    #[test]
+    fn virtual_scan_decodes_style_only_for_placeholder_cells() {
+        let mut terminal = terminal(180, 60);
+        transmit_virtual(&mut terminal, 105, 2, 1);
+        terminal.write(b"\x1b[2;1Hordinary text on the same row");
+        placeholder(&mut terminal, 40, 1, 105, 0, 2);
+        VIRTUAL_CELL_READS.set(0);
+        VIRTUAL_STYLE_READS.set(0);
+
+        assert_eq!(sample_virtual(&terminal, false, Some(1)).len(), 1);
+        assert_eq!(VIRTUAL_CELL_READS.get(), 180);
+        assert_eq!(VIRTUAL_STYLE_READS.get(), 2);
+    }
+
+    #[test]
+    fn virtual_specs_survive_text_only_revisions() {
+        let mut terminal = terminal(20, 10);
+        for image_id in 104..204 {
+            transmit_virtual(&mut terminal, image_id, 1, 1);
+        }
+        placeholder(&mut terminal, 0, 0, 104, 0, 1);
+        VIRTUAL_SPEC_BUILDS.set(0);
+        assert_eq!(sample_virtual(&terminal, false, Some(1)).len(), 1);
+
+        terminal.write(b"\x1b[10;1Hunrelated text");
+        assert_eq!(sample_virtual(&terminal, false, Some(2)).len(), 1);
+        assert_eq!(VIRTUAL_SPEC_BUILDS.get(), 1);
+    }
+
+    #[test]
+    fn virtual_scan_keeps_readable_runs_at_the_end_of_a_short_row() {
+        let mut terminal = terminal(20, 10);
+        placeholder(&mut terminal, 17, 0, 105, 0, 2);
+        let mut runs = Vec::new();
+
+        // Ask for a column past the native row width, as can happen on a
+        // page that is still narrow after incomplete reflow.
+        terminal.collect_viewport_virtual_runs(0, 21, &mut runs, &mut Vec::new());
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].image_id(), 105);
+        assert_eq!(runs[0].width, 2);
+    }
+
+    #[test]
+    fn virtual_only_picture_storage_skips_direct_layout_rebuilds() {
+        let mut terminal = terminal(20, 10);
+        transmit_virtual(&mut terminal, 104, 1, 1);
+        DIRECT_LAYOUT_BUILDS.set(0);
+        assert!(terminal
+            .sample_kitty_direct_pictures(0..=9, false, false, Some(1))
+            .unwrap()
+            .is_empty());
+
+        terminal.write(b"unrelated text");
+        assert!(terminal
+            .sample_kitty_direct_pictures(0..=9, false, false, Some(2))
+            .unwrap()
+            .is_empty());
+        assert_eq!(DIRECT_LAYOUT_BUILDS.get(), 1);
+
+        terminal.write(b"\x1b_Ga=T,f=32,s=1,v=1,i=7,c=1,r=1,q=2,C=1;/wAA/w==\x1b\\");
+        assert_eq!(
+            terminal
+                .sample_kitty_direct_pictures(0..=9, false, false, Some(3))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(DIRECT_LAYOUT_BUILDS.get(), 2);
+    }
+
+    #[test]
+    fn virtual_layout_cache_tracks_the_viewport_origin() {
+        let mut terminal = terminal(40, 10);
+        transmit_virtual(&mut terminal, 103, 2, 2);
+        for row in 0..2 {
+            placeholder(&mut terminal, 2, row, 103, row, 2);
+        }
+        terminal.write(b"\x1b[10;1H\x1b[0m");
+        for line in 0..30 {
+            terminal.write(format!("history {line}\r\n").as_bytes());
+        }
+        assert!(sample_virtual(&terminal, false, Some(7)).is_empty());
+
+        terminal.scroll_viewport_row(0);
+        let pictures = sample_virtual(&terminal, false, Some(7));
+        assert_eq!(pictures.len(), 1);
+        let KittyVirtualPictureSample::Stored(picture) = &pictures[0] else {
+            panic!("expected a stored picture");
+        };
+        assert_eq!(picture.placement.screen_row, 0);
+        assert_eq!(picture.placement.rows, 2);
+
+        terminal.scroll_viewport_bottom();
+        assert!(sample_virtual(&terminal, false, Some(7)).is_empty());
+    }
 
     #[test]
     fn picture_lookup_preserves_the_other_screens_desktop_fingerprint() {

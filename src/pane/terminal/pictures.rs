@@ -43,16 +43,16 @@ impl GhosttyPaneTerminal {
         source: ReadSource,
         lines: Option<usize>,
         offset: Option<usize>,
-        revision: u64,
+        content_revision: impl FnOnce() -> u64,
     ) -> PaneAnsiRead {
         let Ok(mut core) = self.core.lock() else {
             return PaneAnsiRead::default();
         };
+        // A writer can start before it acquires the terminal lock. Cache
+        // only committed revisions and sample the revision under this lock.
+        let revision = content_revision();
+        let revision = revision.is_multiple_of(2).then_some(revision);
         let unwrapped = source == ReadSource::RecentUnwrapped;
-        let has_placements = core
-            .terminal
-            .kitty_graphics_may_have_picture_cells()
-            .unwrap_or(false);
         let (mut read, row_range) = if let Some(offset_from_bottom) = offset {
             let window = ghostty_recent_read_at_offset(
                 &core,
@@ -79,9 +79,7 @@ impl GhosttyPaneTerminal {
             let Ok(text) = ghostty_visible_ansi(&core) else {
                 return PaneAnsiRead::default();
             };
-            let row_range = has_placements
-                .then(|| visible_picture_rows(&core.terminal, &text, lines))
-                .flatten();
+            let row_range = visible_picture_rows(&core.terminal, &text, lines);
             let snapshot = crate::app::api_helpers::limit_snapshot_lines(text, lines);
             (
                 PaneAnsiRead {
@@ -99,7 +97,7 @@ impl GhosttyPaneTerminal {
             let Ok(text) = read_ansi_range(&core.terminal, range, unwrapped) else {
                 return PaneAnsiRead::default();
             };
-            let native_empty = cfg!(windows) && has_placements && text.trim().is_empty();
+            let native_empty = cfg!(windows) && text.trim().is_empty();
             let snapshot = finish_recent_snapshot(&mut core, text, count, unwrapped);
             let row_range = if native_empty && !snapshot.text.trim().is_empty() {
                 // The Windows console fallback has no addressable screen rows.
@@ -117,7 +115,7 @@ impl GhosttyPaneTerminal {
             )
         };
 
-        if has_placements && !read.offset_unsupported {
+        if !read.offset_unsupported {
             let row_range = if source != ReadSource::Visible
                 && read.effective_offset == 0
                 && (row_range.is_some() || read.text.is_empty())
@@ -265,27 +263,25 @@ fn sample_read_pictures(
     rows: RangeInclusive<u32>,
     unwrapped: bool,
     paged: bool,
-    revision: u64,
+    revision: Option<u64>,
 ) -> Result<Option<PictureReadSamples>, crate::ghostty::Error> {
     let first_row = *rows.start();
-    let mut pictures: Vec<ReadPictureSample> = terminal
-        .sample_kitty_direct_pictures(rows.clone(), unwrapped, paged, Some(revision))?
-        .into_iter()
-        .map(ReadPictureSample::Direct)
-        .collect();
-    pictures.extend(
-        terminal
-            .sample_kitty_virtual_pictures(rows, unwrapped, paged, Some(revision))?
-            .into_iter()
-            .map(|sample| match sample {
-                crate::ghostty::KittyVirtualPictureSample::Stored(sample) => {
-                    ReadPictureSample::Virtual(sample)
-                }
-                crate::ghostty::KittyVirtualPictureSample::Evicted(sample) => {
-                    ReadPictureSample::Evicted(sample)
-                }
-            }),
-    );
+    let mut pictures = Vec::new();
+    match terminal.sample_kitty_direct_pictures(rows.clone(), unwrapped, paged, revision) {
+        Ok(samples) => pictures.extend(samples.into_iter().map(ReadPictureSample::Direct)),
+        Err(error) => debug!(%error, "could not read direct Kitty picture placements"),
+    }
+    match terminal.sample_kitty_virtual_pictures(rows, unwrapped, paged, revision) {
+        Ok(samples) => pictures.extend(samples.into_iter().map(|sample| match sample {
+            crate::ghostty::KittyVirtualPictureSample::Stored(sample) => {
+                ReadPictureSample::Virtual(sample)
+            }
+            crate::ghostty::KittyVirtualPictureSample::Evicted(sample) => {
+                ReadPictureSample::Evicted(sample)
+            }
+        })),
+        Err(error) => debug!(%error, "could not read virtual Kitty picture placements"),
+    }
     if pictures.is_empty() {
         return Ok(None);
     }

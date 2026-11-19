@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Cursor};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde_json::{Value, json};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde_json::{json, Value};
 
 use super::*;
 
@@ -155,6 +155,20 @@ fn opaque_png() -> Vec<u8> {
 }
 
 fn virtual_placeholder_row(image_id: u32, row: usize, cols: usize) -> String {
+    virtual_placeholder_run(image_id, row, 0, cols)
+}
+
+fn virtual_placeholder_run(image_id: u32, row: usize, col: usize, cols: usize) -> String {
+    virtual_placeholder_run_with_placement(image_id, 0, row, col, cols)
+}
+
+fn virtual_placeholder_run_with_placement(
+    image_id: u32,
+    placement_id: u32,
+    row: usize,
+    col: usize,
+    cols: usize,
+) -> String {
     const DIACRITICS: [char; 8] = [
         '\u{0305}', '\u{030d}', '\u{030e}', '\u{0310}', '\u{0312}', '\u{033d}', '\u{033e}',
         '\u{033f}',
@@ -163,11 +177,25 @@ fn virtual_placeholder_row(image_id: u32, row: usize, cols: usize) -> String {
         unreachable!()
     };
     let mut cells = format!("\x1b[38;2;{red};{green};{blue}m");
-    for col in 0..cols {
+    if placement_id > 0 {
+        let [blue, green, red] = placement_id.to_le_bytes()[..3] else {
+            unreachable!()
+        };
+        cells.push_str(&format!("\x1b[58;2;{red};{green};{blue}m"));
+    }
+    for cell in 0..cols {
         cells.push('\u{10eeee}');
-        if col == 0 {
+        if cell == 0 {
             cells.push(DIACRITICS[row]);
-            cells.push(DIACRITICS[0]);
+            cells.push(DIACRITICS[col]);
+            let high = image_id >> 24;
+            if high > 0 {
+                cells.push(match high {
+                    94 => '\u{0741}',
+                    148 => '\u{1a7b}',
+                    _ => panic!("missing high-byte diacritic {high}"),
+                });
+            }
         }
     }
     cells.push_str("\x1b[0m");
@@ -438,6 +466,49 @@ fn pane_read_merges_virtual_placeholder_rows_and_fetches_the_image() {
     }
 }
 
+#[test]
+fn pane_read_decodes_high_byte_image_ids_on_adjacent_virtual_pictures() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let first_id = 0x5e3f72e1;
+    let second_id = 0x94b65876;
+    let first = kitty_data(
+        &format!("a=T,U=1,f=32,s=23,v=8,q=2,i={first_id},c=23,r=8"),
+        &[20, 40, 60, 255].repeat(23 * 8),
+    );
+    let second = kitty_data(
+        &format!("a=T,U=1,f=32,s=23,v=8,q=2,i={second_id},c=23,r=8"),
+        &[60, 40, 20, 255].repeat(23 * 8),
+    );
+    let mut placeholders = String::new();
+    for row in 0..8 {
+        placeholders.push_str(&format!("\x1b[{};62H", row + 3));
+        placeholders.push_str(&virtual_placeholder_row(first_id, row, 23));
+        placeholders.push_str(&format!("\x1b[{};86H", row + 3));
+        placeholders.push_str(&virtual_placeholder_row(second_id, row, 23));
+    }
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[Hhigh-bytes{first}{second}{placeholders}\x1b[13;1Hhigh-bytes-ready"
+    )]);
+    server.wait("high-bytes-ready");
+
+    let read = server.read("visible", json!({}));
+    let pictures = read["pictures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{read}"));
+    assert_eq!(pictures.len(), 2, "{read}");
+    for (picture, col) in pictures.iter().zip([61, 85]) {
+        assert_eq!(picture["kind"], "virtual", "{read}");
+        assert_eq!(picture["line"], json!(2), "{read}");
+        assert_eq!(picture["col"], json!(col), "{read}");
+        assert_eq!(picture["cols"], json!(23), "{read}");
+        assert_eq!(picture["rows"], json!(8), "{read}");
+        assert_eq!(picture["crop"], json!([0, 0, 23, 8]), "{read}");
+        assert!(picture.get("evicted").is_none(), "{read}");
+    }
+    assert_ne!(pictures[0]["fingerprint"], pictures[1]["fingerprint"]);
+}
+
 #[cfg(unix)]
 #[test]
 fn pane_read_and_fetch_support_shared_memory_virtual_pictures() {
@@ -516,6 +587,183 @@ fn pane_read_splits_nonrectangular_virtual_runs_and_clips_at_window_top() {
         json!([clipped_wide, clipped_narrow]),
         "{clipped}"
     );
+}
+
+#[test]
+fn pane_read_reports_orphan_placeholders_without_image_storage() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let mut placeholders = String::new();
+    for row in 0..2 {
+        placeholders.push_str(&format!("\x1b[{};2H", row + 2));
+        placeholders.push_str(&virtual_placeholder_row(41, row, 2));
+        placeholders.push_str(&format!("\x1b[{};6H", row + 2));
+        placeholders.push_str(&virtual_placeholder_row(41, row, 2));
+    }
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[Horphans\x1b[?1049h{placeholders}\x1b[6;1H\u{10eeee}\x1b[8;1Horphans-ready"
+    )]);
+    server.wait("orphans-ready");
+
+    let read = server.read("visible", json!({}));
+    assert_eq!(
+        read["pictures"],
+        json!([
+            {"evicted":true,"line":1,"rows_above":0,"col":1,"cols":2,"rows":2},
+            {"evicted":true,"line":1,"rows_above":0,"col":5,"cols":2,"rows":2}
+        ]),
+        "{read}"
+    );
+}
+
+#[test]
+fn pane_read_applies_virtual_source_crops() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let cropped = kitty_data(
+        "a=T,U=1,f=32,s=2,v=1,q=2,i=42,c=2,r=1,x=1,w=1",
+        &[80, 90, 100, 255].repeat(2),
+    );
+    let outside = kitty_data(
+        "a=T,U=1,f=32,s=2,v=1,q=2,i=43,c=2,r=1,x=2,w=1",
+        &[80, 90, 100, 255].repeat(2),
+    );
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[Hcrops{cropped}{outside}\x1b[2;2H{}\x1b[4;2H{}\x1b[6;1Hcrops-ready",
+        virtual_placeholder_row(42, 0, 2),
+        virtual_placeholder_row(43, 0, 2)
+    )]);
+    server.wait("crops-ready");
+
+    let read = server.read("visible", json!({}));
+    let pictures = read["pictures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{read}"));
+    assert_eq!(pictures.len(), 1, "{read}");
+    assert_eq!(pictures[0]["crop"], json!([1, 0, 1, 1]), "{read}");
+    assert_eq!(pictures[0]["kind"], "virtual", "{read}");
+}
+
+#[test]
+fn pane_read_stops_virtual_runs_at_placement_row_bounds() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let picture = kitty_data(
+        "a=T,U=1,f=32,s=16,v=16,q=2,i=44,c=2,r=1",
+        &[80, 90, 100, 255].repeat(16 * 16),
+    );
+    let mut placeholders = String::new();
+    for row in 0..5 {
+        placeholders.push_str(&format!("\x1b[{};3H", row + 2));
+        placeholders.push_str(&virtual_placeholder_row(44, row, 2));
+    }
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[Hbounds{picture}{placeholders}\x1b[8;1Hbounds-ready"
+    )]);
+    server.wait("bounds-ready");
+
+    let read = server.read("visible", json!({}));
+    let pictures = read["pictures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{read}"));
+    assert_eq!(pictures.len(), 1, "{read}");
+    assert_eq!(pictures[0]["rows"], json!(1), "{read}");
+    assert_eq!(pictures[0]["crop"], json!([0, 0, 16, 16]), "{read}");
+}
+
+#[test]
+fn pane_read_scales_virtual_fragment_crop_endpoints() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let picture = kitty_data(
+        "a=T,U=1,f=32,s=10,v=10,q=2,i=45,c=3,r=3",
+        &[80, 90, 100, 255].repeat(10 * 10),
+    );
+    let mut placeholders = String::new();
+    for row in 1..3 {
+        placeholders.push_str(&format!("\x1b[{};5H", row + 1));
+        placeholders.push_str(&virtual_placeholder_run(45, row, 1, 2));
+    }
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[Hendpoints{picture}{placeholders}\x1b[5;1Hendpoints-ready"
+    )]);
+    server.wait("endpoints-ready");
+
+    let read = server.read("visible", json!({}));
+    let pictures = read["pictures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{read}"));
+    assert_eq!(pictures.len(), 1, "{read}");
+    assert_eq!(pictures[0]["rows"], json!(2), "{read}");
+    assert_eq!(pictures[0]["crop"], json!([3, 3, 7, 7]), "{read}");
+}
+
+#[test]
+fn pane_read_keeps_direct_and_cropped_virtual_pictures_with_an_invalid_virtual_run() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let image = kitty_data(
+        "a=T,U=1,f=32,s=13,v=14,q=2,i=47,c=3,r=3,x=2,y=3,w=10,h=10",
+        &[80, 90, 100, 255].repeat(13 * 14),
+    );
+    let direct = kitty_data("a=T,f=32,s=1,v=1,q=2,i=48,c=1,r=1,C=1", &[0, 0, 0, 255]);
+    server.run_stages(&[format!(
+        "\x1b[2J\x1b[Hmixed{image}\x1b[2;5H{}\x1b[2;12H{}\x1b[2;17H{direct}\x1b[3;5H{}\x1b[6;1Hmixed-ready",
+        virtual_placeholder_run(47, 1, 1, 2),
+        virtual_placeholder_run_with_placement(47, 99, 0, 0, 1),
+        virtual_placeholder_run(47, 2, 1, 2)
+    )]);
+    server.wait("mixed-ready");
+
+    let read = server.read("recent_unwrapped", json!({}));
+    let pictures = read["pictures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{read}"));
+    assert_eq!(pictures.len(), 2, "{read}");
+    let direct = pictures.iter().find(|p| p["kind"] == "direct").unwrap();
+    let virtual_picture = pictures.iter().find(|p| p["kind"] == "virtual").unwrap();
+    assert_eq!(direct["crop"], json!([0, 0, 1, 1]), "{read}");
+    assert_eq!(virtual_picture["crop"], json!([5, 6, 7, 7]), "{read}");
+    assert_eq!(virtual_picture["rows"], 2, "{read}");
+}
+
+#[test]
+fn pane_read_uses_external_namespace_for_virtual_placement_ids() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let image = kitty_data("a=t,f=32,s=2,v=2,q=2,i=46", &[80, 90, 100, 255].repeat(4));
+    let first = "\x1b_Ga=p,U=1,i=46,c=1,r=1,z=11,q=2\x1b\\";
+    let second = "\x1b_Ga=p,U=1,i=46,c=2,r=1,z=22,q=2\x1b\\";
+    let draw = format!(
+        "\x1b[2J\x1b[Hnamespaces{image}{first}{second}\x1b[2;2H{}\x1b[4;2H{}\x1b[6;1Hnamespaces-ready",
+        virtual_placeholder_row(46, 0, 1),
+        virtual_placeholder_run_with_placement(46, 1, 0, 0, 1)
+    );
+    let explicit = "\x1b_Ga=p,U=1,i=46,p=3,c=2,r=1,z=33,q=2\x1b\\\x1b_Ga=p,U=1,i=46,p=1,c=2,r=1,z=44,q=2\x1b\\\x1b[8;1Hexternal-ready";
+    server.run_stages(&[draw, explicit.into()]);
+    server.wait("namespaces-ready");
+
+    let read = server.read("visible", json!({}));
+    let pictures = read["pictures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{read}"));
+    assert_eq!(pictures.len(), 1, "{read}");
+    assert_eq!(pictures[0]["cols"], json!(1), "{read}");
+    assert_eq!(pictures[0]["z"], json!(11), "{read}");
+
+    server.advance();
+    server.wait("external-ready");
+    let read = server.read("visible", json!({}));
+    let pictures = read["pictures"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{read}"));
+    assert_eq!(pictures.len(), 2, "{read}");
+    assert_eq!(pictures[0]["line"], 1, "{read}");
+    assert_eq!(pictures[1]["line"], 3, "{read}");
+    for picture in pictures {
+        assert_eq!(picture["z"], 44, "{read}");
+        assert_eq!(picture["crop"], json!([0, 0, 1, 2]), "{read}");
+    }
 }
 
 #[test]

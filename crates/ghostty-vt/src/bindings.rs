@@ -2008,6 +2008,8 @@ pub const GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DAT
 pub const GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z:
     GhosttyKittyGraphicsPlacementData = 12;
 #[doc = " Z-index for this placement.\n\n Output type: int32_t *"]
+pub const GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID_IS_EXTERNAL:
+    GhosttyKittyGraphicsPlacementData = 13;
 pub const GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_MAX_VALUE:
     GhosttyKittyGraphicsPlacementData = 2147483647;
 #[doc = " Queryable data kinds for ghostty_kitty_graphics_placement_get().\n\n @ingroup kitty_graphics"]

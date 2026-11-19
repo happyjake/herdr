@@ -281,11 +281,30 @@ pub struct KittyPlacementRenderInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KittyVirtualPlacementSpec {
-    image_id: u32,
     placement_id: u32,
+    external: bool,
+    image_px: [u32; 2],
+    crop: [u32; 4],
     columns: u32,
     rows: u32,
     z: i32,
+}
+
+#[derive(Default)]
+struct KittyVirtualPlacementSpecs {
+    generation: u64,
+    explicit: HashMap<(u32, u32), KittyVirtualPlacementSpec>,
+    preferred: HashMap<u32, KittyVirtualPlacementSpec>,
+}
+
+impl KittyVirtualPlacementSpecs {
+    fn get(&self, image_id: u32, placement_id: u32) -> Option<KittyVirtualPlacementSpec> {
+        if placement_id == 0 {
+            self.preferred.get(&image_id).copied()
+        } else {
+            self.explicit.get(&(image_id, placement_id)).copied()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -866,6 +885,7 @@ pub struct Terminal {
     picture_catalog: Arc<Mutex<pictures::PictureCatalog>>,
     picture_layout: RefCell<Option<pictures::PictureLayout>>,
     virtual_picture_layout: RefCell<Option<pictures::VirtualPictureLayout>>,
+    virtual_placement_specs: RefCell<[KittyVirtualPlacementSpecs; 2]>,
     kitty_empty_generation: Cell<Option<u64>>,
     kitty_png_forwarding: bool,
 }
@@ -895,6 +915,7 @@ impl Terminal {
             picture_catalog: Arc::default(),
             picture_layout: RefCell::new(None),
             virtual_picture_layout: RefCell::new(None),
+            virtual_placement_specs: RefCell::default(),
             kitty_empty_generation: Cell::new(None),
             kitty_png_forwarding: false,
         };
@@ -1371,19 +1392,6 @@ impl Terminal {
             });
         }
         Ok(rows)
-    }
-
-    fn viewport_graphemes_and_style(&self, x: u16, y: u32) -> Result<(Vec<u32>, CellStyle), Error> {
-        let grid_ref = self.grid_ref(ghostty_viewport_point(x, y))?;
-        let graphemes = grid_ref_graphemes(&grid_ref)?;
-        let mut style = ffi::GhosttyStyle {
-            size: mem::size_of::<ffi::GhosttyStyle>(),
-            ..Default::default()
-        };
-        unsafe {
-            ffi::ghostty_grid_ref_style(&grid_ref, &mut style).into_result()?;
-        }
-        Ok((graphemes, style.into()))
     }
 
     pub fn viewport_hyperlink_uri(&self, x: u16, y: u32) -> Result<Option<String>, Error> {
@@ -1939,12 +1947,6 @@ impl Terminal {
         Ok(generation != 0 && self.kitty_empty_generation.get() != Some(generation))
     }
 
-    /// Placeholder cells can outlive their image and placement storage, so an
-    /// empty-placement generation cannot prove that a picture read is empty.
-    pub fn kitty_graphics_may_have_picture_cells(&self) -> Result<bool, Error> {
-        Ok(self.kitty_graphics_generation()? != 0)
-    }
-
     /// Current fingerprint of each stored image, placed or not, when it is known
     /// without hashing pixels. `None` means deleted or replaced since last seen.
     pub fn kitty_image_fingerprints(&self, image_ids: &[u32]) -> Result<Vec<Option<u64>>, Error> {
@@ -2275,62 +2277,32 @@ impl Terminal {
     where
         F: FnMut(KittyImageDescriptor) -> bool,
     {
-        let specs = kitty_virtual_placement_specs(graphics)?;
-        if specs.is_empty() {
+        let generation = self.kitty_graphics_generation()?;
+        let specs = self.virtual_placement_specs(graphics, screen, generation)?;
+        if specs.preferred.is_empty() {
             return Ok(Vec::new());
         }
 
         let viewport_cols = self.cols()?.max(1);
         let viewport_rows = self.rows()?.max(1);
-        let cell_width = (self.width_px()? / u32::from(viewport_cols)).max(1);
-        let cell_height = (self.height_px()? / u32::from(viewport_rows)).max(1);
+        let [cell_width, cell_height] = self.cell_px()?.map(|size| size.max(1));
         let mut runs = Vec::new();
+        let mut graphemes = Vec::new();
         for y in 0..viewport_rows {
-            let mut current: Option<KittyVirtualRun> = None;
-            for x in 0..viewport_cols {
-                let (graphemes, style) = self.viewport_graphemes_and_style(x, u32::from(y))?;
-                let cell = kitty_virtual_cell(x, y, &graphemes, style);
-                match cell {
-                    Some(cell) => {
-                        if let Some(run) = current.as_mut() {
-                            if run.append(cell) {
-                                continue;
-                            }
-                            runs.push(*run);
-                        }
-                        current = Some(KittyVirtualRun::from_cell(cell));
-                    }
-                    None => {
-                        if let Some(run) = current.take() {
-                            runs.push(run);
-                        }
-                    }
-                }
-            }
-            if let Some(run) = current {
-                runs.push(run);
-            }
+            self.collect_viewport_virtual_runs(y, viewport_cols, &mut runs, &mut graphemes);
         }
 
         let mut placements = Vec::new();
         for run in runs {
             let image_id = run.image_id();
-            let Some(spec) = find_virtual_placement_spec(&specs, image_id, run.placement_id())
-            else {
+            let Some(spec) = specs.get(image_id, run.placement_id()) else {
                 continue;
             };
             let image = unsafe { ffi::ghostty_kitty_graphics_image(graphics, image_id) };
             if image.is_null() {
                 continue;
             }
-            let image_width = kitty_image_u32(
-                image,
-                ffi::GhosttyKittyGraphicsImageData_GHOSTTY_KITTY_IMAGE_DATA_WIDTH,
-            )?;
-            let image_height = kitty_image_u32(
-                image,
-                ffi::GhosttyKittyGraphicsImageData_GHOSTTY_KITTY_IMAGE_DATA_HEIGHT,
-            )?;
+            let [image_width, image_height] = spec.image_px;
             let format = kitty_image_format(image)?;
             let compression = kitty_image_compression(image)?;
             if compression != ffi::GhosttyKittyImageCompression_GHOSTTY_KITTY_IMAGE_COMPRESSION_NONE
@@ -2339,7 +2311,7 @@ impl Terminal {
             }
             let Some(geometry) = kitty_virtual_placement_geometry(
                 run,
-                *spec,
+                spec,
                 image_width,
                 image_height,
                 cell_width,
@@ -2382,6 +2354,23 @@ impl Terminal {
         }
 
         Ok(placements)
+    }
+
+    fn virtual_placement_specs(
+        &self,
+        graphics: ffi::GhosttyKittyGraphics,
+        screen: ActiveScreen,
+        generation: u64,
+    ) -> Result<std::cell::Ref<'_, KittyVirtualPlacementSpecs>, Error> {
+        let index = screen.index();
+        if self.virtual_placement_specs.borrow()[index].generation != generation {
+            self.virtual_placement_specs.borrow_mut()[index] =
+                kitty_virtual_placement_specs(graphics, generation)?;
+        }
+        Ok(std::cell::Ref::map(
+            self.virtual_placement_specs.borrow(),
+            |screens| &screens[index],
+        ))
     }
 
     fn raw(&self) -> ffi::GhosttyTerminal {
@@ -2554,11 +2543,24 @@ fn kitty_placement_bool(
 
 fn kitty_virtual_placement_specs(
     graphics: ffi::GhosttyKittyGraphics,
-) -> Result<Vec<KittyVirtualPlacementSpec>, Error> {
-    let mut iterator: ffi::GhosttyKittyGraphicsPlacementIterator = ptr::null_mut();
+    generation: u64,
+) -> Result<KittyVirtualPlacementSpecs, Error> {
+    let mut specs = KittyVirtualPlacementSpecs {
+        generation,
+        ..Default::default()
+    };
+    if generation == 0 || graphics.is_null() {
+        return Ok(specs);
+    }
+    #[cfg(test)]
+    pictures::VIRTUAL_SPEC_BUILDS.with(|count| count.set(count.get() + 1));
+    let mut iterator = ptr::null_mut();
     unsafe {
         ffi::ghostty_kitty_graphics_placement_iterator_new(ptr::null(), &mut iterator)
             .into_result()?;
+    }
+    let _guard = KittyPlacementIteratorGuard { raw: iterator };
+    unsafe {
         ffi::ghostty_kitty_graphics_get(
             graphics,
             ffi::GhosttyKittyGraphicsData_GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR,
@@ -2566,45 +2568,75 @@ fn kitty_virtual_placement_specs(
         )
         .into_result()?;
     }
-    let _guard = KittyPlacementIteratorGuard { raw: iterator };
 
-    let mut specs = Vec::new();
     while unsafe { ffi::ghostty_kitty_graphics_placement_next(iterator) } {
-        if !kitty_placement_bool(iterator, KITTY_PLACEMENT_DATA_IS_VIRTUAL)? {
-            continue;
+        match read_kitty_virtual_placement_spec(graphics, iterator) {
+            Ok(Some((image_id, spec))) => {
+                if spec.external {
+                    specs.explicit.insert((image_id, spec.placement_id), spec);
+                }
+                // Ghostty's placeholderTarget prefers external IDs, then
+                // the lowest numerical ID in the chosen namespace.
+                let best = specs.preferred.entry(image_id).or_insert(spec);
+                if (!spec.external, spec.placement_id) < (!best.external, best.placement_id) {
+                    *best = spec;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::debug!(%error, "could not read a virtual Kitty placement"),
         }
-        specs.push(KittyVirtualPlacementSpec {
-            image_id: kitty_placement_u32(
-                iterator,
-                ffi::GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID,
-            )?,
+    }
+    Ok(specs)
+}
+
+fn read_kitty_virtual_placement_spec(
+    graphics: ffi::GhosttyKittyGraphics,
+    iterator: ffi::GhosttyKittyGraphicsPlacementIterator,
+) -> Result<Option<(u32, KittyVirtualPlacementSpec)>, Error> {
+    if !kitty_placement_bool(iterator, KITTY_PLACEMENT_DATA_IS_VIRTUAL)? {
+        return Ok(None);
+    }
+    let image_id = kitty_placement_u32(
+        iterator,
+        ffi::GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID,
+    )?;
+    let image = unsafe { ffi::ghostty_kitty_graphics_image(graphics, image_id) };
+    if image.is_null() {
+        return Ok(None);
+    }
+    let (mut x, mut y, mut width, mut height) = (0, 0, 0, 0);
+    unsafe {
+        ffi::ghostty_kitty_graphics_placement_source_rect(
+            iterator,
+            image,
+            &mut x,
+            &mut y,
+            &mut width,
+            &mut height,
+        )
+        .into_result()?;
+    }
+    Ok(Some((
+        image_id,
+        KittyVirtualPlacementSpec {
             placement_id: kitty_placement_u32(
                 iterator,
                 ffi::GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID,
             )?,
+            external: kitty_placement_bool(
+                iterator,
+                ffi::GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID_IS_EXTERNAL,
+            )?,
+            image_px: pictures::image_size(image)?,
+            crop: [x, y, width, height],
             columns: kitty_placement_u32(iterator, KITTY_PLACEMENT_DATA_COLUMNS)?,
             rows: kitty_placement_u32(iterator, KITTY_PLACEMENT_DATA_ROWS)?,
             z: kitty_placement_i32(
                 iterator,
                 ffi::GhosttyKittyGraphicsPlacementData_GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z,
             )?,
-        });
-    }
-    Ok(specs)
-}
-
-fn find_virtual_placement_spec(
-    specs: &[KittyVirtualPlacementSpec],
-    image_id: u32,
-    placement_id: u32,
-) -> Option<&KittyVirtualPlacementSpec> {
-    if placement_id > 0 {
-        specs
-            .iter()
-            .find(|spec| spec.image_id == image_id && spec.placement_id == placement_id)
-    } else {
-        specs.iter().find(|spec| spec.image_id == image_id)
-    }
+        },
+    )))
 }
 
 fn kitty_virtual_cell(

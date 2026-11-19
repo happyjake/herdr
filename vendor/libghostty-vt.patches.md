@@ -360,3 +360,37 @@ just test-one websocket_picture_fetch_survives_an_identical_unplaced_retransmiss
 (cd vendor/libghostty-vt && zig build test-lib-vt -Demit-lib-vt -Demit-xcframework=false -Dtest-filter=kitty.graphics -Dtest-filter=c.kitty_graphics)
 python3 -m unittest scripts.test_vendor_libghostty_vt
 ```
+
+## 0011 expose the Kitty placement ID namespace
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0011-expose-kitty-placement-id-namespace.patch`
+
+herdr issue: none
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
+
+local files:
+
+- `vendor/libghostty-vt/include/ghostty/vt/kitty_graphics.h`
+- `vendor/libghostty-vt/src/terminal/c/kitty_graphics.zig`
+
+reason: Unicode placeholders with underline IDs refer to external placement
+IDs. The existing C iterator provides the numeric ID, which can also belong
+to an anonymous placement in the internal namespace. Exposing the tag lets
+callers distinguish the two and choose the same default as Ghostty.
+
+remove when: the vendored C API exposes the namespace or an equivalent
+indexed placement lookup, and the namespace socket test passes with it.
+
+verification:
+
+```sh
+just test-one pane_read_uses_external_namespace_for_virtual_placement_ids
+python3 -m unittest scripts.test_vendor_libghostty_vt
+```

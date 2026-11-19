@@ -260,6 +260,14 @@ typedef enum GHOSTTY_ENUM_TYPED {
    */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z = 12,
 
+  /**
+   * Whether the placement ID was supplied by a client. Internal IDs are
+   * allocated in a separate namespace and may have the same numeric value.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID_IS_EXTERNAL = 13,
+
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsPlacementData;
 

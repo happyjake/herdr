@@ -80,12 +80,13 @@ pub const PlacementData = enum(c_int) {
     columns = 10,
     rows = 11,
     z = 12,
+    placement_id_is_external = 13,
 
     pub fn OutType(comptime self: PlacementData) type {
         return switch (self) {
             .invalid => void,
             .image_id, .placement_id => u32,
-            .is_virtual => bool,
+            .is_virtual, .placement_id_is_external => bool,
             .x_offset,
             .y_offset,
             .source_x,
@@ -614,6 +615,7 @@ fn placementGetTyped(
         .image_id => out.* = key.image_id,
         .placement_id => out.* = key.placement_id.id,
         .is_virtual => out.* = val.location == .virtual,
+        .placement_id_is_external => out.* = key.placement_id.tag == .external,
         .x_offset => out.* = val.x_offset,
         .y_offset => out.* = val.y_offset,
         .source_x => out.* = val.source_x,

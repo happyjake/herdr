@@ -3990,7 +3990,7 @@ impl PaneRuntime {
         let read = self
             .terminal
             .ghostty
-            .read_pane_ansi(source, lines, offset, self.content_seq());
+            .read_pane_ansi(source, lines, offset, || self.content_seq());
         if offset.is_none() && source != crate::api::schema::ReadSource::Visible {
             self.compression.wake();
         }
