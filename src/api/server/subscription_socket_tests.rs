@@ -274,6 +274,8 @@ fn reply_to_probe_with_flag(
                 alternate_screen: None,
                 continuity: None,
                 continued: None,
+                pictures: None,
+                cell_px: None,
             },
         },
         ref other => panic!("unexpected subscription probe: {other:?}"),

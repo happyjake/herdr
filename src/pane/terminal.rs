@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ use crate::protocol::CellData;
 
 #[cfg(test)]
 mod migration_tests;
+mod pictures;
+pub(crate) use pictures::{PaneAnsiRead, PictureTerminal};
 #[cfg(windows)]
 mod windows_recent_fallback;
 
@@ -86,6 +89,7 @@ pub struct RecentReadWindow {
     /// Internal paging evidence: the first logical line begins mid-wrap.
     /// This is not part of the pane.read wire response.
     pub(crate) top_is_wrap_tail: bool,
+    row_range: Option<RangeInclusive<u32>>,
 }
 
 /// Recent unwrapped history read the way a client pages it — offset 0,
@@ -3258,7 +3262,19 @@ fn ghostty_recent_ansi_for_terminal(
     lines: usize,
     unwrap: bool,
 ) -> Result<String, crate::ghostty::Error> {
-    let Some((start, end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
+    read_ansi_range(
+        terminal,
+        ghostty_recent_read_range(terminal, lines)?,
+        unwrap,
+    )
+}
+
+fn read_ansi_range(
+    terminal: &crate::ghostty::Terminal,
+    range: Option<(usize, usize, u16)>,
+    unwrap: bool,
+) -> Result<String, crate::ghostty::Error> {
+    let Some((start, end, cols)) = range else {
         return Ok(String::new());
     };
     terminal.read_ansi_screen(
@@ -3339,6 +3355,7 @@ fn ghostty_recent_read_at_offset(
                 return Ok(RecentReadWindow {
                     text: fallback.text,
                     truncated: fallback.truncated,
+                    row_range: None,
                     ..window
                 });
             }
@@ -3377,12 +3394,12 @@ fn ghostty_recent_read_at_offset_for_terminal(
     if offset_from_bottom == 0 {
         // The zero-offset window is byte-identical to today's reads, floor
         // guard included; only the echo fields are new.
+        let range = ghostty_recent_read_range(terminal, lines)?;
         let text = match (unwrapped, ansi) {
             (false, false) => ghostty_recent_text_for_terminal(terminal, lines)?,
             (true, false) => ghostty_recent_text_unwrapped_for_terminal(terminal, lines)?,
-            (_, true) => ghostty_recent_ansi_for_terminal(terminal, lines, unwrapped)?,
+            (_, true) => read_ansi_range(terminal, range, unwrapped)?,
         };
-        let range = ghostty_recent_read_range(terminal, lines)?;
         let has_more = range.is_some_and(|(start, _, _)| start > 0);
         let top_is_wrap_tail = match range {
             Some((start, _, _)) if unwrapped => terminal.row_wrap_continuation(start as u32)?,
@@ -3395,6 +3412,7 @@ fn ghostty_recent_read_at_offset_for_terminal(
             has_more,
             offset_unsupported: false,
             top_is_wrap_tail,
+            row_range: range.map(|(start, end, _)| start as u32..=end as u32),
         });
     }
     let Some((_, mut end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
@@ -3475,6 +3493,7 @@ fn ghostty_recent_read_at_offset_for_terminal(
         has_more: start > 0,
         offset_unsupported: false,
         top_is_wrap_tail: unwrapped && terminal.row_wrap_continuation(start as u32)?,
+        row_range: (lines > 0 && start <= page_end).then(|| start as u32..=page_end as u32),
     })
 }
 
@@ -7237,6 +7256,7 @@ mod tests {
                         truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
+                        row_range: None,
                     },
                     1 => RecentReadWindow {
                         // The actual page is "oldest\nolder\n": its bottom
@@ -7247,6 +7267,7 @@ mod tests {
                         truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
+                        row_range: None,
                     },
                     _ => RecentReadWindow {
                         text: "oldest\nolder".into(),
@@ -7255,6 +7276,7 @@ mod tests {
                         truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
+                        row_range: None,
                     },
                 })
             });
@@ -7308,6 +7330,7 @@ mod tests {
                             truncated: true,
                             offset_unsupported: false,
                             top_is_wrap_tail: true,
+                            row_range: None,
                         }
                     } else {
                         RecentReadWindow {
@@ -7317,6 +7340,7 @@ mod tests {
                             truncated: true,
                             offset_unsupported: false,
                             top_is_wrap_tail: false,
+                            row_range: None,
                         }
                     })
                 });
@@ -7348,6 +7372,7 @@ mod tests {
                         truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: true,
+                        row_range: None,
                     },
                     1 => RecentReadWindow {
                         text: format!("L-1\r\n{above}\r\nL1"),
@@ -7356,6 +7381,7 @@ mod tests {
                         truncated: true,
                         offset_unsupported: false,
                         top_is_wrap_tail: false,
+                        row_range: None,
                     },
                     other => panic!("no page at {other}"),
                 })

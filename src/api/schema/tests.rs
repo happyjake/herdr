@@ -1600,6 +1600,8 @@ fn subscription_event_envelope_round_trips() {
                 alternate_screen: None,
                 continuity: None,
                 continued: None,
+                pictures: None,
+                cell_px: None,
             },
         }),
     };
@@ -1726,6 +1728,7 @@ fn success_response_round_trips() {
                 preface: true,
                 read_continuity: true,
                 read_alternate_screen: true,
+                pane_pictures: true,
             }),
             name: Some("test-server".into()),
             reach: Some("test-server".into()),

@@ -311,3 +311,38 @@ verification:
 (cd vendor/libghostty-vt && zig build test-lib-vt -Dtest-filter='cursorAbsolute keeps the hyperlink when style migration splits the page')
 just maintenance-test
 ```
+
+## 0010 visit stored Kitty images
+
+status: active
+
+patch: `vendor/patches/libghostty-vt/0010-visit-stored-kitty-images.patch`
+
+herdr issue: none
+
+upstream discussion: not opened
+
+upstream pr: not opened
+
+vendored base: `44f2a44df7e8c4a0c6df3f7d872ef3d7ead88e51`
+
+local files:
+
+- `vendor/libghostty-vt/src/lib_vt.zig`
+- `vendor/libghostty-vt/src/terminal/c/kitty_graphics.zig`
+
+reason: A picture fetch resolves a payload fingerprint against the terminal's
+stored images. A placement iterator cannot find an unplaced image or an image
+held by an inactive screen. The visitor borrows each image for the duration of
+the search and stops at the first match.
+
+remove when: the vendored C API can enumerate stored images across both screens
+and the socket picture tests pass using that API.
+
+verification:
+
+```sh
+just test-one pane_read_lists_direct_kitty_pictures
+just test-one pane_picture_fetches_alpha_and_checks_current_storage
+python3 -m unittest scripts.test_vendor_libghostty_vt
+```

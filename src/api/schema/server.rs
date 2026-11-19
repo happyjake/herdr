@@ -319,4 +319,7 @@ pub struct ServerCapabilities {
     /// predate it, whose replies omit the field.
     #[serde(default)]
     pub read_alternate_screen: bool,
+    /// ANSI pane reads include Kitty picture placements and support fetching their payloads.
+    #[serde(default)]
+    pub pane_pictures: bool,
 }

@@ -404,13 +404,14 @@ impl App {
         else {
             return agent_not_found(id, &params.target);
         };
-        let (text, truncated, effective_offset, has_more) = match super::pane_read_window(
+        let (text, truncated, effective_offset, has_more, _) = match super::pane_read_window(
             pane,
             params.source,
             params.format,
             params.lines,
             params.offset_from_bottom,
             None,
+            false,
         ) {
             Ok(window) => window,
             Err(message) => return encode_error(id, "invalid_request", message),
@@ -438,6 +439,8 @@ impl App {
                     alternate_screen: None,
                     continuity: None,
                     continued: None,
+                    pictures: None,
+                    cell_px: None,
                 },
             },
         )

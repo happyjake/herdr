@@ -4593,6 +4593,8 @@ fn terminal_control_rejects_attach_during_alt_screen_read() {
                     alternate_screen: None,
                     continuity: None,
                     continued: None,
+                    pictures: None,
+                    cell_px: None,
                 },
                 120,
                 false,

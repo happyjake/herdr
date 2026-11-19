@@ -1755,6 +1755,26 @@ impl App {
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
+    pub(crate) fn handle_pane_picture(
+        &self,
+        id: String,
+        params: crate::api::schema::PanePictureParams,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        let resolved = match self.resolve_pane_command_target(&id, &params.pane_id) {
+            Ok(resolved) => resolved,
+            Err(response) => {
+                let _ = respond_to.send(response);
+                return;
+            }
+        };
+        let Some((pane, _)) = self.lookup_runtime(resolved.ws_idx, resolved.pane_id) else {
+            let _ = respond_to.send(pane_not_found(id, &params.pane_id));
+            return;
+        };
+        super::pictures::fetch(pane.picture_terminal(), id, params, respond_to);
+    }
+
     pub(super) fn handle_pane_read(&mut self, id: String, params: PaneReadParams) -> String {
         let resolved = match self.resolve_pane_command_target(&id, &params.pane_id) {
             Ok(resolved) => resolved,
@@ -1780,10 +1800,11 @@ impl App {
                     params.lines,
                     params.offset_from_bottom,
                     params.span,
+                    true,
                 ),
             )
         });
-        let (text, truncated, effective_offset, has_more) = match window {
+        let (text, truncated, effective_offset, has_more, pictures) = match window {
             Ok(window) => window,
             Err(message) => return encode_error(id, "invalid_request", message),
         };
@@ -1815,6 +1836,8 @@ impl App {
                     alternate_screen: Some(alternate_screen),
                     continuity: continuity.continuity,
                     continued: continuity.continued,
+                    cell_px: pictures.as_ref().map(|(cell_px, _)| *cell_px),
+                    pictures: pictures.map(|(_, placements)| placements),
                 },
             },
         )

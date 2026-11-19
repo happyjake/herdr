@@ -1,0 +1,41 @@
+diff --git a/vendor/libghostty-vt/src/lib_vt.zig b/vendor/libghostty-vt/src/lib_vt.zig
+index 05bc0baa..754c204d 100644
+--- a/vendor/libghostty-vt/src/lib_vt.zig
++++ b/vendor/libghostty-vt/src/lib_vt.zig
+@@ -388,6 +388,7 @@ comptime {
+         if (features.kitty_graphics) {
+             @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
+             @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
++            @export(&c.kitty_graphics.visit_images, .{ .name = "herdr_kitty_graphics_visit_images" });
+             @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
+             @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });
+             @export(&c.kitty_graphics_placement_iterator_new, .{ .name = "ghostty_kitty_graphics_placement_iterator_new" });
+diff --git a/vendor/libghostty-vt/src/terminal/c/kitty_graphics.zig b/vendor/libghostty-vt/src/terminal/c/kitty_graphics.zig
+index c66b13be..2d18cadd 100644
+--- a/vendor/libghostty-vt/src/terminal/c/kitty_graphics.zig
++++ b/vendor/libghostty-vt/src/terminal/c/kitty_graphics.zig
+@@ -212,6 +212,24 @@ pub fn image_get_handle(
+     return storage.images.getPtr(image_id);
+ }
+
++/// Visit stored images even when they have no placement or the screen is inactive.
++pub fn visit_images(
++    terminal_: terminal_c.Terminal,
++    visitor: *const fn (ImageHandle, ?*anyopaque) callconv(lib.calling_conv) bool,
++    context: ?*anyopaque,
++) callconv(lib.calling_conv) void {
++    if (comptime !build_options.kitty_graphics) return;
++
++    const wrapper = terminal_ orelse return;
++    var screens = wrapper.terminal.screens.all.iterator();
++    while (screens.next()) |screen| {
++        var images = screen.value.*.kitty_images.images.valueIterator();
++        while (images.next()) |image| {
++            if (visitor(image, context)) return;
++        }
++    }
++}
++
+ pub fn image_get(
+     image_: ImageHandle,
+     data: ImageData,

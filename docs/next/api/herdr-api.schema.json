@@ -3334,6 +3334,27 @@
           ],
           "type": "object"
         },
+        "PanePictureParams": {
+          "properties": {
+            "fingerprint": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "width_px": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "fingerprint",
+            "width_px"
+          ],
+          "type": "object"
+        },
         "PanePrefaceParams": {
           "description": "`pane.preface` parameters: where the client's oldest held screen line is,\nand how many prompted turns it has room for.",
           "properties": {
@@ -6734,6 +6755,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.picture",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PanePictureParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.report_agent",
               "type": "string"
             },
@@ -7614,6 +7651,89 @@
           ],
           "type": "object"
         },
+        "PanePicture": {
+          "properties": {
+            "col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "crop": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "image_px": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "kind": {
+              "$ref": "#/schemas/subscription_event/$defs/PanePictureKind"
+            },
+            "line": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "opaque": {
+              "type": "boolean"
+            },
+            "rows": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows_above": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "z": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "fingerprint",
+            "image_px",
+            "line",
+            "rows_above",
+            "col",
+            "cols",
+            "rows",
+            "crop",
+            "z",
+            "opaque",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "PanePictureKind": {
+          "enum": [
+            "direct"
+          ],
+          "type": "string"
+        },
         "PaneReadContinued": {
           "description": "The parts of a `pane.read` window around the covered bytes a\n`continue_from` token named.",
           "properties": {
@@ -7655,6 +7775,19 @@
               "description": "Whether the pane was on the alternate screen when this window was\nread, sampled with the window's text so no output lands between\nthem. `pane.read` replies from servers advertising\n`capabilities.read_alternate_screen` always carry it; older servers\nand `agent.read` omit it.",
               "type": [
                 "boolean",
+                "null"
+              ]
+            },
+            "cell_px": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": [
+                "array",
                 "null"
               ]
             },
@@ -7711,6 +7844,16 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "pictures": {
+              "description": "Complete placement list for the full read window, including continued text.",
+              "items": {
+                "$ref": "#/schemas/subscription_event/$defs/PanePicture"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "revision": {
               "format": "uint64",
@@ -10129,6 +10272,96 @@
           ],
           "type": "object"
         },
+        "PanePicture": {
+          "properties": {
+            "col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cols": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "crop": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "image_px": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/PanePictureKind"
+            },
+            "line": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "opaque": {
+              "type": "boolean"
+            },
+            "rows": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows_above": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "z": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "fingerprint",
+            "image_px",
+            "line",
+            "rows_above",
+            "col",
+            "cols",
+            "rows",
+            "crop",
+            "z",
+            "opaque",
+            "kind"
+          ],
+          "type": "object"
+        },
+        "PanePictureKind": {
+          "enum": [
+            "direct"
+          ],
+          "type": "string"
+        },
+        "PanePictureMediaType": {
+          "enum": [
+            "image/jpeg",
+            "image/png"
+          ],
+          "type": "string"
+        },
         "PaneProcessInfo": {
           "properties": {
             "foreground_process_group_id": {
@@ -10256,6 +10489,19 @@
                 "null"
               ]
             },
+            "cell_px": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "cols": {
               "description": "Current terminal width in columns. Older servers omit this field.",
               "format": "uint16",
@@ -10309,6 +10555,16 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "pictures": {
+              "description": "Complete placement list for the full read window, including continued text.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PanePicture"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "revision": {
               "format": "uint64",
@@ -12437,6 +12693,41 @@
             },
             {
               "properties": {
+                "data_b64": {
+                  "type": "string"
+                },
+                "fingerprint": {
+                  "type": "string"
+                },
+                "media_type": {
+                  "$ref": "#/schemas/success_response/$defs/PanePictureMediaType"
+                },
+                "px": {
+                  "items": {
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "maxItems": 2,
+                  "minItems": 2,
+                  "type": "array"
+                },
+                "type": {
+                  "const": "pane_picture",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "fingerprint",
+                "media_type",
+                "px",
+                "data_b64"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "pane_id": {
                   "type": "string"
                 },
@@ -13225,6 +13516,11 @@
             "pane_name_keep_verdicts": {
               "default": false,
               "description": "Whether pane.rename accepts kept_through without rewriting the label.\nClients must omit kept_through unless this capability is advertised.",
+              "type": "boolean"
+            },
+            "pane_pictures": {
+              "default": false,
+              "description": "ANSI pane reads include Kitty picture placements and support fetching their payloads.",
               "type": "boolean"
             },
             "preface": {

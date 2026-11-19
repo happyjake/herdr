@@ -53,8 +53,9 @@ pub(crate) use self::terminal::test_encode_key_for_app;
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
-    TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
+    PaneAnsiRead, PictureTerminal, TerminalCompressionStep, TerminalDirtyPatch,
+    TerminalDirtyPatchOutcome, TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow,
+    TerminalTextPoint, TerminalWordMotion,
 };
 pub use self::{
     state::{unix_now_secs, AgentStatusClaim, PaneState},
@@ -3049,6 +3050,11 @@ impl PaneRuntime {
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         if crate::kitty_graphics::is_enabled() {
+            // Until a client supplies its geometry, use an 8 × 16 cell for
+            // headless Kitty placement sizing and API reads.
+            terminal
+                .resize(cols, rows, 8, 16)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             terminal
                 .enable_kitty_graphics()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -3957,6 +3963,23 @@ impl PaneRuntime {
         let result = self.terminal.recent_unwrapped_ansi_snapshot(lines);
         self.compression.wake();
         result
+    }
+
+    pub(crate) fn picture_terminal(&self) -> PictureTerminal {
+        PictureTerminal::new(&self.terminal)
+    }
+
+    pub(crate) fn read_pane_ansi(
+        &self,
+        source: crate::api::schema::ReadSource,
+        lines: Option<usize>,
+        offset: Option<usize>,
+    ) -> PaneAnsiRead {
+        let read = self.terminal.ghostty.read_pane_ansi(source, lines, offset);
+        if offset.is_none() {
+            self.compression.wake();
+        }
+        read
     }
 
     pub fn recent_read_at_offset(&self, request: RecentReadRequest) -> RecentReadWindow {

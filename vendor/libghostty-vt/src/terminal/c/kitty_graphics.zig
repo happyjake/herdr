@@ -212,6 +212,24 @@ pub fn image_get_handle(
     return storage.images.getPtr(image_id);
 }
 
+/// Visit stored images even when they have no placement or the screen is inactive.
+pub fn visit_images(
+    terminal_: terminal_c.Terminal,
+    visitor: *const fn (ImageHandle, ?*anyopaque) callconv(lib.calling_conv) bool,
+    context: ?*anyopaque,
+) callconv(lib.calling_conv) void {
+    if (comptime !build_options.kitty_graphics) return;
+
+    const wrapper = terminal_ orelse return;
+    var screens = wrapper.terminal.screens.all.iterator();
+    while (screens.next()) |screen| {
+        var images = screen.value.*.kitty_images.images.valueIterator();
+        while (images.next()) |image| {
+            if (visitor(image, context)) return;
+        }
+    }
+}
+
 pub fn image_get(
     image_: ImageHandle,
     data: ImageData,

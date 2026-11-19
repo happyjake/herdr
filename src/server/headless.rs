@@ -3068,6 +3068,11 @@ impl HeadlessServer {
             let _ = msg.respond_to.send(response);
             return changed;
         }
+        if let api::schema::Method::PanePicture(params) = msg.request.method {
+            self.app
+                .handle_pane_picture(msg.request.id, params, msg.respond_to);
+            return changed;
+        }
         let alt_screen_read_spec = self.alt_screen_read_spec(&msg.request);
         if matches!(&msg.request.method, api::schema::Method::AgentPrompt(_)) {
             let deferred_changed = self

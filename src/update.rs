@@ -3068,6 +3068,7 @@ mod tests {
                 preface: false,
                 read_continuity: false,
                 read_alternate_screen: false,
+                pane_pictures: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -3157,6 +3158,7 @@ mod tests {
                     preface: false,
                     read_continuity: false,
                     read_alternate_screen: false,
+                    pane_pictures: false,
                 }),
             },
         };
@@ -3429,6 +3431,7 @@ mod tests {
                     preface: false,
                     read_continuity: false,
                     read_alternate_screen: false,
+                    pane_pictures: false,
                 }),
             },
         };

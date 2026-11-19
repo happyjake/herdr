@@ -28,6 +28,8 @@ use crate::pane_graphics_files::OwnedExport;
 #[cfg(target_os = "linux")]
 mod native_image_sources;
 mod native_source;
+mod pictures;
+pub use pictures::{KittyPicture, KittyPictureImage, KittyPicturePixels};
 pub mod pane_graphics_files;
 
 /// Terminfo entry the terminal emulates; child processes should see it as TERM.
@@ -258,6 +260,7 @@ type KittyPlacementPayload = (KittyImageDescriptor, Vec<u8>, Option<Arc<OwnedExp
 struct KittyImageFingerprintEntry {
     generation: u64,
     fingerprint: u64,
+    opaque: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2046,6 +2049,7 @@ impl Terminal {
                 KittyImageFingerprintEntry {
                     generation,
                     fingerprint,
+                    opaque: None,
                 },
             );
         }

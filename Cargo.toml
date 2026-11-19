@@ -34,6 +34,7 @@ clap_complete = "4.5"
 crossterm = "0.29"
 ctrlc = { version = "3", features = ["termination"] }
 interprocess = "2.4.2"
+jpeg-encoder = "0.6.1"
 jsonc-parser = { version = "0.33.1", default-features = false, features = ["cst", "serde_json"] }
 libc = "0.2"
 portable-pty = "=0.9.0"

@@ -6,6 +6,7 @@ mod env;
 mod integrations;
 mod layouts;
 mod panes;
+mod pictures;
 pub(crate) mod plugins;
 mod read_continuity;
 pub(super) mod responses;
@@ -87,7 +88,13 @@ enum RuntimeExitAction {
 
 /// Text plus the truncation flag and offset echo fields (`Some` only when
 /// the request carried an offset) produced by [`pane_read_window`].
-type PaneReadWindowParts = (String, bool, Option<u64>, Option<bool>);
+type PaneReadWindowParts = (
+    String,
+    bool,
+    Option<u64>,
+    Option<bool>,
+    Option<([u32; 2], Vec<crate::api::schema::PanePicture>)>,
+);
 
 /// Read window shared by the pane.read and agent.read handlers so their
 /// source dispatch and offset semantics cannot drift. Returns the text plus
@@ -101,29 +108,51 @@ fn pane_read_window(
     lines: Option<u32>,
     offset_from_bottom: Option<u64>,
     span: Option<crate::api::schema::ReadSpan>,
+    include_pictures: bool,
 ) -> Result<PaneReadWindowParts, &'static str> {
     use crate::api::schema::{ReadFormat, ReadSource};
 
-    if let Some(span) = span {
-        if offset_from_bottom.is_some() || source != ReadSource::RecentUnwrapped {
-            return Err("a span read is a recent_unwrapped read from the bottom");
+    if span.is_some() && (offset_from_bottom.is_some() || source != ReadSource::RecentUnwrapped) {
+        return Err("a span read is a recent_unwrapped read from the bottom");
+    }
+    if offset_from_bottom.is_some()
+        && !matches!(source, ReadSource::Recent | ReadSource::RecentUnwrapped)
+    {
+        return Err("offset_from_bottom requires source recent or recent_unwrapped");
+    }
+    if include_pictures
+        && format == ReadFormat::Ansi
+        && source != ReadSource::Detection
+        && span.is_none()
+    {
+        let read = pane.read_pane_ansi(
+            source,
+            lines.map(|lines| lines.min(1000) as usize),
+            offset_from_bottom.map(|offset| usize::try_from(offset).unwrap_or(usize::MAX)),
+        );
+        if read.offset_unsupported {
+            return Err("offset paging is unsupported on this pane");
         }
+        let paging = offset_from_bottom.is_some();
+        return Ok((
+            read.text,
+            read.truncated,
+            paging.then_some(read.effective_offset as u64),
+            paging.then_some(read.has_more),
+            read.pictures,
+        ));
+    }
+    if let Some(span) = span {
         let page_lines = lines.unwrap_or(1000).min(1000) as usize;
         let read = pane
             .recent_read_span(
                 page_lines,
                 span.min_lines,
                 span.max_lines,
-                matches!(format, ReadFormat::Ansi),
+                format == ReadFormat::Ansi,
             )
             .ok_or("this pane's history cannot be read as one span")?;
-        return Ok((read.text, read.has_more, Some(0), Some(read.has_more)));
-    }
-
-    if offset_from_bottom.is_some()
-        && !matches!(source, ReadSource::Recent | ReadSource::RecentUnwrapped)
-    {
-        return Err("offset_from_bottom requires source recent or recent_unwrapped");
+        return Ok((read.text, read.has_more, Some(0), Some(read.has_more), None));
     }
     Ok(match offset_from_bottom {
         Some(offset) => {
@@ -142,12 +171,13 @@ fn pane_read_window(
                 window.truncated,
                 Some(window.effective_offset as u64),
                 Some(window.has_more),
+                None,
             )
         }
         None => {
             let snapshot =
                 crate::app::api_helpers::read_terminal_snapshot(pane, source, format, lines);
-            (snapshot.text, snapshot.truncated, None, None)
+            (snapshot.text, snapshot.truncated, None, None, None)
         }
     })
 }
@@ -1482,6 +1512,13 @@ impl App {
                 return self.handle_pane_flag(request.id, params.pane_id, None)
             }
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
+            Method::PanePicture(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "picture fetch requires a socket request",
+                );
+            }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
             }

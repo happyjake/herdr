@@ -437,6 +437,19 @@ impl TerminalRuntime {
         self.0.recent_unwrapped_ansi_snapshot(lines)
     }
 
+    pub(crate) fn picture_terminal(&self) -> crate::pane::PictureTerminal {
+        self.0.picture_terminal()
+    }
+
+    pub(crate) fn read_pane_ansi(
+        &self,
+        source: crate::api::schema::ReadSource,
+        lines: Option<usize>,
+        offset: Option<usize>,
+    ) -> crate::pane::PaneAnsiRead {
+        self.0.read_pane_ansi(source, lines, offset)
+    }
+
     pub fn recent_read_at_offset(
         &self,
         request: crate::pane::RecentReadRequest,

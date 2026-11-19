@@ -3883,3 +3883,6 @@ fn preface_places_the_seam_between_a_real_screen_and_a_reported_record() {
     cleanup_spawned_herdr(server.child, server.base);
     let _ = fs::remove_dir_all(&home);
 }
+
+#[path = "ws_api/pictures.rs"]
+mod pictures;

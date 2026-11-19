@@ -9,9 +9,9 @@ use super::integrations::{
 };
 use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
-    PaneMouseRouting, PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult,
-    PaneResizeResult, PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult, Preface,
-    PrefaceReason, PromptTrail, PromptTrailReason, TurnIndex,
+    PaneMouseRouting, PaneMoveResult, PaneNeighborResult, PanePictureMediaType, PaneProcessInfo,
+    PaneReadResult, PaneResizeResult, PaneSwapResult, PaneTextPoint, PaneTextRange, PaneZoomResult,
+    Preface, PrefaceReason, PromptTrail, PromptTrailReason, TurnIndex,
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
@@ -265,6 +265,12 @@ pub enum ResponseResult {
     },
     PaneRead {
         read: PaneReadResult,
+    },
+    PanePicture {
+        fingerprint: String,
+        media_type: PanePictureMediaType,
+        px: [u32; 2],
+        data_b64: String,
     },
     PaneSelection {
         pane_id: String,

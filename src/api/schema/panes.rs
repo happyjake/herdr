@@ -1176,6 +1176,47 @@ pub struct PaneReadResult {
     /// bytes, then `after`. Every other field describes the full window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued: Option<PaneReadContinued>,
+    /// Complete placement list for the full read window, including continued text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pictures: Option<Vec<PanePicture>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_px: Option<[u32; 2]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PanePictureParams {
+    pub pane_id: String,
+    pub fingerprint: String,
+    pub width_px: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PanePicture {
+    pub fingerprint: String,
+    pub image_px: [u32; 2],
+    pub line: u32,
+    pub rows_above: u32,
+    pub col: u16,
+    pub cols: u32,
+    pub rows: u32,
+    pub crop: [u32; 4],
+    pub z: i32,
+    pub opaque: bool,
+    pub kind: PanePictureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PanePictureKind {
+    Direct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub enum PanePictureMediaType {
+    #[serde(rename = "image/jpeg")]
+    Jpeg,
+    #[serde(rename = "image/png")]
+    Png,
 }
 
 /// A continuity token over a `pane.read` reply's covered text. Opaque to

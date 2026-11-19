@@ -457,6 +457,8 @@ pub(crate) fn answer_with_alternate_screen_text(
     }
     read.continuity = None;
     read.continued = None;
+    read.pictures = None;
+    read.cell_px = None;
     if read.effective_offset.is_some() || read.has_more.is_some() {
         read.effective_offset = Some(0);
         read.has_more = Some(snapshot.truncated);
@@ -536,6 +538,8 @@ mod tests {
                 alternate_screen: None,
                 continuity: None,
                 continued: None,
+                pictures: None,
+                cell_px: None,
             },
             lines,
             false,

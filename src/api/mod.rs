@@ -74,6 +74,7 @@ pub fn server_capabilities() -> crate::api::schema::ServerCapabilities {
         preface: true,
         read_continuity: true,
         read_alternate_screen: true,
+        pane_pictures: true,
     }
 }
 

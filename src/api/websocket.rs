@@ -2274,6 +2274,7 @@ mod tests {
             preface: false,
             read_continuity: false,
             read_alternate_screen: false,
+            pane_pictures: false,
         }));
         let mut websocket = connect_authorized(&server);
 

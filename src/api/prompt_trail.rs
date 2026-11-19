@@ -1937,6 +1937,8 @@ mod tests {
                 alternate_screen: None,
                 continuity: None,
                 continued: None,
+                pictures: None,
+                cell_px: None,
             }
         }
 
@@ -1962,6 +1964,8 @@ mod tests {
                 alternate_screen: None,
                 continuity: None,
                 continued: None,
+                pictures: None,
+                cell_px: None,
             }
         }
     }
