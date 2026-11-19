@@ -101,6 +101,20 @@ unsafe extern "C" {
         visit: extern "C" fn(*const c_void, u32, *mut c_void),
         context: *mut c_void,
     );
+    fn ghostty_kitty_graphics_visit_image_identities(
+        storage: ffi::GhosttyKittyGraphics,
+        visit: extern "C" fn(u32, u64, *mut c_void),
+        context: *mut c_void,
+    );
+    fn ghostty_kitty_graphics_screen_wrap_ranges(
+        terminal: ffi::GhosttyTerminal,
+        ranges: *mut RowRange,
+        count: usize,
+    ) -> ffi::GhosttyResult;
+    fn ghostty_kitty_graphics_placement_anchor(
+        iterator: ffi::GhosttyKittyGraphicsPlacementIterator,
+        anchor: *mut ffi::GhosttyGridRef,
+    ) -> ffi::GhosttyResult;
     fn ghostty_kitty_graphics_screen_row_evidence(
         terminal: ffi::GhosttyTerminal,
         first: u32,
@@ -125,6 +139,7 @@ struct PictureContent {
 #[derive(Default)]
 pub(super) struct PictureCatalog {
     generations: [u64; 2],
+    indexed_generations: [u64; 2],
     by_image: HashMap<ImageIdentity, Option<PictureContent>>,
     by_fingerprint: HashMap<u64, HashSet<ImageIdentity>>,
 }
@@ -157,6 +172,47 @@ impl PictureCatalog {
             !candidates.is_empty()
         });
     }
+
+    /// On a fetch miss, register any new identities without reading their bytes.
+    fn index_stores(&mut self, terminal: &Terminal) {
+        struct Visit<'a> {
+            screen: ActiveScreen,
+            images: &'a mut HashMap<ImageIdentity, Option<PictureContent>>,
+        }
+        extern "C" fn visit(id: u32, root_generation: u64, context: *mut c_void) {
+            // The synchronous store visitor only passes this context during the call.
+            let ctx = unsafe { &mut *context.cast::<Visit<'_>>() };
+            ctx.images
+                .entry(ImageIdentity {
+                    screen: ctx.screen,
+                    id,
+                    root_generation,
+                })
+                .or_default();
+        }
+
+        for screen in [ActiveScreen::Primary, ActiveScreen::Alternate] {
+            let i = screen.index();
+            if self.indexed_generations[i] == self.generations[i] {
+                continue;
+            }
+            let storage = terminal.picture_storage(screen);
+            if !storage.is_null() {
+                let mut ctx = Visit {
+                    screen,
+                    images: &mut self.by_image,
+                };
+                unsafe {
+                    ghostty_kitty_graphics_visit_image_identities(
+                        storage,
+                        visit,
+                        (&mut ctx as *mut Visit<'_>).cast(),
+                    )
+                };
+            }
+            self.indexed_generations[i] = self.generations[i];
+        }
+    }
 }
 
 fn image_matches(
@@ -181,11 +237,65 @@ pub struct KittyPictureSample {
 
 enum ContentSample {
     Ready(PictureContent),
-    Root {
-        image: KittyPictureImage,
-        id: ImageIdentity,
-        catalog: Arc<Mutex<PictureCatalog>>,
-    },
+    Root(PictureRoot),
+}
+
+struct PictureRoot {
+    image: KittyPictureImage,
+    id: ImageIdentity,
+    catalog: Arc<Mutex<PictureCatalog>>,
+}
+
+impl PictureRoot {
+    fn content(&self) -> io::Result<PictureContent> {
+        if let Some(content) = self
+            .catalog
+            .lock()
+            .ok()
+            .and_then(|c| c.by_image.get(&self.id).copied().flatten())
+        {
+            return Ok(content);
+        }
+        let content = fingerprint_pixels(self.image.pixels()?)?;
+        if let Ok(mut catalog) = self.catalog.lock() {
+            if let Some(entry) = catalog.by_image.get_mut(&self.id) {
+                *entry = Some(content);
+                catalog
+                    .by_fingerprint
+                    .entry(content.fingerprint)
+                    .or_default()
+                    .insert(self.id);
+            }
+        }
+        Ok(content)
+    }
+}
+
+/// Immutable candidates from one storage snapshot. Resolve after releasing
+/// the terminal lock so reading a new file or hashing pixels cannot stall PTY writes.
+pub struct KittyPictureLookup {
+    fingerprint: u64,
+    indexed: Option<KittyPictureImage>,
+    unindexed: Vec<PictureRoot>,
+}
+
+impl KittyPictureLookup {
+    pub fn finish(self) -> io::Result<Option<KittyPictureImage>> {
+        if let Some(image) = self.indexed {
+            return Ok(Some(image));
+        }
+        let mut error = None;
+        for root in self.unindexed {
+            match root.content() {
+                Ok(content) if content.fingerprint == self.fingerprint => {
+                    return Ok(Some(root.image))
+                }
+                Ok(_) => {}
+                Err(err) => error = Some(err),
+            }
+        }
+        error.map_or(Ok(None), Err)
+    }
 }
 
 impl KittyPictureSample {
@@ -194,28 +304,7 @@ impl KittyPictureSample {
     pub fn finish(self) -> io::Result<KittyPicture> {
         let content = match self.content {
             ContentSample::Ready(content) => content,
-            ContentSample::Root { image, id, catalog } => {
-                let cached = catalog
-                    .lock()
-                    .ok()
-                    .and_then(|c| c.by_image.get(&id).copied().flatten());
-                if let Some(content) = cached {
-                    content
-                } else {
-                    let content = fingerprint_pixels(image.pixels()?)?;
-                    if let Ok(mut catalog) = catalog.lock() {
-                        if let Some(entry) = catalog.by_image.get_mut(&id) {
-                            *entry = Some(content);
-                            catalog
-                                .by_fingerprint
-                                .entry(content.fingerprint)
-                                .or_default()
-                                .insert(id);
-                        }
-                    }
-                    content
-                }
-            }
+            ContentSample::Root(root) => root.content()?,
         };
         let p = self.placement;
         Ok(KittyPicture {
@@ -266,6 +355,7 @@ struct Placement {
     image_id: u32,
     screen_row: u32,
     bottom: u32,
+    wrapped: Option<bool>,
     max_bottom: u32,
     col: u16,
     cols: u32,
@@ -281,16 +371,21 @@ pub(super) struct PictureLayout {
     evidence: Option<RowEvidence>,
 }
 
+#[repr(C)]
+struct RowRange {
+    first: u32,
+    last: u32,
+    clean_rows: u32,
+}
+
 struct RowEvidence {
     range: RangeInclusive<u32>,
-    wrapped: Vec<u32>,
     formatted: Vec<u32>,
     paged: Vec<u32>,
 }
 
 impl RowEvidence {
     fn new(terminal: &Terminal, range: RangeInclusive<u32>) -> Result<Self, Error> {
-        const WRAP: u8 = 1;
         const CONTINUATION: u8 = 2;
         const FORMATTER_BREAK: u8 = 4;
         let count = range.end() - range.start() + 1;
@@ -305,16 +400,12 @@ impl RowEvidence {
             .into_result()?;
         }
 
-        let mut wrapped = Vec::with_capacity(flags.len() + 1);
         let mut formatted = Vec::with_capacity(flags.len());
         let mut paged = Vec::with_capacity(flags.len());
-        wrapped.push(0);
-        let (mut wrap_count, mut line, mut page_line) = (0, 0, 0);
+        let (mut line, mut page_line) = (0, 0);
         for (index, &flag) in flags.iter().enumerate() {
             formatted.push(line);
             paged.push(page_line);
-            wrap_count += u32::from(flag & (WRAP | CONTINUATION) != 0);
-            wrapped.push(wrap_count);
             // PageFormatter adds a break after an empty row or a hard
             // break. Offset formatting also separates its logical groups.
             let formatter_break = flag & FORMATTER_BREAK != 0;
@@ -326,7 +417,6 @@ impl RowEvidence {
         }
         Ok(Self {
             range,
-            wrapped,
             formatted,
             paged,
         })
@@ -334,12 +424,6 @@ impl RowEvidence {
 
     fn contains(&self, rows: &RangeInclusive<u32>) -> bool {
         self.range.contains(rows.start()) && self.range.contains(rows.end())
-    }
-
-    fn is_wrapped(&self, placement: Placement) -> bool {
-        let first = *self.range.start();
-        self.wrapped[(placement.screen_row - first) as usize]
-            != self.wrapped[(placement.bottom - first + 1) as usize]
     }
 
     fn line(&self, start: u32, row: u32, paged: bool) -> u32 {
@@ -366,17 +450,54 @@ impl Terminal {
     /// Resolve a previously issued fingerprint against the current image
     /// identity, including inactive screens and images without placements.
     pub fn kitty_picture_by_fingerprint(&self, fingerprint: u64) -> Option<KittyPictureImage> {
-        let mut catalog = self.picture_catalog.lock().ok()?;
+        self.sample_kitty_picture_lookup(fingerprint)
+            .ok()?
+            .finish()
+            .ok()?
+    }
+
+    pub fn sample_kitty_picture_lookup(&self, fingerprint: u64) -> io::Result<KittyPictureLookup> {
+        let mut catalog = self
+            .picture_catalog
+            .lock()
+            .map_err(|_| io::Error::other("picture catalog poisoned"))?;
         catalog.prune(self);
-        catalog
-            .by_fingerprint
-            .get(&fingerprint)?
-            .iter()
-            .find_map(|&id| {
-                let image = image_matches(self.picture_storage(id.screen), id)?;
-                let image_px = image_size(image).ok()?;
-                self.retain_picture(id, image, image_px).ok()
-            })
+        let retain = |id: ImageIdentity| -> Result<Option<KittyPictureImage>, Error> {
+            let Some(image) = image_matches(self.picture_storage(id.screen), id) else {
+                return Ok(None);
+            };
+            let size = image_size(image)?;
+            match self.retain_picture(id, image, size) {
+                Err(Error(ffi::GhosttyResult_GHOSTTY_NO_VALUE)) => Ok(None),
+                other => other.map(Some),
+            }
+        };
+        let mut lookup = KittyPictureLookup {
+            fingerprint,
+            indexed: None,
+            unindexed: Vec::new(),
+        };
+        if let Some(candidates) = catalog.by_fingerprint.get(&fingerprint) {
+            for &id in candidates {
+                if let Some(image) = retain(id).map_err(io::Error::other)? {
+                    lookup.indexed = Some(image);
+                    return Ok(lookup);
+                }
+            }
+        }
+        catalog.index_stores(self);
+        for (&id, content) in &catalog.by_image {
+            if content.is_none() {
+                if let Some(image) = retain(id).map_err(io::Error::other)? {
+                    lookup.unindexed.push(PictureRoot {
+                        id,
+                        image,
+                        catalog: Arc::clone(&self.picture_catalog),
+                    });
+                }
+            }
+        }
+        Ok(lookup)
     }
 
     fn retain_picture(
@@ -458,13 +579,42 @@ impl Terminal {
         if first >= last {
             return Ok(Vec::new());
         }
-        let candidates = &layout.placements[first..last];
+        let candidates = &mut layout.placements[first..last];
         if unwrapped {
-            let evidence_start = candidates[0].screen_row.min(start);
-            let evidence_end = candidates[last - first - 1].max_bottom;
-            let rows = evidence_start..=evidence_end;
-            if layout.evidence.as_ref().is_none_or(|e| !e.contains(&rows)) {
-                layout.evidence = Some(RowEvidence::new(self, rows)?);
+            let needs_wrap = |p: &Placement| p.bottom >= start && p.wrapped.is_none();
+            let mut ranges: Vec<_> = candidates
+                .iter()
+                .filter(|p| needs_wrap(p))
+                .map(|p| RowRange {
+                    first: p.screen_row,
+                    last: p.bottom,
+                    clean_rows: 0,
+                })
+                .collect();
+            if !ranges.is_empty() {
+                unsafe {
+                    ghostty_kitty_graphics_screen_wrap_ranges(
+                        self.raw,
+                        ranges.as_mut_ptr(),
+                        ranges.len(),
+                    )
+                    .into_result()?;
+                }
+                for (p, range) in candidates.iter_mut().filter(|p| needs_wrap(p)).zip(ranges) {
+                    p.wrapped = Some(range.clean_rows <= range.last - range.first);
+                }
+            }
+            // Only surviving anchors need formatted line numbers. A placement
+            // clipped at the window top is already known to be on line zero.
+            if let Some(last) = candidates
+                .iter()
+                .rev()
+                .find(|p| p.wrapped == Some(false) && p.screen_row > start)
+            {
+                let rows = start..=last.screen_row;
+                if layout.evidence.as_ref().is_none_or(|e| !e.contains(&rows)) {
+                    layout.evidence = Some(RowEvidence::new(self, rows)?);
+                }
             }
         }
 
@@ -475,15 +625,16 @@ impl Terminal {
             .map_err(|_| Error(ffi::GhosttyResult_GHOSTTY_INVALID_VALUE))?;
         catalog.prune(self);
         let mut pictures = Vec::new();
-        for &placement in candidates {
-            if placement.bottom < start {
+        for &placement in candidates.iter() {
+            if placement.bottom < start || (unwrapped && placement.wrapped == Some(true)) {
                 continue;
             }
             let first_row = placement.screen_row.max(start);
-            let line = if let Some(evidence) = layout.evidence.as_ref().filter(|_| unwrapped) {
-                if evidence.is_wrapped(placement) {
-                    continue;
-                }
+            let line = if let Some(evidence) = layout
+                .evidence
+                .as_ref()
+                .filter(|_| unwrapped && start < first_row)
+            {
                 evidence.line(start, first_row, paged)
             } else {
                 first_row - start
@@ -517,11 +668,11 @@ impl Terminal {
         let image_px = image_size(image)?;
         let content = match *catalog.by_image.entry(id).or_default() {
             Some(content) => ContentSample::Ready(content),
-            None => ContentSample::Root {
+            None => ContentSample::Root(PictureRoot {
                 image: self.retain_picture(id, image, image_px)?,
                 id,
                 catalog: Arc::clone(&self.picture_catalog),
-            },
+            }),
         };
         Ok(Some(KittyPictureSample {
             placement,
@@ -554,9 +705,10 @@ impl Terminal {
         let mut pictures = Vec::new();
         let mut has_placements = false;
         let mut pages = None;
+        let last_row = u32::try_from(self.total_rows()?.saturating_sub(1)).unwrap_or(u32::MAX);
         while unsafe { ffi::ghostty_kitty_graphics_placement_next(iterator) } {
             has_placements = true;
-            match self.picture_placement(graphics, iterator, &mut pages) {
+            match self.picture_placement(graphics, iterator, &mut pages, last_row) {
                 Ok(Some(placement)) => pictures.push(placement),
                 Ok(None) => {}
                 Err(error) => tracing::debug!(%error, "could not locate a Kitty picture placement"),
@@ -579,6 +731,7 @@ impl Terminal {
         graphics: ffi::GhosttyKittyGraphics,
         iterator: ffi::GhosttyKittyGraphicsPlacementIterator,
         pages: &mut Option<HashMap<usize, u32>>,
+        last_row: u32,
     ) -> Result<Option<Placement>, Error> {
         if kitty_placement_bool(iterator, KITTY_PLACEMENT_DATA_IS_VIRTUAL)? {
             return Ok(None);
@@ -591,22 +744,17 @@ impl Terminal {
         if image.is_null() {
             return Ok(None);
         }
-        let mut rect = ffi::GhosttySelection::default();
-        let result = unsafe {
-            ffi::ghostty_kitty_graphics_placement_rect(iterator, image, self.raw, &mut rect)
-        };
+        let mut anchor = ffi::GhosttyGridRef::default();
+        let result = unsafe { ghostty_kitty_graphics_placement_anchor(iterator, &mut anchor) };
         if result == ffi::GhosttyResult_GHOSTTY_NO_VALUE {
             return Ok(None);
         }
         result.into_result()?;
-
         let pages = pages.get_or_insert_with(|| self.picture_pages());
-        let screen_row = |grid: &ffi::GhosttyGridRef| {
-            pages
-                .get(&(grid.node as usize))
-                .map(|start| start + u32::from(grid.y))
-                .ok_or(Error(ffi::GhosttyResult_GHOSTTY_NO_VALUE))
-        };
+        let page_start = pages
+            .get(&(anchor.node as usize))
+            .ok_or(Error(ffi::GhosttyResult_GHOSTTY_NO_VALUE))?;
+        let screen_row = page_start + u32::from(anchor.y);
         let (mut cols, mut rows) = (0, 0);
         let (mut x, mut y, mut w, mut h) = (0, 0, 0, 0);
         unsafe {
@@ -619,7 +767,7 @@ impl Terminal {
             )
             .into_result()?;
         }
-        if w == 0 || h == 0 {
+        if cols == 0 || rows == 0 || w == 0 || h == 0 {
             return Ok(None);
         }
         let z = kitty_placement_i32(
@@ -628,10 +776,11 @@ impl Terminal {
         )?;
         Ok(Some(Placement {
             image_id,
-            screen_row: screen_row(&rect.start)?,
-            bottom: screen_row(&rect.end)?,
+            screen_row,
+            bottom: screen_row.saturating_add(rows - 1).min(last_row),
+            wrapped: None,
             max_bottom: 0,
-            col: rect.start.x,
+            col: anchor.x,
             cols,
             rows,
             crop: [x, y, w, h],

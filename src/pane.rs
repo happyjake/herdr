@@ -3074,7 +3074,8 @@ impl PaneRuntime {
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
 
-        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
+        let size = crate::pty::window_size(rows, cols, cell_width_px, cell_height_px);
+        let spawned = crate::pty::backend::spawn_with_portable_pty(size, cmd)
             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
 
         // --- Child watcher task ---
@@ -7524,6 +7525,52 @@ mod tests {
 
         let expected = std::env::var(FISH_HANDLE_REFLOW_ENV_VAR).unwrap_or_else(|_| "0".into());
         assert_eq!(output, format!("{expected}\n"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_pty_has_headless_pixels_before_a_same_size_attach() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let (events, _rx) = mpsc::channel(8);
+        let runtime = PaneRuntime::spawn_shell_command(
+            PaneId::from_raw(42),
+            24,
+            80,
+            std::env::temp_dir(),
+            "exec cat",
+            &PaneLaunchEnv::default(),
+            AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(2))
+            .unwrap();
+        let fd = unsafe { OwnedFd::from_raw_fd(runtime.duplicate_handoff_fd().unwrap()) };
+        runtime.set_handoff_reader_paused(false);
+        let size = || {
+            let mut size = libc::winsize {
+                ws_row: 0,
+                ws_col: 0,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGWINSZ, &mut size) },
+                0
+            );
+            (size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel)
+        };
+        assert_eq!(size(), (24, 80, 640, 384));
+        runtime.resize(24, 80, 8, 16);
+        assert_eq!(size(), (24, 80, 640, 384));
+        runtime.shutdown();
     }
 
     #[cfg(unix)]

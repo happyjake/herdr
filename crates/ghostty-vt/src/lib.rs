@@ -29,7 +29,9 @@ use crate::pane_graphics_files::OwnedExport;
 mod native_image_sources;
 mod native_source;
 mod pictures;
-pub use pictures::{KittyPicture, KittyPictureImage, KittyPicturePixels, KittyPictureSample};
+pub use pictures::{
+    KittyPicture, KittyPictureImage, KittyPictureLookup, KittyPicturePixels, KittyPictureSample,
+};
 pub mod pane_graphics_files;
 
 /// Terminfo entry the terminal emulates; child processes should see it as TERM.

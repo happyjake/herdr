@@ -31,7 +31,9 @@ impl PictureTerminal {
             .core
             .lock()
             .map_err(|_| std::io::Error::other("terminal lock poisoned"))?;
-        Ok(core.terminal.kitty_picture_by_fingerprint(fingerprint))
+        let lookup = core.terminal.sample_kitty_picture_lookup(fingerprint)?;
+        drop(core);
+        lookup.finish()
     }
 }
 

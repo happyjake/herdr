@@ -395,7 +395,7 @@ index b1b968b2..203190f1 100644
 +    try testing.expect(storage.loading == null);
 +}
 diff --git a/vendor/libghostty-vt/src/terminal/kitty/graphics_image.zig b/vendor/libghostty-vt/src/terminal/kitty/graphics_image.zig
-index e411bafe..e133d3fb 100644
+index e411bafe..133a3eca 100644
 --- a/vendor/libghostty-vt/src/terminal/kitty/graphics_image.zig
 +++ b/vendor/libghostty-vt/src/terminal/kitty/graphics_image.zig
 @@ -21,6 +21,24 @@ const max_dimension = 10000;
@@ -586,7 +586,7 @@ index e411bafe..e133d3fb 100644
              };
          }
 
-@@ -792,12 +887,90 @@ pub const Image = struct {
+@@ -792,12 +887,92 @@ pub const Image = struct {
              switch (self.*) {
                  .complete => |data| if (data.len > 0) alloc.free(data),
                  .pending => {},
@@ -635,6 +635,8 @@ index e411bafe..e133d3fb 100644
 +
 +    pub fn makeRootWritable(self: *Image, alloc: Allocator) Allocator.Error!void {
 +        const lease = self.root_lease orelse return;
++        // Retains are serialized with edits. Only releases can race this load.
++        if (lease.refs.load(.acquire) == 1) return;
 +        const bytes = try alloc.dupe(u8, self.data.complete);
 +        self.root_lease = null;
 +        self.data = .{ .complete = bytes };
@@ -678,7 +680,7 @@ index e411bafe..e133d3fb 100644
          if (self.animation) |anim| {
              anim.deinit(alloc);
              alloc.destroy(anim);
-@@ -2159,3 +2332,404 @@ test "limits: temporary file medium allowed by limits" {
+@@ -2159,3 +2334,428 @@ test "limits: temporary file medium allowed by limits" {
      );
      defer loading.deinit(alloc);
  }
@@ -1082,6 +1084,30 @@ index e411bafe..e133d3fb 100644
 +    try testing.expectEqual(@as(usize, 0), fake.reads);
 +    accepted.deinit(testing.allocator);
 +    try testing.expectEqual(@as(usize, 2), fake.releases);
++}
++
++test "picture sampling releases the root for subsequent in-place edits" {
++    const alloc = std.testing.allocator;
++    const bytes = try alloc.alloc(u8, 16 * 1024 * 1024);
++    @memset(bytes, 0);
++    var image: Image = .{ .data = .{ .complete = bytes } };
++    defer image.deinit(alloc);
++    var copies: usize = 0;
++    for (0..6) |i| {
++        const sample = (try image.retainRoot(alloc)).?;
++        const previous = @intFromPtr(sample.data.complete.ptr);
++        sample.release();
++        try image.makeRootWritable(alloc);
++        @constCast(image.data.complete)[0] = @intCast(i);
++        if (@intFromPtr(image.data.complete.ptr) != previous) copies += 1;
++    }
++    try std.testing.expectEqual(@as(usize, 0), copies);
++
++    const held = (try image.retainRoot(alloc)).?;
++    defer held.release();
++    try image.makeRootWritable(alloc);
++    @constCast(image.data.complete)[0] = 6;
++    try std.testing.expectEqual(@as(u8, 5), held.data.complete[0]);
 +}
 diff --git a/vendor/libghostty-vt/src/terminal/kitty/graphics_storage.zig b/vendor/libghostty-vt/src/terminal/kitty/graphics_storage.zig
 index 897c8944..bd8cd424 100644

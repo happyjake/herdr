@@ -224,15 +224,12 @@ pub(crate) fn resize_pty_fd(
     cell_width_px: u32,
     cell_height_px: u32,
 ) -> std::io::Result<()> {
+    let window = super::window_size(rows, cols, cell_width_px, cell_height_px);
     let size = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: (cols as u32)
-            .saturating_mul(cell_width_px)
-            .min(u16::MAX as u32) as u16,
-        ws_ypixel: (rows as u32)
-            .saturating_mul(cell_height_px)
-            .min(u16::MAX as u32) as u16,
+        ws_row: window.rows,
+        ws_col: window.cols,
+        ws_xpixel: window.pixel_width,
+        ws_ypixel: window.pixel_height,
     };
     if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &size) } < 0 {
         return Err(std::io::Error::last_os_error());

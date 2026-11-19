@@ -395,6 +395,9 @@ comptime {
             @export(&c.kitty_graphics_image_root_unref, .{ .name = "ghostty_kitty_graphics_image_root_unref" });
             @export(&c.kitty_graphics_visit_screen_pages, .{ .name = "ghostty_kitty_graphics_visit_screen_pages" });
             @export(&c.kitty_graphics_screen_row_evidence, .{ .name = "ghostty_kitty_graphics_screen_row_evidence" });
+            @export(&c.kitty_graphics_screen_wrap_ranges, .{ .name = "ghostty_kitty_graphics_screen_wrap_ranges" });
+            @export(&c.kitty_graphics_placement_anchor, .{ .name = "ghostty_kitty_graphics_placement_anchor" });
+            @export(&c.kitty_graphics_visit_image_identities, .{ .name = "ghostty_kitty_graphics_visit_image_identities" });
             @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
             @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });
             @export(&c.kitty_graphics_placement_iterator_new, .{ .name = "ghostty_kitty_graphics_placement_iterator_new" });

@@ -10,18 +10,12 @@ pub(crate) struct SpawnedPty {
 }
 
 pub(crate) fn spawn_with_portable_pty(
-    rows: u16,
-    cols: u16,
+    size: PtySize,
     cmd: CommandBuilder,
 ) -> std::io::Result<SpawnedPty> {
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
+        .openpty(size)
         .map_err(|err| std::io::Error::other(err.to_string()))?;
     let master_fd = pair
         .master
@@ -76,8 +70,8 @@ mod tests {
         let mut cmd = CommandBuilder::new("/bin/cat");
         cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
 
-        let mut spawned =
-            spawn_with_portable_pty(24, 80, cmd).expect("portable pty setup succeeds");
+        let mut spawned = spawn_with_portable_pty(crate::pty::window_size(24, 80, 8, 16), cmd)
+            .expect("portable pty setup succeeds");
         let after_spawn = parent_pty_fd_count();
 
         assert_eq!(

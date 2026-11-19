@@ -932,6 +932,8 @@ pub const Image = struct {
 
     pub fn makeRootWritable(self: *Image, alloc: Allocator) Allocator.Error!void {
         const lease = self.root_lease orelse return;
+        // Retains are serialized with edits. Only releases can race this load.
+        if (lease.refs.load(.acquire) == 1) return;
         const bytes = try alloc.dupe(u8, self.data.complete);
         self.root_lease = null;
         self.data = .{ .complete = bytes };
@@ -2732,4 +2734,28 @@ test "native file snapshot rejects missing callbacks before retaining" {
     try testing.expectEqual(@as(usize, 0), fake.reads);
     accepted.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), fake.releases);
+}
+
+test "picture sampling releases the root for subsequent in-place edits" {
+    const alloc = std.testing.allocator;
+    const bytes = try alloc.alloc(u8, 16 * 1024 * 1024);
+    @memset(bytes, 0);
+    var image: Image = .{ .data = .{ .complete = bytes } };
+    defer image.deinit(alloc);
+    var copies: usize = 0;
+    for (0..6) |i| {
+        const sample = (try image.retainRoot(alloc)).?;
+        const previous = @intFromPtr(sample.data.complete.ptr);
+        sample.release();
+        try image.makeRootWritable(alloc);
+        @constCast(image.data.complete)[0] = @intCast(i);
+        if (@intFromPtr(image.data.complete.ptr) != previous) copies += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), copies);
+
+    const held = (try image.retainRoot(alloc)).?;
+    defer held.release();
+    try image.makeRootWritable(alloc);
+    @constCast(image.data.complete)[0] = 6;
+    try std.testing.expectEqual(@as(u8, 5), held.data.complete[0]);
 }

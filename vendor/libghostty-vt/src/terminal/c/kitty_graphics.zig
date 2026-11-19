@@ -289,6 +289,90 @@ pub fn visit_screen_pages(
     }
 }
 
+pub const RowRange = extern struct {
+    first: u32,
+    last: u32,
+    clean_rows: u32 = 0,
+};
+
+/// The ranges are sorted by start row. Carry the last examined pin forward:
+/// overlapping ranges reuse its clear prefix and the first wrap, if any.
+pub fn screen_wrap_ranges(
+    terminal_: terminal_c.Terminal,
+    ranges: [*]RowRange,
+    count: usize,
+) callconv(lib.calling_conv) Result {
+    const t = terminal_c.zigTerminal(terminal_) orelse return .invalid_value;
+    if (count == 0) return .success;
+    const pages = &t.screens.active.pages;
+    var at = ranges[0].first;
+    var pin = pages.pin(.{ .screen = .{ .y = at } }) orelse return .invalid_value;
+    var checked = false;
+    var wrapped = false;
+    var previous_start = at;
+    for (ranges[0..count]) |*range| {
+        if (range.first < previous_start or range.first > range.last or range.last >= pages.total_rows)
+            return .invalid_value;
+        previous_start = range.first;
+        if (checked and range.first <= at) {
+            if (wrapped and at <= range.last) {
+                range.clean_rows = at - range.first;
+                continue;
+            }
+            if (range.last <= at) {
+                range.clean_rows = range.last - range.first + 1;
+                continue;
+            }
+        }
+
+        const first = @max(range.first, at + @intFromBool(checked));
+        pin = pin.down(first - at) orelse return .invalid_value;
+        at = first;
+        var iter = pin.pageIterator(.right_down, null);
+        while (iter.next()) |chunk| {
+            const page = chunk.node.page();
+            const len = @min(range.last - at + 1, chunk.end - chunk.start);
+            for (0..len) |offset| {
+                const y = chunk.start + offset;
+                const row = page.getRow(@intCast(y));
+                wrapped = row.wrap or row.wrap_continuation;
+                if (wrapped or at == range.last) {
+                    pin = .{ .node = chunk.node, .y = @intCast(y) };
+                    break;
+                }
+                at += 1;
+            } else continue;
+            break;
+        }
+        checked = true;
+        range.clean_rows = at - range.first + @intFromBool(!wrapped);
+    }
+    return .success;
+}
+
+pub fn placement_anchor(iter_: PlacementIterator, out: *grid_ref.CGridRef) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+    const iter = iter_ orelse return .invalid_value;
+    const entry = iter.entry orelse return .invalid_value;
+    const pin = switch (entry.value_ptr.location) {
+        .pin => |p| p,
+        .virtual, .relative => return .no_value,
+    };
+    if (pin.garbage) return .no_value;
+    out.* = grid_ref.CGridRef.fromPin(pin.*);
+    return .success;
+}
+
+pub fn visit_image_identities(
+    graphics: KittyGraphics,
+    visitor: *const fn (u32, u64, ?*anyopaque) callconv(lib.calling_conv) void,
+    context: ?*anyopaque,
+) callconv(lib.calling_conv) void {
+    if (comptime !build_options.kitty_graphics) return;
+    var iter = graphics.images.valueIterator();
+    while (iter.next()) |image| visitor(image.id, image.root_generation, context);
+}
+
 pub fn screen_row_evidence(
     terminal_: terminal_c.Terminal,
     first: u32,
@@ -2265,4 +2349,46 @@ test "generation never recurs across resets and screen switches" {
     try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
     try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen)));
     try testing.expect(gen > gen_alt);
+}
+
+test "picture sampling stops restoring history at the first wrapped row" {
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer terminal_c.free(t);
+    const term = terminal_c.zigTerminal(t).?;
+    term.setScrollbackMaxBytes(null);
+    const text = "x" ** 81 ++ "\r\n" ** 3000;
+    terminal_c.vt_write(t, text.ptr, text.len);
+
+    const pages = &term.screens.active.pages;
+    const cold = struct {
+        fn count(list: *PageList) usize {
+            var iter = list.pageIterator(.right_down, .{ .screen = .{} }, null);
+            var n: usize = 0;
+            while (iter.next()) |chunk| {
+                if (chunk.node.storage() == .compressed) n += 1;
+            }
+            return n;
+        }
+    }.count;
+    var ranges = [_]RowRange{.{ .first = 0, .last = @intCast(pages.total_rows - 1) }} ** 15;
+    for ([_]usize{ 1, ranges.len }) |count| {
+        if (pages.compress(.full) == .unsupported) return error.SkipZigTest;
+        const before = cold(pages);
+        try testing.expect(before > 2);
+        try testing.expectEqual(Result.success, screen_wrap_ranges(t, &ranges, count));
+        for (ranges[0..count]) |range| try testing.expectEqual(@as(u32, 0), range.clean_rows);
+        try testing.expectEqual(@as(usize, 1), before - cold(pages));
+    }
+
+    var tail = [_]RowRange{
+        .{ .first = 1, .last = 1500 }, // wrap continuation
+        .{ .first = 2, .last = 1000 },
+        .{ .first = 5, .last = 7 }, // contained in the previous clean prefix
+        .{ .first = 999, .last = 1500 },
+    };
+    try testing.expectEqual(Result.success, screen_wrap_ranges(t, &tail, tail.len));
+    for (tail, [_]u32{ 0, 999, 3, 502 }) |range, expected| {
+        try testing.expectEqual(expected, range.clean_rows);
+    }
 }

@@ -278,3 +278,29 @@ fn area_average(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_cache_evicts_the_oldest_entry_when_crossing_sixteen_mib() {
+        let mut cache = EncodeCache::default();
+        let mib = 1024 * 1024;
+        let picture = Arc::new(EncodedPicture {
+            px: [64, 64],
+            media_type: PanePictureMediaType::Jpeg,
+            data_b64: "A".repeat(mib),
+        });
+        for id in 0..16 {
+            cache.insert((id, 64), Arc::clone(&picture));
+        }
+        assert_eq!(cache.bytes, 16 * mib);
+        assert!(cache.entries.contains_key(&(0, 64)));
+
+        cache.insert((16, 64), picture);
+        assert!(!cache.entries.contains_key(&(0, 64)));
+        assert!((1..=16).all(|id| cache.entries.contains_key(&(id, 64))));
+        assert_eq!(cache.bytes, 16 * mib);
+    }
+}

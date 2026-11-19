@@ -252,8 +252,9 @@ file backing before reading pixels. Herdr installs this callback automatically
 on Linux, using same-filesystem CoW snapshots. It never retains a mutable producer pathname. Unsupported snapshots
 use the original loader; animation materializes pixels transactionally. Backing
 ownership and bounded reads are explicit in the embedding ABI. Root pixel
-allocations can also be retained across eviction and terminal teardown. An
-in-place root frame edit detaches from retained readers before replacing pixels.
+allocations can also be retained across eviction and terminal teardown. A
+root frame edit reuses the allocation after the last reader releases it and
+copies it while another reader still holds it.
 
 remove when: upstream provides an equivalent opt-in owned encoded-image
 representation and immutable host-backed raw sources with bounded storage,
@@ -340,7 +341,10 @@ local files:
 
 reason: A picture fetch validates the root image generation across both screen
 stores and retains its immutable bytes. A picture read shares a page walk and
-uses the formatter's full-row break rules for placement coordinates. Root byte
+stops at the first wrap in each covered range. The anchor and grid height
+determine the clipped bottom. Formatter evidence ends at the last surviving
+anchor. A fetch indexes new and unplaced roots on demand and resolves their
+content outside the terminal lock. Root byte
 ownership is part of patch 0007 because it shares the image backing lifecycle.
 
 remove when: the vendored C API supports immutable root-frame references,
@@ -352,5 +356,7 @@ verification:
 ```sh
 just test-one pane_read_lists_direct_kitty_pictures
 just test-one pane_picture_fetches_alpha_and_checks_current_storage
+just test-one websocket_picture_fetch_survives_an_identical_unplaced_retransmission
+(cd vendor/libghostty-vt && zig build test-lib-vt -Demit-lib-vt -Demit-xcframework=false -Dtest-filter=kitty.graphics -Dtest-filter=c.kitty_graphics)
 python3 -m unittest scripts.test_vendor_libghostty_vt
 ```

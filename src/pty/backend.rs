@@ -15,18 +15,12 @@ pub(crate) struct SpawnedPty {
 
 #[cfg(windows)]
 pub(crate) fn spawn_with_portable_pty(
-    rows: u16,
-    cols: u16,
+    size: PtySize,
     cmd: CommandBuilder,
 ) -> std::io::Result<SpawnedPty> {
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
+        .openpty(size)
         .map_err(|err| std::io::Error::other(err.to_string()))?;
     let child = pair
         .slave

@@ -608,3 +608,42 @@ fn pane_read_reports_picture_crop_after_scrolling_inside_margins() {
         "{read}"
     );
 }
+
+#[test]
+fn websocket_picture_fetch_survives_an_identical_unplaced_retransmission() {
+    let _lock = test_lock();
+    let server = PictureServer::start();
+    let payload = opaque_png();
+    let placed = kitty_data("a=T,f=100,i=31,c=2,r=2,C=1,q=2", &payload);
+    let unplaced = kitty_data("a=t,f=100,i=31,q=2", &payload);
+    server.run_stages(&[
+        format!("\x1b[2J\x1b[H{placed}\x1b[5;1Hpicture-ready"),
+        format!("{unplaced}\r\nretransmitted"),
+    ]);
+    server.wait("picture-ready");
+
+    let address = server.server.as_ref().unwrap().ws_addr;
+    let mut reads = WsClient::connect(address, TEST_TOKEN);
+    let read = reads.request(&wire_request(
+        "pane.read",
+        json!({"pane_id":server.pane,"format":"ansi","source":"visible"}),
+    ));
+    let fingerprint = read["result"]["read"]["pictures"][0]["fingerprint"]
+        .as_str()
+        .unwrap();
+    let fetch = |width| {
+        WsClient::connect(address, TEST_TOKEN).request(&wire_request(
+            "pane.picture",
+            server.fetch_params(fingerprint, width),
+        ))
+    };
+    let before = fetch(64);
+    assert_eq!(before["result"]["fingerprint"], fingerprint, "{before}");
+    assert_eq!(jpeg_dimensions(&image_bytes(&before)), [64, 32]);
+
+    server.advance();
+    server.wait("retransmitted");
+    let after = fetch(128);
+    assert_eq!(after["result"]["fingerprint"], fingerprint, "{after}");
+    assert_eq!(jpeg_dimensions(&image_bytes(&after)), [100, 50]);
+}

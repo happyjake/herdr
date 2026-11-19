@@ -498,6 +498,10 @@ typedef struct {
   uint32_t source_height;
 } GhosttyKittyGraphicsPlacementRenderInfo;
 
+typedef struct {
+    uint32_t first, last, clean_rows;
+} GhosttyKittyRowRange;
+
 /**
  * Get data from a kitty graphics storage instance.
  *
@@ -578,6 +582,19 @@ GHOSTTY_API void ghostty_kitty_graphics_image_root_unref(GhosttyKittyImageRootRe
 GHOSTTY_API void ghostty_kitty_graphics_visit_screen_pages(
     GhosttyTerminal terminal, void (*visit)(const void *node, uint32_t row, void *context),
     void *context);
+
+/** For each inclusive range, count the rows before its first wrap or wrap
+ * continuation. Ranges must be sorted by first row and fit the screen. */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_screen_wrap_ranges(
+    GhosttyTerminal terminal, GhosttyKittyRowRange *ranges, size_t count);
+
+/** Borrow the direct placement's tracked anchor without walking to its end. */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_anchor(
+    GhosttyKittyGraphicsPlacementIterator iter, GhosttyGridRef *anchor);
+
+/** Visit each stored image ID and root generation synchronously. */
+GHOSTTY_API void ghostty_kitty_graphics_visit_image_identities(
+    GhosttyKittyGraphics storage, void (*visit)(uint32_t, uint64_t, void *), void *context);
 
 /**
  * Write one byte per screen row, starting at first. Bits 0, 1, and 2
