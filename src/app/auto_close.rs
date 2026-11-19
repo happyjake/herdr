@@ -324,7 +324,8 @@ fn main_checkout_home<'a>(
 
 fn is_home(pane: &PaneSnapshot, panes: &[PaneSnapshot]) -> bool {
     pane.single_pane_workspace
-        && main_checkout_home(pane, panes).is_some_and(|home| home.workspace_id == pane.workspace_id)
+        && main_checkout_home(pane, panes)
+            .is_some_and(|home| home.workspace_id == pane.workspace_id)
 }
 
 /// When the pane last showed activity of its own. A Debrief's status changes
@@ -360,7 +361,10 @@ fn home_released(pane: &PaneSnapshot, panes: &[PaneSnapshot], config: &Config, n
         .filter(|other| is_home(other, panes))
         .collect();
     homes.sort_by_key(|home| (idle_since(home), home.pane_id.as_str()));
-    homes.iter().take(over).any(|home| home.pane_id == pane.pane_id)
+    homes
+        .iter()
+        .take(over)
+        .any(|home| home.pane_id == pane.pane_id)
 }
 
 fn main_checkout_fields(
@@ -581,9 +585,7 @@ fn debrief_waits(
         if agent == Some("agy") {
             continue;
         }
-        let pane = panes
-            .iter()
-            .find(|pane| pane.pane_id == candidate.pane_id);
+        let pane = panes.iter().find(|pane| pane.pane_id == candidate.pane_id);
         candidate.action = Action::Wait;
         candidate.wait_reason = Some(
             if !matches!(agent, Some("claude" | "codex" | "pi")) {
@@ -1432,12 +1434,7 @@ impl App {
                     }
                     // A Debrief no longer in flight (retrying or given up) leaves the
                     // composer as it found it: its own untaken invocation comes out.
-                    Action::Wait
-                        if pane
-                            .debrief
-                            .as_ref()
-                            .is_some_and(|state| !state.active()) =>
-                    {
+                    Action::Wait if pane.debrief.as_ref().is_some_and(|state| !state.active()) => {
                         if let Some(chars) = own_draft(pane, &self.auto_close.config) {
                             self.clear_debrief_draft(&pane.pane_id, chars);
                         }
@@ -1659,40 +1656,55 @@ mod tests {
 
     #[test]
     fn auto_close_a_restore_failed_agent_pane_has_ended_once_its_failure_dated_it() {
-        let mut terminal =
-            crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), "/gone".into());
+        let mut terminal = crate::terminal::TerminalState::new(
+            crate::terminal::TerminalId::alloc(),
+            "/gone".into(),
+        );
         terminal.session_reported = true;
-        assert!(!pane_ended(&terminal, false), "a pane whose restore has not failed");
+        assert!(
+            !pane_ended(&terminal, false),
+            "a pane whose restore has not failed"
+        );
         terminal.fail_restore("Saved directory is unavailable.".into(), None);
         assert!(terminal.ended_at.is_some());
         assert!(pane_ended(&terminal, false));
-        assert!(!pane_ended(&terminal, true), "a live runtime decides for itself");
+        assert!(
+            !pane_ended(&terminal, true),
+            "a live runtime decides for itself"
+        );
         // A failed shell pane that never ran an agent gets no date: it stays a plain shell.
-        let mut shell =
-            crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), "/gone".into());
+        let mut shell = crate::terminal::TerminalState::new(
+            crate::terminal::TerminalId::alloc(),
+            "/gone".into(),
+        );
         shell.fail_restore("Saved directory is unavailable.".into(), None);
         assert_eq!(shell.ended_at, None);
         assert!(!pane_ended(&shell, false));
         // Every kind of agent history dates the failure; a known date is kept.
         for mark in 0..3 {
-            let mut agent =
-                crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), "/gone".into());
+            let mut agent = crate::terminal::TerminalState::new(
+                crate::terminal::TerminalId::alloc(),
+                "/gone".into(),
+            );
             match mark {
                 0 => agent.agent_name = Some("helper".into()),
                 1 => agent.ended_agent = Some("pi".into()),
                 _ => {
-                    agent.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
-                        source: "herdr:codex".into(),
-                        agent: "codex".into(),
-                        session_ref: crate::agent_resume::AgentSessionRef::id("s").unwrap(),
-                    })
+                    agent.persisted_agent_session =
+                        Some(crate::agent_resume::PersistedAgentSession {
+                            source: "herdr:codex".into(),
+                            agent: "codex".into(),
+                            session_ref: crate::agent_resume::AgentSessionRef::id("s").unwrap(),
+                        })
                 }
             }
             agent.fail_restore("x".into(), None);
             assert!(agent.ended_at.is_some(), "mark {mark}");
         }
-        let mut known =
-            crate::terminal::TerminalState::new(crate::terminal::TerminalId::alloc(), "/gone".into());
+        let mut known = crate::terminal::TerminalState::new(
+            crate::terminal::TerminalId::alloc(),
+            "/gone".into(),
+        );
         known.session_reported = true;
         known.ended_at = Some(123);
         known.fail_restore("x".into(), Some(456));
@@ -1791,7 +1803,10 @@ mod tests {
         debriefing.agent = Some("claude".into());
         debriefing.status = AgentStatus::Idle;
         let panes = [home.clone(), debriefing.clone()];
-        assert_eq!(decide(&home, &panes, &config, 200), Err("last-main-checkout-pane"));
+        assert_eq!(
+            decide(&home, &panes, &config, 200),
+            Err("last-main-checkout-pane")
+        );
         assert!(decide(&debriefing, &panes, &config, 200).is_ok());
 
         // The Debrief ran: its working and done transitions restamped status_at.
@@ -1821,7 +1836,10 @@ mod tests {
             decide(&debriefing, &panes, &config, 200),
             Err("last-main-checkout-pane")
         );
-        assert_eq!(decide(&home, &panes, &config, 200), Err("last-main-checkout-pane"));
+        assert_eq!(
+            decide(&home, &panes, &config, 200),
+            Err("last-main-checkout-pane")
+        );
 
         // Without a Debrief, the same status change would move the home as before.
         debriefing.debrief = None;
@@ -1842,8 +1860,14 @@ mod tests {
             ..Config::default()
         };
         let mut home = main_checkout_shell("w1", 100, 100);
-        assert_eq!(decide(&home, &[], &config, 1099), Err("last-main-checkout-pane"));
-        assert_eq!(decide(&home, &[], &config, 1100).unwrap().kind, Kind::PlainShell);
+        assert_eq!(
+            decide(&home, &[], &config, 1099),
+            Err("last-main-checkout-pane")
+        );
+        assert_eq!(
+            decide(&home, &[], &config, 1100).unwrap().kind,
+            Kind::PlainShell
+        );
         // Every other exemption still holds for a released home.
         home.pinned = true;
         assert_eq!(decide(&home, &[], &config, 1100), Err("pinned"));
@@ -1856,9 +1880,15 @@ mod tests {
         home.agent = Some("claude".into());
         home.status = AgentStatus::Idle;
         home.status_at = 1050;
-        assert_eq!(decide(&home, &[], &config, 1100), Err("last-main-checkout-pane"));
+        assert_eq!(
+            decide(&home, &[], &config, 1100),
+            Err("last-main-checkout-pane")
+        );
         home.status_at = 100;
-        assert_eq!(decide(&home, &[], &config, 1100).unwrap().kind, Kind::Dormant);
+        assert_eq!(
+            decide(&home, &[], &config, 1100).unwrap().kind,
+            Kind::Dormant
+        );
         home.status_at = 1090;
         home.debrief = Some(Debrief {
             agent: "claude".into(),
@@ -1880,7 +1910,10 @@ mod tests {
             delivery_abort: None,
             recovered_delivery: false,
         });
-        assert_ne!(decide(&home, &[], &config, 1100), Err("last-main-checkout-pane"));
+        assert_ne!(
+            decide(&home, &[], &config, 1100),
+            Err("last-main-checkout-pane")
+        );
     }
 
     #[test]
@@ -1918,7 +1951,11 @@ mod tests {
         };
         assert_eq!(spared_homes(0), ["w1:p1", "w2:p1", "w3:p1"], "no cap");
         assert_eq!(spared_homes(4), ["w1:p1", "w2:p1", "w3:p1"], "at the cap");
-        assert_eq!(spared_homes(3), ["w2:p1", "w3:p1"], "one over: the oldest home goes");
+        assert_eq!(
+            spared_homes(3),
+            ["w2:p1", "w3:p1"],
+            "one over: the oldest home goes"
+        );
         assert_eq!(spared_homes(2), ["w3:p1"], "two over: the two oldest go");
         assert!(spared_homes(1).is_empty());
     }
@@ -2048,7 +2085,7 @@ mod tests {
                 &config,
                 true,
             )
-                .candidates[0]
+            .candidates[0]
                 .wait_reason
                 .clone()
         };

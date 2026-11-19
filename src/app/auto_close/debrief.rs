@@ -500,8 +500,14 @@ impl App {
             None,
             false,
         ) {
-            Ok(_) => tracing::info!(pane, chars, "auto-close cleared its own untaken Debrief invocation"),
-            Err(error) => tracing::warn!(pane, %error, "auto-close could not clear its Debrief invocation"),
+            Ok(_) => tracing::info!(
+                pane,
+                chars,
+                "auto-close cleared its own untaken Debrief invocation"
+            ),
+            Err(error) => {
+                tracing::warn!(pane, %error, "auto-close could not clear its Debrief invocation")
+            }
         }
     }
 
@@ -590,7 +596,11 @@ impl App {
             self.auto_close.close_probe_after.remove(&pane);
         }
         if !self.auto_close.debriefs.values().any(Debrief::active)
-            && self.auto_close.delivery.is_none() && self.auto_close.submission.is_none() { return; }
+            && self.auto_close.delivery.is_none()
+            && self.auto_close.submission.is_none()
+        {
+            return;
+        }
         let now = logbook::now_ms();
         let panes = self.auto_close_snapshot_for(now / 1000, true);
         for pane in &panes {
