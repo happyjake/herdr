@@ -78,7 +78,11 @@ impl SpawnedHerdr {
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
-        let _ = self.child.kill();
+        // SIGTERM, a stop the server shuts down cleanly on. portable-pty's
+        // kill sends SIGHUP, which the server ignores: the wait below then ran
+        // out, and the sweep after it killed the server outright, leaving what
+        // the server cleans up as it exits (a model listing) still running.
+        support::stop_spawned_herdr(&mut *self.child);
 
         if let Some(pid) = pid {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -3557,6 +3561,90 @@ fn a_client_started_server_advertises_the_credential_registry_capability() {
         }),
         "the server plain herdr started still listens at {ws_addr} after its test"
     );
+}
+
+/// A model listing still running when the server stops dies with it. The
+/// listing leads a session of its own, so the server's exit does not reach
+/// it, and it would go on running pi and writing into the server's temporary
+/// directory after the server is gone.
+#[test]
+fn a_model_listing_still_running_when_the_server_stops_dies_with_it() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let home = base.join("home");
+    let pi_dir = home.join("pi-config");
+    let shell_bin_dir = home.join("shell-bin");
+    fs::create_dir_all(&pi_dir).unwrap();
+    fs::create_dir_all(&shell_bin_dir).unwrap();
+    // pi lists from the pane shell, a login sh here, whose startup file puts
+    // this pi first. It records its pid and never finishes on its own.
+    fs::write(
+        home.join(".profile"),
+        "export PATH=\"$HOME/shell-bin:$PATH\"\n",
+    )
+    .unwrap();
+    let fake_pi = shell_bin_dir.join("pi");
+    fs::write(
+        &fake_pi,
+        "#!/bin/sh\necho $$ > \"$HOME/listing.pid\"\nexec sleep 30\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut spawned = spawn_herdr_with_config_and_env(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        "[terminal]\nshell_mode = \"login\"\n",
+        &[
+            ("HOME", home.to_str().unwrap()),
+            ("PI_CODING_AGENT_DIR", pi_dir.to_str().unwrap()),
+        ],
+    );
+    wait_for_socket(&socket_path, Duration::from_secs(10));
+    let pid_file = home.join("listing.pid");
+    support::wait_for_file(&pid_file, Duration::from_secs(10));
+    assert!(support::wait_until(
+        Duration::from_secs(2),
+        Duration::from_millis(20),
+        || fs::read_to_string(&pid_file).is_ok_and(|text| text.ends_with('\n'))
+    ));
+    let listing: libc::pid_t = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: signal 0 only checks that the process exists.
+    assert_eq!(
+        unsafe { libc::kill(listing, 0) },
+        0,
+        "the listing is running"
+    );
+    // The server takes SIGTERM as a stop only once its event loop runs, which
+    // starts after the listing; until then the signal ends it outright. An
+    // answer from the loop shows it is running.
+    let snapshot = unix_request(
+        &socket_path,
+        r#"{"id":"loop_running","method":"session.snapshot","params":{}}"#,
+    );
+    assert!(snapshot.get("result").is_some(), "{snapshot}");
+
+    support::stop_spawned_herdr(&mut *spawned.child);
+    spawned.child.wait().unwrap();
+    assert!(
+        support::wait_until(Duration::from_secs(3), Duration::from_millis(20), || {
+            // SAFETY: signal 0 only checks that the process exists.
+            let status = unsafe { libc::kill(listing, 0) };
+            status != 0
+        }),
+        "the listing (pid {listing}) outlived the server"
+    );
+    cleanup_spawned_herdr(spawned, base);
 }
 
 /// The stolen-phone case, end to end: `credential.revoke_all` logs every

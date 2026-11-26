@@ -8,7 +8,7 @@
 
 use std::io::Read;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// A listing older than this is read again on the next ask.
@@ -150,6 +150,8 @@ pub(super) fn run_bounded(
     #[cfg(unix)]
     start_own_session(&mut command);
     let mut child = command.spawn().ok()?;
+    #[cfg(unix)]
+    let _in_flight = InFlight::track(&child);
     let Some(chunks) = child.stdout.take().and_then(read_in_background) else {
         kill(&mut child);
         return None;
@@ -251,6 +253,69 @@ fn start_own_session(command: &mut Command) {
             }
             Ok(())
         });
+    }
+}
+
+/// The process groups of listings still running. A listing leads a session
+/// of its own, which the server's exit does not reach: without this, a
+/// listing still running when the server stops (a stop, a live handoff) runs
+/// on to its end, writing into a temporary directory the server has left.
+#[cfg(unix)]
+static IN_FLIGHT: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+
+/// A running listing's process group, held on [IN_FLIGHT] until dropped.
+#[cfg(unix)]
+struct InFlight(libc::pid_t);
+
+#[cfg(unix)]
+impl InFlight {
+    fn track(child: &Child) -> Option<Self> {
+        static KILL_AT_EXIT: std::sync::Once = std::sync::Once::new();
+        KILL_AT_EXIT.call_once(|| {
+            // SAFETY: registers a function that takes no state of its own.
+            unsafe {
+                libc::atexit(kill_in_flight);
+            }
+        });
+        let group = libc::pid_t::try_from(child.id()).ok()?;
+        in_flight().push(group);
+        Some(Self(group))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        in_flight().retain(|group| *group != self.0);
+    }
+}
+
+#[cfg(unix)]
+fn in_flight() -> MutexGuard<'static, Vec<libc::pid_t>> {
+    IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Kills every listing still running. It runs as the server process exits.
+#[cfg(unix)]
+extern "C" fn kill_in_flight() {
+    // A listing thread holds the lock only to add or remove its group; a
+    // thread that never lets go must not hang the exit.
+    for _ in 0..100 {
+        let groups = match IN_FLIGHT.try_lock() {
+            Ok(groups) => groups,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::yield_now();
+                continue;
+            }
+        };
+        for group in groups.iter() {
+            // SAFETY: killpg reads only its arguments.
+            unsafe {
+                libc::killpg(*group, libc::SIGKILL);
+            }
+        }
+        return;
     }
 }
 
@@ -529,6 +594,42 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn a_running_listing_is_held_for_the_exit_and_released_when_it_returns() {
+        let pid_file = scratch_file("in-flight.pid");
+        let _ = std::fs::remove_file(&pid_file);
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "echo $$ > \"$0\"; exec sleep 1",
+            pid_file.to_str().unwrap(),
+        ]);
+        let listing = std::thread::spawn(move || run_bounded(command, Duration::from_secs(10)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let group = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the listing never started");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // The listing can write its pid before its thread records the group.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !in_flight().contains(&group) {
+            assert!(
+                Instant::now() < deadline,
+                "the running listing was not held"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(listing.join().unwrap().is_some());
+        assert!(!in_flight().contains(&group));
+    }
+
     #[test]
     fn a_command_past_its_deadline_is_killed_with_the_jobs_it_started() {
         let pid_file = scratch_file("deadline-job.pid");
