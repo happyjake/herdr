@@ -175,13 +175,14 @@ fn spawn_herdr_with_launch(
     )
 }
 
-/// How the spawned herdr runs. Monolithic mode (plain `herdr`) starts the
-/// same listeners from `main.rs` rather than from the headless server, so it
-/// is its own path through the API declarations.
+/// How the spawned herdr runs. `Server` runs `herdr server` itself. `Client`
+/// runs plain `herdr`, a client that finds no server and starts one in the
+/// background: a process outside this test's tree, which the test base's
+/// cleanup has to find and stop.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LaunchMode {
     Server,
-    Monolithic,
+    Client,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3498,11 +3499,12 @@ fn a_revoked_browser_is_told_so_on_reconnect_over_both_transports() {
     cleanup_spawned_herdr(server.child, server.base);
 }
 
-/// Monolithic mode (plain `herdr`) starts its listeners from `main.rs`, not
-/// from the headless server. It must declare the same capabilities, or a
-/// client reads a capable server as one too old to link against.
+/// A server that plain `herdr` starts in the background declares the same
+/// capabilities on both transports, or a client reads a capable server as one
+/// too old to link against. It is not a child of this test, so the cleanup
+/// must stop it too.
 #[test]
-fn monolithic_mode_advertises_the_credential_registry_capability() {
+fn a_client_started_server_advertises_the_credential_registry_capability() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -3519,12 +3521,12 @@ fn monolithic_mode_advertises_the_credential_registry_capability() {
         None,
         &websocket_section(ws_port),
         &[],
-        LaunchMode::Monolithic,
+        LaunchMode::Client,
     );
     wait_for_socket(&socket_path, Duration::from_secs(10));
     wait_for_ws_listener(ws_addr, Duration::from_secs(10));
 
-    let ping = r#"{"id":"req_monolithic_cap","method":"ping","params":{}}"#;
+    let ping = r#"{"id":"req_client_started_cap","method":"ping","params":{}}"#;
     let unix_response = unix_request(&socket_path, ping);
     let mut ws = WsClient::connect(ws_addr, TEST_TOKEN);
     let ws_response = ws.request(ping);
@@ -3532,7 +3534,7 @@ fn monolithic_mode_advertises_the_credential_registry_capability() {
     assert_eq!(
         transport_neutral_pong(unix_response.clone()),
         ws_response,
-        "both transports declare the same capabilities in monolithic mode"
+        "both transports declare the same capabilities on a client-started server"
     );
     assert_eq!(
         unix_response["result"]["capabilities"]["credential_registry"], true,
@@ -3542,11 +3544,19 @@ fn monolithic_mode_advertises_the_credential_registry_capability() {
     // And the verbs actually work there.
     let minted = unix_request(
         &socket_path,
-        &mint_request("req_monolithic_mint", "browser"),
+        &mint_request("req_client_started_mint", "browser"),
     );
     assert_eq!(minted["result"]["credential"]["tier"], "limited");
 
     cleanup_spawned_herdr(child, base);
+    // The listener is the evidence the background server is gone; asking the
+    // cleanup's own process sweep would ask the instrument that missed it.
+    assert!(
+        support::wait_until(Duration::from_secs(3), Duration::from_millis(50), || {
+            TcpStream::connect(ws_addr).is_err()
+        }),
+        "the server plain herdr started still listens at {ws_addr} after its test"
+    );
 }
 
 /// The stolen-phone case, end to end: `credential.revoke_all` logs every

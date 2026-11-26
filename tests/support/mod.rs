@@ -975,35 +975,14 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
 
 fn iter_worktree_server_pids() -> std::io::Result<Vec<u32>> {
     let own_pid = std::process::id();
-    let mut pids = Vec::new();
-
-    let proc_entries = match fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err),
-    };
-
-    for entry in proc_entries {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let Some(pid) = file_name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
-            continue;
-        };
-
-        if pid == own_pid {
-            continue;
-        }
-
-        if is_test_herdr_server_process(pid) {
-            pids.push(pid);
-        }
-    }
-
-    Ok(pids)
+    Ok(all_pids()?
+        .into_iter()
+        .filter(|pid| *pid != own_pid && is_test_herdr_server_process(*pid))
+        .collect())
 }
 
 fn is_test_herdr_server_process(pid: u32) -> bool {
-    let Some(exe_path) = proc_link_target(pid, "exe") else {
+    let Some(exe_path) = process_executable(pid) else {
         return false;
     };
 
@@ -1018,10 +997,34 @@ fn is_test_herdr_server_process(pid: u32) -> bool {
     cmdline.iter().any(|arg| arg == "server")
 }
 
-fn proc_link_target(pid: u32, link: &str) -> Option<PathBuf> {
-    fs::read_link(format!("/proc/{pid}/{link}")).ok()
+#[cfg(target_os = "linux")]
+fn all_pids() -> std::io::Result<Vec<u32>> {
+    let proc_entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+
+    let mut pids = Vec::new();
+    for entry in proc_entries {
+        let entry = entry?;
+        if let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        {
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
 }
 
+#[cfg(target_os = "linux")]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(target_os = "linux")]
 fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
     let cmdline = fs::read(format!("/proc/{pid}/cmdline"))?;
     Ok(cmdline
@@ -1031,8 +1034,153 @@ fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
         .collect())
 }
 
+/// The environment a process started with, as NUL-terminated entries.
+#[cfg(target_os = "linux")]
+fn read_environ(pid: u32) -> std::io::Result<Vec<u8>> {
+    fs::read(format!("/proc/{pid}/environ"))
+}
+
+// macOS has no /proc. Without these, every sweep here found nothing, and a
+// server that a client started in the background (through launchd, so not a
+// child of the test) outlived its test for good.
+#[cfg(target_os = "macos")]
+fn all_pids() -> std::io::Result<Vec<u32>> {
+    let mut capacity = 4096;
+    loop {
+        let mut pids = vec![0 as libc::pid_t; capacity];
+        // SAFETY: the buffer holds `capacity` pids and its size is passed in bytes.
+        let count = unsafe {
+            libc::proc_listallpids(
+                pids.as_mut_ptr().cast(),
+                (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+            )
+        };
+        if count < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let count = count as usize;
+        if count < capacity {
+            pids.truncate(count);
+            return Ok(pids
+                .into_iter()
+                .filter(|pid| *pid > 0)
+                .map(|pid| pid as u32)
+                .collect());
+        }
+        capacity *= 2;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is PROC_PIDPATHINFO_MAXSIZE bytes, as proc_pidpath requires.
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer)))
+}
+
+#[cfg(target_os = "macos")]
+fn read_cmdline(pid: u32) -> std::io::Result<Vec<String>> {
+    process_arguments(pid).map(|(args, _)| args)
+}
+
+/// The environment a process started with, as NUL-terminated entries.
+#[cfg(target_os = "macos")]
+fn read_environ(pid: u32) -> std::io::Result<Vec<u8>> {
+    process_arguments(pid).map(|(_, environ)| environ)
+}
+
+/// `sysctl(KERN_PROCARGS2)` holds argc, the executable path, NUL padding,
+/// argc arguments, then the environment the process started with, ended by
+/// an empty string.
+#[cfg(target_os = "macos")]
+fn process_arguments(pid: u32) -> std::io::Result<(Vec<String>, Vec<u8>)> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    // SAFETY: a null buffer asks sysctl for the size it needs.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buffer = vec![0u8; size];
+    // SAFETY: the buffer is `size` bytes, and sysctl writes back how many it used.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(size);
+
+    let malformed = || std::io::Error::new(std::io::ErrorKind::InvalidData, "short KERN_PROCARGS2");
+    let argc = buffer.get(..4).ok_or_else(malformed)?;
+    let argc = i32::from_ne_bytes([argc[0], argc[1], argc[2], argc[3]]).max(0) as usize;
+    let mut strings = buffer[4..].split(|byte| *byte == 0);
+    strings.next().ok_or_else(malformed)?;
+    let mut strings = strings.skip_while(|string| string.is_empty());
+    let args = strings
+        .by_ref()
+        .take(argc)
+        .map(|arg| String::from_utf8_lossy(arg).to_string())
+        .collect();
+    let mut environ = Vec::new();
+    for entry in strings.take_while(|entry| !entry.is_empty()) {
+        environ.extend_from_slice(entry);
+        environ.push(0);
+    }
+    Ok((args, environ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn all_pids() -> std::io::Result<Vec<u32>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_executable(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_cmdline(_pid: u32) -> std::io::Result<Vec<String>> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_environ(_pid: u32) -> std::io::Result<Vec<u8>> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 fn process_runtime_dir(pid: u32) -> std::io::Result<Option<PathBuf>> {
-    let environ = fs::read(format!("/proc/{pid}/environ"))?;
+    let environ = read_environ(pid)?;
 
     let mut socket_path: Option<PathBuf> = None;
 
@@ -1209,6 +1357,29 @@ mod tests {
         let should_terminate = should_terminate_runtime_dir(&runtime_dir, &registered_runtime_dirs);
         fs::remove_dir_all(runtime_dir).unwrap();
         assert!(!should_terminate, "a live test owner must remain protected");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn process_readers_see_this_process_as_it_started() {
+        let pid = std::process::id();
+        assert_eq!(
+            read_cmdline(pid).unwrap(),
+            std::env::args().collect::<Vec<_>>()
+        );
+        let path = format!("PATH={}", std::env::var("PATH").unwrap());
+        assert!(
+            read_environ(pid)
+                .unwrap()
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == path.as_bytes()),
+            "the starting environment holds this process's PATH"
+        );
+        assert_eq!(
+            process_executable(pid).map(|path| fs::canonicalize(path).unwrap()),
+            Some(fs::canonicalize(std::env::current_exe().unwrap()).unwrap())
+        );
+        assert!(all_pids().unwrap().contains(&pid));
     }
 
     #[test]
