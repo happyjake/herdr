@@ -2179,6 +2179,23 @@ impl<'a> PaneShellConfig<'a> {
             mode,
         }
     }
+
+    /// The shell a new pane runs under this configuration, and whether it
+    /// starts as a login shell.
+    pub(crate) fn launch(self) -> PaneShellLaunch {
+        PaneShellLaunch {
+            program: pane_shell(self.default_shell),
+            login: shell_mode_uses_login_shell(self.mode, ShellLaunchTarget::current()),
+        }
+    }
+}
+
+/// The shell a new pane runs, for work that must see what an agent started
+/// in a pane sees: the shell's startup files set its PATH and environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaneShellLaunch {
+    pub(crate) program: String,
+    pub(crate) login: bool,
 }
 
 /// Target platform for shell launch policy. Parameterized (instead of raw
@@ -3261,7 +3278,8 @@ impl PaneRuntime {
                     let now_for_tick = Instant::now();
                     let tick = if active_pending_release(&pending_release_for_task, now_for_tick)
                         .is_some()
-                        || terminal.needs_transient_default_color_restore_probe(last_foreground_pgid)
+                        || terminal
+                            .needs_transient_default_color_restore_probe(last_foreground_pgid)
                     {
                         TICK_PENDING_RELEASE
                     } else if pending_idle.active() {

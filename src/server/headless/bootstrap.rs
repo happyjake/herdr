@@ -88,9 +88,10 @@ pub fn run_server() -> io::Result<()> {
     };
 
     // agy and pi list their models by running a command; start now so the
-    // first agent settings answer already holds both lists.
+    // first agent settings answer already holds both lists. pi lists from
+    // the shell a new pane runs, as the agents it lists for do.
     api::warm_agy_models();
-    api::warm_pi_models();
+    api::warm_pi_models(pane_shell_launch(&loaded_config.config));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -177,6 +178,11 @@ fn take_startup_cwd() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
+fn pane_shell_launch(config: &config::Config) -> crate::pane::PaneShellLaunch {
+    crate::pane::PaneShellConfig::new(&config.terminal.default_shell, config.terminal.shell_mode)
+        .launch()
+}
+
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
@@ -240,7 +246,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             auto_close.clone(),
         )?;
         api::warm_agy_models();
-        api::warm_pi_models();
+        api::warm_pi_models(pane_shell_launch(&loaded_config.config));
         // The old server released the websocket port with its socket files;
         // bind it here so a committed handoff keeps the listener alive.
         // Failure fails the handoff and the old server restores its sockets.

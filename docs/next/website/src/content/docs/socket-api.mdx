@@ -131,7 +131,11 @@ pattern that names no model pi can run is left out, so every entry is a value
 pi's `--model` flag takes. The server expands the patterns against
 `pi --list-models`, which it runs when it starts and again when that list is an
 hour old or pi's `settings.json`, `models.json` or `auth.json` changed; a
-request waits at most one second for such a listing. While pi has not listed,
+request waits at most one second for such a listing. It runs pi the way an
+agent started in a new pane runs it: through the pane shell (`[terminal]`
+`default_shell` and `shell_mode`), interactive, so the PATH and provider keys
+that the shell's startup files set count. A key added to those files counts
+from the next hourly listing. While pi has not listed,
 `models` keeps the patterns without `*` or `?` as written. `models` is `[]`
 when `enabledModels` is unset or the settings file is unavailable.
 `agy` holds only `models`: every `{id, name}` that `agy models` lists, in its

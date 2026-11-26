@@ -703,12 +703,22 @@ fn agent_settings_websocket_reads_fixture_home_without_leaking_secrets_to_tracin
     )
     .unwrap();
     // pi's patterns are expanded against `pi --list-models`, which lists
-    // only under the agent directory the server hands down.
-    let fake_pi = bin_dir.join("pi");
+    // only under the agent directory the server hands down. pi lists from
+    // the pane shell, here a login sh: only its startup file puts this pi on
+    // the PATH and sets the key it lists with.
+    let shell_bin_dir = home.join("shell-bin");
+    fs::create_dir_all(&shell_bin_dir).unwrap();
+    fs::write(
+        home.join(".profile"),
+        "export PATH=\"$HOME/shell-bin:$PATH\"\nexport PROVIDER_FIXTURE_KEY=set\n",
+    )
+    .unwrap();
+    let fake_pi = shell_bin_dir.join("pi");
     fs::write(
         &fake_pi,
         "#!/bin/sh\n[ \"$1\" = --list-models ] || exit 2\n\
          [ \"$PI_CODING_AGENT_DIR\" = '~/pi-config' ] || exit 3\n\
+         [ \"$PROVIDER_FIXTURE_KEY\" = set ] || exit 4\n\
          echo 'Warning: No models match pattern \"gone/model\"' >&2\n\
          echo 'provider  model   context  max-out  thinking  images'\n\
          echo 'other     model   128K     16.4K    no        no'\n\
@@ -734,7 +744,10 @@ fn agent_settings_websocket_reads_fixture_home_without_leaking_secrets_to_tracin
         &config_home,
         &runtime_dir,
         &socket_path,
-        &websocket_section(port),
+        &format!(
+            "{}[terminal]\nshell_mode = \"login\"\n",
+            websocket_section(port)
+        ),
         &[
             ("HOME", home.to_str().unwrap()),
             ("PI_CODING_AGENT_DIR", "~/pi-config"),

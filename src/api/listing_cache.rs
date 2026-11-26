@@ -7,7 +7,7 @@
 //! no list read under the current settings, and then only briefly.
 
 use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -128,50 +128,140 @@ where
     }
 }
 
-/// Run a command with no input, keep at most [MAX_OUTPUT_BYTES] of its
-/// stdout, and kill it at the deadline.
+/// Run a command with no input, keep its stdout, and stop it at the
+/// deadline. None when it cannot start, runs past the deadline, or writes
+/// more than [MAX_OUTPUT_BYTES].
+///
+/// The command may be a shell whose startup files leave background jobs
+/// that hold stdout open after the shell exits. So it runs in a session of
+/// its own; its output is complete once it has exited and its stdout has
+/// been quiet for [LINGER]; and what is left of its session then gets the
+/// hangup a closed terminal sends. At the deadline the whole session is
+/// killed.
 pub(super) fn run_bounded(
     mut command: Command,
     deadline: Duration,
 ) -> Option<(ExitStatus, Vec<u8>)> {
     let started = Instant::now();
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    start_own_session(&mut command);
+    let mut child = command.spawn().ok()?;
+    let Some(chunks) = child.stdout.take().and_then(read_in_background) else {
+        kill(&mut child);
+        return None;
+    };
+    let mut output = Vec::new();
+    let mut open = true;
+    let mut exited: Option<(ExitStatus, Instant)> = None;
+    loop {
+        if started.elapsed() >= deadline || output.len() as u64 > MAX_OUTPUT_BYTES {
+            kill(&mut child);
+            return None;
+        }
+        if open {
+            match chunks.recv_timeout(POLL) {
+                Ok(chunk) => {
+                    output.extend_from_slice(&chunk);
+                    if let Some((_, quiet_since)) = &mut exited {
+                        *quiet_since = Instant::now();
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => open = false,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        } else if exited.is_none() {
+            std::thread::sleep(POLL);
+        }
+        if exited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => exited = Some((status, Instant::now())),
+                Ok(None) => {}
+                Err(_) => {
+                    kill(&mut child);
+                    return None;
+                }
+            }
+        }
+        if let Some((status, quiet_since)) = exited {
+            if !open || quiet_since.elapsed() >= LINGER {
+                #[cfg(unix)]
+                signal_session(&child, libc::SIGHUP);
+                return Some((status, output));
+            }
+        }
+    }
+}
+
+/// How often a running listing is checked.
+const POLL: Duration = Duration::from_millis(20);
+/// How long stdout may stay open and quiet after the command exits before
+/// the output counts as complete.
+const LINGER: Duration = Duration::from_millis(500);
+
+/// Stdout in chunks as they arrive, read on a thread of its own so that a
+/// command that stops writing without exiting still meets the deadline. The
+/// channel closes at end of file.
+fn read_in_background(mut stdout: ChildStdout) -> Option<mpsc::Receiver<Vec<u8>>> {
     let (sender, receiver) = mpsc::channel();
-    // A reader of its own, so a child that stops writing without exiting
-    // still meets the deadline.
-    let reader = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("model-listing-read".into())
         .spawn(move || {
-            let mut output = Vec::new();
-            let read = (&mut stdout)
-                .take(MAX_OUTPUT_BYTES)
-                .read_to_end(&mut output);
-            let _ = sender.send(read.map(|_| output));
+            let mut chunk = [0; 8192];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(read) => {
+                        if sender.send(chunk[..read].to_vec()).is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
+        })
+        .ok()?;
+    Some(receiver)
+}
+
+fn kill(child: &mut Child) {
+    #[cfg(unix)]
+    signal_session(child, libc::SIGKILL);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The command leads a new session, so its process group holds the
+/// programs it starts, and it has no controlling terminal for an
+/// interactive shell to take over.
+#[cfg(unix)]
+fn start_own_session(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: setsid is async-signal-safe and touches only the child.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         });
-    let output = match reader {
-        Ok(_) => receiver
-            .recv_timeout(deadline.saturating_sub(started.elapsed()))
-            .ok()
-            .and_then(Result::ok),
-        Err(_) => None,
-    };
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return output.map(|output| (status, output)),
-            Ok(None) if output.is_some() && started.elapsed() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+    }
+}
+
+/// Signal the process group the command leads. Harmless once the group is
+/// empty.
+#[cfg(unix)]
+fn signal_session(child: &Child, signal: libc::c_int) {
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: killpg reads only its arguments.
+        unsafe {
+            libc::killpg(group, signal);
         }
     }
 }
@@ -390,5 +480,65 @@ mod tests {
         let (status, output) = run_bounded(command, Duration::from_secs(10)).unwrap();
         assert!(status.success());
         assert_eq!(output, b"a\tA\n");
+    }
+
+    #[cfg(unix)]
+    fn scratch_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("listing-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// Whether a process is gone, waiting up to two seconds for it to go.
+    #[cfg(unix)]
+    fn gone(pid_file: &std::path::Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pid: libc::pid_t = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        loop {
+            // SAFETY: signal 0 only checks that the process exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_job_left_holding_stdout_does_not_hold_the_listing() {
+        let pid_file = scratch_file("left-job.pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "sleep 30 & echo $! > \"$0\"; printf 'a\\tA\\n'",
+            pid_file.to_str().unwrap(),
+        ]);
+        let started = Instant::now();
+        let (status, output) = run_bounded(command, Duration::from_secs(20)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(status.success());
+        assert_eq!(output, b"a\tA\n");
+        assert!(gone(&pid_file), "the job left behind got no hangup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_past_its_deadline_is_killed_with_the_jobs_it_started() {
+        let pid_file = scratch_file("deadline-job.pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "trap '' HUP; sleep 30 & echo $! > \"$0\"; wait",
+            pid_file.to_str().unwrap(),
+        ]);
+        assert!(run_bounded(command, Duration::from_millis(500)).is_none());
+        assert!(gone(&pid_file), "the job outlived the deadline");
     }
 }

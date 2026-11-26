@@ -11,15 +11,23 @@
 //! credentials and its extensions all decide. So the server reads
 //! `pi --list-models` and holds the list (see [super::listing_cache]). A
 //! change to pi's settings, models or credentials file lists again at once.
+//!
+//! The keys pi reads from the environment decide too, and a server started
+//! by a service manager often has none of them: they come from the shell's
+//! startup files. An agent started from the sheet is typed into a pane's
+//! shell, so pi lists from that same shell, started the way a new pane
+//! starts it, and sees the PATH and keys the agent will see.
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Instant, SystemTime};
 
 use regex::Regex;
 
 use super::listing_cache::{run_bounded, ListingCache, FIRST_WAIT, LIST_DEADLINE};
+use crate::config::ShellModeConfig;
+use crate::pane::{PaneShellConfig, PaneShellLaunch};
 
 /// One model pi can run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,9 +45,15 @@ const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "
 /// Each watched file's modification time and length, or None while absent.
 type Stamp = Vec<Option<(SystemTime, u64)>>;
 
+/// The shell pi lists from: the one a new pane runs. None until the server
+/// starts, which leaves the shell of the default pane configuration.
+static LIST_SHELL: Mutex<Option<PaneShellLaunch>> = Mutex::new(None);
+
 /// Start reading pi's model list in the background, so that the first
-/// settings answer after a server start already has it.
-pub(crate) fn warm() {
+/// settings answer after a server start already has it. `shell` is the shell
+/// a new pane runs, which pi lists from from now on.
+pub(crate) fn warm(shell: PaneShellLaunch) {
+    *LIST_SHELL.lock().unwrap_or_else(PoisonError::into_inner) = Some(shell);
     if let Some(dir) = super::agent_settings::pi_agent_dir() {
         cache().refresh(Instant::now(), &stamp(&dir));
     }
@@ -70,14 +84,59 @@ fn stamp(dir: &Path) -> Stamp {
 /// Run `pi --list-models`, or None when pi is missing, fails, runs past its
 /// deadline, or lists nothing.
 fn list_with_pi() -> Option<Vec<PiModel>> {
-    let mut command = Command::new("pi");
-    command.arg("--list-models");
-    let (status, output) = run_bounded(command, LIST_DEADLINE)?;
+    let shell = LIST_SHELL
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| PaneShellConfig::new("", ShellModeConfig::Auto).launch());
+    let (status, output) = run_bounded(list_command(&shell), LIST_DEADLINE)?;
     if !status.success() {
         return None;
     }
     let models = parse_listing(&String::from_utf8_lossy(&output));
     (!models.is_empty()).then_some(models)
+}
+
+/// `pi --list-models` as an agent started from the sheet runs pi: typed
+/// into `shell`, started as a new pane starts it, so its startup files run
+/// first. The shell is interactive because pane shells are, and many
+/// startup files set the environment only for interactive shells.
+#[cfg(unix)]
+fn list_command(shell: &PaneShellLaunch) -> Command {
+    use std::os::unix::process::CommandExt as _;
+
+    let name = Path::new(&shell.program)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| shell.program.clone());
+    let argv = [pi_executable().to_string(), "--list-models".to_string()];
+    let Some(script) = crate::platform::interactive_shell_command(&argv, &name) else {
+        return direct_list_command();
+    };
+    let mut command = Command::new(&shell.program);
+    if shell.login {
+        // The login convention a pane's shell starts with: a `-` before its
+        // name.
+        command.arg0(format!("-{name}"));
+    }
+    command.args(["-i", "-c", &script]);
+    command
+}
+
+/// Windows pane shells take no POSIX flags, so pi runs directly there.
+#[cfg(not(unix))]
+fn list_command(_shell: &PaneShellLaunch) -> Command {
+    direct_list_command()
+}
+
+fn direct_list_command() -> Command {
+    let mut command = Command::new(pi_executable());
+    command.arg("--list-models");
+    command
+}
+
+fn pi_executable() -> &'static str {
+    crate::detect::interactive_agent_executable(crate::detect::Agent::Pi)
 }
 
 /// `pi --list-models` prints a table: a `provider model context max-out
@@ -481,6 +540,7 @@ fn glob_class(chars: &[char], open: usize) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn models(rows: &[(&str, &str)]) -> Vec<PiModel> {
         rows.iter()
@@ -682,6 +742,86 @@ mod tests {
     fn a_class_that_never_closes_is_literal() {
         let listing = models(&[("p", "a[b"), ("p", "ab")]);
         assert_eq!(scoped(&["p/a[b*"], &listing), ["p/a[b"]);
+    }
+
+    /// What pi lists when run through `shell` in a home whose startup file
+    /// `rc` puts pi on the PATH and sets a key that unlocks one provider.
+    #[cfg(unix)]
+    fn listed_through(
+        command: impl FnOnce() -> Command,
+        name: &str,
+        rc: &str,
+    ) -> Option<Vec<PiModel>> {
+        let home =
+            std::env::temp_dir().join(format!("pi-models-shell-{}-{name}", std::process::id()));
+        let tools = home.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let pi = tools.join("pi");
+        std::fs::write(
+            &pi,
+            "#!/bin/sh\n[ \"$1\" = --list-models ] || exit 2\n\
+             echo 'provider  model  context  max-out  thinking  images'\n\
+             [ -n \"$SHELL_ONLY_KEY\" ] && echo 'keyed  model  1M  32.8K  yes  yes'\n\
+             echo 'open  model  1M  32.8K  yes  yes'\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(
+            home.join(rc),
+            "export PATH=\"$HOME/tools:$PATH\"\nexport SHELL_ONLY_KEY=set\n",
+        )
+        .unwrap();
+        let mut command = command();
+        command
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env_remove("SHELL_ONLY_KEY")
+            .env_remove("ZDOTDIR")
+            .env_remove("ENV")
+            .env_remove("BASH_ENV");
+        let (status, output) = run_bounded(command, Duration::from_secs(20))?;
+        status
+            .success()
+            .then(|| parse_listing(&String::from_utf8_lossy(&output)))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_lists_from_the_pane_shell_after_its_startup_files() {
+        // zsh reads .zshrc only when interactive, bash reads .bashrc only
+        // when interactive and not a login shell, sh reads .profile only as
+        // a login shell.
+        let shells = [
+            ("/bin/zsh", true, ".zshrc"),
+            ("/bin/bash", false, ".bashrc"),
+            ("/bin/sh", true, ".profile"),
+        ];
+        let mut ran = 0;
+        for (program, login, rc) in shells {
+            if !Path::new(program).exists() {
+                continue;
+            }
+            ran += 1;
+            let shell = PaneShellLaunch {
+                program: program.into(),
+                login,
+            };
+            let name = rc.trim_start_matches('.');
+            assert_eq!(
+                listed_through(|| list_command(&shell), name, rc),
+                Some(models(&[("keyed", "model"), ("open", "model")])),
+                "{program}"
+            );
+        }
+        assert!(ran > 0, "no shell to try");
+        // Run directly, pi is not on the PATH the startup file sets.
+        assert_eq!(
+            listed_through(direct_list_command, "direct", ".profile"),
+            None
+        );
     }
 
     #[test]
