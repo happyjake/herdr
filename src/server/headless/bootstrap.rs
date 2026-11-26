@@ -87,9 +87,10 @@ pub fn run_server() -> io::Result<()> {
         }
     };
 
-    // agy lists its models over the network; start now so the first
-    // agent settings answer already holds the list.
+    // agy and pi list their models by running a command; start now so the
+    // first agent settings answer already holds both lists.
     api::warm_agy_models();
+    api::warm_pi_models();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -239,6 +240,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             auto_close.clone(),
         )?;
         api::warm_agy_models();
+        api::warm_pi_models();
         // The old server released the websocket port with its socket files;
         // bind it here so a committed handoff keeps the listener alive.
         // Failure fails the handoff and the old server restores its sockets.

@@ -5,6 +5,8 @@ mod attachment;
 pub mod client;
 pub(crate) mod credentials;
 mod event_hub;
+mod listing_cache;
+mod pi_models;
 mod place_lookup;
 mod prompt_trail;
 pub mod schema;
@@ -23,6 +25,7 @@ pub(crate) use advertised_endpoint::{declared_advertised_endpoint, normalize_adv
 pub(crate) use agy_models::warm as warm_agy_models;
 pub use credentials::SharedCredentialRegistry;
 pub use event_hub::EventHub;
+pub(crate) use pi_models::warm as warm_pi_models;
 pub(crate) use search_sessions::handle_active_session_snapshot;
 pub use server::ServerHandle;
 pub(crate) use server::{api_method_name, start_server_with_stop_control};

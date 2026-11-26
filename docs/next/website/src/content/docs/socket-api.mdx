@@ -122,8 +122,18 @@ file yields `default: {model, effort}` and `reason: null`, with null for any
 missing field. A missing file yields `default: null, reason: "no_settings"`;
 an unreadable, malformed, non-regular, or oversized file yields
 `default: null, reason: "unreadable"`. Each file is limited to 1 MiB, and a
-failure affects only that agent. Pi also always includes `models`, containing
-`enabledModels` in file order, or `[]` when unset or unavailable.
+failure affects only that agent. Pi also always includes `models`: the models
+that pi's `enabledModels` patterns name, as pi expands them when it starts,
+each once as `provider/id` in pattern order, with a pattern's `:level` thinking
+suffix kept. A glob such as `provider/*` lists each model it matches, by
+provider and then id, and a
+pattern that names no model pi can run is left out, so every entry is a value
+pi's `--model` flag takes. The server expands the patterns against
+`pi --list-models`, which it runs when it starts and again when that list is an
+hour old or pi's `settings.json`, `models.json` or `auth.json` changed; a
+request waits at most one second for such a listing. While pi has not listed,
+`models` keeps the patterns without `*` or `?` as written. `models` is `[]`
+when `enabledModels` is unset or the settings file is unavailable.
 `agy` holds only `models`: every `{id, name}` that `agy models` lists, in its
 order, where `id` is what agy's `--model` flag takes. That listing goes over
 the network and takes seconds, so the server starts it when it starts, keeps

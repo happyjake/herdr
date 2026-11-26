@@ -674,7 +674,7 @@ fn agent_settings_websocket_reads_fixture_home_without_leaking_secrets_to_tracin
         pi_dir.join("settings.json"),
         r#"{
         "defaultProvider":"provider", "defaultModel":"model", "defaultThinkingLevel":"xhigh",
-        "enabledModels":["provider/second", "provider/first"],
+        "enabledModels":["provider/second", "provider/*", "gone/model"],
         "apiKey":"pi-private-token", "env":{"TOKEN":"pi-env-token"}
     }"#,
     )
@@ -702,9 +702,26 @@ fn agent_settings_websocket_reads_fixture_home_without_leaking_secrets_to_tracin
          printf 'gemini-pro-orchestrator-argon\\tOrchestrator (Argon)\\ngemini-4-argon-high\\tGemini 4 Argon (High)\\n'\n",
     )
     .unwrap();
+    // pi's patterns are expanded against `pi --list-models`, which lists
+    // only under the agent directory the server hands down.
+    let fake_pi = bin_dir.join("pi");
+    fs::write(
+        &fake_pi,
+        "#!/bin/sh\n[ \"$1\" = --list-models ] || exit 2\n\
+         [ \"$PI_CODING_AGENT_DIR\" = '~/pi-config' ] || exit 3\n\
+         echo 'Warning: No models match pattern \"gone/model\"' >&2\n\
+         echo 'provider  model   context  max-out  thinking  images'\n\
+         echo 'other     model   128K     16.4K    no        no'\n\
+         echo 'provider  first   1M       32.8K    yes       yes'\n\
+         echo 'provider  second  1M       32.8K    yes       yes'\n\
+         echo 'provider  third   1M       32.8K    yes       no'\n",
+    )
+    .unwrap();
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+        for fake in [&fake_agy, &fake_pi] {
+            fs::set_permissions(fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
     let path = format!(
         "{}:{}",
@@ -738,7 +755,7 @@ fn agent_settings_websocket_reads_fixture_home_without_leaking_secrets_to_tracin
         response,
         serde_json::json!({"id":"settings_present", "result":{
             "type":"server_agent_settings",
-            "pi":{"default":{"model":"provider/model", "effort":"xhigh"}, "reason":null, "models":["provider/second", "provider/first"]},
+            "pi":{"default":{"model":"provider/model", "effort":"xhigh"}, "reason":null, "models":["provider/second", "provider/first", "provider/third"]},
             "claude":{"default":{"model":"sonnet", "effort":"high"}, "reason":null},
             "codex":{"default":{"model":"model", "effort":"high"}, "reason":null},
             "agy":{"models":[

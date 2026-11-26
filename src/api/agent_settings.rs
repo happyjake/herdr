@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::pi_models::PiModel;
 use super::schema::{
     AgentDefault, AgentSettings, AgentSettingsReason, AgyAgentSettings, PiAgentSettings,
     ResponseResult, SuccessResponse,
@@ -17,10 +18,11 @@ pub(super) fn handle_settings(id: String) -> String {
     let agy = AgyAgentSettings {
         models: super::agy_models::models(),
     };
-    let result = read_settings_with_agy(
+    let result = read_settings_with(
         crate::worktree::home_dir().as_deref(),
         |key| std::env::var_os(key),
         agy,
+        super::pi_models::listing,
     );
     serde_json::to_string(&SuccessResponse {
         id: id.clone(),
@@ -59,34 +61,56 @@ struct CodexFile {
     model_reasoning_effort: Option<String>,
 }
 
-/// The settings files as read, with no agy models.
-#[cfg(test)]
-fn read_settings(home: Option<&Path>, env: impl Fn(&str) -> Option<OsString>) -> ResponseResult {
-    read_settings_with_agy(home, env, AgyAgentSettings { models: Vec::new() })
+/// pi's agent directory as pi resolves it for this server, or None when
+/// there is none.
+pub(super) fn pi_agent_dir() -> Option<PathBuf> {
+    pi_config_dir(
+        crate::worktree::home_dir().as_deref(),
+        std::env::var_os("PI_CODING_AGENT_DIR"),
+    )
+    .ok()
+    .flatten()
 }
 
-fn read_settings_with_agy(
+/// The settings files as read, with no agy models and no pi listing.
+#[cfg(test)]
+fn read_settings(home: Option<&Path>, env: impl Fn(&str) -> Option<OsString>) -> ResponseResult {
+    read_settings_with(home, env, AgyAgentSettings { models: Vec::new() }, |_| None)
+}
+
+/// `pi_listing` gives the models pi can run with the agent directory it is
+/// handed; it is asked only when `enabledModels` is not empty.
+fn read_settings_with(
     home: Option<&Path>,
     env: impl Fn(&str) -> Option<OsString>,
     agy: AgyAgentSettings,
+    pi_listing: impl FnOnce(&Path) -> Option<Vec<PiModel>>,
 ) -> ResponseResult {
     let pi_dir = pi_config_dir(home, env("PI_CODING_AGENT_DIR"));
     let claude_dir = config_dir(home, env("CLAUDE_CONFIG_DIR"), ".claude");
     let codex_dir = config_dir(home, env("CODEX_HOME"), ".codex");
-    let pi = pi_dir
-        .and_then(|dir| read_json::<PiFile>(dir.map(|dir| dir.join("settings.json")).as_deref()));
+    let pi = pi_dir.and_then(|dir| {
+        let file =
+            read_json::<PiFile>(dir.as_ref().map(|dir| dir.join("settings.json")).as_deref())?;
+        Ok((dir, file))
+    });
     let (pi, models) = match pi {
-        Ok(file) => {
+        Ok((dir, file)) => {
             let model = match (file.default_provider, file.default_model) {
                 (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
                 (_, model) => model,
+            };
+            let patterns = file.enabled_models.unwrap_or_default();
+            let listing = match dir {
+                Some(dir) if !patterns.is_empty() => pi_listing(&dir),
+                _ => None,
             };
             (
                 Ok(AgentDefault {
                     model,
                     effort: file.default_thinking_level,
                 }),
-                file.enabled_models.unwrap_or_default(),
+                super::pi_models::scope(&patterns, listing.as_deref()),
             )
         }
         Err(reason) => (Err(reason), Vec::new()),
@@ -307,12 +331,68 @@ mod tests {
             fixture.read(),
             serde_json::json!({
                 "type":"server_agent_settings",
-                "pi":{"default":{"model":"provider/model", "effort":"high"}, "reason":null, "models":["provider/second", "provider/first", "provider/second"]},
+                "pi":{"default":{"model":"provider/model", "effort":"high"}, "reason":null, "models":["provider/second", "provider/first"]},
                 "claude":{"default":{"model":"sonnet", "effort":"max"}, "reason":null},
                 "codex":{"default":{"model":"model", "effort":"high"}, "reason":null},
                 "agy":{"models":[]}
             })
         );
+    }
+
+    #[test]
+    fn agent_settings_lists_the_models_pi_patterns_name_in_pi_listing() {
+        let fixture = Fixture::new();
+        fixture.write(
+            "pi-config/settings.json",
+            r#"{"enabledModels":["zai/glm-5.4", "local/*", "gone/model", "local/default"]}"#,
+        );
+        let asked = std::cell::RefCell::new(Vec::new());
+        let result = serde_json::to_value(read_settings_with(
+            Some(&fixture.home),
+            |key| (key == "PI_CODING_AGENT_DIR").then(|| "~/pi-config".into()),
+            AgyAgentSettings { models: Vec::new() },
+            |dir| {
+                asked.borrow_mut().push(dir.to_path_buf());
+                Some(
+                    [
+                        ("local", "default"),
+                        ("local", "hy4-flash"),
+                        ("zai", "glm-5.4"),
+                    ]
+                    .into_iter()
+                    .map(|(provider, id)| PiModel {
+                        provider: provider.into(),
+                        id: id.into(),
+                    })
+                    .collect(),
+                )
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            result["pi"]["models"],
+            serde_json::json!(["zai/glm-5.4", "local/default", "local/hy4-flash"])
+        );
+        assert_eq!(asked.into_inner(), [fixture.home.join("pi-config")]);
+    }
+
+    #[test]
+    fn agent_settings_asks_for_no_pi_listing_without_patterns() {
+        let fixture = Fixture::new();
+        let read = |fixture: &Fixture| {
+            serde_json::to_value(read_settings_with(
+                Some(&fixture.home),
+                |_| None,
+                AgyAgentSettings { models: Vec::new() },
+                |_| panic!("listed pi models with no pattern to expand"),
+            ))
+            .unwrap()
+        };
+        assert_eq!(read(&fixture)["pi"]["models"], serde_json::json!([]));
+        fixture.write(".pi/agent/settings.json", r#"{"defaultModel":"model"}"#);
+        assert_eq!(read(&fixture)["pi"]["models"], serde_json::json!([]));
+        fixture.write(".pi/agent/settings.json", r#"{"enabledModels":[]}"#);
+        assert_eq!(read(&fixture)["pi"]["models"], serde_json::json!([]));
     }
 
     #[test]

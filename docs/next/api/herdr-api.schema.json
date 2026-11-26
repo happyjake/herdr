@@ -10871,7 +10871,7 @@
               ]
             },
             "models": {
-              "description": "Enabled models in file order; empty when unset or unreadable.",
+              "description": "The models `enabledModels` names, as `provider/id` in pattern order,\nexpanded against `pi --list-models`; empty when unset or unreadable.",
               "items": {
                 "type": "string"
               },

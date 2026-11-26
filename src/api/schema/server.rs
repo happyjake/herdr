@@ -153,7 +153,8 @@ fn required_nullable<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
 pub struct PiAgentSettings {
     #[serde(flatten)]
     pub settings: AgentSettings,
-    /// Enabled models in file order; empty when unset or unreadable.
+    /// The models `enabledModels` names, as `provider/id` in pattern order,
+    /// expanded against `pi --list-models`; empty when unset or unreadable.
     pub models: Vec<String>,
 }
 
